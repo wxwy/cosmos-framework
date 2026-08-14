@@ -22,7 +22,11 @@ def _action_policy_libero_edge_model_config() -> dict:
     cfg["diffusion_expert_config"]["load_weights_from_pretrained"] = False
     cfg["ema"]["enabled"] = False
     cfg["tokenizer"]["encode_exact_durations"] = [17, 61, 73]
-    cfg["vlm_config"]["tokenizer"]["repository"] = "${oc.env:EDGE_POLICY_CHECKPOINT}"
+    cfg["vlm_config"]["tokenizer"].update(
+        repository=None,
+        revision=None,
+        tokenizer_type="${oc.env:EDGE_POLICY_CHECKPOINT}",
+    )
     return cfg
 
 
