@@ -36,6 +36,13 @@ action_policy_libero_edge_warmstart["job"].update(
 )
 action_policy_libero_edge_warmstart["model"]["config"] = _action_policy_libero_edge_model_config()
 
+# Admission smoke is fully offline. Keep the safety/monitor callbacks, but do
+# not instantiate the basic group because it unconditionally initializes W&B.
+for _default in action_policy_libero_edge_warmstart["defaults"]:
+    if "override /callbacks" in _default:
+        _default["override /callbacks"] = ["optimization", "job_monitor"]
+        break
+
 # Preserve the Policy-DROID action heads. LIBERO owns domain 5; DROID domain 8
 # and every other untouched embedding row must survive the warm-start.
 action_policy_libero_edge_warmstart["checkpoint"]["keys_to_skip_loading"] = ["net_ema."]
