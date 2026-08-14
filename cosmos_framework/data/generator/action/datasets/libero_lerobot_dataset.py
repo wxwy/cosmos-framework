@@ -143,7 +143,10 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         # columns the sample builder needs into contiguous arrays, ordered by global
         # frame index, so DataLoader worker forks share them copy-on-write.
         index_parts, episode_parts, task_parts, ts_parts, action_parts = [], [], [], [], []
-        for path in sorted((self._root / "data").glob("chunk-*/file-*.parquet")):
+        data_paths = sorted((self._root / "data").glob("chunk-*/file-*.parquet"))
+        if not data_paths:
+            data_paths = sorted((self._root / "data").glob("chunk-*/episode_*.parquet"))
+        for path in data_paths:
             table = pq.read_table(path, columns=["index", "episode_index", "task_index", "timestamp", _ACTION_FEATURE])
             index_parts.append(table["index"].to_numpy())
             episode_parts.append(table["episode_index"].to_numpy())

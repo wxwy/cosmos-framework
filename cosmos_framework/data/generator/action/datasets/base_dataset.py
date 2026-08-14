@@ -65,16 +65,27 @@ class ActionBaseDataset(ABC, Dataset):
 
         self._root = Path(root)
         self._info = json.loads((self._root / "meta" / "info.json").read_text())
-        self._episodes = {
-            int(row["episode_index"]): row
-            for path in sorted((self._root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
-            for row in pq.read_table(path).to_pylist()
-        }
-        tasks_df = pd.read_parquet(self._root / "meta" / "tasks.parquet")
-        # LeRobot v2.x stores task text in a "task" column; v3.0 stores it as the
-        # (unnamed) DataFrame index and keeps only "task_index" as a column.
-        task_texts = tasks_df["task"] if "task" in tasks_df.columns else tasks_df.index
-        self._tasks = {int(task_index): str(task) for task, task_index in zip(task_texts, tasks_df["task_index"])}
+        episode_paths = sorted((self._root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+        if episode_paths:
+            episode_rows = [row for path in episode_paths for row in pq.read_table(path).to_pylist()]
+        else:
+            episodes_jsonl = self._root / "meta" / "episodes.jsonl"
+            episode_rows = [json.loads(line) for line in episodes_jsonl.read_text().splitlines() if line.strip()]
+        self._episodes = {int(row["episode_index"]): row for row in episode_rows}
+
+        tasks_path = self._root / "meta" / "tasks.parquet"
+        if tasks_path.exists():
+            tasks_df = pd.read_parquet(tasks_path)
+            # LeRobot v2.x stores task text in a "task" column; v3.0 stores it as the
+            # (unnamed) DataFrame index and keeps only "task_index" as a column.
+            task_texts = tasks_df["task"] if "task" in tasks_df.columns else tasks_df.index
+            self._tasks = {
+                int(task_index): str(task) for task, task_index in zip(task_texts, tasks_df["task_index"])
+            }
+        else:
+            tasks_jsonl = self._root / "meta" / "tasks.jsonl"
+            task_rows = [json.loads(line) for line in tasks_jsonl.read_text().splitlines() if line.strip()]
+            self._tasks = {int(row["task_index"]): str(row["task"]) for row in task_rows}
         # ``self._rows`` (the flat, index-sorted list of every frame dict) is built
         # lazily on first access — see the ``_rows`` property. Materializing all
         # ~18M frames as Python dicts plus a full sort costs ~13 min and tens of GB;
@@ -172,6 +183,7 @@ class ActionBaseDataset(ABC, Dataset):
         )
         rel = self._info["video_path"].format(
             video_key=video_key,
+            episode_index=int(episode["episode_index"]),
             chunk_index=chunk_idx,
             file_index=file_idx,
             episode_chunk=chunk_idx,
