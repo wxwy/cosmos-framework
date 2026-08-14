@@ -325,6 +325,8 @@ class RobolabServerArgs(pydantic.BaseModel):
     """Output directory for OmniInference. Defaults to /tmp/cosmos3_action_server/robolab."""
     sampler: Literal["unipc", "edm"] = "unipc"
     """Diffusion sampler used by OmniInference."""
+    guardrails: bool = False
+    """Enable guardrails during policy serving."""
 
     seed: int = 0
     """Base generation seed used to initialize the request RNG."""
@@ -426,6 +428,7 @@ class RobolabPolicyService:
             "checkpoint_path": args.checkpoint_path,
             "output_dir": args.output_dir or _DEFAULT_ROBOLAB_OUTPUT_DIR,
             "sampler": args.sampler,
+            "guardrails": args.guardrails,
         }
         if args.experiment is not None:
             setup_overrides["experiment"] = args.experiment

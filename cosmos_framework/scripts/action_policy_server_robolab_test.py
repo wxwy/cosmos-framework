@@ -94,6 +94,7 @@ def test_server_args_default_to_released_droid_serving_config() -> None:
     assert args.num_steps == 4
     assert args.shift == 5.0
     assert args.deterministic_seed is False
+    assert args.guardrails is False
 
 
 def test_joint_pos_observation_preprocessing_matches_internal_layout() -> None:

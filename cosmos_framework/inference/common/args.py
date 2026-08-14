@@ -751,7 +751,7 @@ class GuardrailArgs(ArgsBase):
 
 
 class GuardrailOverrides(OverridesBase):
-    guardrails: bool = True
+    guardrails: bool = False
     """Enable guardrails."""
     offload_guardrail_models: bool = False
     """Offload guardrail models to CPU."""
