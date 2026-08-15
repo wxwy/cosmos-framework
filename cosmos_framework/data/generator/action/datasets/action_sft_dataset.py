@@ -22,6 +22,7 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
+from cosmos_framework.data.generator.action.latent_cache import R12CosmosLatentCache
 from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
 
 
@@ -42,6 +43,33 @@ class ActionSFTDataset(Dataset):
 
     def get_shuffle_blocks(self):
         """Delegate to the inner DROIDLeRobotDataset (per-episode/segment flat-index blocks)."""
+        return self._dataset.get_shuffle_blocks()
+
+
+class ActionLatentCacheDataset(Dataset):
+    """Attach R12 latents after transforms while preserving online fallback."""
+
+    def __init__(self, dataset: Dataset, cache: R12CosmosLatentCache):
+        self._dataset = dataset
+        self._cache = cache
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        sample = self._dataset[idx]
+        inner = self._dataset
+        while hasattr(inner, "_dataset") and not hasattr(inner, "get_window_identity"):
+            inner = inner._dataset
+        if hasattr(inner, "get_window_identity"):
+            episode, start = inner.get_window_identity(idx)
+            latent = self._cache.get_window(episode, start)
+            if latent is not None:
+                sample["vision_latent_cache"] = latent
+                sample["vision_latent_cache_enabled"] = True
+        return sample
+
+    def get_shuffle_blocks(self):
         return self._dataset.get_shuffle_blocks()
 
 
@@ -280,6 +308,10 @@ def get_action_libero_sft_dataset(
     episode_shuffle_seed: int = 42,
     tiny_overfit_num_samples: int | None = None,
     tiny_overfit_start_index: int = 0,
+    task_index: int | None = None,
+    use_latent_cache: bool = True,
+    latent_cache_root: str | None = None,
+    latent_cache_parity_path: str | None = None,
 ) -> Dataset:
     """Build the LIBERO action-policy SFT dataset (GA reproduction defaults).
 
@@ -307,6 +339,7 @@ def get_action_libero_sft_dataset(
         pose_coordinate_frame=pose_coordinate_frame,
         action_normalization=action_normalization,
         action_stats_path=action_stats_path,
+        task_index=task_index,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
@@ -318,7 +351,12 @@ def get_action_libero_sft_dataset(
         append_idle_frames=append_idle_frames,
         format_prompt_as_json=format_prompt_as_json,
     )
-    sft = ActionSFTDataset(dataset, transform, resolution)
+    sft: Dataset = ActionSFTDataset(dataset, transform, resolution)
+    if use_latent_cache and latent_cache_root:
+        sft = ActionLatentCacheDataset(
+            sft,
+            R12CosmosLatentCache(latent_cache_root, parity_path=latent_cache_parity_path),
+        )
     if tiny_overfit_num_samples is not None:
         if iterable_shuffle:
             raise ValueError("tiny_overfit_num_samples and iterable_shuffle cannot be enabled together.")

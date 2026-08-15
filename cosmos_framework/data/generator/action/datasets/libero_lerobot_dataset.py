@@ -83,6 +83,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         val_ratio: float = 0.01,
         seed: int = 0,
         sample_stride: int = 1,
+        task_index: int | None = None,
     ) -> None:
         if action_space != "frame_wise_relative":
             raise NotImplementedError(
@@ -164,6 +165,13 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         assert np.all(np.diff(self._row_episode) >= 0), "episode_index not contiguous after sorting by frame index"
         ep_vals, ep_starts, ep_counts = np.unique(self._row_episode, return_index=True, return_counts=True)
 
+        if task_index is not None:
+            task_index = int(task_index)
+            task_ep_mask = np.asarray(
+                [int(self._row_task[start]) == task_index for start in ep_starts], dtype=bool
+            )
+            ep_vals, ep_starts, ep_counts = ep_vals[task_ep_mask], ep_starts[task_ep_mask], ep_counts[task_ep_mask]
+
         # Deterministic per-episode train/val split (seeded; same on every rank).
         keep = self._split_episode_ids(ep_vals.tolist(), split, val_ratio, seed)
         kept = np.array([int(v) in keep for v in ep_vals], dtype=bool)
@@ -178,6 +186,14 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
             f"fps={self._fps} kept_episodes={len(self._ep_vals)}/{len(ep_vals)} "
             f"valid_indices={int(self._valid_cum[-1]) if self._valid_cum.size else 0}"
         )
+
+    def get_window_identity(self, idx: int) -> tuple[int, int]:
+        """Return ``(episode_index, source-frame start)`` for a flat window index."""
+        idx = int(idx)
+        ep = int(np.searchsorted(self._valid_cum, idx, side="right"))
+        prev = int(self._valid_cum[ep - 1]) if ep > 0 else 0
+        start = idx - prev
+        return int(self._ep_vals[ep]), start
 
     # ---- spec / dims -------------------------------------------------------
 
@@ -292,6 +308,8 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         ai_caption = random.choice([p.strip() for p in task.split(" | ") if p.strip()] or [task])
 
         extras: dict[str, Any] = {}
+        extras["episode_index"] = episode_index
+        extras["window_start_frame"] = start - int(self._ep_starts[ep])
         if self._camera_mode == "concat_view":
             extras["additional_view_description"] = (
                 "The left half shows the third-person view; the right half shows the wrist-mounted camera."

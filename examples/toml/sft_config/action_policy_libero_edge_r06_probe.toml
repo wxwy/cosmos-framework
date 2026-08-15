@@ -1,0 +1,22 @@
+# G0-R06-SFT five-step memory/time probe; never a formal training result.
+
+[job]
+task       = "vfm"
+experiment = "action_policy_libero_edge_r06"
+project    = "psm_wma"
+group      = "g0_r06_sft_probe"
+name       = "edge_libero_task0_probe"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 51200
+
+[trainer]
+max_iter        = 5
+logging_iter    = 1
+grad_accum_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 5

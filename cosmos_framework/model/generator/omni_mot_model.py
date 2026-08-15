@@ -3886,13 +3886,43 @@ class OmniMoTModel(ImaginaireModel):
                     )
                 raw_state_vision.append(item)
 
-        x0_tokens_vision = self._encode_vision_x0_tokens(
-            raw_state_vision,
-            num_vision_items_per_sample,
-            vision_condition_indexes,
-            num_views_per_vision_item,
-            frames_per_vision_item,
-        )
+        cached_latents = data_batch.get("vision_latent_cache", None)
+        cache_enabled = data_batch.get("vision_latent_cache_enabled", False)
+        if cached_latents is not None and (not isinstance(cache_enabled, torch.Tensor) or bool(cache_enabled.all())):
+            if isinstance(cached_latents, torch.Tensor):
+                cached_latents = [item for item in cached_latents]
+            if isinstance(cached_latents, (list, tuple)) and len(cached_latents) == len(raw_state_vision):
+                x0_tokens_vision = []
+                for latent in cached_latents:
+                    if not isinstance(latent, torch.Tensor) or latent.ndim != 4:
+                        x0_tokens_vision = []
+                        break
+                    # R12 stores [T_latent,C,H,W]; the model consumes [B,C,T,H,W].
+                    x0_tokens_vision.append(latent.permute(1, 0, 2, 3).unsqueeze(0).to(**self.tensor_kwargs))
+                if not x0_tokens_vision:
+                    x0_tokens_vision = self._encode_vision_x0_tokens(
+                        raw_state_vision,
+                        num_vision_items_per_sample,
+                        vision_condition_indexes,
+                        num_views_per_vision_item,
+                        frames_per_vision_item,
+                    )
+            else:
+                x0_tokens_vision = self._encode_vision_x0_tokens(
+                    raw_state_vision,
+                    num_vision_items_per_sample,
+                    vision_condition_indexes,
+                    num_views_per_vision_item,
+                    frames_per_vision_item,
+                )
+        else:
+            x0_tokens_vision = self._encode_vision_x0_tokens(
+                raw_state_vision,
+                num_vision_items_per_sample,
+                vision_condition_indexes,
+                num_views_per_vision_item,
+                frames_per_vision_item,
+            )
 
         frame_size = data_batch.get("image_size", None)
         if frame_size is not None:

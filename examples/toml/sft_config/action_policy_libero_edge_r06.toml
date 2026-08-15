@@ -1,0 +1,40 @@
+# G0-R06-SFT task-0-only formal baseline. Do not use before latent parity is PASS.
+
+[job]
+task       = "vfm"
+experiment = "action_policy_libero_edge_r06"
+project    = "psm_wma"
+group      = "g0_r06_sft"
+name       = "edge_libero_task0_sft"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 51200
+
+[model.parallelism]
+data_parallel_shard_degree     = -1
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [500]
+warm_up_steps = [20]
+
+[trainer]
+max_iter        = 500
+logging_iter    = 1
+grad_accum_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 100
