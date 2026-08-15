@@ -330,10 +330,9 @@ class OptimizersContainer(Stateful):
             **optimizer_kwargs: Forwarded to the optimizer constructor, with the
                 following container-level kwargs intercepted first:
 
-                - ``fused`` (required): Must be truthy. Forwarded to
-                  ``torch.optim.AdamW`` / ``Adam`` so they use the fused CUDA
-                  kernel; ignored for ``"fusedadam"`` which is fused by
-                  construction.  Eager optimizers are not supported.
+                - ``fused``: Forwarded to ``torch.optim.AdamW`` / ``Adam``;
+                  standard Adam/AdamW may explicitly use ``False`` for an eager
+                  optimizer, while fused-only optimizers still require ``True``.
                 - ``lr`` (required): Base learning rate.  Each param group's
                   effective LR is ``lr * matched_multiplier``; ``lr`` is still
                   required because PyTorch optimizers expect a default.
@@ -359,10 +358,10 @@ class OptimizersContainer(Stateful):
 
         # Pop only the container-level kwargs.  ``fused`` and ``lr`` are
         # intentionally NOT popped: ``fused`` must flow through to
-        # ``torch.optim.AdamW`` / ``Adam`` so the fused CUDA kernel is actually
-        # selected, and ``lr`` is needed both here (as the base for per-group
-        # multipliers) and by the underlying optimizer (as the group-level
-        # default).
+        # ``torch.optim.AdamW`` / ``Adam`` to select the requested optimizer
+        # implementation, and ``lr`` is needed both here (as the base for
+        # per-group multipliers) and by the underlying optimizer (as the
+        # group-level default).
         keys_to_select = optimizer_kwargs.pop("keys_to_select", [])
         lr_multipliers: dict[str, float] = optimizer_kwargs.pop("lr_multipliers", {})
         disable_weight_decay_for_1d_params = optimizer_kwargs.pop("disable_weight_decay_for_1d_params", False)
@@ -375,7 +374,7 @@ class OptimizersContainer(Stateful):
         # (aux) optimizers, which accept it as a named arg. Normalize to a tuple of str.
         orthogonalize_skip_patterns = tuple(optimizer_kwargs.pop("orthogonalize_skip_patterns", None) or ())
 
-        if not optimizer_kwargs.get("fused", False):
+        if optimizer_type.lower() not in ("adam", "adamw") and not optimizer_kwargs.get("fused", False):
             raise ValueError("Optimizers with fused=False are not supported; pass fused=True in optimizer_kwargs.")
         if "lr" not in optimizer_kwargs:
             raise ValueError("`lr` is required in optimizer_kwargs (used as the base for per-group LR multipliers).")
@@ -507,8 +506,9 @@ def build_optimizer(
             intercepts a few container-level kwargs and forwards the rest to
             the underlying ``torch.optim`` constructor.  Container-level kwargs:
 
-            - ``fused`` (required, truthy): Use the fused CUDA kernel.  Eager
-              optimizers are intentionally not supported.
+            - ``fused``: Forwarded to Adam/AdamW; standard Adam/AdamW may use
+              ``False`` for an eager optimizer. Fused-only optimizers still
+              require ``True``.
             - ``lr`` (required): Base learning rate.  Each param group's
               effective LR is ``lr * matched_multiplier``.
             - ``keys_to_select`` (optional, default ``[]``): Substrings used to
