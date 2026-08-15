@@ -12,6 +12,9 @@ wandb_mode = "disabled"
 precision = "bfloat16"
 max_num_tokens_after_packing = 51200
 
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
 [trainer]
 max_iter        = 5
 logging_iter    = 1

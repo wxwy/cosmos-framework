@@ -324,6 +324,11 @@ def get_action_libero_sft_dataset(
     dataset is FPS-agnostic (decodes at real frame timestamps); ``fps`` is metadata
     for ``conditioning_fps`` / prompt duration.
     """
+    latent_cache = (
+        R12CosmosLatentCache(latent_cache_root, parity_path=latent_cache_parity_path)
+        if use_latent_cache and latent_cache_root
+        else None
+    )
     dataset = LIBEROLeRobotDataset(
         root=root,
         image_size=image_size,
@@ -340,6 +345,7 @@ def get_action_libero_sft_dataset(
         action_normalization=action_normalization,
         action_stats_path=action_stats_path,
         task_index=task_index,
+        latent_cache=latent_cache,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
@@ -352,10 +358,10 @@ def get_action_libero_sft_dataset(
         format_prompt_as_json=format_prompt_as_json,
     )
     sft: Dataset = ActionSFTDataset(dataset, transform, resolution)
-    if use_latent_cache and latent_cache_root:
+    if latent_cache is not None:
         sft = ActionLatentCacheDataset(
             sft,
-            R12CosmosLatentCache(latent_cache_root, parity_path=latent_cache_parity_path),
+            latent_cache,
         )
     if tiny_overfit_num_samples is not None:
         if iterable_shuffle:

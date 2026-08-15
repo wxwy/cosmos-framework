@@ -35,6 +35,7 @@ import torch.nn.functional as F
 from cosmos_framework.data.generator.action.action_spec import ActionSpec, Gripper, Pos, Rot, build_action_spec
 from cosmos_framework.data.generator.action.datasets.base_dataset import ActionBaseDataset
 from cosmos_framework.data.generator.action.libero_pose_utils import libero_action_dim, libero_rotation_format
+from cosmos_framework.data.generator.action.latent_cache import R12CosmosLatentCache
 from cosmos_framework.data.generator.action.pose_utils import convert_rotation
 from cosmos_framework.utils import log
 
@@ -83,6 +84,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         val_ratio: float = 0.01,
         seed: int = 0,
         sample_stride: int = 1,
+        latent_cache: R12CosmosLatentCache | None = None,
         task_index: int | None = None,
     ) -> None:
         if action_space != "frame_wise_relative":
@@ -132,6 +134,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         # under "global_raw"; everything else uses "global".
         self._stats_key = "global_raw" if action_normalization == "quantile_rot" else "global"
         self._stats_file = self._resolve_stats_file(action_stats_path)
+        self._latent_cache = latent_cache if latent_cache is not None and latent_cache.enabled else None
 
         if self._camera_mode == "image":
             self._video_keys = [_IMAGE_FEATURE]
@@ -298,7 +301,17 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
 
         stop = start + self._chunk_length + 1
         timestamps = [float(self._row_timestamp[j]) for j in range(start, stop)]
-        video = self._load_video(episode, timestamps)
+        window_start_frame = start - int(self._ep_starts[ep])
+        cached_latent = None
+        if self._latent_cache is not None:
+            cached_latent = self._latent_cache.get_window(episode_index, window_start_frame)
+        if cached_latent is not None:
+            # Keep the transform/model batch contract without decoding video; the
+            # model consumes the validated cache latent on this path.
+            width = self._image_size * (2 if self._camera_mode == "concat_view" else 1)
+            video = torch.zeros((self._chunk_length + 1, 3, self._image_size, width), dtype=torch.uint8)
+        else:
+            video = self._load_video(episode, timestamps)
 
         # frame_wise_relative: chunk per-frame deltas are the stored actions directly.
         raw = self._row_action[start : start + self._chunk_length]  # [chunk, 7]
@@ -309,7 +322,10 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
 
         extras: dict[str, Any] = {}
         extras["episode_index"] = episode_index
-        extras["window_start_frame"] = start - int(self._ep_starts[ep])
+        extras["window_start_frame"] = window_start_frame
+        if cached_latent is not None:
+            extras["vision_latent_cache"] = cached_latent
+            extras["vision_latent_cache_enabled"] = True
         if self._camera_mode == "concat_view":
             extras["additional_view_description"] = (
                 "The left half shows the third-person view; the right half shows the wrist-mounted camera."

@@ -15,8 +15,8 @@ dataset_cfg = action_policy_libero_edge_r06["dataloader_train"]["dataloader"]["d
 dataset_cfg.update(
     task_index=0,
     use_latent_cache=True,
-    latent_cache_root="${oc.env:LIBERO_LATENT_CACHE_ROOT,}",
-    latent_cache_parity_path="${oc.env:LIBERO_LATENT_CACHE_PARITY,}",
+    latent_cache_root="${oc.env:LIBERO_LATENT_CACHE_ROOT,''}",
+    latent_cache_parity_path="${oc.env:LIBERO_LATENT_CACHE_PARITY,''}",
 )
 action_policy_libero_edge_r06["trainer"].update(max_iter=500, logging_iter=1, grad_accum_iter=1)
 
