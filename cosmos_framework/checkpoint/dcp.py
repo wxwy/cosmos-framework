@@ -542,6 +542,8 @@ def _broadcast_state_dict(
     set of leaves broadcast is precisely the set the planner dropped: DTensors elect a per-mesh
     reader; every other leaf (plain tensor or scalar) is read by global rank 0 only.
     """
+    if dist.get_world_size() == 1:
+        return
 
     # 1) Broadcast tensor leaves in place. Keys are sorted by repr() so the traversal order is
     #    identical across ranks regardless of key type (int param ids vs str fqns). DTensors go over
