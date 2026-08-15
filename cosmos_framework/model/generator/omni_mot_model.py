@@ -3515,8 +3515,11 @@ class OmniMoTModel(ImaginaireModel):
         )
 
     @torch.no_grad()
-    def validation_step(self, data_batch: dict[str, torch.Tensor], iteration: int):
-        pass
+    def validation_step(
+        self, data_batch: dict[str, torch.Tensor], iteration: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """在不计算梯度的情况下复用训练前向与损失路径。"""
+        return self.training_step(data_batch, iteration)
 
     @torch.no_grad()
     def forward(self, xt, t):
