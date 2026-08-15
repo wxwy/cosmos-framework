@@ -19,12 +19,11 @@ dataset stack:
     canonical public entrypoint for representation conversion.
 """
 
-from __future__ import annotations
-
 import math
 from typing import Literal
 
 import numpy as np
+import torch
 from scipy.spatial.transform import Rotation as R
 
 PoseConvention = Literal["absolute", "backward_anchored", "backward_framewise"]
@@ -47,8 +46,6 @@ def _to_numpy_float32(array: torch.Tensor | np.ndarray) -> np.ndarray:
             These utilities are non-differentiable; callers must explicitly
             detach tensors before conversion.
     """
-    import torch
-
     if isinstance(array, torch.Tensor):
         if array.requires_grad:
             raise ValueError(
@@ -148,8 +145,6 @@ def convert_rotation(
         ValueError: If the input shape is incompatible with ``input_format`` or
             if either format is unsupported.
     """
-    import torch
-
     input_is_tensor = isinstance(rotation, torch.Tensor)
     input_dtype = rotation.dtype if input_is_tensor else None
     input_device = rotation.device if input_is_tensor else None
@@ -702,8 +697,6 @@ def compute_idle_frames(
     checks. Callers (e.g. the LeRobot base class) gate on pose convention
     before calling this function.
     """
-    import torch
-
     if isinstance(action_raw, torch.Tensor):
         action = action_raw.detach().cpu().numpy().astype(np.float32, copy=False)
     else:

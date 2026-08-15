@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Literal
 
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
+from cosmos_framework.utils import log
 
 Viewpoint = Literal["ego_view", "third_person_view", "wrist_view", "concat_view", "top_down_2d_view", "video_game_view"]
 
@@ -93,8 +94,6 @@ class ViewpointTextInfo(Augmentor):
         template = self.templates.get(viewpoint)
 
         if template is None:
-            from cosmos_framework.utils import log
-
             log.warning(
                 f"ViewpointTextInfo: unrecognized viewpoint {viewpoint!r}. "
                 f"Known viewpoints: {sorted(self.templates.keys())}. Skipping.",

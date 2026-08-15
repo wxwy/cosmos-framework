@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 from cosmos_framework.data.generator.action.pose_utils import (
     RotationConvention,
@@ -57,8 +58,6 @@ def build_libero_abs_pose(state_raw: torch.Tensor | np.ndarray, *, to_opencv: bo
     ``state_raw`` is ``[x,y,z,axisangle(3),gripper(2)]``.  When requested, the
     local EE frame is post-rotated into the shared OpenCV-style action frame.
     """
-    import torch
-
     if isinstance(state_raw, torch.Tensor):
         state_np = state_raw.detach().cpu().numpy().astype(np.float32, copy=False)
     else:
