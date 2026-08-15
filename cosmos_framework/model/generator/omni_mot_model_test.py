@@ -5,6 +5,26 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
+
+
+def test_action_x0_reconstruction_mae_masks_padding_and_conditioning() -> None:
+    from cosmos_framework.model.generator.omni_mot_model import _action_x0_reconstruction_mae
+
+    pred = [torch.tensor([[3.0, 5.0, 99.0], [7.0, 11.0, 99.0]])]
+    target = [torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 0.0]])]
+    sigma = [torch.tensor([[0.5], [0.25]])]
+    condition_mask = [torch.tensor([[0.0], [1.0]])]
+
+    result = _action_x0_reconstruction_mae(
+        predictions=pred,
+        targets=target,
+        sigmas=sigma,
+        condition_masks=condition_mask,
+        raw_action_dims=[torch.tensor(2)],
+    )
+
+    assert torch.equal(result, torch.tensor(1.5))
 
 
 def test_reasoner_only_setup_skips_vision_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:

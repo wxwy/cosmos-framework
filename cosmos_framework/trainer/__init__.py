@@ -284,7 +284,9 @@ class ImaginaireTrainer:
             log.info(f"Set SM carveout to {sm_carveout}")
         self.callbacks.on_train_start(model, iteration=iteration)
         # Initial validation.
-        if self.config.trainer.run_validation and iteration == 0 and self.config.trainer.run_validation_on_start:
+        # ``run_validation_on_start`` applies to both fresh and resumed runs.
+        # The resumed path is used by checkpoint reload-consistency gates.
+        if self.config.trainer.run_validation and self.config.trainer.run_validation_on_start:
             self.validate(model, dataloader_val, iteration=iteration)
 
         if self.config.trainer.save_zero_checkpoint and iteration == 0:

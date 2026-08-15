@@ -89,6 +89,46 @@ class ActionIterableShuffleDataset(IterableDataset):
             epoch += 1
 
 
+class ActionFixedSubsetCycleDataset(IterableDataset):
+    """Cycle over a deterministic contiguous subset for tiny-overfit checks."""
+
+    def __init__(self, dataset: "ActionSFTDataset", start_index: int, num_samples: int) -> None:
+        super().__init__()
+        self._dataset = dataset
+        self._start_index = int(start_index)
+        self._num_samples = int(num_samples)
+        self.shard_world_size = 1
+        self.shard_rank = 0
+        if self._start_index < 0:
+            raise ValueError(f"start_index must be >= 0, got {self._start_index}.")
+        if self._num_samples < 1:
+            raise ValueError(f"num_samples must be >= 1, got {self._num_samples}.")
+        if self._start_index + self._num_samples > len(dataset):
+            raise ValueError(
+                f"Fixed subset [{self._start_index}, {self._start_index + self._num_samples}) "
+                f"exceeds dataset length {len(dataset)}."
+            )
+
+    def __len__(self) -> int:
+        return self._num_samples
+
+    def __iter__(self):
+        wi = get_worker_info()
+        wid = wi.id if wi is not None else 0
+        nw = wi.num_workers if wi is not None else 1
+        global_shard = int(self.shard_rank) * nw + wid
+        total_shards = max(1, int(self.shard_world_size) * nw)
+        indices = list(range(self._start_index, self._start_index + self._num_samples))[global_shard::total_shards]
+        if not indices:
+            raise RuntimeError(
+                f"Fixed subset has no samples for shard {global_shard}/{total_shards}; "
+                "reduce dataloader workers/ranks or increase tiny_overfit_num_samples."
+            )
+        while True:
+            for idx in indices:
+                yield self._dataset[idx]
+
+
 def get_action_droid_sft_dataset(
     *,
     root: str,
@@ -238,6 +278,8 @@ def get_action_libero_sft_dataset(
     format_prompt_as_json: bool = False,
     iterable_shuffle: bool = False,
     episode_shuffle_seed: int = 42,
+    tiny_overfit_num_samples: int | None = None,
+    tiny_overfit_start_index: int = 0,
 ) -> Dataset:
     """Build the LIBERO action-policy SFT dataset (GA reproduction defaults).
 
@@ -277,6 +319,10 @@ def get_action_libero_sft_dataset(
         format_prompt_as_json=format_prompt_as_json,
     )
     sft = ActionSFTDataset(dataset, transform, resolution)
+    if tiny_overfit_num_samples is not None:
+        if iterable_shuffle:
+            raise ValueError("tiny_overfit_num_samples and iterable_shuffle cannot be enabled together.")
+        return ActionFixedSubsetCycleDataset(sft, tiny_overfit_start_index, tiny_overfit_num_samples)
     if iterable_shuffle:
         return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
     return sft

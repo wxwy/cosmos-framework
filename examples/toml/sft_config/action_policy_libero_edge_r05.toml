@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# G0-R05 deterministic four-sample tiny-overfit. Env: LIBERO_ROOT,
+# BASE_CHECKPOINT_PATH, EDGE_POLICY_CHECKPOINT, WAN_VAE_PATH,
+# IMAGINAIRE_OUTPUT_ROOT.
+
+[job]
+task       = "vfm"
+experiment = "action_policy_libero_edge_tiny_overfit"
+project    = "psm_wma"
+group      = "g0_r05"
+name       = "edge_libero_tiny_overfit"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 45056
+
+[model.parallelism]
+data_parallel_shard_degree     = -1
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [100]
+warm_up_steps = [0]
+
+[trainer]
+max_iter        = 100
+logging_iter    = 1
+grad_accum_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 100

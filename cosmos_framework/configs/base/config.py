@@ -98,6 +98,7 @@ def make_config() -> Config:
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_droid_nano  # noqa: F401
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano  # noqa: F401
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_edge_warmstart  # noqa: F401
+    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_edge_tiny_overfit  # noqa: F401
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_nano  # noqa: F401
     import cosmos_framework.configs.base.experiment.sft.vision_sft_edge  # noqa: F401
     import cosmos_framework.configs.base.experiment.sft.vision_sft_nano  # noqa: F401

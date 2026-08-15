@@ -88,6 +88,34 @@ from cosmos_framework.utils.generator.parallelism import ParallelDims
 from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_linears_on_meta
 
 
+def _action_x0_reconstruction_mae(
+    predictions: list[torch.Tensor],
+    targets: list[torch.Tensor],
+    sigmas: list[torch.Tensor],
+    condition_masks: list[torch.Tensor],
+    raw_action_dims: list[torch.Tensor | None] | None,
+) -> torch.Tensor:
+    """Return one-step x0 MAE derived from rectified-flow velocity predictions."""
+    if not predictions:
+        return torch.tensor(0.0)
+    total = predictions[0].new_zeros((), dtype=torch.float32)
+    count = 0
+    for index, (pred, target, sigma, condition_mask) in enumerate(
+        zip(predictions, targets, sigmas, condition_masks, strict=True)
+    ):
+        action_dim = pred.shape[-1]
+        if raw_action_dims is not None and raw_action_dims[index] is not None:
+            action_dim = int(raw_action_dims[index].item())
+        noisy_mask = (1.0 - condition_mask).to(dtype=pred.dtype)
+        # Rectified flow uses xt = x0 + sigma * velocity. Therefore
+        # |sigma * (pred_velocity - target_velocity)| is the one-step x0
+        # reconstruction error for the same noisy action input.
+        error = (sigma * (pred - target)).abs()[:, :action_dim] * noisy_mask
+        total += error.detach().float().sum()
+        count += int(noisy_mask.sum().item()) * action_dim
+    return total / max(count, 1)
+
+
 class OmniMoTModel(ImaginaireModel):
     """
     Mixture of Transformers (MoT) model to be trained with the flow matching objective
@@ -1474,6 +1502,14 @@ class OmniMoTModel(ImaginaireModel):
                 # Yihuai: In case the video loss is too large (1.5) and covers the action loss (0.05), we scale up the action loss to match the video loss to improve action precision.
                 total_loss += fm_loss_action * rf_cfg.action_loss_weight
                 losses_dict["flow_matching_loss_action"] = fm_loss_action
+                assert gen_data_noised.sigmas_action is not None
+                losses_dict["action_x0_reconstruction_mae"] = _action_x0_reconstruction_mae(
+                    predictions=out_net["preds_action"],
+                    targets=gen_data_noised.vt_target_action,
+                    sigmas=gen_data_noised.sigmas_action,
+                    condition_masks=data_batch_packed.action.condition_mask,
+                    raw_action_dims=data_batch_packed.action.raw_action_dim,
+                )
             else:
                 # No action data in this batch. Connect the network's dummy preds_action
                 # to the loss so action-specific params
@@ -1483,8 +1519,10 @@ class OmniMoTModel(ImaginaireModel):
                 dummy_loss = 0.0 * sum(p.sum() for p in out_net["preds_action"])
                 total_loss += dummy_loss
                 losses_dict["flow_matching_loss_action"] = dummy_loss
+                losses_dict["action_x0_reconstruction_mae"] = torch.tensor(0.0, **self.tensor_kwargs_fp32)
         else:
             losses_dict["flow_matching_loss_action"] = torch.tensor(0.0, **self.tensor_kwargs_fp32)
+            losses_dict["action_x0_reconstruction_mae"] = torch.tensor(0.0, **self.tensor_kwargs_fp32)
 
         if self.config.sound_gen:
             if data_batch_packed.sound is not None:

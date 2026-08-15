@@ -3,8 +3,26 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from torch.utils.data import Dataset
 
+from cosmos_framework.data.generator.action.datasets.action_sft_dataset import ActionFixedSubsetCycleDataset
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
+
+
+class _IndexDataset(Dataset):
+    def __len__(self) -> int:
+        return 10
+
+    def __getitem__(self, index: int) -> int:
+        return index
+
+
+def test_fixed_subset_cycle_is_deterministic() -> None:
+    dataset = ActionFixedSubsetCycleDataset(_IndexDataset(), start_index=2, num_samples=3)
+    iterator = iter(dataset)
+
+    assert len(dataset) == 3
+    assert [next(iterator) for _ in range(8)] == [2, 3, 4, 2, 3, 4, 2, 3]
 
 
 def test_jsonl_per_episode_layout(tmp_path: Path) -> None:
