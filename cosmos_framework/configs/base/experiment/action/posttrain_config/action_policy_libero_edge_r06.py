@@ -11,7 +11,7 @@ from cosmos_framework.configs.base.experiment.action.posttrain_config.action_pol
 
 action_policy_libero_edge_r06 = copy.deepcopy(action_policy_libero_edge_warmstart)
 action_policy_libero_edge_r06["job"].update(name="action_policy_libero_edge_r06")
-dataset_cfg = action_policy_libero_edge_r06["trainer"]["dataloader"]["datasets"]["libero"]["dataset"]
+dataset_cfg = action_policy_libero_edge_r06["dataloader_train"]["dataloader"]["datasets"]["libero"]["dataset"]
 dataset_cfg.update(
     task_index=0,
     use_latent_cache=True,
