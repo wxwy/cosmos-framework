@@ -58,6 +58,10 @@ class ActionLatentCacheDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         sample = self._dataset[idx]
+        # The inner LIBERO dataset already attaches the cache latent on hit; both
+        # layers query the same cache, so skip the duplicate lookup here.
+        if sample.get("vision_latent_cache") is not None:
+            return sample
         inner = self._dataset
         while hasattr(inner, "_dataset") and not hasattr(inner, "get_window_identity"):
             inner = inner._dataset

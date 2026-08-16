@@ -1,5 +1,7 @@
 # Regular Episode Latent + LIBERO 单任务 Overfit
 
+> **SUPERSEDED BY D013（2026-08-16）**：本文档为历史候选实验记录，不是当前项目主线。当前 RGB/Memory 编码规划以 `docs/build/PSM-WMA_RGB_representation_and_memory_encoding_plan_v0.1.md` 和 `MEMORY/DECISIONS.md` D013 为准（Cosmos-native exact-window latent cache）。
+>
 > 状态：实现口径冻结（2026-08-16）  
 > 目标：不再以官方 window-local `z0` 作为当前视觉 condition；改为 MoWA-style 整 episode 因果 VAE 编码，保存 `z0,z1,...`，训练仅使用 regular latent `z1+`，先用单任务 tiny-overfit 验证 Cosmos3 是否能适应新的 condition latent 分布。
 
