@@ -3886,15 +3886,6 @@ class OmniMoTModel(ImaginaireModel):
                     )
                 raw_state_vision.append(item)
 
-        # Window-cache artifacts use the production camera-major contract:
-        # two independent 17-frame views, concatenated on the latent time axis.
-        # The cache dataset keeps a single placeholder clip to avoid decoding;
-        # duplicate it here only for temporal-position bookkeeping.
-        if data_batch.get("vision_latent_cache") is not None and num_views_per_vision_item is None:
-            num_views_per_vision_item = [2] * len(raw_state_vision)
-            frames_per_vision_item = [17] * len(raw_state_vision)
-            raw_state_vision = [torch.cat([state, state], dim=2) for state in raw_state_vision]
-
         cached_latents = data_batch.get("vision_latent_cache", None)
         cache_enabled = data_batch.get("vision_latent_cache_enabled", False)
         if cached_latents is not None and (not isinstance(cache_enabled, torch.Tensor) or bool(cache_enabled.all())):
@@ -3907,7 +3898,13 @@ class OmniMoTModel(ImaginaireModel):
                         x0_tokens_vision = []
                         break
                     # R12 stores [T_latent,C,H,W]; the model consumes [B,C,T,H,W].
-                    x0_tokens_vision.append(latent.permute(1, 0, 2, 3).unsqueeze(0).to(**self.tensor_kwargs))
+                    # Keep fp32 (online _encode_vision_item returns fp32); only move
+                    # device so the cached x0 matches the online noising path dtype.
+                    x0_tokens_vision.append(
+                        latent.permute(1, 0, 2, 3).unsqueeze(0).to(
+                            device=self.tensor_kwargs_fp32["device"], dtype=torch.float32
+                        )
+                    )
                 if not x0_tokens_vision:
                     x0_tokens_vision = self._encode_vision_x0_tokens(
                         raw_state_vision,

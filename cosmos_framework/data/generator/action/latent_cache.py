@@ -66,14 +66,18 @@ class R12CosmosLatentCache:
         """
         if not self.enabled:
             return None
-        item = self._load_episode(episode_index)
+        try:
+            item = self._load_episode(episode_index)
+        except FileNotFoundError:
+            # Partial cache coverage falls back to the online VAE path.
+            return None
         windows = item.get("windows")
         if isinstance(windows, dict):
             window = windows.get(str(int(start_frame)))
             if not isinstance(window, dict):
                 return None
             latent = window.get("latent")
-            if not isinstance(latent, torch.Tensor) or latent.ndim != 4 or latent.shape[0] != 10:
+            if not isinstance(latent, torch.Tensor) or latent.ndim != 4 or latent.shape[0] != 5:
                 return None
             return latent.contiguous()
         indices = item.get("indices", {}).get("source_frame_indices")
