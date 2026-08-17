@@ -39,6 +39,7 @@ import io
 import json
 import os
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -435,6 +436,24 @@ def _save_gif(frames: list[Image.Image], output_path: Path, fps: int) -> None:
     )
 
 
+def _save_mp4(frames: list[Image.Image], output_path: Path, fps: int) -> None:
+    """Save rendered frames as an H.264 MP4 (requires imageio-ffmpeg)."""
+    if not frames:
+        return
+    import imageio.v2 as imageio
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with imageio.get_writer(output_path, fps=max(1, fps), codec="libx264", quality=8) as writer:
+        for frame in frames:
+            writer.append_data(np.asarray(frame))
+
+
+def _slugify(text: str, max_len: int = 60) -> str:
+    """Filesystem-safe slug for embedding the sim task instruction in filenames."""
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return slug[:max_len] or "task"
+
+
 def _decode_b64_frames(b64_frames: list[str]) -> list[Image.Image]:
     """Decode a list of base64-encoded PNG strings into PIL Images."""
     images: list[Image.Image] = []
@@ -451,7 +470,7 @@ def _save_comparison_gif(
     target_height: int = 256,
     separator_width: int = 4,
 ) -> None:
-    """Create and save a side-by-side comparison GIF (Action prediction | env rollout).
+    """Create and save a side-by-side comparison video (Action prediction | env rollout).
 
     Each window is a (action_frames, env_frames) pair from one prediction call.
     Frames are paired index-by-index; the conditioning frame (index 0) of
@@ -489,7 +508,7 @@ def _save_comparison_gif(
             combined_frames.append(combined)
 
     if combined_frames:
-        _save_gif(combined_frames, output_path, fps)
+        _save_mp4(combined_frames, output_path, fps)
 
 
 def _select_action_chunk(actions: list[list[float]], action_horizon: int) -> list[list[float]]:
@@ -740,7 +759,7 @@ def _run_episode(
             break
 
     if gif_path is not None:
-        _save_gif(gif_frames, gif_path, gif_fps)
+        _save_mp4(gif_frames, gif_path, gif_fps)
     if comparison_path is not None and comparison_windows:
         _save_comparison_gif(comparison_windows, comparison_path, gif_fps)
     return EpisodeResult(success, step, None, action_log)
@@ -823,13 +842,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP request timeout in seconds")
     parser.add_argument("--wait_timeout", type=float, default=60.0, help="Seconds to wait for server health")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--save_gifs", action="store_true", help="Save per-episode GIFs of rendered frames")
+    parser.add_argument("--save_gifs", action="store_true", help="Save per-episode MP4 videos of rendered frames (named with the sim task instruction slug, episode number, and outcome)")
     parser.add_argument(
         "--save_comparison",
         action="store_true",
         help="Save side-by-side comparison GIFs (Action prediction vs environment rollout)",
     )
-    parser.add_argument("--gif_fps", type=int, default=20, help="Frames per second for saved GIFs")
+    parser.add_argument("--gif_fps", type=int, default=20, help="Frames per second for saved MP4 videos")
     parser.add_argument(
         "--mujoco_gl",
         type=str,
@@ -1110,7 +1129,7 @@ def main() -> None:
     task_results: list[dict[str, Any]] = []
 
     output_dir = Path(args.output_dir) if args.output_dir else None
-    gif_root = output_dir / "gifs" if output_dir and args.save_gifs else None
+    gif_root = output_dir / "videos" if output_dir and args.save_gifs else None
     comparison_root = output_dir / "comparisons" if output_dir and args.save_comparison else None
 
     for task_id in selected_task_ids:
@@ -1225,10 +1244,10 @@ def main() -> None:
                 continue
 
             gif_path = (
-                gif_root / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}.gif" if gif_root is not None else None
+                gif_root / f"task_{task_id:03d}" / f".episode_{episode_idx:03d}.tmp.mp4" if gif_root is not None else None
             )
             comparison_path = (
-                comparison_root / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}.gif"
+                comparison_root / f"task_{task_id:03d}" / f".episode_{episode_idx:03d}.tmp.mp4"
                 if comparison_root is not None
                 else None
             )
@@ -1254,6 +1273,19 @@ def main() -> None:
             except Exception as exc:
                 result = EpisodeResult(False, 0, str(exc), [])
             episode_elapsed_s = time.perf_counter() - episode_t0
+
+            # Final video names carry the sim-side instruction slug + episode no. + outcome.
+            outcome = "success" if result.success else "fail"
+            if gif_path is not None and gif_path.exists():
+                gif_path.rename(
+                    gif_path.parent
+                    / f"{_slugify(task_description)}_task{task_id:03d}_ep{episode_idx:03d}_{outcome}.mp4"
+                )
+            if comparison_path is not None and comparison_path.exists():
+                comparison_path.rename(
+                    comparison_path.parent
+                    / f"{_slugify(task_description)}_task{task_id:03d}_ep{episode_idx:03d}_{outcome}_compare.mp4"
+                )
 
             task_episodes += 1
             total_episodes += 1
