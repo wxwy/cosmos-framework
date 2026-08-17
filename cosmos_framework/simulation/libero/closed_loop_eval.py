@@ -473,10 +473,11 @@ def _save_comparison_gif(
     """Create and save a side-by-side comparison video (Action prediction | env rollout).
 
     Each window is a (action_frames, env_frames) pair from one prediction call.
-    Frames are paired index-by-index. Every window's index-0 frame IS kept, so at
-    each re-planning boundary the left side shows the new real conditioning frame
-    (a VAE reconstruction of the env frame) instead of skipping it — this makes
-    the stitched left side read as: cond, PD, ..., PD, cond, PD, ...
+    Frames are paired index-by-index. Every window keeps its index-0 conditioning
+    frame (a VAE reconstruction of the real env frame). To keep the env (right)
+    side time-contiguous, each non-final window drops its last pair — the next
+    window's cond pair re-shows exactly that env moment. With action_horizon=4
+    the stitched left side therefore reads: cond, PD, PD, PD, cond, PD, ...
 
     Banner labels: left = PD (model-generated prediction), GT->PD (cond) for each
     window's conditioning frame; right = GT (ground-truth env rollout). Both
@@ -495,6 +496,9 @@ def _save_comparison_gif(
 
     for window_idx, (action_frames, env_frames) in enumerate(comparison_windows):
         n = min(len(action_frames), len(env_frames))
+        if window_idx < len(comparison_windows) - 1:
+            # Drop the last pair; the next window's cond pair re-shows this env moment.
+            n = max(0, n - 1)
         for i in range(0, n):
             action_img = action_frames[i]
             env_img = env_frames[i]
