@@ -697,6 +697,8 @@ def _run_episode(
     gif_path: Path | None,
     gif_fps: int,
     comparison_path: Path | None = None,
+    prediction_dir: Path | None = None,
+    prediction_prefix: str = "prediction",
 ) -> EpisodeResult:
     env.reset()
     if initial_state is not None:
@@ -777,11 +779,11 @@ def _run_episode(
                     window_idx = len(comparison_windows)
                     comparison_windows.append((action_frames, env_comparison_frames))
                     # Also keep the full 17-frame prediction of every call for inspection.
-                    pred_dir = comparison_path.parents[2] / "predictions" / comparison_path.parent.name
-                    pred_name = comparison_path.name.replace("_compare.mp4", f"_win{window_idx:03d}_pred.mp4")
-                    _save_prediction_window_mp4(
-                        action_frames, pred_dir / pred_name, gif_fps, window_idx=window_idx, step=step
-                    )
+                    if prediction_dir is not None:
+                        pred_path = prediction_dir / f"{prediction_prefix}_win{window_idx:03d}_pred.mp4"
+                        _save_prediction_window_mp4(
+                            action_frames, pred_path, gif_fps, window_idx=window_idx, step=step
+                        )
 
             if action_space == "relative":
                 base_pose = _obs_to_pose(obs)
@@ -1334,6 +1336,14 @@ def main() -> None:
                     gif_path=gif_path,
                     gif_fps=args.gif_fps,
                     comparison_path=comparison_path,
+                    prediction_dir=(
+                        output_dir / "predictions" / f"task_{task_id:03d}"
+                        if comparison_path is not None
+                        else None
+                    ),
+                    prediction_prefix=(
+                        f"{_slugify(task_description)}_task{task_id:03d}_ep{episode_idx:03d}"
+                    ),
                 )
             except Exception as exc:
                 result = EpisodeResult(False, 0, str(exc), [])
