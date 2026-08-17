@@ -473,13 +473,14 @@ def _save_comparison_gif(
     """Create and save a side-by-side comparison video (Action prediction | env rollout).
 
     Each window is a (action_frames, env_frames) pair from one prediction call.
-    Frames are paired index-by-index; the conditioning frame (index 0) of
-    subsequent windows is skipped to avoid duplicating the boundary frame.
+    Frames are paired index-by-index. Every window's index-0 frame IS kept, so at
+    each re-planning boundary the left side shows the new real conditioning frame
+    (a VAE reconstruction of the env frame) instead of skipping it — this makes
+    the stitched left side read as: cond, PD, ..., PD, cond, PD, ...
 
-    Banner labels: left = PD (model-generated prediction), GT->PD f000 for the
-    very first frame (window-0 conditioning frame, a VAE reconstruction of the
-    real observation); right = GT (ground-truth env rollout). Both sides carry
-    the global stitched frame index.
+    Banner labels: left = PD (model-generated prediction), GT->PD (cond) for each
+    window's conditioning frame; right = GT (ground-truth env rollout). Both
+    sides carry the global stitched frame index.
     """
     from PIL import ImageDraw, ImageFont
 
@@ -494,8 +495,7 @@ def _save_comparison_gif(
 
     for window_idx, (action_frames, env_frames) in enumerate(comparison_windows):
         n = min(len(action_frames), len(env_frames))
-        start = 1 if window_idx > 0 else 0
-        for i in range(start, n):
+        for i in range(0, n):
             action_img = action_frames[i]
             env_img = env_frames[i]
 
@@ -508,10 +508,10 @@ def _save_comparison_gif(
             total_h = target_height + banner_h
             combined = Image.new("RGB", (total_w, total_h), color=0)
 
-            # Window-0 frame 0 is the decoded real conditioning frame, not a prediction.
+            # Each window's frame 0 is the decoded real conditioning frame, not a prediction.
             left_label = (
                 f"GT->PD f{global_idx:03d} (cond)"
-                if global_idx == 0
+                if i == 0
                 else f"PD f{global_idx:03d}"
             )
             right_label = f"GT f{global_idx:03d}"
@@ -529,6 +529,40 @@ def _save_comparison_gif(
 
     if combined_frames:
         _save_mp4(combined_frames, output_path, fps)
+
+
+def _save_prediction_window_mp4(
+    action_frames: list[Image.Image],
+    output_path: Path,
+    fps: int,
+    *,
+    window_idx: int,
+    step: int,
+    banner_h: int = 32,
+) -> None:
+    """Save one full prediction window (cond frame + all generated frames).
+
+    Frame 0 is labelled COND(real) — it is the VAE reconstruction of the real
+    observation; the rest are PD (model-generated). ``step`` is the env step at
+    which this prediction was requested.
+    """
+    from PIL import ImageDraw, ImageFont
+
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except OSError:
+        font = ImageFont.load_default()
+
+    labeled: list[Image.Image] = []
+    for i, img in enumerate(action_frames):
+        frame = Image.new("RGB", (img.width, img.height + banner_h), color=0)
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle([(0, 0), (img.width, banner_h)], fill=(30, 30, 60))
+        kind = "COND(real)" if i == 0 else "PD"
+        draw.text((4, 4), f"win{window_idx:03d} f{i:02d} {kind} envstep{step}", fill=(100, 180, 255), font=font)
+        frame.paste(img, (0, banner_h))
+        labeled.append(frame)
+    _save_mp4(labeled, output_path, fps)
 
 
 def _select_action_chunk(actions: list[list[float]], action_horizon: int) -> list[list[float]]:
@@ -736,7 +770,14 @@ def _run_episode(
                 if action_video_b64:
                     action_frames = _decode_b64_frames(action_video_b64)
                     env_comparison_frames = [capture_comparison_frame(obs)]
+                    window_idx = len(comparison_windows)
                     comparison_windows.append((action_frames, env_comparison_frames))
+                    # Also keep the full 17-frame prediction of every call for inspection.
+                    pred_dir = comparison_path.parents[2] / "predictions" / comparison_path.parent.name
+                    pred_name = comparison_path.name.replace("_compare.mp4", f"_win{window_idx:03d}_pred.mp4")
+                    _save_prediction_window_mp4(
+                        action_frames, pred_dir / pred_name, gif_fps, window_idx=window_idx, step=step
+                    )
 
             if action_space == "relative":
                 base_pose = _obs_to_pose(obs)
