@@ -475,11 +475,22 @@ def _save_comparison_gif(
     Each window is a (action_frames, env_frames) pair from one prediction call.
     Frames are paired index-by-index; the conditioning frame (index 0) of
     subsequent windows is skipped to avoid duplicating the boundary frame.
+
+    Banner labels: left = PD (model-generated prediction), GT->PD f000 for the
+    very first frame (window-0 conditioning frame, a VAE reconstruction of the
+    real observation); right = GT (ground-truth env rollout). Both sides carry
+    the global stitched frame index.
     """
-    from PIL import ImageDraw
+    from PIL import ImageDraw, ImageFont
+
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except OSError:
+        font = ImageFont.load_default()
 
     combined_frames: list[Image.Image] = []
-    banner_h = 16
+    banner_h = 26
+    global_idx = 0
 
     for window_idx, (action_frames, env_frames) in enumerate(comparison_windows):
         n = min(len(action_frames), len(env_frames))
@@ -497,15 +508,24 @@ def _save_comparison_gif(
             total_h = target_height + banner_h
             combined = Image.new("RGB", (total_w, total_h), color=0)
 
+            # Window-0 frame 0 is the decoded real conditioning frame, not a prediction.
+            left_label = (
+                f"GT->PD f{global_idx:03d} (cond)"
+                if global_idx == 0
+                else f"PD f{global_idx:03d}"
+            )
+            right_label = f"GT f{global_idx:03d}"
+
             draw = ImageDraw.Draw(combined)
             draw.rectangle([(0, 0), (action_w, banner_h)], fill=(30, 30, 60))
             draw.rectangle([(action_w + separator_width, 0), (total_w, banner_h)], fill=(30, 60, 30))
-            draw.text((4, 1), "Action Prediction", fill=(100, 180, 255))
-            draw.text((action_w + separator_width + 4, 1), "Environment", fill=(100, 255, 100))
+            draw.text((4, 4), left_label, fill=(100, 180, 255), font=font)
+            draw.text((action_w + separator_width + 4, 4), right_label, fill=(100, 255, 100), font=font)
 
             combined.paste(action_resized, (0, banner_h))
             combined.paste(env_resized, (action_w + separator_width, banner_h))
             combined_frames.append(combined)
+            global_idx += 1
 
     if combined_frames:
         _save_mp4(combined_frames, output_path, fps)
