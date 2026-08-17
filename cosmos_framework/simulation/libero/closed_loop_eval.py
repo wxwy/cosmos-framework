@@ -780,7 +780,7 @@ def _run_episode(
                     comparison_windows.append((action_frames, env_comparison_frames))
                     # Also keep the full 17-frame prediction of every call for inspection.
                     if prediction_dir is not None:
-                        pred_path = prediction_dir / f"{prediction_prefix}_win{window_idx:03d}_pred.mp4"
+                        pred_path = prediction_dir / f"{prediction_prefix}_win{window_idx:03d}_step{step:04d}_pred.mp4"
                         _save_prediction_window_mp4(
                             action_frames, pred_path, gif_fps, window_idx=window_idx, step=step
                         )
