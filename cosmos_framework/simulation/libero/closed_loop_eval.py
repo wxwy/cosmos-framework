@@ -481,9 +481,18 @@ def _save_comparison_gif(
 
     Banner labels: left = PD (model-generated prediction), GT->PD (cond) for each
     window's conditioning frame; right = GT (ground-truth env rollout). Both
-    sides carry the global stitched frame index.
+    sides carry the global stitched frame index. Borders are drawn at render
+    time: blue = real (GT / cond reconstruction), red = prediction (PD).
     """
     from PIL import ImageDraw, ImageFont
+
+    GT_BLUE = (80, 140, 255)
+    PD_RED = (255, 70, 70)
+    GT_BANNER = (20, 45, 90)
+    PD_BANNER = (80, 25, 25)
+    GT_TEXT = (160, 200, 255)
+    PD_TEXT = (255, 160, 150)
+    border_w = 6
 
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 18)
@@ -513,21 +522,28 @@ def _save_comparison_gif(
             combined = Image.new("RGB", (total_w, total_h), color=0)
 
             # Each window's frame 0 is the decoded real conditioning frame, not a prediction.
-            left_label = (
-                f"GT->PD f{global_idx:03d} (cond)"
-                if i == 0
-                else f"PD f{global_idx:03d}"
-            )
+            is_cond = i == 0
+            left_label = f"GT->PD f{global_idx:03d} (cond)" if is_cond else f"PD f{global_idx:03d}"
             right_label = f"GT f{global_idx:03d}"
+            left_x = action_w + separator_width
 
             draw = ImageDraw.Draw(combined)
-            draw.rectangle([(0, 0), (action_w, banner_h)], fill=(30, 30, 60))
-            draw.rectangle([(action_w + separator_width, 0), (total_w, banner_h)], fill=(30, 60, 30))
-            draw.text((4, 4), left_label, fill=(100, 180, 255), font=font)
-            draw.text((action_w + separator_width + 4, 4), right_label, fill=(100, 255, 100), font=font)
+            draw.rectangle([(0, 0), (action_w, banner_h)], fill=GT_BANNER if is_cond else PD_BANNER)
+            draw.rectangle([(left_x, 0), (total_w, banner_h)], fill=GT_BANNER)
+            draw.text((4, 4), left_label, fill=GT_TEXT if is_cond else PD_TEXT, font=font)
+            draw.text((left_x + 4, 4), right_label, fill=GT_TEXT, font=font)
 
             combined.paste(action_resized, (0, banner_h))
-            combined.paste(env_resized, (action_w + separator_width, banner_h))
+            combined.paste(env_resized, (left_x, banner_h))
+            # Panel borders: blue = real (GT / cond), red = prediction (PD).
+            draw.rectangle(
+                [(0, 0), (action_w - 1, total_h - 1)],
+                outline=GT_BLUE if is_cond else PD_RED,
+                width=border_w,
+            )
+            draw.rectangle(
+                [(left_x, 0), (total_w - 1, total_h - 1)], outline=GT_BLUE, width=border_w
+            )
             combined_frames.append(combined)
             global_idx += 1
 
@@ -548,9 +564,18 @@ def _save_prediction_window_mp4(
 
     Frame 0 is labelled COND(real) — it is the VAE reconstruction of the real
     observation; the rest are PD (model-generated). ``step`` is the env step at
-    which this prediction was requested.
+    which this prediction was requested. Borders are drawn at render time:
+    blue = real (cond), red = prediction (PD).
     """
     from PIL import ImageDraw, ImageFont
+
+    GT_BLUE = (80, 140, 255)
+    PD_RED = (255, 70, 70)
+    GT_BANNER = (20, 45, 90)
+    PD_BANNER = (80, 25, 25)
+    GT_TEXT = (160, 200, 255)
+    PD_TEXT = (255, 160, 150)
+    border_w = 6
 
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 18)
@@ -561,10 +586,21 @@ def _save_prediction_window_mp4(
     for i, img in enumerate(action_frames):
         frame = Image.new("RGB", (img.width, img.height + banner_h), color=0)
         draw = ImageDraw.Draw(frame)
-        draw.rectangle([(0, 0), (img.width, banner_h)], fill=(30, 30, 60))
-        kind = "COND(real)" if i == 0 else "PD"
-        draw.text((4, 4), f"win{window_idx:03d} f{i:02d} {kind} envstep{step}", fill=(100, 180, 255), font=font)
+        is_cond = i == 0
+        draw.rectangle([(0, 0), (img.width, banner_h)], fill=GT_BANNER if is_cond else PD_BANNER)
+        kind = "COND(real)" if is_cond else "PD"
+        draw.text(
+            (4, 4),
+            f"win{window_idx:03d} f{i:02d} {kind} envstep{step}",
+            fill=GT_TEXT if is_cond else PD_TEXT,
+            font=font,
+        )
         frame.paste(img, (0, banner_h))
+        draw.rectangle(
+            [(0, 0), (img.width - 1, img.height + banner_h - 1)],
+            outline=GT_BLUE if is_cond else PD_RED,
+            width=border_w,
+        )
         labeled.append(frame)
     _save_mp4(labeled, output_path, fps)
 
