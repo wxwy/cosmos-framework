@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# Edge warmstart 单任务 overfit（LIBERO task 0: turn on the stove and put the moka pot on it）。
+#
+# 用途：把 4.7 天的多任务训练风险前置到几小时内——只喂 task 0 的 ~38 条 episode，
+# 验证 warmstart → SFT → checkpoint → 闭环 eval 整条链路能否产出可用策略。
+# 数据集过滤在 experiment 配置里（SingleTaskLIBEROLeRobotDataset，task_index=0），
+# 本 TOML 不改任何 cosmos 原码。
+#
+# 训练参数：官方超参保留（bs=128/rank、74000 tokens、lr 5e-5、selective AC、ga=16 单卡全局批 2048）；
+# 与官方的差异（overfit 专用，非超参退化）：
+#   - max_iter 2000 -> 200（43 个 task-0 epoch，足够记忆单任务）
+#   - save_iter 500 -> 50（50/100/150/200 四个评估点看收敛进度）
+#   - warmup 500 -> 20、cycle 16000 -> 200（官方 schedule 为 2000-iter 设计，
+#     500 步 warmup 会让 200-iter 全程困在 lr 爬坡；overfit 需快速达到目标 lr）
+# 单卡：dp_shard=-1 + grad_accum_iter=16（全局批 128 x 1 x 16 = 2048 与官方一致）。
+# Env: LIBERO_ROOT, BASE_CHECKPOINT_PATH, EDGE_POLICY_CHECKPOINT, WAN_VAE_PATH.
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_libero_edge_task0_overfit"
+project      = "cosmos3_action_libero"
+group        = "action_sft"
+name         = "edge_libero_task0_overfit"
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 74000
+
+[model.parallelism]
+data_parallel_shard_degree     = -1    # 单卡 -> 1 rank
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [200]
+warm_up_steps = [20]
+
+[trainer]
+max_iter        = 200
+logging_iter    = 50
+grad_accum_iter = 16   # 单卡补 8 路 DP；全局批 128 x 1 x 16 = 2048 与官方一致
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 50

@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# Edge-Policy-DROID warm-start LIBERO-10 action-policy SFT (单卡 A100-80GB 版)。
+#
+# 复现官方 `action_policy_libero_nano` 的训练参数：
+#   - max_samples_per_batch = 128/rank（nano 配置内默认，官方注释 "256 OOMs on H200"）
+#   - max_num_tokens_after_packing = 74000（官方；非 fork r04 smoke 的 45056）
+#   - lr 5e-5, cycle 16000 / warmup 500, selective AC + fmha, FusedAdamW（配置默认）
+# 与官方的差异（仅因单卡，非超参改动）：
+#   - HSDP 2x8 = 16 ranks -> 单 rank（data_parallel_shard_degree=-1, replicate=1）
+#   - grad_accum_iter 1 -> 16（补回 8 路 DP：官方 ga=2 的 8 倍；全局批 128 x 1 x 16 = 2048 与官方一致）
+# 模型 = Edge 架构（Nemotron backbone），base = Edge-Policy-DROID DCP，在线 VAE。
+# Env: LIBERO_ROOT, BASE_CHECKPOINT_PATH, EDGE_POLICY_CHECKPOINT, WAN_VAE_PATH.
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_libero_edge_warmstart"
+project      = "cosmos3_action_libero"
+group        = "action_sft"
+name         = "edge_libero_warmstart"
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 74000
+
+[model.parallelism]
+data_parallel_shard_degree     = -1    # 单卡 -> 1 rank
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [16000]
+warm_up_steps = [500]
+
+[trainer]
+max_iter        = 2000
+logging_iter    = 50
+grad_accum_iter = 16   # 单卡补 8 路 DP；全局批 128 x 1 x 16 = 2048 与官方一致
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 100
