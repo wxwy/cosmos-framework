@@ -41,7 +41,7 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -125,6 +125,7 @@ class EpisodeResult:
     steps: int
     error: str | None
     actions: list[list[float]]
+    predictions: list[dict] = field(default_factory=list)
 
 
 class ActionEnvironmentClient:
@@ -435,6 +436,49 @@ def _save_gif(frames: list[Image.Image], output_path: Path, fps: int) -> None:
     )
 
 
+def _save_mp4(frames: list[Image.Image], output_path: Path, fps: int) -> None:
+    """Write collected frames to an MP4 (H.264) file via OpenCV's mp4v codec."""
+    if not frames:
+        return
+    import cv2
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    h, w = np.asarray(frames[0]).shape[:2]
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        max(1, int(fps)),
+        (w, h),
+    )
+    try:
+        for frame in frames:
+            arr = np.asarray(frame)
+            if arr.ndim == 3:
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            writer.write(arr)
+    finally:
+        writer.release()
+
+
+def _save_prediction_videos(
+    prediction_videos: list[tuple[int, list[Image.Image]]],
+    output_dir: Path,
+    fps: int,
+) -> None:
+    """Save each prediction's model-generated video (returned by the server) as its
+    own MP4 named by env step (predict_stepXXXXXX.mp4), plus a concatenated stream
+    (predict_combined.mp4) for quick browsing. Each video is the 17-frame rollout the
+    model imagined when it predicted the 16-step action chunk at that step."""
+    if not prediction_videos:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    combined: list[Image.Image] = []
+    for step, frames in prediction_videos:
+        _save_mp4(frames, output_dir / f"predict_step{step:06d}.mp4", fps)
+        combined.extend(frames)
+    _save_mp4(combined, output_dir / "predict_combined.mp4", fps)
+
+
 def _decode_b64_frames(b64_frames: list[str]) -> list[Image.Image]:
     """Decode a list of base64-encoded PNG strings into PIL Images."""
     images: list[Image.Image] = []
@@ -620,6 +664,10 @@ def _run_episode(
     gif_path: Path | None,
     gif_fps: int,
     comparison_path: Path | None = None,
+    mp4_path: Path | None = None,
+    mp4_fps: int = 20,
+    pred_video_dir: Path | None = None,
+    pred_video_fps: int = 20,
 ) -> EpisodeResult:
     env.reset()
     if initial_state is not None:
@@ -633,6 +681,8 @@ def _run_episode(
     success = False
     gif_frames: list[Image.Image] = []
     action_log: list[list[float]] = []
+    predict_log: list[dict] = []
+    prediction_videos: list[tuple[int, list[Image.Image]]] = []
     is_multi_view = len(cameras) > 1
     resolved_rotation_space = _infer_rotation_space(action_dim, rotation_space)
 
@@ -689,13 +739,29 @@ def _run_episode(
                 result = client.predict(observation_img)
             actions = result.get("action", [])
             if not actions:
-                return EpisodeResult(False, step, "Empty action chunk from server", action_log)
+                return EpisodeResult(False, step, "Empty action chunk from server", action_log, predict_log)
             action_queue = _select_action_chunk(actions, action_horizon)
 
-            if comparison_path is not None:
-                action_video_b64 = result.get("video", [])
-                if action_video_b64:
-                    action_frames = _decode_b64_frames(action_video_b64)
+            # Save the full prediction result for this request: the denormalized
+            # action chunk the server returned, plus the slice that will actually
+            # be executed (bounded by --action-horizon), keyed by env step.
+            predict_log.append(
+                {
+                    "step": step,
+                    "chunk_size": len(actions),
+                    "action_chunk": actions,
+                    "executed": list(action_queue),
+                    "n_execute": len(action_queue),
+                    "video_frames": len(result.get("video", [])),
+                }
+            )
+
+            action_video_b64 = result.get("video", [])
+            if action_video_b64 and (pred_video_dir is not None or comparison_path is not None):
+                action_frames = _decode_b64_frames(action_video_b64)
+                if pred_video_dir is not None:
+                    prediction_videos.append((step, action_frames))
+                if comparison_path is not None:
                     env_comparison_frames = [capture_comparison_frame(obs)]
                     comparison_windows.append((action_frames, env_comparison_frames))
 
@@ -741,9 +807,13 @@ def _run_episode(
 
     if gif_path is not None:
         _save_gif(gif_frames, gif_path, gif_fps)
+    if mp4_path is not None:
+        _save_mp4(gif_frames, mp4_path, mp4_fps)
+    if pred_video_dir is not None and prediction_videos:
+        _save_prediction_videos(prediction_videos, pred_video_dir, pred_video_fps)
     if comparison_path is not None and comparison_windows:
         _save_comparison_gif(comparison_windows, comparison_path, gif_fps)
-    return EpisodeResult(success, step, None, action_log)
+    return EpisodeResult(success, step, None, action_log, predict_log)
 
 
 def _load_initial_states(
@@ -830,6 +900,13 @@ def _parse_args() -> argparse.Namespace:
         help="Save side-by-side comparison GIFs (Action prediction vs environment rollout)",
     )
     parser.add_argument("--gif_fps", type=int, default=20, help="Frames per second for saved GIFs")
+    parser.add_argument("--save_mp4", action="store_true", help="Save per-episode MP4 (H.264) of rendered frames")
+    parser.add_argument("--mp4_fps", type=int, default=20, help="Frames per second for saved MP4s")
+    parser.add_argument(
+        "--save_pred_mp4",
+        action="store_true",
+        help="Save each prediction's model-generated video as MP4 (per-predict + combined)",
+    )
     parser.add_argument(
         "--mujoco_gl",
         type=str,
@@ -1070,6 +1147,10 @@ def main() -> None:
         raise ValueError("--save_gifs requires --output_dir to be set")
     if args.save_comparison and not args.output_dir:
         raise ValueError("--save_comparison requires --output_dir to be set")
+    if args.save_mp4 and not args.output_dir:
+        raise ValueError("--save_mp4 requires --output_dir to be set")
+    if args.save_pred_mp4 and not args.output_dir:
+        raise ValueError("--save_pred_mp4 requires --output_dir to be set")
 
     # Parse cameras from comma-separated string
     cameras = [c.strip() for c in args.camera.split(",") if c.strip()]
@@ -1112,6 +1193,8 @@ def main() -> None:
     output_dir = Path(args.output_dir) if args.output_dir else None
     gif_root = output_dir / "gifs" if output_dir and args.save_gifs else None
     comparison_root = output_dir / "comparisons" if output_dir and args.save_comparison else None
+    mp4_root = output_dir / "mp4" if output_dir and args.save_mp4 else None
+    mp4_pred_root = output_dir / "mp4_pred" if output_dir and args.save_pred_mp4 else None
 
     for task_id in selected_task_ids:
         task = task_suite.get_task(task_id)
@@ -1232,6 +1315,14 @@ def main() -> None:
                 if comparison_root is not None
                 else None
             )
+            mp4_path = (
+                mp4_root / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}.mp4" if mp4_root is not None else None
+            )
+            pred_video_dir = (
+                mp4_pred_root / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}"
+                if mp4_pred_root is not None
+                else None
+            )
             try:
                 result = _run_episode(
                     env,
@@ -1250,6 +1341,10 @@ def main() -> None:
                     gif_path=gif_path,
                     gif_fps=args.gif_fps,
                     comparison_path=comparison_path,
+                    mp4_path=mp4_path,
+                    mp4_fps=args.mp4_fps,
+                    pred_video_dir=pred_video_dir,
+                    pred_video_fps=args.mp4_fps,
                 )
             except Exception as exc:
                 result = EpisodeResult(False, 0, str(exc), [])
@@ -1278,6 +1373,17 @@ def main() -> None:
                 action_log_path = action_log_dir / f"episode_{episode_idx:03d}.json"
                 action_log_path.write_text(
                     json.dumps(result.actions, indent=2),
+                    encoding="utf-8",
+                )
+
+            # Save per-prediction details as JSON: each HTTP /predict call's returned
+            # action chunk + the executed slice (bounded by --action-horizon).
+            if output_dir is not None and result.predictions:
+                predict_dir = output_dir / "predictions" / f"task_{task_id:03d}"
+                predict_dir.mkdir(parents=True, exist_ok=True)
+                predict_path = predict_dir / f"episode_{episode_idx:03d}.json"
+                predict_path.write_text(
+                    json.dumps(result.predictions, indent=2),
                     encoding="utf-8",
                 )
 

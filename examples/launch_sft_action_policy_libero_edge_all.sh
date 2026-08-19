@@ -2,42 +2,43 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-# Structured-TOML launch for task0 overfit — Edge-Policy-DROID warm-start 单任务 overfit
-# （LIBERO task 0: turn on the stove and put the moka pot on it，单卡 A100-80GB 版）。
-# Drives cosmos_framework.scripts.train against
-# examples/toml/sft_config/action_policy_libero_edge_task0_overfit.toml。
+# Structured-TOML launch for action_policy_libero_edge_all — Edge-Policy-DROID
+# warm-start LIBERO-all (4-suite) action-policy SFT (单卡 A100-80GB 版). Drives
+# cosmos_framework.scripts.train against
+# examples/toml/sft_config/action_policy_libero_edge_all.toml.
 #
-# 无任何自定义数据集代码：experiment 用标准 action_policy_libero_edge_warmstart（标准多任务
-# loader），LIBERO_ROOT 指向 /disk/data/LIBERO_LeRobot_v3/libero_10_task0 —— 该目录的
-# data/ 只有 task-0 过滤后的帧 parquet，meta/ 与 videos/ 是到原 libero_10 的软链，所以
-# 标准 loader 读到的就是单任务数据。overfit schedule（max_iter=200, save_iter=50,
-# logging_iter=1, warmup 20 / cycle 200）全在 TOML 里。模型/权重/参数与 warmstart 全同。
+# 官方 all_nano 超参全保留（bs=128/rank、74000 tokens、lr 5e-5、cycle 16000/500、selective AC）；
 # 单卡差异：dp_shard=-1 + grad_accum_iter=16（全局批 128x1x16=2048 与官方一致）。
+# 在线 VAE；base = Edge-Policy-DROID DCP；tokenizer = 本地 Edge 包（EDGE_POLICY_CHECKPOINT）。
 #
 # Required env vars:
-#   LIBERO_ROOT           task-0-only LIBERO 数据集根（默认 libero_10_task0）
+#   LIBERO_ROOT           LIBERO_LeRobot_v3 PARENT dir（含 4 个 suite 子目录，no default）
 # Optional env vars (defaults below; override to relocate data/checkpoints):
 #   BASE_CHECKPOINT_PATH  default: examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp
 #   EDGE_POLICY_CHECKPOINT default: /disk/rl/models/Cosmos3-Edge-Policy-DROID (本地 Edge 包, 零下载)
 #   WAN_VAE_PATH          default: examples/checkpoints/wan22_vae/Wan2.2_VAE.pth (本地转化原生 VAE)
 #   NPROC_PER_NODE        default: 1 (单卡)
-#   EXTRA_TAIL_OVERRIDES  额外 Hydra override 字符串，如 "trainer.max_iter=5 trainer.logging_iter=1"
+#   EXTRA_TAIL_OVERRIDES  额外 Hydra override 字符串（smoke 用），如 "trainer.max_iter=5 trainer.logging_iter=1"
 #   OUTPUT_ROOT           default: outputs/train
 #
 # Usage:
-#   bash examples/launch_sft_action_policy_libero_edge_task0_overfit.sh
+#   LIBERO_ROOT=/disk/data/LIBERO_LeRobot_v3 \
+#     bash examples/launch_sft_action_policy_libero_edge_all.sh
+#   # smoke:
+#   LIBERO_ROOT=/disk/data/LIBERO_LeRobot_v3 \
+#     EXTRA_TAIL_OVERRIDES="trainer.max_iter=5 trainer.logging_iter=1" \
+#     bash examples/launch_sft_action_policy_libero_edge_all.sh
 
-TOML_FILE="examples/toml/sft_config/action_policy_libero_edge_task0_overfit.toml"
+TOML_FILE="examples/toml/sft_config/action_policy_libero_edge_all.toml"
 : "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp}"
 : "${EDGE_POLICY_CHECKPOINT:=/disk/rl/models/Cosmos3-Edge-Policy-DROID}"
 : "${NPROC_PER_NODE:=1}"
-: "${LIBERO_ROOT:=/disk/data/LIBERO_LeRobot_v3/libero_10_task0}"
 
 # EDGE_POLICY_CHECKPOINT 被 experiment 配置经 ${oc.env:...} 解析（tokenizer_type 本地包路径），
 # 必须 export 才能被 torchrun 子进程继承；共享 launcher 不处理它（只处理 BASE_CHECKPOINT_PATH/WAN_VAE_PATH）。
 export EDGE_POLICY_CHECKPOINT
 
-# LIBEROLeRobotDataset reads ${oc.env:LIBERO_ROOT} directly (a LOCAL LeRobot dir);
+# LIBEROLeRobotDataset reads ${oc.env:LIBERO_ROOT}/<suite> (a LOCAL LeRobot PARENT dir);
 # export it so torchrun (launched in this shell) inherits it.
 export LIBERO_ROOT="${LIBERO_ROOT:-}"
 
@@ -47,7 +48,7 @@ if [[ -z "${LD_LIBRARY_PATH:-}" || "$LD_LIBRARY_PATH" != *cu13/lib* ]]; then
     export LD_LIBRARY_PATH="$CU13_LIB:${LD_LIBRARY_PATH:-}"
 fi
 
-EXTRA_DATASET_CHECK='[[ -f "$LIBERO_ROOT/meta/info.json" ]] || { echo "ERROR: LIBERO_ROOT must be a local LeRobot dir containing meta/info.json (got: '\''$LIBERO_ROOT'\''). See /disk/rl/psm_wma/datasets/README.md" >&2; exit 1; }'
+EXTRA_DATASET_CHECK='for _s in libero_spatial libero_object libero_goal libero_10; do [[ -f "$LIBERO_ROOT/$_s/meta/info.json" ]] || { echo "ERROR: LIBERO_ROOT must be the LIBERO_LeRobot_v3 parent dir containing all 4 suites (missing $_s; got: '\''$LIBERO_ROOT'\''). Pre-sync: hf download nvidia/LIBERO_LeRobot_v3 --repo-type dataset --local-dir <dir> (then LIBERO_ROOT=<dir>). See docs/action_policy_libero_posttrain.md" >&2; exit 1; }; done'
 
 # Extra Hydra overrides from the environment: a space-separated string word-split into
 # the TAIL_OVERRIDES array. An exported string survives `bash <wrapper>` (a child

@@ -14,6 +14,12 @@
 # Local training output (generated, large).
 training_output/
 
+# Closed-loop eval artifacts: keep the small text/json summaries, drop the
+# large mp4 videos / npy arrays / gif animations (regenerated on every eval run).
+results/**/*.mp4
+results/**/*.npy
+results/**/*.gif
+
 # Release-tool metadata (regenerated on every release run).
 cosmos_training_meta/
 
