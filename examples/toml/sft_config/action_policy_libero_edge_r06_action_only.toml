@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# G0-R06 action-only tiny-overfit probe. Start from the original
+# Cosmos3-Edge-Policy-DROID checkpoint and zero out the vision flow-matching
+# loss to test whether the vision "static future" shortcut is the only cause
+# of the SFT collapse.
+#
+# 修正说明(Kimi 原版有两个 bug,DS 已修):
+#   1) experiment 必须指向已注册的 posttrain_config——复用 R05 的
+#      "action_policy_libero_edge_tiny_overfit"(4 样本 train index 0-3 /
+#      1 样本 held-out index 4 / 在线编码),与 R05 joint tiny-overfit 同数据路径,
+#      唯一变量 = vision loss 开关。
+#   2) [model.config.rectified_flow_training_config] 不属于 TOML schema
+#      (extra="forbid" 会报 ValidationError),loss_scale=0.0 改由 CLI override
+#      传入: model.config.rectified_flow_training_config.loss_scale=0.0。
+
+[job]
+task       = "vfm"
+experiment = "action_policy_libero_edge_tiny_overfit"
+project    = "psm_wma"
+group      = "g0_r06"
+name       = "edge_libero_action_only_probe"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 45056
+
+[model.parallelism]
+data_parallel_shard_degree     = -1
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [100]
+warm_up_steps = [0]
+
+[trainer]
+max_iter        = 100
+logging_iter    = 1
+grad_accum_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 100
