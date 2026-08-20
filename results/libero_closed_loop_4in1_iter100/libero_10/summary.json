@@ -1,0 +1,31 @@
+{
+  "task_suite": "libero_10",
+  "total_episodes": 1,
+  "total_successes": 0,
+  "overall_success_rate": 0.0,
+  "num_trials_per_task": 1,
+  "selected_task_ids": [
+    2
+  ],
+  "action_space": "frame_wise_relative",
+  "rotation_space": "6d",
+  "action_dim": 10,
+  "task_results": [
+    {
+      "task_id": 2,
+      "task_description": "turn on the stove and put the moka pot on it",
+      "episodes": 1,
+      "successes": 0,
+      "success_rate": 0.0,
+      "episode_results": [
+        {
+          "episode": 0,
+          "success": false,
+          "steps": 520,
+          "error": null,
+          "elapsed_s": 1004.735
+        }
+      ]
+    }
+  ]
+}

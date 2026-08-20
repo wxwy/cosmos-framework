@@ -421,6 +421,52 @@ def _ensure_uint8_image(image: np.ndarray) -> np.ndarray:
     return image
 
 
+def _annotate_frame_number(
+    frame: Image.Image,
+    frame_index: int,
+    *,
+    label: str = "",
+    instruction: str = "",
+    border_color: tuple[int, int, int] | None = None,
+) -> Image.Image:
+    """在帧上叠加：左上=任务语言指令，右上=帧序号（不重叠），可选加整帧 3px 细边框。
+
+    frame_index: 显示的帧序号（env step）。
+    label: 附加标签（如 "input" / "pred 03/16"，紧跟在帧序号后面）。
+    instruction: 任务语言指令，置于左上角；多行/超长会截断到 80 字符换行。
+    border_color: 非 None 时在帧四周画 3px 细边框（输入帧绿 / 预测帧红）。
+    """
+    from PIL import ImageDraw, ImageFont
+
+    annotated = frame.copy()
+    draw = ImageDraw.Draw(annotated)
+    w, h = annotated.size
+
+    # 顶部信息条高度（24px），黑底。
+    bar_h = 24
+    draw.rectangle([(0, 0), (w, bar_h)], fill=(0, 0, 0))
+
+    # 左上：任务语言指令（最多 80 字符，超长截断 + "..."）。
+    if instruction:
+        instr = instruction.strip()
+        if len(instr) > 80:
+            instr = instr[:77] + "..."
+        draw.text((4, 5), instr, fill=(255, 255, 255))
+
+    # 右上：帧序号 + 可选 label；用文本尺寸算 right-aligned 起点，与左上不重叠。
+    frame_text = f"step {frame_index:04d}"
+    if label:
+        frame_text += f"  {label}"
+    bbox = draw.textbbox((0, 0), frame_text)
+    text_w = bbox[2] - bbox[0]
+    draw.text((w - text_w - 4, 5), frame_text, fill=(255, 255, 0))
+
+    if border_color is not None:
+        for i in range(3):
+            draw.rectangle([(i, i), (w - 1 - i, h - 1 - i)], outline=border_color)
+    return annotated
+
+
 def _save_gif(frames: list[Image.Image], output_path: Path, fps: int) -> None:
     if not frames:
         return
@@ -437,19 +483,51 @@ def _save_gif(frames: list[Image.Image], output_path: Path, fps: int) -> None:
 
 
 def _save_mp4(frames: list[Image.Image], output_path: Path, fps: int) -> None:
-    """Write collected frames to an MP4 (H.264) file via OpenCV's mp4v codec."""
+    """Write collected frames to an MP4 file. Prefers H.264 (libx264 via ffmpeg
+    subprocess) for VSCode Chromium-webview compatibility + reliable encoding of
+    PIL outputs (text overlays, colored borders); falls back to OpenCV mp4v if
+    ffmpeg / libx264 are unavailable."""
     if not frames:
         return
-    import cv2
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     h, w = np.asarray(frames[0]).shape[:2]
-    writer = cv2.VideoWriter(
-        str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        max(1, int(fps)),
-        (w, h),
-    )
+
+    import shutil
+    if shutil.which("ffmpeg") is not None:
+        # Pipe raw RGB24 frames to ffmpeg; libx264 with yuv420p for max compatibility
+        # (VSCode Chromium, VLC, macOS QuickTime).
+        import subprocess
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", f"{w}x{h}",
+            "-r", str(max(1, int(fps))),
+            "-i", "pipe:0",
+            "-vcodec", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+        proc = subprocess.run(
+            cmd,
+            input=b"".join(np.asarray(f).tobytes() for f in frames),
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            return
+
+    # Fallback: OpenCV mp4v (unreliable on PIL overlays, but at least produces something).
+    import cv2
+
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), max(1, int(fps)), (w, h))
+    if not writer.isOpened():
+        return
     try:
         for frame in frames:
             arr = np.asarray(frame)
@@ -461,19 +539,39 @@ def _save_mp4(frames: list[Image.Image], output_path: Path, fps: int) -> None:
 
 
 def _save_prediction_videos(
-    prediction_videos: list[tuple[int, list[Image.Image]]],
+    prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]],
     output_dir: Path,
     fps: int,
 ) -> None:
-    """Save each prediction's model-generated video (returned by the server) as its
-    own MP4 named by env step (predict_stepXXXXXX.mp4), plus a concatenated stream
-    (predict_combined.mp4) for quick browsing. Each video is the 17-frame rollout the
-    model imagined when it predicted the 16-step action chunk at that step."""
+    """Save each prediction as one MP4 (predict_stepXXXXXX.mp4) + a concatenated
+    stream (predict_combined.mp4). Each video = 1 input frame (green border) +
+    16 predicted frames (red border), every frame stamped with its frame index.
+
+    prediction_videos elements are (env_step, input_frame, action_frames):
+      - input_frame: the real observation at prediction time (third-person + wrist
+        concatenated view), drawn with a thin green border.
+      - action_frames: the server's 17-frame model rollout (= 1 conditioning frame
+        + 16 imagined future frames); the trailing 16 frames are the prediction,
+        drawn with a thin red border."""
     if not prediction_videos:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
     combined: list[Image.Image] = []
-    for step, frames in prediction_videos:
+    for step, input_frame, action_frames, task_description in prediction_videos:
+        frames: list[Image.Image] = []
+        output_size = input_frame.size
+        frames.append(
+            _annotate_frame_number(input_frame, step, label="input", instruction=task_description, border_color=(0, 255, 0))
+        )
+        # 17-frame rollout = 1 conditioning + 16 predicted; keep the 16 imagined frames.
+        pred_frames = action_frames[1:] if len(action_frames) > 1 else action_frames
+        n_pred = len(pred_frames)
+        for i, pf in enumerate(pred_frames, start=1):
+            if pf.size != output_size:
+                pf = pf.resize(output_size, Image.Resampling.BILINEAR)
+            frames.append(
+                _annotate_frame_number(pf, step, label=f"pred {i:02d}/{n_pred:02d}", instruction=task_description, border_color=(255, 0, 0))
+            )
         _save_mp4(frames, output_dir / f"predict_step{step:06d}.mp4", fps)
         combined.extend(frames)
     _save_mp4(combined, output_dir / "predict_combined.mp4", fps)
@@ -668,6 +766,7 @@ def _run_episode(
     mp4_fps: int = 20,
     pred_video_dir: Path | None = None,
     pred_video_fps: int = 20,
+    task_description: str = "",
 ) -> EpisodeResult:
     env.reset()
     if initial_state is not None:
@@ -682,23 +781,33 @@ def _run_episode(
     gif_frames: list[Image.Image] = []
     action_log: list[list[float]] = []
     predict_log: list[dict] = []
-    prediction_videos: list[tuple[int, list[Image.Image]]] = []
+    prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]] = []
     is_multi_view = len(cameras) > 1
     resolved_rotation_space = _infer_rotation_space(action_dim, rotation_space)
 
     comparison_windows: list[tuple[list[Image.Image], list[Image.Image]]] = []
 
     def record_frame(current_obs: dict[str, Any]) -> None:
-        if gif_path is None:
+        if gif_path is None and mp4_path is None:
             return
-        image = _get_libero_image(
-            current_obs,
-            cameras[0],
-            flip_images=flip_images,
-            rotate_180=rotate_180,
-        )
+        if is_multi_view:
+            imgs = _get_libero_images(
+                current_obs,
+                cameras,
+                flip_images=flip_images,
+                rotate_180=rotate_180,
+            )
+            image = client.concatenate_images(imgs)
+        else:
+            image = _get_libero_image(
+                current_obs,
+                cameras[0],
+                flip_images=flip_images,
+                rotate_180=rotate_180,
+            )
         image = _ensure_uint8_image(image)
-        gif_frames.append(Image.fromarray(image).convert("RGB"))
+        frame = Image.fromarray(image).convert("RGB")
+        gif_frames.append(_annotate_frame_number(frame, step, instruction=task_description))
 
     def capture_comparison_frame(current_obs: dict[str, Any]) -> Image.Image:
         """Capture an env frame matching Action's input view (multi-view concatenated if applicable)."""
@@ -759,11 +868,11 @@ def _run_episode(
             action_video_b64 = result.get("video", [])
             if action_video_b64 and (pred_video_dir is not None or comparison_path is not None):
                 action_frames = _decode_b64_frames(action_video_b64)
+                input_frame = capture_comparison_frame(obs)
                 if pred_video_dir is not None:
-                    prediction_videos.append((step, action_frames))
+                    prediction_videos.append((step, input_frame, action_frames, task_description))
                 if comparison_path is not None:
-                    env_comparison_frames = [capture_comparison_frame(obs)]
-                    comparison_windows.append((action_frames, env_comparison_frames))
+                    comparison_windows.append((action_frames, [input_frame]))
 
             if action_space == "relative":
                 base_pose = _obs_to_pose(obs)
@@ -1345,6 +1454,7 @@ def main() -> None:
                     mp4_fps=args.mp4_fps,
                     pred_video_dir=pred_video_dir,
                     pred_video_fps=args.mp4_fps,
+                    task_description=task_description,
                 )
             except Exception as exc:
                 result = EpisodeResult(False, 0, str(exc), [])

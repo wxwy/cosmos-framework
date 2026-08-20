@@ -100,10 +100,10 @@ def _action_policy_libero_edge_dataloader():
                     dataset=_suite_dataset(_suite),
                     batch_size=1,
                     in_order=False,
-                    num_workers=36,  # 4 suites x 3 = 12 workers + main = 13 (cgroup CPU budget)
+                    num_workers=30,  # 4 suites x 3 = 12 workers + main = 13 (cgroup CPU budget)
                     persistent_workers=True,
                     pin_memory=True,
-                    prefetch_factor=4,
+                    prefetch_factor=3,
                     sampler=None,
                 ),
             )

@@ -1,0 +1,45 @@
+{
+  "task_suite": "libero_object",
+  "total_episodes": 3,
+  "total_successes": 0,
+  "overall_success_rate": 0.0,
+  "num_trials_per_task": 3,
+  "selected_task_ids": [
+    0
+  ],
+  "action_space": "frame_wise_relative",
+  "rotation_space": "6d",
+  "action_dim": 10,
+  "task_results": [
+    {
+      "task_id": 0,
+      "task_description": "pick up the alphabet soup and place it in the basket",
+      "episodes": 3,
+      "successes": 0,
+      "success_rate": 0.0,
+      "episode_results": [
+        {
+          "episode": 0,
+          "success": false,
+          "steps": 280,
+          "error": null,
+          "elapsed_s": 497.484
+        },
+        {
+          "episode": 1,
+          "success": false,
+          "steps": 280,
+          "error": null,
+          "elapsed_s": 511.534
+        },
+        {
+          "episode": 2,
+          "success": false,
+          "steps": 280,
+          "error": null,
+          "elapsed_s": 516.24
+        }
+      ]
+    }
+  ]
+}
