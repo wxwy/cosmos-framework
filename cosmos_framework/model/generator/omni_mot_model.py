@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import hashlib
 import inspect
 import json
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
@@ -84,6 +86,7 @@ from cosmos_framework.data.generator.sequence_packing import (
 from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
 from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
 from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
+from cosmos_framework.model.generator.vision_vae import encode_uint8_vision_item, normalize_uint8_vision_item
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution, read_positive_int_metadata
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
@@ -3532,11 +3535,17 @@ class OmniMoTModel(ImaginaireModel):
         state: torch.Tensor,
     ) -> torch.Tensor:  # state: [...,C,T,H,W], returns [...,C,T,H,W]
         """Convert one GPU-resident uint8 vision item to fp32 and normalize to ``[-1,1]``."""
-        if state.dtype != torch.uint8:
-            raise ValueError(f"Per-camera VAE encoding requires uint8 pixels, got {state.dtype}.")
-        normalized_state = state.to(**self.tensor_kwargs_fp32)  # [...,C,T,H,W]
-        normalized_state.div_(127.5).sub_(1.0)  # [...,C,T,H,W]
-        return normalized_state
+        return normalize_uint8_vision_item(state, tensor_kwargs_fp32=self.tensor_kwargs_fp32)
+
+    def _encode_uint8_vision_item(
+        self,
+        state: torch.Tensor,
+        *,
+        num_views: int = 1,
+        frames_per_view: int | None = None,
+    ) -> torch.Tensor:
+        """公共 uint8 VAE 入口，供在线 guard 与离线 cache 使用同一编码契约。"""
+        return encode_uint8_vision_item(self, state, num_views=num_views, frames_per_view=frames_per_view)
 
     def _encode_vision_item(
         self,
@@ -3822,7 +3831,28 @@ class OmniMoTModel(ImaginaireModel):
 
         # Vision (image/video) raw state and tokenized latent state.
         media_key = self.input_image_key if is_image_batch else self.input_video_key
-        if num_views_per_vision_item is None:
+        cached_video_latents = data_batch.get("video_latent")
+        if cached_video_latents is not None:
+            # Cache entries already are fp32 VAE outputs. Keep the uint8 placeholder
+            # pixels only for downstream shape/temporal-position bookkeeping; do not
+            # normalize or encode them on the cache-hit path.
+            raw_state_vision = []
+            for item in data_batch[media_key]:
+                if isinstance(item, (list, tuple)):
+                    if len(item) != 1:
+                        raise ValueError("Cached vision samples must contain exactly one pixel placeholder.")
+                    item = item[0]
+                if not isinstance(item, torch.Tensor):
+                    raise TypeError(f"Cached vision placeholder must be a tensor, got {type(item).__name__}.")
+                if item.dim() == 4:
+                    item = item.unsqueeze(0)
+                elif item.dim() != 5:
+                    raise ValueError(
+                        "Cached vision placeholders must have shape [C,T,H,W] or [B,C,T,H,W], "
+                        f"got {tuple(item.shape)}."
+                    )
+                raw_state_vision.append(item)
+        elif num_views_per_vision_item is None:
             # Legacy VFM/image path: normalize the complete input when needed and
             # preserve the existing image batch-dimension handling.
             self._normalize_video_databatch_inplace(data_batch)
@@ -3849,13 +3879,149 @@ class OmniMoTModel(ImaginaireModel):
                     )
                 raw_state_vision.append(item)
 
-        x0_tokens_vision = self._encode_vision_x0_tokens(
-            raw_state_vision,
-            num_vision_items_per_sample,
-            vision_condition_indexes,
-            num_views_per_vision_item,
-            frames_per_vision_item,
-        )
+        if cached_video_latents is None:
+            x0_tokens_vision = self._encode_vision_x0_tokens(
+                raw_state_vision,
+                num_vision_items_per_sample,
+                vision_condition_indexes,
+                num_views_per_vision_item,
+                frames_per_vision_item,
+            )
+        else:
+            if len(cached_video_latents) != len(raw_state_vision):
+                raise ValueError(
+                    f"Cached latent count {len(cached_video_latents)} must match vision item count {len(raw_state_vision)}."
+                )
+            x0_tokens_vision = []
+            verify_cached_latents = data_batch.get("verify_cached_latent", [])
+            for cache_index, cached in enumerate(cached_video_latents):
+                if not isinstance(cached, (list, tuple)) or len(cached) != 1:
+                    raise ValueError("Each cached vision item must contain exactly one latent tensor.")
+                latent = cached[0]
+                if latent.dim() == 4:
+                    # Cache contract is [T_latent,C_latent,H,W], while the model
+                    # consumes [B,C_latent,T_latent,H,W].
+                    latent = latent.permute(1, 0, 2, 3).unsqueeze(0)
+                if latent.dim() != 5 or latent.shape[1] != 48 or latent.shape[2] != 5:
+                    raise ValueError(
+                        "Cached vision latent must have shape [1,48,5,H,W], "
+                        f"got {tuple(latent.shape)}."
+                    )
+                if latent.dtype != torch.float32:
+                    raise ValueError(f"Cached vision latent must be float32, got {latent.dtype}.")
+                latent = latent.contiguous()
+                verify_item = verify_cached_latents[cache_index] if cache_index < len(verify_cached_latents) else False
+                if isinstance(verify_item, torch.Tensor):
+                    verify_item = bool(verify_item.detach().reshape(-1)[0].item())
+                elif isinstance(verify_item, (list, tuple)):
+                    verify_item = bool(verify_item[0]) if verify_item else False
+                if verify_item:
+                    # The dataset returns uint8 pixels after _build_result/ActionTransformPipeline.
+                    # _normalize_uint8_vision_item requires uint8; if the tensor is float [0,1],
+                    # round-trip through uint8 first.
+                    raw_vision = raw_state_vision[cache_index].detach()
+                    if raw_vision.dtype == torch.uint8:
+                        raw_uint8 = raw_vision
+                    else:
+                        raw_uint8 = raw_vision.mul(255.0).clamp(0.0, 255.0).round().to(torch.uint8)
+                    online_latent = self._encode_uint8_vision_item(raw_uint8)
+                    # Diagnose the cache guard against the exact online-training route
+                    # on the same pixels. This is only enabled for explicit cache
+                    # verification and never changes the cache-hit training path.
+                    training_route_batch = {media_key: [raw_uint8.clone()]}
+                    self._normalize_video_databatch_inplace(training_route_batch, input_key=media_key)
+                    training_route_latent = self._encode_vision_x0_tokens(
+                        training_route_batch[media_key],
+                        num_vision_items_per_sample=None,
+                        vision_condition_indexes=None,
+                    )[0]
+
+                    def _pair_metrics(left: torch.Tensor, right: torch.Tensor) -> dict[str, Any]:
+                        shape_match = tuple(left.shape) == tuple(right.shape)
+                        return {
+                            "shape_match": shape_match,
+                            "dtype_match": left.dtype == right.dtype,
+                            "finite": bool(torch.isfinite(left).all() and torch.isfinite(right).all()),
+                            "max_abs_diff": float((left - right).abs().max().item()) if shape_match else None,
+                            "mean_abs_diff": float((left - right).abs().mean().item()) if shape_match else None,
+                        }
+
+                    raw_uint8_cpu = raw_uint8.detach().contiguous().cpu()
+                    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+                    project_root = Path(__file__).resolve().parents[4]
+                    route_probe_dir = project_root / "artifacts/g0/latent_cache_route_probe" / f"rank_{rank:02d}"
+                    route_probe_dir.mkdir(parents=True, exist_ok=True)
+                    route_probe = {
+                        "schema_version": "latent_cache_route_probe_v1",
+                        "iteration": iteration,
+                        "cache_index": cache_index,
+                        "raw_uint8": {
+                            "shape": list(raw_uint8.shape),
+                            "dtype": str(raw_uint8.dtype),
+                            "min": int(raw_uint8_cpu.min().item()),
+                            "max": int(raw_uint8_cpu.max().item()),
+                            "sha256": hashlib.sha256(raw_uint8_cpu.numpy().tobytes()).hexdigest(),
+                        },
+                        "shared_guard": {"shape": list(online_latent.shape), "dtype": str(online_latent.dtype)},
+                        "training_online_route": {
+                            "shape": list(training_route_latent.shape),
+                            "dtype": str(training_route_latent.dtype),
+                        },
+                        "cache": {"shape": list(latent.shape), "dtype": str(latent.dtype)},
+                        "shared_guard_vs_training_online_route": _pair_metrics(online_latent, training_route_latent),
+                        "shared_guard_vs_cache": _pair_metrics(online_latent, latent),
+                        "training_online_route_vs_cache": _pair_metrics(training_route_latent, latent),
+                    }
+                    for key in ("episode_index", "start_frame", "task_index", "dataset_name"):
+                        value = data_batch.get(key)
+                        if isinstance(value, list) and cache_index < len(value):
+                            value = value[cache_index]
+                        if isinstance(value, torch.Tensor):
+                            value = value.detach().cpu().reshape(-1).tolist()
+                        route_probe[key] = value
+                    route_probe_path = route_probe_dir / f"iter_{iteration:08d}_{time.time_ns()}.json"
+                    route_probe_path.write_text(
+                        json.dumps(route_probe, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                    )
+
+                    shape_match = tuple(online_latent.shape) == tuple(latent.shape)
+                    dtype_match = online_latent.dtype == latent.dtype
+                    finite = bool(torch.isfinite(online_latent).all() and torch.isfinite(latent).all())
+                    max_abs_diff = (
+                        float((online_latent - latent).abs().max().item()) if shape_match else None
+                    )
+                    mean_abs_diff = (
+                        float((online_latent - latent).abs().mean().item()) if shape_match else None
+                    )
+                    if not (shape_match and dtype_match and finite and max_abs_diff is not None and max_abs_diff <= 1e-5):
+                        evidence_dir = project_root / "artifacts/g0/latent_cache_mismatch" / f"rank_{rank:02d}"
+                        evidence_dir.mkdir(parents=True, exist_ok=True)
+                        evidence = {
+                            "iteration": iteration,
+                            "cache_index": cache_index,
+                            "cache_shape": list(latent.shape),
+                            "online_shape": list(online_latent.shape) if isinstance(online_latent, torch.Tensor) else None,
+                            "cache_dtype": str(latent.dtype),
+                            "online_dtype": str(online_latent.dtype) if isinstance(online_latent, torch.Tensor) else None,
+                            "shape_match": shape_match,
+                            "dtype_match": dtype_match,
+                            "finite": finite,
+                            "max_abs_diff": max_abs_diff,
+                            "mean_abs_diff": mean_abs_diff,
+                            "threshold": 1e-5,
+                        }
+                        for key in ("episode_index", "start_frame", "task_index", "dataset_name"):
+                            value = data_batch.get(key)
+                            if isinstance(value, list) and cache_index < len(value):
+                                value = value[cache_index]
+                            if isinstance(value, torch.Tensor):
+                                value = value.detach().cpu().reshape(-1).tolist()
+                            evidence[key] = value
+                        evidence_path = evidence_dir / f"iter_{iteration:08d}_{time.time_ns()}.json"
+                        evidence_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                        log.warning(f"Latent cache mismatch; falling back to online VAE: {evidence_path}")
+                        latent = online_latent.float().contiguous()
+                x0_tokens_vision.append(latent)
 
         frame_size = data_batch.get("image_size", None)
         if frame_size is not None:

@@ -22,7 +22,7 @@ export NUM_STEPS="${NUM_STEPS:-50}"
 # edge_all 继承 action_policy_libero_all_nano，数据 root 用 ${oc.env:LIBERO_ROOT}；
 # 服务端不加载训练数据，但 OmegaConf 急切解析插值（含 4 个 suite 子路径），缺了会崩。
 # 与 4in1 训练同一路径：LIBERO_LeRobot_v3 PARENT 目录。
-export LIBERO_ROOT="${LIBERO_ROOT:-/disk/data/LIBERO_LeRobot_v3}"
+export LIBERO_ROOT="${LIBERO_ROOT:-/disk/rl/data/LIBERO_LeRobot_v3}"
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.13/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 # sitecustomize shim: 把 guardrails 默认打成 False，跳过未安装的重型 guardrail 依赖链
 # (nltk/better_profanity/retinaface/qwen3guard)。不修改任何 cosmos 源码。

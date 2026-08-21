@@ -134,6 +134,7 @@ def custom_collate_fn(batch):
         "text_token_ids",
         "images",
         "video",
+        "video_latent",
         "action",
         "action_raw",
         "domain_id",
@@ -791,7 +792,7 @@ class JointDataLoader(webdataset.WebLoader):
     # Keys where each sample may hold multiple tensors (e.g. multiple video
     # clips in a packed sequence).  Kept as single-element lists per sample
     # via v[i:i+1] so that _update_output_batch yields list[list[Tensor]].
-    _MULTI_ITEM_KEYS = {"text_token_ids", "images", "video", "action", "action_raw", "sound"}
+    _MULTI_ITEM_KEYS = {"text_token_ids", "images", "video", "video_latent", "action", "action_raw", "sound"}
 
     def _get_next_sample(self, index_id: int) -> dict:
         """Pop the next single-sample dict from the buffer for the given dataloader.

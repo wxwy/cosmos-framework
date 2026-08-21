@@ -19,7 +19,7 @@ CKPT="$PWD/outputs/train/cosmos3_action_libero/action_sft/edge_libero_4in1/check
 [[ -d "$CKPT" ]] || { echo "ERROR: checkpoint not found: $CKPT" >&2; exit 1; }
 
 # 必需/默认资产（可在调用前 export 覆盖）。
-: "${LIBERO_ROOT:=/disk/data/LIBERO_LeRobot_v3}"
+: "${LIBERO_ROOT:=/disk/rl/data/LIBERO_LeRobot_v3}"
 : "${BASE_CHECKPOINT_PATH:=$PWD/examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp}"
 : "${EDGE_POLICY_CHECKPOINT:=/disk/rl/models/Cosmos3-Edge-Policy-DROID}"
 

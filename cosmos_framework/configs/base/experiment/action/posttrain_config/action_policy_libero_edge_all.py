@@ -16,16 +16,23 @@ suites). See docs/action_policy_libero_posttrain.md.
 """
 
 import copy
+import os
 
 import torch
 from hydra.core.config_store import ConfigStore
 
+from cosmos_framework.callbacks.online_vae_probe import OnlineVAEProbeCallback
+from cosmos_framework.callbacks.stdout_loss_logger import StdoutLossLogger
 from cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano import (
     action_policy_libero_all_nano,
 )
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
 from cosmos_framework.data.generator.action.datasets.action_sft_dataset import get_action_libero_sft_dataset
 from cosmos_framework.data.generator.joint_dataloader import IterativeJointDataLoader
+from cosmos_framework.model.generator.vision_vae import (
+    LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES,
+    LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS,
+)
 from cosmos_framework.utils.lazy_config import LazyCall as L
 
 _SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
@@ -40,7 +47,8 @@ def _action_policy_libero_edge_model_config() -> dict:
     cfg["compile"]["enabled"] = False
     cfg["diffusion_expert_config"]["load_weights_from_pretrained"] = False
     cfg["ema"]["enabled"] = False
-    cfg["tokenizer"]["encode_exact_durations"] = [17, 61, 73]
+    cfg["tokenizer"]["encode_exact_durations"] = LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS
+    cfg["tokenizer"]["encode_chunk_frames"] = LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES
     cfg["vlm_config"]["tokenizer"].update(
         repository=None,
         revision=None,
@@ -63,6 +71,21 @@ def _action_policy_libero_edge_dataloader():
     """
 
     def _suite_dataset(_suite):
+        latent_cache_root = os.environ.get("LIBERO_LATENT_CACHE_ROOT")
+        cache_kwargs = (
+            {
+                "latent_cache_root": f"{latent_cache_root}/{_suite}",
+                # cache 模式默认完全跳过 VAE；仅在显式设置大于 0 的比例时做在线抽检。
+                "latent_cache_verify_ratio": float(os.environ.get("LIBERO_LATENT_CACHE_VERIFY_RATIO", "0.0")),
+            }
+            if latent_cache_root
+            else {}
+        )
+        if os.environ.get("LIBERO_MAX_EPISODES"):
+            max_episodes = int(os.environ["LIBERO_MAX_EPISODES"])
+            if max_episodes <= 0:
+                raise ValueError(f"LIBERO_MAX_EPISODES must be a positive integer, got {max_episodes}")
+            cache_kwargs["max_episodes"] = max_episodes
         return L(get_action_libero_sft_dataset)(
             root="${oc.env:LIBERO_ROOT}/" + _suite,
             fps=20,
@@ -82,6 +105,7 @@ def _action_policy_libero_edge_dataloader():
             cfg_dropout_rate=0.1,
             format_prompt_as_json=True,
             tokenizer_config="${model.config.vlm_config.tokenizer}",
+            **cache_kwargs,
         )
 
     return L(IterativeJointDataLoader)(
@@ -100,10 +124,10 @@ def _action_policy_libero_edge_dataloader():
                     dataset=_suite_dataset(_suite),
                     batch_size=1,
                     in_order=False,
-                    num_workers=30,  # 4 suites x 3 = 12 workers + main = 13 (cgroup CPU budget)
-                    persistent_workers=True,
+                    num_workers=int(os.environ.get("LIBERO_NUM_WORKERS", "36")),
+                    persistent_workers=int(os.environ.get("LIBERO_NUM_WORKERS", "36")) > 0,
                     pin_memory=True,
-                    prefetch_factor=3,
+                    prefetch_factor=3 if int(os.environ.get("LIBERO_NUM_WORKERS", "36")) > 0 else None,
                     sampler=None,
                 ),
             )
@@ -140,6 +164,22 @@ action_policy_libero_edge_all["optimizer"]["weight_decay_skip_patterns"] = [
     r"action2llm\.(fc|bias)\.weight$",
     r"llm2action\.(fc|bias)\.weight$",
 ]
+
+# The ``basic`` callback group is disabled to avoid W&B initialization, but that
+# also removes loss logging. Add a lightweight stdout-only logger so the training
+# log file captures the loss curve.
+action_policy_libero_edge_all["trainer"]["callbacks"]["stdout_loss_logger"] = L(StdoutLossLogger)(
+    every_n=1,
+)
+
+# Disabled unless explicitly requested. The probe captures pre-normalization uint8
+# frames and the exact online VAE outputs for offline-cache parity verification.
+_probe_output = os.environ.get("ONLINE_VAE_PROBE_OUTPUT")
+if _probe_output:
+    action_policy_libero_edge_all["trainer"]["callbacks"]["online_vae_probe"] = L(OnlineVAEProbeCallback)(
+        output_dir=_probe_output,
+        max_samples=int(os.environ.get("ONLINE_VAE_PROBE_MAX_SAMPLES", "200")),
+    )
 
 ConfigStore.instance().store(
     group="experiment",

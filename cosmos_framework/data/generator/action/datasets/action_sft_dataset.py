@@ -238,6 +238,9 @@ def get_action_libero_sft_dataset(
     format_prompt_as_json: bool = False,
     iterable_shuffle: bool = False,
     episode_shuffle_seed: int = 42,
+    latent_cache_root: str | None = None,
+    latent_cache_verify_ratio: float = 0.0,
+    max_episodes: int | None = None,
 ) -> Dataset:
     """Build the LIBERO action-policy SFT dataset (GA reproduction defaults).
 
@@ -265,6 +268,9 @@ def get_action_libero_sft_dataset(
         pose_coordinate_frame=pose_coordinate_frame,
         action_normalization=action_normalization,
         action_stats_path=action_stats_path,
+        latent_cache_root=latent_cache_root,
+        latent_cache_verify_ratio=latent_cache_verify_ratio,
+        max_episodes=max_episodes,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,

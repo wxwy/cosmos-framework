@@ -7,10 +7,12 @@ import copy
 
 from hydra.core.config_store import ConfigStore
 
+from cosmos_framework.callbacks.stdout_loss_logger import StdoutLossLogger
 from cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_nano import (
     action_policy_libero_nano,
 )
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
+from cosmos_framework.utils.lazy_config import LazyCall as L
 
 
 def _action_policy_libero_edge_model_config() -> dict:
@@ -58,6 +60,13 @@ action_policy_libero_edge_warmstart["optimizer"]["weight_decay_skip_patterns"] =
     r"action2llm\.(fc|bias)\.weight$",
     r"llm2action\.(fc|bias)\.weight$",
 ]
+
+# The ``basic`` callback group is disabled to avoid W&B initialization, but that
+# also removes loss logging. Add a lightweight stdout-only logger so the training
+# log file captures the loss curve.
+action_policy_libero_edge_warmstart["trainer"]["callbacks"]["stdout_loss_logger"] = L(StdoutLossLogger)(
+    every_n=1,
+)
 
 ConfigStore.instance().store(
     group="experiment",

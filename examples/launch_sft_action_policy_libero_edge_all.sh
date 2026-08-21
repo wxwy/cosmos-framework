@@ -22,10 +22,10 @@
 #   OUTPUT_ROOT           default: outputs/train
 #
 # Usage:
-#   LIBERO_ROOT=/disk/data/LIBERO_LeRobot_v3 \
+#   LIBERO_ROOT=/disk/rl/data/LIBERO_LeRobot_v3 \
 #     bash examples/launch_sft_action_policy_libero_edge_all.sh
 #   # smoke:
-#   LIBERO_ROOT=/disk/data/LIBERO_LeRobot_v3 \
+#   LIBERO_ROOT=/disk/rl/data/LIBERO_LeRobot_v3 \
 #     EXTRA_TAIL_OVERRIDES="trainer.max_iter=5 trainer.logging_iter=1" \
 #     bash examples/launch_sft_action_policy_libero_edge_all.sh
 

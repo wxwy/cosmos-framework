@@ -50,6 +50,10 @@ max_iter        = 5000
 logging_iter    = 1
 grad_accum_iter = 16   # 单卡补 8 路 DP；全局批 128 x 1 x 16 = 2048 与官方一致
 
+[trainer.cudnn]
+# Keep bf16 VAE convolution selection aligned with the offline latent-cache builder.
+benchmark = false
+
 [checkpoint]
 load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
 save_iter = 25

@@ -559,6 +559,21 @@ class TrainerCallbacksConfig(BaseModel):
     grad_clip: GradClipCallback = Field(default_factory=GradClipCallback)
 
 
+class CuDNNConfig(BaseModel):
+    """cuDNN backend selection. Lands at ``config.trainer.cudnn.*``."""
+
+    model_config = _PYDANTIC_MODEL_CONFIG
+
+    deterministic: bool = Field(
+        default=False,
+        description="Restrict cuDNN to deterministic kernels when available.",
+    )
+    benchmark: bool = Field(
+        default=True,
+        description="Benchmark convolution algorithms and select the fastest implementation.",
+    )
+
+
 class TrainerConfig(BaseModel):
     """Trainer-level knobs that the TOML drives directly."""
 
@@ -587,6 +602,7 @@ class TrainerConfig(BaseModel):
         default=500,
         description="Total number of optimizer steps the run will execute.",
     )
+    cudnn: CuDNNConfig = Field(default_factory=CuDNNConfig)
     callbacks: TrainerCallbacksConfig = Field(default_factory=TrainerCallbacksConfig)
 
 

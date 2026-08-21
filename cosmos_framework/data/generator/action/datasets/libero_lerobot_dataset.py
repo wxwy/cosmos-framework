@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import random
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
 
@@ -36,6 +37,10 @@ from cosmos_framework.data.generator.action.utils.action_spec import ActionSpec,
 from cosmos_framework.data.generator.action.datasets.base_dataset import ActionBaseDataset
 from cosmos_framework.data.generator.action.libero_pose_utils import libero_action_dim, libero_rotation_format
 from cosmos_framework.data.generator.action.utils.pose_utils import convert_rotation
+from cosmos_framework.model.generator.vision_vae import (
+    LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES,
+    LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS,
+)
 from cosmos_framework.utils import log
 
 CameraMode = Literal["image", "wrist_image", "concat_view"]
@@ -83,6 +88,9 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         val_ratio: float = 0.01,
         seed: int = 0,
         sample_stride: int = 1,
+        latent_cache_root: str | None = None,
+        latent_cache_verify_ratio: float = 0.0,
+        max_episodes: int | None = None,
     ) -> None:
         if action_space != "frame_wise_relative":
             raise NotImplementedError(
@@ -127,6 +135,15 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         self._pose_coordinate_frame = pose_coordinate_frame
         self._embodiment_type = embodiment_type
         self._requested_normalization = action_normalization
+        self._latent_cache_root = Path(latent_cache_root) if latent_cache_root else None
+        self._sample_stride = sample_stride
+        if not 0.0 <= latent_cache_verify_ratio <= 1.0:
+            raise ValueError(f"latent_cache_verify_ratio must be in [0,1], got {latent_cache_verify_ratio}.")
+        self._latent_cache_verify_ratio = latent_cache_verify_ratio
+        self._latent_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        if max_episodes is not None and max_episodes <= 0:
+            raise ValueError(f"max_episodes must be a positive integer, got {max_episodes}")
+        self._max_episodes = max_episodes
         # quantile_rot normalizes against the raw (un-orthonormalized) rotation stats
         # under "global_raw"; everything else uses "global".
         self._stats_key = "global_raw" if action_normalization == "quantile_rot" else "global"
@@ -167,8 +184,14 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         self._ep_vals = ep_vals.astype(np.int64)[kept]
         self._ep_starts = ep_starts.astype(np.int64)[kept]
         kept_counts = ep_counts.astype(np.int64)[kept]
+        if self._max_episodes is not None:
+            self._ep_vals = self._ep_vals[: self._max_episodes]
+            self._ep_starts = self._ep_starts[: self._max_episodes]
+            kept_counts = kept_counts[: self._max_episodes]
         # Within-episode windows only: total - n_kept_episodes * chunk_length valid samples.
         self._valid_cum = np.cumsum(np.maximum(0, kept_counts - self._chunk_length)).astype(np.int64)
+        if self._latent_cache_root is not None:
+            self._validate_latent_cache_manifest()
 
         log.info(
             f"Loaded LIBERO dataset root={self._root} split={split!r} camera_mode={camera_mode!r} "
@@ -254,6 +277,105 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
 
     # ---- sample build ------------------------------------------------------
 
+    def _validate_latent_cache_manifest(self) -> None:
+        assert self._latent_cache_root is not None
+        manifest_path = self._latent_cache_root / "dataset_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Missing latent cache manifest: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema_version") != "exact_window_v1":
+            raise ValueError(f"Unsupported latent cache schema in {manifest_path}: {manifest.get('schema_version')!r}")
+        if int(manifest.get("image_size", -1)) != self._image_size:
+            raise ValueError(
+                f"Latent cache image_size mismatch in {manifest_path}: "
+                f"cache={manifest.get('image_size')!r}, dataset={self._image_size}"
+            )
+        expected_vae_contract = {
+            "compute_dtype": "torch.bfloat16",
+            "encode_exact_durations": LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS,
+            "encode_chunk_frames": LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES,
+        }
+        if manifest.get("vae_encode_contract") != expected_vae_contract:
+            raise ValueError(
+                f"Latent cache VAE encoding contract mismatch in {manifest_path}; "
+                "rebuild the cache with the current exact-window builder."
+            )
+        expected_latent_shape = manifest.get("latent_shape")
+        if not isinstance(expected_latent_shape, list) or len(expected_latent_shape) != 4 or expected_latent_shape[:2] != [5, 48]:
+            raise ValueError(
+                f"Latent cache manifest has invalid latent_shape {expected_latent_shape!r} in {manifest_path}; "
+                "expected [5, 48, H, W]"
+            )
+        self._latent_cache_expected_shape = tuple(expected_latent_shape)
+        expected = {
+            "suite": self._root.name,
+            "chunk_length": self._chunk_length,
+            "camera_mode": self._camera_mode,
+            "sample_stride": self._sample_stride,
+            "fps": self._fps,
+        }
+        for key, value in expected.items():
+            if manifest.get(key) != value:
+                raise ValueError(
+                    f"Latent cache {key} mismatch in {manifest_path}: cache={manifest.get(key)!r}, dataset={value!r}"
+                )
+        cached_episodes = {int(row["episode_index"]) for row in manifest.get("episodes", [])}
+        required_episodes = {int(episode) for episode in self._ep_vals}
+        missing_episodes = sorted(required_episodes - cached_episodes)
+        if missing_episodes:
+            raise ValueError(
+                f"Latent cache misses {len(missing_episodes)} selected episodes in {manifest_path}; "
+                f"first={missing_episodes[:5]}"
+            )
+
+    def _load_cached_latent(self, episode_index: int, start_frame: int) -> torch.Tensor | None:
+        if self._latent_cache_root is None:
+            return None
+
+        cache_item = self._latent_cache.get(episode_index)
+        if cache_item is None:
+            path = self._latent_cache_root / "episodes" / f"episode_{episode_index:06d}.pt"
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing latent cache episode file: {path}")
+            cache_item = torch.load(path, map_location="cpu", weights_only=True)
+            if cache_item.get("format") != "exact_window_v1":
+                raise ValueError(f"Unsupported latent cache format in {path}: {cache_item.get('format')!r}")
+            if int(cache_item.get("episode_index", -1)) != episode_index:
+                raise ValueError(f"Latent cache episode mismatch in {path}")
+            self._latent_cache[episode_index] = cache_item
+            if len(self._latent_cache) > 8:
+                self._latent_cache.popitem(last=False)
+        else:
+            self._latent_cache.move_to_end(episode_index)
+
+        window = cache_item.get("windows", {}).get(str(start_frame))
+        if not isinstance(window, dict) or not isinstance(window.get("latent"), torch.Tensor):
+            raise KeyError(f"Missing latent cache window episode={episode_index} start_frame={start_frame}")
+        latent_raw = window["latent"]
+        if latent_raw.dtype != torch.float32:
+            raise ValueError(
+                f"Cached latent must be float32, got {latent_raw.dtype} for "
+                f"episode={episode_index} start_frame={start_frame}"
+            )
+        latent = latent_raw.contiguous()
+        expected_shape = getattr(self, "_latent_cache_expected_shape", (5, 48, 16, 32))
+        if tuple(latent.shape) != expected_shape:
+            raise ValueError(
+                f"Invalid cached latent shape for episode={episode_index} start_frame={start_frame}: "
+                f"expected {expected_shape}, got {tuple(latent.shape)}"
+            )
+        expected_window = torch.arange(start_frame, start_frame + self._chunk_length + 1, dtype=torch.long)
+        expected_anchors = torch.arange(start_frame, start_frame + self._chunk_length + 1, 4, dtype=torch.long)
+        window_indices = window.get("window_frame_indices")
+        anchor_indices = window.get("latent_source_frame_indices")
+        if not isinstance(window_indices, torch.Tensor) or not torch.equal(window_indices, expected_window):
+            raise ValueError(f"Invalid window_frame_indices for episode={episode_index} start_frame={start_frame}")
+        if not isinstance(anchor_indices, torch.Tensor) or not torch.equal(anchor_indices, expected_anchors):
+            raise ValueError(f"Invalid latent_source_frame_indices for episode={episode_index} start_frame={start_frame}")
+        if not torch.isfinite(latent).all():
+            raise FloatingPointError(f"Non-finite cached latent episode={episode_index} start_frame={start_frame}")
+        return latent
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         # Resample a different valid window if a frame fails to decode (bounded retries).
         n = len(self)
@@ -278,8 +400,16 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         episode = self._episodes[episode_index]
 
         stop = start + self._chunk_length + 1
-        timestamps = [float(self._row_timestamp[j]) for j in range(start, stop)]
-        video = self._load_video(episode, timestamps)
+        video_latent = self._load_cached_latent(episode_index, start - int(self._ep_starts[ep]))
+        verify_cached_latent = video_latent is not None and random.random() < self._latent_cache_verify_ratio
+        if video_latent is None or verify_cached_latent:
+            timestamps = [float(self._row_timestamp[j]) for j in range(start, stop)]
+            video = self._load_video(episode, timestamps)
+        else:
+            # _build_result() consumes [T,C,H,W] and returns [C,T,H,W]. Keep this
+            # exact input layout so temporal-position bookkeeping still sees T=17.
+            width = self._image_size * (2 if self._camera_mode == "concat_view" else 1)
+            video = torch.zeros((self._chunk_length + 1, 3, self._image_size, width), dtype=torch.float32)
 
         # frame_wise_relative: chunk per-frame deltas are the stored actions directly.
         raw = self._row_action[start : start + self._chunk_length]  # [chunk, 7]
@@ -288,7 +418,17 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         task = self._tasks[int(self._row_task[start])]
         ai_caption = random.choice([p.strip() for p in task.split(" | ") if p.strip()] or [task])
 
-        extras: dict[str, Any] = {}
+        local_start_frame = start - int(self._ep_starts[ep])
+        extras: dict[str, Any] = {
+            "episode_index": torch.tensor(episode_index, dtype=torch.long),
+            "start_frame": torch.tensor(local_start_frame, dtype=torch.long),
+            "task_index": torch.tensor(int(self._row_task[start]), dtype=torch.long),
+            "window_frame_indices": torch.arange(local_start_frame, local_start_frame + self._chunk_length + 1),
+            "latent_source_frame_indices": torch.arange(local_start_frame, local_start_frame + self._chunk_length + 1, 4),
+            "verify_cached_latent": torch.tensor(verify_cached_latent, dtype=torch.bool),
+        }
+        if video_latent is not None:
+            extras["video_latent"] = video_latent
         if self._camera_mode == "concat_view":
             extras["additional_view_description"] = (
                 "The left half shows the third-person view; the right half shows the wrist-mounted camera."
