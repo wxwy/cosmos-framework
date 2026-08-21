@@ -19,6 +19,9 @@ SESSION="${1:-sft_4in1}"
 : "${LIBERO_ROOT:=/disk/rl/data/LIBERO_LeRobot_v3}"
 : "${BASE_CHECKPOINT_PATH:=$PWD/examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp}"
 : "${EDGE_POLICY_CHECKPOINT:=/disk/rl/models/Cosmos3-Edge-Policy-DROID}"
+: "${LIBERO_LATENT_CACHE_ROOT:=/disk/rl/data/LIBERO_LeRobot_v3_cosmos_exact_window_shared_vae_v1}"
+: "${LIBERO_LATENT_CACHE_VERIFY_RATIO:=0.001}"
+: "${LIBERO_NUM_WORKERS:=36}"
 
 [[ -d "$LIBERO_ROOT" ]]              || { echo "ERROR: LIBERO_ROOT not found: $LIBERO_ROOT" >&2; exit 1; }
 [[ -d "$BASE_CHECKPOINT_PATH" ]]     || { echo "ERROR: BASE_CHECKPOINT_PATH not found: $BASE_CHECKPOINT_PATH" >&2; exit 1; }
@@ -32,7 +35,7 @@ fi
 # tmux session 环境继承自 tmux *server*（由更早的 ds/fq 会话启动），本脚本的 export
 # 不会传到 session 里。因此把全部 env 直接内联进命令串，保证在 session 内生效。
 /usr/bin/tmux new-session -d -s "$SESSION" -x 200 -y 50 \
-  "cd $PWD && export PATH=$PWD/.venv/bin:\$PATH && export LIBERO_ROOT='$LIBERO_ROOT' && export BASE_CHECKPOINT_PATH='$BASE_CHECKPOINT_PATH' && export EDGE_POLICY_CHECKPOINT='$EDGE_POLICY_CHECKPOINT' && export LOG_FILENAME=action_policy_libero_edge_all_sft.log && bash examples/launch_sft_action_policy_libero_edge_all.sh"
+  "cd $PWD && export PATH=$PWD/.venv/bin:\$PATH && export LIBERO_ROOT='$LIBERO_ROOT' && export BASE_CHECKPOINT_PATH='$BASE_CHECKPOINT_PATH' && export EDGE_POLICY_CHECKPOINT='$EDGE_POLICY_CHECKPOINT' && export LIBERO_LATENT_CACHE_ROOT='$LIBERO_LATENT_CACHE_ROOT' && export LIBERO_LATENT_CACHE_VERIFY_RATIO='$LIBERO_LATENT_CACHE_VERIFY_RATIO' && export LIBERO_NUM_WORKERS='$LIBERO_NUM_WORKERS' && export DISABLE_AUTO_RESUME='${DISABLE_AUTO_RESUME:-0}' && export AUTO_RESUME_CHECKPOINT='${AUTO_RESUME_CHECKPOINT:-}' && export LOG_FILENAME=action_policy_libero_edge_all_sft.log && bash examples/launch_sft_action_policy_libero_edge_all.sh"
 
 echo ">>> tmux session '$SESSION' started; attach with: /usr/bin/tmux attach -t $SESSION"
 echo ">>> log: outputs/train/logs/action_policy_libero_edge_all_sft.log"

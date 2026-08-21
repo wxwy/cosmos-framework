@@ -9,7 +9,8 @@
 #
 # 官方 all_nano 超参全保留（bs=128/rank、74000 tokens、lr 5e-5、cycle 16000/500、selective AC）；
 # 单卡差异：dp_shard=-1 + grad_accum_iter=16（全局批 128x1x16=2048 与官方一致）。
-# 在线 VAE；base = Edge-Policy-DROID DCP；tokenizer = 本地 Edge 包（EDGE_POLICY_CHECKPOINT）。
+# 默认使用 exact-window latent cache；base = Edge-Policy-DROID DCP；tokenizer = 本地 Edge 包
+# （EDGE_POLICY_CHECKPOINT）。若存在训练 checkpoint 则自动从最大 iter_* 恢复。
 #
 # Required env vars:
 #   LIBERO_ROOT           LIBERO_LeRobot_v3 PARENT dir（含 4 个 suite 子目录，no default）
@@ -20,6 +21,11 @@
 #   NPROC_PER_NODE        default: 1 (单卡)
 #   EXTRA_TAIL_OVERRIDES  额外 Hydra override 字符串（smoke 用），如 "trainer.max_iter=5 trainer.logging_iter=1"
 #   OUTPUT_ROOT           default: outputs/train
+#   LIBERO_LATENT_CACHE_ROOT default: /disk/rl/data/LIBERO_LeRobot_v3_cosmos_exact_window_shared_vae_v1
+#   LIBERO_LATENT_CACHE_VERIFY_RATIO default: 0.001 (0 disables online verification)
+#   LIBERO_NUM_WORKERS    default: 36
+#   DISABLE_AUTO_RESUME   set 1 to ignore saved iter_* checkpoints and start fresh
+#   DRY_RUN               set 1 to print the resolved command without running it
 #
 # Usage:
 #   LIBERO_ROOT=/disk/rl/data/LIBERO_LeRobot_v3 \
@@ -33,10 +39,18 @@ TOML_FILE="examples/toml/sft_config/action_policy_libero_edge_all.toml"
 : "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp}"
 : "${EDGE_POLICY_CHECKPOINT:=/disk/rl/models/Cosmos3-Edge-Policy-DROID}"
 : "${NPROC_PER_NODE:=1}"
+: "${LIBERO_LATENT_CACHE_ROOT:=/disk/rl/data/LIBERO_LeRobot_v3_cosmos_exact_window_shared_vae_v1}"
+: "${LIBERO_LATENT_CACHE_VERIFY_RATIO:=0.001}"
+: "${LIBERO_NUM_WORKERS:=36}"
 
 # EDGE_POLICY_CHECKPOINT 被 experiment 配置经 ${oc.env:...} 解析（tokenizer_type 本地包路径），
 # 必须 export 才能被 torchrun 子进程继承；共享 launcher 不处理它（只处理 BASE_CHECKPOINT_PATH/WAN_VAE_PATH）。
 export EDGE_POLICY_CHECKPOINT
+export LIBERO_LATENT_CACHE_ROOT LIBERO_LATENT_CACHE_VERIFY_RATIO LIBERO_NUM_WORKERS
+if [[ "${DRY_RUN:-0}" != "1" && ! -d "$LIBERO_LATENT_CACHE_ROOT" ]]; then
+    echo "ERROR: LIBERO_LATENT_CACHE_ROOT not found: $LIBERO_LATENT_CACHE_ROOT" >&2
+    exit 1
+fi
 
 # LIBEROLeRobotDataset reads ${oc.env:LIBERO_ROOT}/<suite> (a LOCAL LeRobot PARENT dir);
 # export it so torchrun (launched in this shell) inherits it.
@@ -56,5 +70,47 @@ EXTRA_DATASET_CHECK='for _s in libero_spatial libero_object libero_goal libero_1
 TAIL_OVERRIDES=(
     ${EXTRA_TAIL_OVERRIDES:-}
 )
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUTPUT_ROOT_FOR_RESUME="${OUTPUT_ROOT:-$REPO_ROOT/outputs/train}"
+[[ "$OUTPUT_ROOT_FOR_RESUME" = /* ]] || OUTPUT_ROOT_FOR_RESUME="$REPO_ROOT/$OUTPUT_ROOT_FOR_RESUME"
+CHECKPOINT_ROOT="$OUTPUT_ROOT_FOR_RESUME/cosmos3_action_libero/action_sft/edge_libero_4in1/checkpoints"
+
+_print_resume_candidates() {
+    local -a candidates=("$@")
+    local start=$(( ${#candidates[@]} > 3 ? ${#candidates[@]} - 3 : 0 ))
+    local candidate
+    echo ">>> AUTO-RESUME candidates (latest up to 3):"
+    for ((i = start; i < ${#candidates[@]}; ++i)); do
+        candidate="${candidates[i]}"
+        echo ">>>   $(basename "$candidate")"
+    done
+}
+
+if [[ "${DISABLE_AUTO_RESUME:-0}" == "1" ]]; then
+    echo ">>> FRESH start (DISABLE_AUTO_RESUME=1; ignoring $CHECKPOINT_ROOT)"
+elif [[ -n "${AUTO_RESUME_CHECKPOINT:-}" ]]; then
+    SELECTED_CHECKPOINT="$AUTO_RESUME_CHECKPOINT"
+    [[ "$SELECTED_CHECKPOINT" = /* ]] || SELECTED_CHECKPOINT="$CHECKPOINT_ROOT/$SELECTED_CHECKPOINT"
+    [[ -d "$SELECTED_CHECKPOINT" ]] || { echo "ERROR: explicit resume checkpoint not found: $SELECTED_CHECKPOINT" >&2; exit 1; }
+    echo ">>> DEPRECATED explicit resume selected: $(basename "$SELECTED_CHECKPOINT")"
+    echo ">>> RESUME from $(basename "$SELECTED_CHECKPOINT") ($SELECTED_CHECKPOINT)"
+    TAIL_OVERRIDES+=("checkpoint.load_path=$SELECTED_CHECKPOINT" "checkpoint.load_training_state=True")
+else
+    CHECKPOINT_CANDIDATES=()
+    if [[ -d "$CHECKPOINT_ROOT" ]]; then
+        while IFS= read -r checkpoint; do
+            CHECKPOINT_CANDIDATES+=("$checkpoint")
+        done < <(find "$CHECKPOINT_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'iter_*' -print | sort -V)
+    fi
+    if (( ${#CHECKPOINT_CANDIDATES[@]} == 0 )); then
+        echo ">>> FRESH start (no iter_* checkpoint under $CHECKPOINT_ROOT)"
+    else
+        _print_resume_candidates "${CHECKPOINT_CANDIDATES[@]}"
+        SELECTED_CHECKPOINT="${CHECKPOINT_CANDIDATES[${#CHECKPOINT_CANDIDATES[@]} - 1]}"
+        echo ">>> RESUME from $(basename "$SELECTED_CHECKPOINT") ($SELECTED_CHECKPOINT)"
+        TAIL_OVERRIDES+=("checkpoint.load_path=$SELECTED_CHECKPOINT" "checkpoint.load_training_state=True")
+    fi
+fi
 
 source "$(dirname "${BASH_SOURCE[0]}")/_sft_launcher_common.sh"

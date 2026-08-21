@@ -59,8 +59,44 @@ LOG_DIR="$OUTPUT_ROOT/logs"
 TOML_STEM="$(basename "$TOML_FILE" .toml)"
 LOG_FILE="$LOG_DIR/${LOG_FILENAME:-${TOML_STEM}_sft.log}"
 IMAGINAIRE_OUTPUT_ROOT="${IMAGINAIRE_OUTPUT_ROOT:-$OUTPUT_ROOT}"
-mkdir -p "$LOG_DIR"
 
+# Default empty if caller didn't set; safe under set -u.
+[[ ${TAIL_OVERRIDES+x} ]] || TAIL_OVERRIDES=()
+
+TRAILING_ARGS=()
+if (( ${#TAIL_OVERRIDES[@]} > 0 )); then
+    TRAILING_ARGS=(-- "${TAIL_OVERRIDES[@]}")
+fi
+
+# torchrun topology. Single-node by default; a SLURM/Lepton wrapper sets NNODES /
+# NODE_RANK / MASTER_ADDR for multi-node. Each is appended only when set, so with all
+# three unset the invocation is identical to the single-node case.
+TORCHRUN_ARGS=(--nproc_per_node="${NPROC_PER_NODE:-8}" --master_port="${MASTER_PORT:-50012}")
+[[ -n "${NNODES:-}" ]]      && TORCHRUN_ARGS+=(--nnodes="$NNODES")
+[[ -n "${NODE_RANK:-}" ]]   && TORCHRUN_ARGS+=(--node_rank="$NODE_RANK")
+[[ -n "${MASTER_ADDR:-}" ]] && TORCHRUN_ARGS+=(--master_addr="$MASTER_ADDR")
+
+TORCHRUN_COMMAND=(
+    env "IMAGINAIRE_OUTPUT_ROOT=$IMAGINAIRE_OUTPUT_ROOT" "PYTHONPATH=."
+    torchrun "${TORCHRUN_ARGS[@]}" -m cosmos_framework.scripts.train
+    "--sft-toml=$TOML_FILE" "${TRAILING_ARGS[@]}"
+)
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    printf '>>> DRY_RUN torchrun command:'
+    printf ' %q' "${TORCHRUN_COMMAND[@]}"
+    printf '\n'
+    printf '>>> DRY_RUN overrides:'
+    if (( ${#TAIL_OVERRIDES[@]} == 0 )); then
+        printf ' <none>'
+    else
+        printf ' %q' "${TAIL_OVERRIDES[@]}"
+    fi
+    printf '\n'
+    exit 0
+fi
+
+mkdir -p "$LOG_DIR"
 echo ">>> $(date '+%H:%M:%S') Checking inputs..."
 [[ -f "$TOML_FILE" ]] || { echo "ERROR: TOML not found: $TOML_FILE" >&2; exit 1; }
 if [[ -n "${DATASET_PATH:-}" ]]; then
@@ -79,27 +115,7 @@ echo ">>> $(date '+%H:%M:%S') TOML:       $TOML_FILE"
 [[ -n "${BASE_CHECKPOINT_PATH:-}" ]] && echo ">>> $(date '+%H:%M:%S') checkpoint: $BASE_CHECKPOINT_PATH"
 echo ">>> $(date '+%H:%M:%S') log:        $LOG_FILE"
 
-# Default empty if caller didn't set; safe under set -u.
-[[ ${TAIL_OVERRIDES+x} ]] || TAIL_OVERRIDES=()
-
-TRAILING_ARGS=()
-if (( ${#TAIL_OVERRIDES[@]} > 0 )); then
-    TRAILING_ARGS=(-- "${TAIL_OVERRIDES[@]}")
-fi
-
-# torchrun topology. Single-node by default; a SLURM/Lepton wrapper sets NNODES /
-# NODE_RANK / MASTER_ADDR for multi-node. Each is appended only when set, so with all
-# three unset the invocation is identical to the single-node case.
-TORCHRUN_ARGS=(--nproc_per_node="${NPROC_PER_NODE:-8}" --master_port="${MASTER_PORT:-50012}")
-[[ -n "${NNODES:-}" ]]      && TORCHRUN_ARGS+=(--nnodes="$NNODES")
-[[ -n "${NODE_RANK:-}" ]]   && TORCHRUN_ARGS+=(--node_rank="$NODE_RANK")
-[[ -n "${MASTER_ADDR:-}" ]] && TORCHRUN_ARGS+=(--master_addr="$MASTER_ADDR")
-
-IMAGINAIRE_OUTPUT_ROOT="$IMAGINAIRE_OUTPUT_ROOT" PYTHONPATH=. \
-    torchrun "${TORCHRUN_ARGS[@]}" -m cosmos_framework.scripts.train \
-    --sft-toml="$TOML_FILE" \
-    "${TRAILING_ARGS[@]}" \
-    2>&1 | tee "$LOG_FILE"
+"${TORCHRUN_COMMAND[@]}" 2>&1 | tee "$LOG_FILE"
 
 EXIT_CODE=${PIPESTATUS[0]}
 echo ">>> $(date '+%H:%M:%S') Done (exit $EXIT_CODE)"
