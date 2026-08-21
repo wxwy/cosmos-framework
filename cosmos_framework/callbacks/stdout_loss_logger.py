@@ -84,4 +84,20 @@ class StdoutLossLogger(Callback):
             avg = sub_losses[key].item() / sample_size.item() if sample_size.item() > 0 else float("nan")
             parts.append(f"{key}={avg:.6f}")
 
+        timing = self.trainer.last_optimizer_step_timing
+        if timing is not None:
+            parts.extend(
+                (
+                    f"perf/dataloader_wait_s={timing['dataloader_wait_seconds']:.6f}",
+                    f"perf/dataloader_wait_mean_s={timing['dataloader_wait_mean_seconds']:.6f}",
+                    f"perf/model_compute_s={timing['model_compute_seconds']:.6f}",
+                    f"perf/model_compute_mean_s={timing['model_compute_mean_seconds']:.6f}",
+                    f"perf/other_s={timing['other_seconds']:.6f}",
+                    f"perf/step_wall_s={timing['step_wall_seconds']:.6f}",
+                    f"perf/dataloader_wait_pct={100.0 * timing['dataloader_wait_fraction']:.2f}",
+                    f"perf/model_compute_pct={100.0 * timing['model_compute_fraction']:.2f}",
+                    f"perf/microbatches={timing['microbatch_count']}",
+                )
+            )
+
         log.info(" | ".join(parts))

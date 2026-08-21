@@ -5,6 +5,7 @@ import functools
 import inspect
 import os
 import signal
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,6 +74,53 @@ class ContextParallelDataWindow:
             raise RuntimeError(
                 f"CP data-window desync: trainer offset {self.offset} != model window slot {model_window_slot}."
             )
+
+
+@dataclass
+class OptimizerStepTiming:
+    """Aggregate host wall-clock timings for one optimizer step.
+
+    ``dataloader_wait`` measures only the main-process interval around
+    ``next(dataloader)``. ``model_compute`` measures ``training_step`` and thus
+    includes forward, backward, and the final optimizer update. CUDA work is
+    intentionally not synchronized: this observer must not perturb training.
+    """
+
+    dataloader_wait_seconds: float = 0.0
+    model_compute_seconds: float = 0.0
+    microbatch_count: int = 0
+    step_started_at: float | None = None
+
+    def record_dataloader_wait(self, start: float, end: float) -> None:
+        if self.step_started_at is None:
+            self.step_started_at = start
+        self.dataloader_wait_seconds += end - start
+
+    def record_model_compute(self, start: float, end: float) -> None:
+        self.model_compute_seconds += end - start
+        self.microbatch_count += 1
+
+    def finish(self, end: float) -> dict[str, float | int] | None:
+        if self.step_started_at is None or self.microbatch_count == 0:
+            return None
+        step_wall_seconds = end - self.step_started_at
+        other_seconds = max(0.0, step_wall_seconds - self.dataloader_wait_seconds - self.model_compute_seconds)
+        timing = {
+            "dataloader_wait_seconds": self.dataloader_wait_seconds,
+            "dataloader_wait_mean_seconds": self.dataloader_wait_seconds / self.microbatch_count,
+            "model_compute_seconds": self.model_compute_seconds,
+            "model_compute_mean_seconds": self.model_compute_seconds / self.microbatch_count,
+            "other_seconds": other_seconds,
+            "step_wall_seconds": step_wall_seconds,
+            "dataloader_wait_fraction": self.dataloader_wait_seconds / step_wall_seconds if step_wall_seconds else 0.0,
+            "model_compute_fraction": self.model_compute_seconds / step_wall_seconds if step_wall_seconds else 0.0,
+            "microbatch_count": self.microbatch_count,
+        }
+        self.dataloader_wait_seconds = 0.0
+        self.model_compute_seconds = 0.0
+        self.microbatch_count = 0
+        self.step_started_at = None
+        return timing
 
 
 class ImaginaireTrainer:
@@ -180,6 +228,10 @@ class ImaginaireTrainer:
         self.straggler_detector.initialize()
         # One fetched batch reused for cp_size consecutive steps when CP is enabled.
         self._cp_data_window = ContextParallelDataWindow()
+        # Host-side timing only. It is read by lightweight stdout callbacks and
+        # deliberately avoids CUDA synchronization or distributed collectives.
+        self._optimizer_step_timing = OptimizerStepTiming()
+        self.last_optimizer_step_timing: dict[str, float | int] | None = None
         # Send a TimeoutError if a training step takes over timeout_period seconds.
         signal.signal(signal.SIGALRM, functools.partial(misc.timeout_handler, config.trainer.timeout_period))  # type: ignore
 
@@ -306,6 +358,7 @@ class ImaginaireTrainer:
                 while True:
                     self.callbacks.on_before_dataloading(iteration)
                     try:
+                        dataloader_wait_start = time.monotonic()
                         with (
                             self.training_timer("dataloader_train"),
                             self.straggler_detector.profile_section(
@@ -318,8 +371,13 @@ class ImaginaireTrainer:
                                 model,
                                 dataloader_train_iter,
                             )
+                            dataloader_wait_end = time.monotonic()
                             if stop_signal:
                                 raise StopIteration
+                            self._optimizer_step_timing.record_dataloader_wait(
+                                dataloader_wait_start,
+                                dataloader_wait_end,
+                            )
                     except StopIteration:
                         break
                     finally:
@@ -339,6 +397,7 @@ class ImaginaireTrainer:
                         model_ddp.train()
                     assert model_ddp.training, "model_ddp is not in training mode."
                     assert model.training, "model is not in training mode."
+                    model_compute_start = time.monotonic()
                     output_batch, loss, grad_accum_iter = self.training_step(
                         model_ddp,
                         optimizer,
@@ -348,6 +407,7 @@ class ImaginaireTrainer:
                         iteration=iteration,
                         grad_accum_iter=grad_accum_iter,
                     )
+                    self._optimizer_step_timing.record_model_compute(model_compute_start, time.monotonic())
                     self.callbacks.on_training_step_batch_end(
                         model, data_batch, output_batch, loss, iteration=iteration
                     )
@@ -356,6 +416,7 @@ class ImaginaireTrainer:
                         continue
                     # Do the following when an actual optimizer (update) step has been made.
                     iteration += 1
+                    self.last_optimizer_step_timing = self._optimizer_step_timing.finish(time.monotonic())
                     # Save checkpoint.
                     if iteration % self.config.checkpoint.save_iter == 0:
                         self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
