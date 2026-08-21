@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-# 周期性闭环 eval watcher：监控 4in1 SFT 训练，每保存到一个 iter%250==0 的
+# 周期性闭环 eval watcher：监控 4in1 SFT 训练，每保存到一个 iter%200==0 的
 # checkpoint 时，自动起 action server 并对 4 个 suite 各一个固定任务跑一次
 # closed-loop eval（复用 launch_closed_loop_eval_libero_task0.sh 的 env 覆写），
 # 完成后写 .done 标记，避免重复跑。
 #
-# 训练不动（save_iter=25 继续跑），本脚本只读 checkpoint 目录、到点起 eval。
+# 训练不动（save_iter=50 继续跑），本脚本只读 checkpoint 目录、到点起 eval。
 # 与训练并发共享 GPU（用户已确认并发模式）。
 #
 # 挂到独立 tmux 会话：
@@ -17,19 +17,19 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 CHECKPOINT_DIR="outputs/train/cosmos3_action_libero/action_sft/edge_libero_4in1/checkpoints"
 RESULTS_ROOT="results/libero_closed_loop_4in1"   # watcher 在下面按 iter_XXXX 加子目录
-EVAL_STRIDE=250            # 每 250 步测一次
-NUM_TRIALS=3               # 每任务 3 次 trial（同 task0 eval）
-POLL_INTERVAL_INITIAL=300    # 启动后立即一轮，之后每 5min 查一次（避免错过首批 iter%250==0）
-POLL_INTERVAL_LATER=36000    # 看到第一个 ≥250 checkpoint 后改 10h 轮询（250 步 ≈ 10h）
+EVAL_STRIDE=200            # 每 200 步测一次
+NUM_TRIALS=1               # 每 suite 的 task0 测 1 次 trial
+POLL_INTERVAL_INITIAL=300    # 启动后立即一轮，之后每 5min 查一次（避免错过首批 iter%200==0）
+POLL_INTERVAL_LATER=18000    # 看到第一个 ≥200 checkpoint 后改 5h 轮询（200 步 ≈ 5h）
 SERVER_READY_TIMEOUT=600   # server 就绪最长等待（秒）
 SERVER_PORT=8000
 
-# 固定任务：suite -> benchmark task_id（libero_10 用 task 2 = moka 壶，overfit 对齐过）
+# 固定任务：所有 suite 统一评测 benchmark task0。
 SUITES=(
   "libero_spatial:0"
   "libero_object:0"
   "libero_goal:0"
-  "libero_10:2"
+  "libero_10:0"
 )
 
 log() { echo "[$(date '+%F %T')] $*"; }
@@ -114,7 +114,7 @@ while true; do
     [[ -f "$done_marker" ]] && continue
     run_eval "$it_num"
   done
-  # 看到第一个 ≥250 倍数 checkpoint 后切到低频轮询
+  # 看到第一个 ≥200 倍数 checkpoint 后切到低频轮询
   if [[ "$POLL_INTERVAL" == "$POLL_INTERVAL_INITIAL" ]]; then
     for it in $(list_iters); do
       it_num=$((10#$it))
