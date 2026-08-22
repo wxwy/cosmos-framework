@@ -23,7 +23,8 @@
 #   OUTPUT_ROOT           default: outputs/train
 #   LIBERO_LATENT_CACHE_ROOT default: /disk/rl/data/LIBERO_LeRobot_v3_cosmos_exact_window_shared_vae_v1
 #   LIBERO_LATENT_CACHE_VERIFY_RATIO default: 0.001 (0 disables online verification)
-#   LIBERO_NUM_WORKERS    default: 36
+#   LIBERO_NUM_WORKERS    default: 32
+#   LIBERO_PREFETCH_FACTOR default: 4 (num_workers=0 时自动为 None)
 #   DISABLE_AUTO_RESUME   set 1 to ignore saved iter_* checkpoints and start fresh
 #   DRY_RUN               set 1 to print the resolved command without running it
 #
@@ -41,12 +42,13 @@ TOML_FILE="examples/toml/sft_config/action_policy_libero_edge_all.toml"
 : "${NPROC_PER_NODE:=1}"
 : "${LIBERO_LATENT_CACHE_ROOT:=/disk/rl/data/LIBERO_LeRobot_v3_cosmos_exact_window_shared_vae_v1}"
 : "${LIBERO_LATENT_CACHE_VERIFY_RATIO:=0.001}"
-: "${LIBERO_NUM_WORKERS:=36}"
+: "${LIBERO_NUM_WORKERS:=12}"
+: "${LIBERO_PREFETCH_FACTOR:=8}"
 
 # EDGE_POLICY_CHECKPOINT 被 experiment 配置经 ${oc.env:...} 解析（tokenizer_type 本地包路径），
 # 必须 export 才能被 torchrun 子进程继承；共享 launcher 不处理它（只处理 BASE_CHECKPOINT_PATH/WAN_VAE_PATH）。
 export EDGE_POLICY_CHECKPOINT
-export LIBERO_LATENT_CACHE_ROOT LIBERO_LATENT_CACHE_VERIFY_RATIO LIBERO_NUM_WORKERS
+export LIBERO_LATENT_CACHE_ROOT LIBERO_LATENT_CACHE_VERIFY_RATIO LIBERO_NUM_WORKERS LIBERO_PREFETCH_FACTOR
 if [[ "${DRY_RUN:-0}" != "1" && ! -d "$LIBERO_LATENT_CACHE_ROOT" ]]; then
     echo "ERROR: LIBERO_LATENT_CACHE_ROOT not found: $LIBERO_LATENT_CACHE_ROOT" >&2
     exit 1

@@ -108,6 +108,13 @@ def _action_policy_libero_edge_dataloader():
             **cache_kwargs,
         )
 
+    _num_workers = int(os.environ.get("LIBERO_NUM_WORKERS", "32"))
+    _prefetch_factor = int(os.environ.get("LIBERO_PREFETCH_FACTOR", "4"))
+    if _num_workers > 0 and _prefetch_factor <= 0:
+        raise ValueError(
+            f"LIBERO_PREFETCH_FACTOR must be a positive integer when LIBERO_NUM_WORKERS > 0, got {_prefetch_factor}"
+        )
+
     return L(IterativeJointDataLoader)(
         tokenizer_spatial_compression_factor=16,
         tokenizer_temporal_compression_factor=4,
@@ -124,10 +131,10 @@ def _action_policy_libero_edge_dataloader():
                     dataset=_suite_dataset(_suite),
                     batch_size=1,
                     in_order=False,
-                    num_workers=int(os.environ.get("LIBERO_NUM_WORKERS", "36")),
-                    persistent_workers=int(os.environ.get("LIBERO_NUM_WORKERS", "36")) > 0,
+                    num_workers=_num_workers,
+                    persistent_workers=_num_workers > 0,
                     pin_memory=True,
-                    prefetch_factor=3 if int(os.environ.get("LIBERO_NUM_WORKERS", "36")) > 0 else None,
+                    prefetch_factor=_prefetch_factor if _num_workers > 0 else None,
                     sampler=None,
                 ),
             )

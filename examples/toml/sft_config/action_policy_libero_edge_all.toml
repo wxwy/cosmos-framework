@@ -56,4 +56,4 @@ benchmark = false
 
 [checkpoint]
 load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
-save_iter = 25
+save_iter = 50
