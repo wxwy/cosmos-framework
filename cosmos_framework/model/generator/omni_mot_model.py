@@ -3972,7 +3972,7 @@ class OmniMoTModel(ImaginaireModel):
                         "shared_guard_vs_cache": _pair_metrics(online_latent, latent),
                         "training_online_route_vs_cache": _pair_metrics(training_route_latent, latent),
                     }
-                    for key in ("episode_index", "start_frame", "task_index", "dataset_name"):
+                    for key in ("suite", "task_id", "episode_index", "start_frame", "task_index", "dataset_name"):
                         value = data_batch.get(key)
                         if isinstance(value, list) and cache_index < len(value):
                             value = value[cache_index]
@@ -4010,7 +4010,7 @@ class OmniMoTModel(ImaginaireModel):
                             "mean_abs_diff": mean_abs_diff,
                             "threshold": 1e-5,
                         }
-                        for key in ("episode_index", "start_frame", "task_index", "dataset_name"):
+                        for key in ("suite", "task_id", "episode_index", "start_frame", "task_index", "dataset_name"):
                             value = data_batch.get(key)
                             if isinstance(value, list) and cache_index < len(value):
                                 value = value[cache_index]

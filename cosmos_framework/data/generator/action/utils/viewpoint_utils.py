@@ -15,13 +15,17 @@ from typing import Literal
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
 from cosmos_framework.utils import log
 
-Viewpoint = Literal["ego_view", "third_person_view", "wrist_view", "concat_view", "top_down_2d_view", "video_game_view"]
+Viewpoint = Literal[
+    "ego_view", "third_person_view", "wrist_view", "concat_view", "wrist_top_agentview_lr_bottom",
+    "top_down_2d_view", "video_game_view",
+]
 
 DEFAULT_VIEWPOINT_TEMPLATES: dict[str, str] = {
     "ego_view": "This video is captured from a first-person perspective looking at the scene.",
     "third_person_view": "This video is captured from a third-person perspective looking towards the agent from the front.",
     "wrist_view": "This video is captured from a wrist-mounted camera.",
     "concat_view": "This video contains concatenated views from multiple camera perspectives.",
+    "wrist_top_agentview_lr_bottom": "This video contains a wrist camera on top and left/right agent views on the bottom.",
     "top_down_2d_view": "This video is captured from a top-down view of a flat 2D scene.",
     "video_game_view": "This video is captured from an in-game camera perspective in a virtual environment.",
 }
