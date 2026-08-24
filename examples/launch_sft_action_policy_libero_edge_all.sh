@@ -43,7 +43,7 @@ TOML_FILE="examples/toml/sft_config/action_policy_libero_edge_all.toml"
 : "${LIBERO_LATENT_CACHE_ROOT:=/disk/rl/data/LIBERO_LeRobot_v3_cosmos_exact_window_shared_vae_v1}"
 : "${LIBERO_LATENT_CACHE_VERIFY_RATIO:=0.001}"
 : "${LIBERO_NUM_WORKERS:=12}"
-: "${LIBERO_PREFETCH_FACTOR:=8}"
+: "${LIBERO_PREFETCH_FACTOR:=4}"
 
 # EDGE_POLICY_CHECKPOINT 被 experiment 配置经 ${oc.env:...} 解析（tokenizer_type 本地包路径），
 # 必须 export 才能被 torchrun 子进程继承；共享 launcher 不处理它（只处理 BASE_CHECKPOINT_PATH/WAN_VAE_PATH）。

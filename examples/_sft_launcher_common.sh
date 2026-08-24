@@ -115,7 +115,7 @@ echo ">>> $(date '+%H:%M:%S') TOML:       $TOML_FILE"
 [[ -n "${BASE_CHECKPOINT_PATH:-}" ]] && echo ">>> $(date '+%H:%M:%S') checkpoint: $BASE_CHECKPOINT_PATH"
 echo ">>> $(date '+%H:%M:%S') log:        $LOG_FILE"
 
-"${TORCHRUN_COMMAND[@]}" 2>&1 | tee "$LOG_FILE"
+"${TORCHRUN_COMMAND[@]}" 2>&1 | tee -a "$LOG_FILE"
 
 EXIT_CODE=${PIPESTATUS[0]}
 echo ">>> $(date '+%H:%M:%S') Done (exit $EXIT_CODE)"
