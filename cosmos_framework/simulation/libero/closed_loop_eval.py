@@ -538,6 +538,29 @@ def _save_mp4(frames: list[Image.Image], output_path: Path, fps: int) -> None:
         writer.release()
 
 
+def _rename_with_outcome(path: Path, success: bool) -> None:
+    """Append ``_success`` or ``_fail`` to a media path (file or directory) so
+    users can see per-episode outcome at a glance after a closed-loop eval.
+
+    For a regular file the suffix goes before the file extension (e.g.
+    ``episode_007.mp4`` -> ``episode_007_success.mp4``). For a directory
+    (the prediction video folder, e.g. ``mp4_pred/task_000/episode_007/``) the
+    suffix is appended to the directory name.
+
+    Skips when the source no longer exists (e.g. ``_save_*`` was a no-op because
+    the frame list was empty), so it is safe to call on optional / unwritten
+    targets alongside the existing save branches.
+    """
+    if not path.exists():
+        return
+    suffix = "success" if success else "fail"
+    if path.is_dir():
+        new_path = path.with_name(f"{path.name}_{suffix}")
+    else:
+        new_path = path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+    path.rename(new_path)
+
+
 def _save_prediction_videos(
     prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]],
     output_dir: Path,
@@ -922,6 +945,13 @@ def _run_episode(
         _save_prediction_videos(prediction_videos, pred_video_dir, pred_video_fps)
     if comparison_path is not None and comparison_windows:
         _save_comparison_gif(comparison_windows, comparison_path, gif_fps)
+    # Annotate per-episode media with success/fail so users can filter at a
+    # glance. The helper no-ops when the source path was never written (empty
+    # frame list, --save_* disabled), so it composes cleanly with the
+    # conditional save branches above.
+    for media_path in (gif_path, mp4_path, pred_video_dir, comparison_path):
+        if media_path is not None and media_path.exists():
+            _rename_with_outcome(media_path, success)
     return EpisodeResult(success, step, None, action_log, predict_log)
 
 
