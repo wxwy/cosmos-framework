@@ -11,11 +11,55 @@ import torch
 from cosmos_framework.data.generator.action.utils.json_formatter import ActionPromptJsonFormatter
 from cosmos_framework.data.generator.action.utils.transforms import (
     ActionTransformPipeline,
+    LocalDummyTransform,
     reflection_pad_to_target,
     remove_reflection_padding,
 )
 from cosmos_framework.data.generator.augmentors.duration_fps_text_timestamps import DurationFPSTextTimeStamps
 from cosmos_framework.data.generator.augmentors.resolution_text_info import ResolutionTextInfo
+from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
+from cosmos_framework.data.generator.sequence_packing import SequencePlan
+
+
+@pytest.mark.L0
+def test_local_dummy_transform_is_opt_in_deterministic_and_sample_distinct() -> None:
+    disabled_plan = SequencePlan()
+    disabled_result = LocalDummyTransform()({}, disabled_plan)
+    assert "local_memory" not in disabled_result
+    assert not disabled_plan.has_local_memory
+
+    transform = LocalDummyTransform(enabled=True, tokens=3, dim=4)
+    first_plan = SequencePlan()
+    first = transform({"episode_index": torch.tensor(2), "start_frame": torch.tensor(7)}, first_plan)
+    repeated_plan = SequencePlan()
+    repeated = transform({"episode_index": torch.tensor(2), "start_frame": torch.tensor(7)}, repeated_plan)
+    different_plan = SequencePlan()
+    different = transform({"episode_index": torch.tensor(2), "start_frame": torch.tensor(8)}, different_plan)
+
+    assert first_plan.has_local_memory
+    assert first["local_memory"].shape == (3, 4)
+    assert first["local_memory"].dtype == torch.float32
+    assert torch.isfinite(first["local_memory"]).all()
+    torch.testing.assert_close(first["local_memory"], repeated["local_memory"])
+    assert not torch.equal(first["local_memory"], different["local_memory"])
+
+
+@pytest.mark.L0
+def test_local_memory_collate_preserves_mixed_none_alignment() -> None:
+    first = torch.zeros(3, 4)
+    third = torch.ones(3, 4)
+    batch = [
+        {"local_memory": first, "sequence_plan": SequencePlan(has_local_memory=True)},
+        {"local_memory": None, "sequence_plan": SequencePlan(has_local_memory=False)},
+        {"local_memory": third, "sequence_plan": SequencePlan(has_local_memory=True)},
+    ]
+
+    result = custom_collate_fn(batch)
+
+    assert result["local_memory"][0] is first
+    assert result["local_memory"][1] is None
+    assert result["local_memory"][2] is third
+    assert [plan.has_local_memory for plan in result["sequence_plan"]] == [True, False, True]
 
 
 @pytest.mark.L0

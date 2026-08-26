@@ -29,6 +29,7 @@ from cosmos_framework.model.generator.utils.data_and_condition import Generation
 from cosmos_framework.model.generator.utils.load_balancing_stats import LBLMetadata, compute_sample_lbl_stats
 from cosmos_framework.data.generator.sequence_packing import (
     PackedSequence,
+    SequencePlan,
     build_sequence_plans_from_data_batch,
     pack_input_sequence,
 )
@@ -58,6 +59,54 @@ class _CountingIterator:
     def __next__(self) -> dict[str, Any]:
         self.fetch_count += 1
         return next(self._iterator)
+
+
+@pytest.mark.L0
+@pytest.mark.CPU
+def test_local_memory_packing_preserves_native_mrope_and_stays_clean() -> None:
+    def _pack(has_local_memory: bool) -> PackedSequence:
+        plan = SequencePlan(
+            has_text=True,
+            has_vision=True,
+            has_action=True,
+            has_local_memory=has_local_memory,
+        )
+        clean = GenerationDataClean(
+            batch_size=1,
+            is_image_batch=False,
+            x0_tokens_vision=[torch.zeros(1, 2, 1, 2, 2)],
+            x0_tokens_action=[torch.zeros(2, 3)],
+            x0_tokens_local_memory=[torch.arange(12, dtype=torch.float32).reshape(3, 4)]
+            if has_local_memory
+            else None,
+        )
+        return pack_input_sequence(
+            sequence_plans=[plan],
+            input_text_indexes=[[10, 11]],
+            gen_data_clean=clean,
+            input_timesteps=torch.tensor([0.5]),
+            special_tokens={"bos_token_id": 1, "eos_token_id": 2, "start_of_generation": 3, "end_of_generation": 4},
+            max_num_tokens=128,
+            latent_patch_size=1,
+        )
+
+    absent = _pack(has_local_memory=False)
+    present = _pack(has_local_memory=True)
+
+    assert absent.vision is not None and present.vision is not None
+    assert absent.action is not None and present.action is not None
+    torch.testing.assert_close(
+        absent.position_ids[:, absent.vision.sequence_indexes],
+        present.position_ids[:, present.vision.sequence_indexes],
+    )
+    torch.testing.assert_close(
+        absent.position_ids[:, absent.action.sequence_indexes],
+        present.position_ids[:, present.action.sequence_indexes],
+    )
+    assert present.local_memory is not None
+    assert present.local_memory.mse_loss_indexes.numel() == 0
+    assert present.local_memory.timesteps.numel() == 0
+    assert all(torch.all(mask == 1) for mask in present.local_memory.condition_mask)
 
 
 def _make_window_trainer(cp_size: int = 2) -> tuple[ImaginaireTrainer, Any]:

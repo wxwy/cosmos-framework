@@ -277,6 +277,8 @@ class OmniMoTModel(ImaginaireModel):
                 # Sound generation parameters
                 sound_dim=self.config.sound_dim,
                 sound_latent_fps=self.config.sound_latent_fps,
+                local_memory_enabled=self.config.local_memory_enabled,
+                local_memory_dim=self.config.local_memory_dim,
                 enable_input_bias=self.config.enable_input_bias,
             )
             network_config._attn_implementation_internal = "eager"
@@ -4054,6 +4056,36 @@ class OmniMoTModel(ImaginaireModel):
         else:
             x0_tokens_sound = None
 
+        # Local memory is already a clean continuous payload produced by the
+        # data-side transform. Preserve mixed-batch alignment before densifying
+        # it so the packer's local index stays aligned with has_local_memory.
+        raw_local_memory = data_batch.get("local_memory", None)
+        sequence_plans = data_batch.get("sequence_plan", [])
+        if isinstance(raw_local_memory, list):
+            if raw_local_memory and isinstance(raw_local_memory[0], list):
+                raw_local_memory = [item[0] if isinstance(item, list) else item for item in raw_local_memory]
+            if len(raw_local_memory) != len(sequence_plans):
+                raise ValueError(
+                    "Local memory/sequence-plan length mismatch: "
+                    f"{len(raw_local_memory)} payloads for {len(sequence_plans)} plans."
+                )
+            for plan, local_memory in zip(sequence_plans, raw_local_memory, strict=True):
+                if local_memory is None:
+                    plan.has_local_memory = False
+            x0_tokens_local_memory = [
+                local_memory.to(**self.tensor_kwargs_fp32)
+                for local_memory in raw_local_memory
+                if local_memory is not None
+            ]
+            if not x0_tokens_local_memory:
+                x0_tokens_local_memory = None
+        elif raw_local_memory is None:
+            for plan in sequence_plans:
+                plan.has_local_memory = False
+            x0_tokens_local_memory = None
+        else:
+            x0_tokens_local_memory = [raw_local_memory.to(**self.tensor_kwargs_fp32)]
+
         # FPS metadata is used by the sequence packer for mRoPE temporal IDs when
         # FPS modulation is enabled in the training config.
         fps_raw = data_batch.get("conditioning_fps", None)
@@ -4110,6 +4142,7 @@ class OmniMoTModel(ImaginaireModel):
             x0_tokens_vision=x0_tokens_vision,
             x0_tokens_action=x0_tokens_action,
             x0_tokens_sound=x0_tokens_sound,
+            x0_tokens_local_memory=x0_tokens_local_memory,
             fps_vision=fps_vision,
             temporal_positions_vision=temporal_positions_vision,
             fps_action=fps_action,

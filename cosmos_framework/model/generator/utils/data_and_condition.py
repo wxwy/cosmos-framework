@@ -45,6 +45,11 @@ class GenerationDataClean:
     x0_tokens_sound: torch.Tensor | None = None
     fps_sound: torch.Tensor | None = None
 
+    # Local clean memory (dense list over samples with has_local_memory=True).
+    # These tokens are packed as conditioning-only generation tokens: no noise,
+    # timestep, decoder, or flow-matching target is created for them.
+    x0_tokens_local_memory: list[torch.Tensor] | None = None
+
     # Action (dense list of per-sample tensors, only action-having samples)
     raw_state_action: list[torch.Tensor] | None = None
     x0_tokens_action: list[torch.Tensor] | None = None

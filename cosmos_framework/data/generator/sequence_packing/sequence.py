@@ -57,6 +57,7 @@ class PackedSequenceBuilder:
         vision: Vision modality construction state, or ``None`` if no vision was appended.
         action: Action modality construction state, or ``None`` if no action was appended.
         sound: Sound modality construction state, or ``None`` if no sound was appended.
+        local_memory: Local clean memory construction state, or ``None`` if absent.
         vision_item_split_lens: Per-sample per-vision-item token counts for multi-control
             transfer.
         control_weights: Per-sample per-control weights for multi-control weighted V-scaling.
@@ -110,6 +111,7 @@ class PackedSequenceBuilder:
     vision: ModalityDataBuilder | None = None
     action: ModalityDataBuilder | None = None
     sound: ModalityDataBuilder | None = None
+    local_memory: ModalityDataBuilder | None = None
 
     def ensure_vision(self) -> ModalityDataBuilder:
         """Return the vision builder, creating it on first use.
@@ -140,6 +142,12 @@ class PackedSequenceBuilder:
         if self.sound is None:
             self.sound = ModalityDataBuilder()
         return self.sound
+
+    def ensure_local_memory(self) -> ModalityDataBuilder:
+        """Return the Local clean-memory builder, creating it on first use."""
+        if self.local_memory is None:
+            self.local_memory = ModalityDataBuilder()
+        return self.local_memory
 
     # Multi-control transfer: per-sample list of per-vision-item token counts.
     # For a multi-control transfer sample with N controls + 1 noisy target,
@@ -534,6 +542,52 @@ class PackedSequenceBuilder:
 
         return sound_split_len
 
+    def pack_local_memory_tokens(
+        self,
+        input_local_memory_tokens: torch.Tensor,
+        local_temporal_offset: int | float,
+        use_float_positions: bool = False,
+    ) -> int:
+        """Pack clean Local memory without advancing the native mRoPE cursor.
+
+        Local tokens use a fixed text-style mRoPE grid rooted at the native
+        vision start.  The returned next offset is intentionally discarded so
+        Vision and Action retain their No-Memory position IDs.
+        """
+        if input_local_memory_tokens.ndim != 2:
+            raise ValueError(
+                "Local memory tokens must have shape [K_local, D_local], "
+                f"got {tuple(input_local_memory_tokens.shape)}."
+            )
+        local_split_len = input_local_memory_tokens.shape[0]
+        if local_split_len <= 0:
+            raise ValueError("Local memory must contain at least one token.")
+
+        local_memory = self.ensure_local_memory()
+        local_memory.token_shapes.append((local_split_len,))
+        local_memory.tokens.append(input_local_memory_tokens)
+        payload_index = len(local_memory.tokens) - 1
+        local_memory.condition_mask.append(
+            torch.ones((local_split_len, 1), device=input_local_memory_tokens.device, dtype=input_local_memory_tokens.dtype)
+        )
+        local_memory.noisy_frame_indexes.append(
+            torch.empty(0, device=input_local_memory_tokens.device, dtype=torch.long)
+        )
+
+        local_position_ids, _ = get_3d_mrope_ids_text_tokens(
+            num_tokens=local_split_len,
+            temporal_offset=local_temporal_offset,
+            use_float_positions=use_float_positions,
+        )
+        self.append_local_memory_span(
+            local_split_len,
+            local_position_ids,
+            payload_index=payload_index,
+            payload_start=0,
+            payload_shape=(local_split_len,),
+        )
+        return local_split_len
+
     def _append_position_ids(self, position_ids: torch.Tensor, span_len: int) -> None:
         """Append one block of position IDs.
 
@@ -708,6 +762,25 @@ class PackedSequenceBuilder:
             payload_shape=payload_shape,
         )
 
+    def append_local_memory_span(
+        self,
+        span_len: int,
+        position_ids: torch.Tensor,
+        *,
+        payload_index: int,
+        payload_start: int,
+        payload_shape: tuple[int],
+    ) -> list[int]:
+        """Append one contiguous Local clean-memory span."""
+        return self._append_modality_span(
+            self.ensure_local_memory(),
+            span_len,
+            position_ids,
+            payload_index=payload_index,
+            payload_start=payload_start,
+            payload_shape=payload_shape,
+        )
+
     def append_end_of_generation_token(
         self,
         token_id: int,
@@ -822,6 +895,7 @@ class PackedSequenceBuilder:
             include_raw_action_dim=True,
         )
         sound = self._finalize_modality(self.sound)
+        local_memory = self._finalize_modality(self.local_memory)
 
         # Finalize position IDs.
         assert isinstance(self.position_ids, list)
@@ -851,6 +925,7 @@ class PackedSequenceBuilder:
             vision=vision,
             action=action,
             sound=sound,
+            local_memory=local_memory,
             # Temporal causal
             null_action_supertokens=self.null_action_supertokens,
             num_action_tokens_per_supertoken=self.num_action_tokens_per_supertoken,
@@ -937,6 +1012,7 @@ class PackedSequence:
     vision: ModalityData | None = None
     action: ModalityData | None = None
     sound: ModalityData | None = None
+    local_memory: ModalityData | None = None
 
     # Multi-control transfer: per-sample list of per-vision-item token counts.
     # For a multi-control transfer sample with N controls + 1 noisy target,
@@ -971,7 +1047,7 @@ class PackedSequence:
             assert isinstance(self.ce_loss_indexes, torch.Tensor), "PackedSequence.ce_loss_indexes must be finalized"
         if self.ce_loss_weights is not None:
             assert isinstance(self.ce_loss_weights, torch.Tensor), "PackedSequence.ce_loss_weights must be finalized"
-        for modality in [self.vision, self.action, self.sound]:
+        for modality in [self.vision, self.action, self.sound, self.local_memory]:
             assert modality is None or isinstance(modality, ModalityData), (
                 "PackedSequence modality fields must be finalized ModalityData"
             )
@@ -993,6 +1069,8 @@ class PackedSequence:
             self.action.to_cuda()
         if self.sound is not None:
             self.sound.to_cuda()
+        if self.local_memory is not None:
+            self.local_memory.to_cuda()
         self.prepare_sequence_pack_metadata()
 
     def prepare_sequence_pack_metadata(self) -> None:

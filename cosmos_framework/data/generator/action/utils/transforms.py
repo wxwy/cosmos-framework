@@ -420,6 +420,41 @@ class VideoResize:
                 log.debug(f"{self.log_prefix}: {when} padding '{key}' shape = {tuple(val.shape)}")
 
 
+class LocalDummyTransform:
+    """Inject the config-controlled R07 Local dummy clean modality.
+
+    The payload is deterministic for one LIBERO sample and differs across
+    ``episode_index``/``start_frame`` pairs. It is intentionally a data-side
+    transform: the model must only consume an explicit ``local_memory`` input.
+    """
+
+    def __init__(self, enabled: bool = False, tokens: int = 1, dim: int = 32) -> None:
+        self.enabled = enabled
+        self.tokens = tokens
+        self.dim = dim
+        if self.enabled and (self.tokens <= 0 or self.dim <= 0):
+            raise ValueError("local dummy token count and dimension must be positive")
+
+    @staticmethod
+    def _scalar_index(data_dict: dict, key: str) -> int:
+        value = data_dict.get(key, 0)
+        if isinstance(value, torch.Tensor):
+            return int(value.item())
+        return int(value)
+
+    def __call__(self, data_dict: dict, sequence_plan: SequencePlan) -> dict:
+        if not self.enabled:
+            return data_dict
+
+        episode_index = self._scalar_index(data_dict, "episode_index")
+        start_frame = self._scalar_index(data_dict, "start_frame")
+        sample_offset = ((episode_index * 1_000_003 + start_frame) % 8_191) / 8_191.0
+        payload = torch.arange(self.tokens * self.dim, dtype=torch.float32).reshape(self.tokens, self.dim)
+        data_dict["local_memory"] = payload / max(payload.numel() - 1, 1) + sample_offset
+        sequence_plan.has_local_memory = True
+        return data_dict
+
+
 class ActionTransformPipeline:
     """A composable transform pipeline that chains ``VideoResize``, text
     tokenization, and automatic sequence plan construction.
@@ -521,11 +556,11 @@ class ActionTransformPipeline:
         self.video_temporal_downsample: int = video_temporal_downsample
         self.max_action_dim: int = max_action_dim
         self.action_channel_masking: bool = action_channel_masking
-        self.local_dummy_enabled = local_dummy_enabled
-        self.local_dummy_tokens = local_dummy_tokens
-        self.local_dummy_dim = local_dummy_dim
-        if self.local_dummy_enabled and (self.local_dummy_tokens <= 0 or self.local_dummy_dim <= 0):
-            raise ValueError("local dummy token count and dimension must be positive")
+        self.local_dummy_transform = LocalDummyTransform(
+            enabled=local_dummy_enabled,
+            tokens=local_dummy_tokens,
+            dim=local_dummy_dim,
+        )
         self.action_processor: ActionProcessor = ActionProcessor(
             max_action_dim=max_action_dim,
             action_channel_masking=action_channel_masking,
@@ -715,11 +750,7 @@ class ActionTransformPipeline:
             num_history_actions=num_history_actions,
         )
         data_dict["sequence_plan"] = sequence_plan
-        if self.local_dummy_enabled:
-            data_dict["local_memory"] = torch.ones(
-                (self.local_dummy_tokens, self.local_dummy_dim), dtype=torch.float32
-            )
-            sequence_plan.has_local_memory = True
+        data_dict = self.local_dummy_transform(data_dict, sequence_plan)
 
         assert isinstance(action, torch.Tensor), "action tensor is required for action modes"
         data_dict = self.action_processor.preprocess_action(

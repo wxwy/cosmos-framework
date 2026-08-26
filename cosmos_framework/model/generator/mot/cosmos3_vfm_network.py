@@ -70,6 +70,8 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         sound_dim: int | None = None,
         temporal_compression_factor_sound=1,
         sound_latent_fps: int = 25,
+        local_memory_enabled: bool = False,
+        local_memory_dim: int | None = None,
         enable_input_bias: bool = True,
         **kwargs,
     ):
@@ -123,6 +125,11 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
             assert self.vision_gen, (
                 "Sound generation requires visual generation! We do NOT support sound only training!"
             )
+
+        self.local_memory_enabled = local_memory_enabled
+        self.local_memory_dim = local_memory_dim
+        if self.local_memory_enabled and (self.local_memory_dim is None or self.local_memory_dim <= 0):
+            raise ValueError("local_memory_dim must be positive when local_memory_enabled=True")
 
         super().__init__(**kwargs)
 
@@ -216,6 +223,10 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             self.llm2sound = nn.Linear(self.hidden_size, config.sound_dim)
             self.sound_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
+        if config.local_memory_enabled:
+            self.local_memory2llm = nn.Linear(config.local_memory_dim, self.hidden_size, bias=config.enable_input_bias)
+            self.local_memory_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
+
         self.config = config
         self.parallel_dims = None
 
@@ -268,6 +279,15 @@ class Cosmos3VFMNetwork(PreTrainedModel):
 
             std = 1.0 / math.sqrt(self.hidden_size)
             torch.nn.init.trunc_normal_(self.sound_modality_embed, std=std, a=-3 * std, b=3 * std)
+
+        if self.config.local_memory_enabled:
+            # Function-preserving initialization for a newly introduced clean
+            # condition: initial Normal/Zero/Shuffle sensitivity is expected to
+            # be zero and must become non-zero only after optimizer updates.
+            torch.nn.init.zeros_(self.local_memory2llm.weight)
+            if self.config.enable_input_bias:
+                torch.nn.init.zeros_(self.local_memory2llm.bias)
+            torch.nn.init.zeros_(self.local_memory_modality_embed)
 
         self.language_model.init_weights(buffer_device=buffer_device)
 
@@ -915,6 +935,29 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             packed_tokens_sound  # [total_sound_tokens,hidden_size] scattered into [N_total,hidden_size]
         )
 
+    def _encode_local_memory(
+        self,
+        packed_seq: PackedSequence,
+        packed_sequence: torch.Tensor,
+        target_dtype: torch.dtype,
+    ) -> None:
+        """Project explicit clean Local memory into the packed GEN stream."""
+        local_memory = packed_seq.local_memory
+        if local_memory is None or local_memory.tokens is None:
+            return
+        if not self.config.local_memory_enabled:
+            raise ValueError("Packed Local memory requires local_memory_enabled=True.")
+        assert isinstance(local_memory.sequence_indexes, torch.Tensor)
+        packed_tokens_local = torch.cat(local_memory.tokens, dim=0).to(target_dtype)
+        expected_dim = self.config.local_memory_dim
+        if packed_tokens_local.shape[-1] != expected_dim:
+            raise ValueError(
+                f"Local memory feature dimension {packed_tokens_local.shape[-1]} "
+                f"does not match local_memory_dim={expected_dim}."
+            )
+        packed_tokens_local = self.local_memory2llm(packed_tokens_local) + self.local_memory_modality_embed
+        packed_sequence[local_memory.sequence_indexes] = packed_tokens_local
+
     def _decode_sound(
         self,
         packed_seq: PackedSequence,
@@ -1007,6 +1050,8 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         if self.config.sound_gen:
             self._encode_sound(packed_seq, packed_sequence, target_dtype)
 
+        self._encode_local_memory(packed_seq, packed_sequence, target_dtype)
+
         assert packed_seq.attn_modes is not None
         assert packed_seq.split_lens is not None
         use_video_temporal_causal = (
@@ -1026,6 +1071,8 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             all_gen_indexes.append(packed_seq.action.sequence_indexes)
         if packed_seq.sound is not None and isinstance(packed_seq.sound.sequence_indexes, torch.Tensor):
             all_gen_indexes.append(packed_seq.sound.sequence_indexes)
+        if packed_seq.local_memory is not None and isinstance(packed_seq.local_memory.sequence_indexes, torch.Tensor):
+            all_gen_indexes.append(packed_seq.local_memory.sequence_indexes)
         vision_sequence_indexes = torch.cat(all_gen_indexes, dim=0) if all_gen_indexes else None  # [N_gen_tokens]
 
         # When temporal causal is enabled the buffer is [action_t0, vision_t0, action_t1, vision_t1, ...].

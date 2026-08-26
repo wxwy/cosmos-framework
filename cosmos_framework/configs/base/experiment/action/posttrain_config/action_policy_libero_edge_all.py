@@ -49,6 +49,9 @@ def _action_policy_libero_edge_model_config() -> dict:
     cfg["ema"]["enabled"] = False
     cfg["tokenizer"]["encode_exact_durations"] = LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS
     cfg["tokenizer"]["encode_chunk_frames"] = LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES
+    local_dummy_enabled = os.environ.get("PSM_LOCAL_DUMMY_ENABLED", "0") == "1"
+    cfg["local_memory_enabled"] = local_dummy_enabled
+    cfg["local_memory_dim"] = int(os.environ.get("PSM_LOCAL_DUMMY_DIM", "32")) if local_dummy_enabled else None
     cfg["vlm_config"]["tokenizer"].update(
         repository=None,
         revision=None,
@@ -105,6 +108,9 @@ def _action_policy_libero_edge_dataloader():
             cfg_dropout_rate=0.1,
             format_prompt_as_json=True,
             tokenizer_config="${model.config.vlm_config.tokenizer}",
+            local_dummy_enabled="${model.config.local_memory_enabled}",
+            local_dummy_tokens=int(os.environ.get("PSM_LOCAL_DUMMY_TOKENS", "1")),
+            local_dummy_dim="${model.config.local_memory_dim}",
             **cache_kwargs,
         )
 
