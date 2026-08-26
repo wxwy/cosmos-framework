@@ -2513,6 +2513,8 @@ class OmniMoTModel(ImaginaireModel):
             raw_state_sound=gen_data_clean.raw_state_sound if has_sound else None,
             x0_tokens_sound=noise_x_sound if has_sound else None,
             fps_sound=gen_data_clean.fps_sound if has_sound else None,
+            # Local remains a clean condition throughout inference packing.
+            x0_tokens_local_memory=gen_data_clean.x0_tokens_local_memory,
             num_vision_items_per_sample=num_items,
             num_views_per_vision_item=gen_data_clean.num_views_per_vision_item,
             # Multi-control transfer: carry per-control weights so the packer can
@@ -3381,7 +3383,13 @@ class OmniMoTModel(ImaginaireModel):
 
         return condition_images
 
-    def _slice_gen_data_clean(self, gen_data_clean: GenerationDataClean, start: int, limit: int) -> GenerationDataClean:
+    def _slice_gen_data_clean(
+        self,
+        gen_data_clean: GenerationDataClean,
+        start: int,
+        limit: int,
+        sequence_plans: list[SequencePlan] | None = None,
+    ) -> GenerationDataClean:
         """Extract a subset of GenerationDataClean for inference.
 
         The samples in [start:limit] are extracted from the original GenerationDataClean.
@@ -3396,6 +3404,9 @@ class OmniMoTModel(ImaginaireModel):
             gen_data_clean: GenerationDataClean to slice.
             start: Start index of the slice.
             limit: Limit index of the slice.
+            sequence_plans: Original per-sample plans. Required only when
+                Local memory is sparse (present for fewer than all samples),
+                so dense Local payloads can be mapped back to sample indexes.
 
         Returns:
             Sliced GenerationDataClean.
@@ -3403,6 +3414,7 @@ class OmniMoTModel(ImaginaireModel):
         # x0_tokens_action can be an empty list for general-video samples, not just None.
         has_action = bool(gen_data_clean.x0_tokens_action)
         has_sound = bool(gen_data_clean.x0_tokens_sound)
+        has_local_memory = bool(gen_data_clean.x0_tokens_local_memory)
 
         # Determine vision slice for this sample
         num_items = gen_data_clean.num_vision_items_per_sample
@@ -3466,6 +3478,30 @@ class OmniMoTModel(ImaginaireModel):
             x0_tokens_sound = None
             fps_sound = None
 
+        if has_local_memory:
+            assert gen_data_clean.x0_tokens_local_memory is not None
+            if len(gen_data_clean.x0_tokens_local_memory) == gen_data_clean.batch_size:
+                x0_tokens_local_memory = gen_data_clean.x0_tokens_local_memory[start:limit]
+            else:
+                if sequence_plans is None or len(sequence_plans) != gen_data_clean.batch_size:
+                    raise ValueError(
+                        "Sparse Local memory slicing requires one SequencePlan per original sample."
+                    )
+                local_sample_indexes = [
+                    sample_idx for sample_idx, plan in enumerate(sequence_plans) if plan.has_local_memory
+                ]
+                x0_tokens_local_memory = [
+                    local_memory
+                    for sample_idx, local_memory in zip(
+                        local_sample_indexes, gen_data_clean.x0_tokens_local_memory, strict=True
+                    )
+                    if start <= sample_idx < limit
+                ]
+                if not x0_tokens_local_memory:
+                    x0_tokens_local_memory = None
+        else:
+            x0_tokens_local_memory = None
+
         return GenerationDataClean(
             batch_size=limit - start,
             is_image_batch=gen_data_clean.is_image_batch,
@@ -3475,6 +3511,7 @@ class OmniMoTModel(ImaginaireModel):
             x0_tokens_vision=subset_x0_vision,
             x0_tokens_action=x0_tokens_action,
             x0_tokens_sound=x0_tokens_sound,
+            x0_tokens_local_memory=x0_tokens_local_memory,
             fps_vision=fps_vision,
             temporal_positions_vision=subset_temporal_positions_vision,
             fps_action=fps_action,

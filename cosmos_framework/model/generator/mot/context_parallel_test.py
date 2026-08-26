@@ -26,6 +26,7 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
 )
 
 from cosmos_framework.model.generator.utils.data_and_condition import GenerationDataClean
+from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
 from cosmos_framework.model.generator.utils.load_balancing_stats import LBLMetadata, compute_sample_lbl_stats
 from cosmos_framework.data.generator.sequence_packing import (
     PackedSequence,
@@ -107,6 +108,73 @@ def test_local_memory_packing_preserves_native_mrope_and_stays_clean() -> None:
     assert present.local_memory.mse_loss_indexes.numel() == 0
     assert present.local_memory.timesteps.numel() == 0
     assert all(torch.all(mask == 1) for mask in present.local_memory.condition_mask)
+
+
+@pytest.mark.L0
+@pytest.mark.CPU
+def test_get_velocity_rebuild_preserves_local_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = object.__new__(OmniMoTModel)
+    model.config = SimpleNamespace(action_gen=False, sound_gen=False)
+    captured: dict[str, GenerationDataClean] = {}
+
+    def _capture_pack(*args, **kwargs):
+        captured["gen_data_clean"] = args[2]
+        raise RuntimeError("stop after pack input capture")
+
+    monkeypatch.setattr(model, "_pack_input_sequence", _capture_pack)
+    monkeypatch.setattr(model, "_derive_include_end_of_generation_token", lambda: False)
+    local_memory = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    clean = GenerationDataClean(
+        batch_size=1,
+        is_image_batch=False,
+        x0_tokens_vision=[torch.zeros(1, 2, 1, 1, 1)],
+        x0_tokens_local_memory=[local_memory],
+    )
+    plan = SequencePlan(has_text=True, has_vision=True, has_local_memory=True)
+
+    with pytest.raises(RuntimeError, match="stop after pack input capture"):
+        model._get_velocity(
+            noise_x=[torch.zeros(2)],
+            timestep=torch.tensor([0.5]),
+            text_tokens=[[10]],
+            sequence_plans=[plan],
+            gen_data_clean=clean,
+            has_noisy_actions=False,
+        )
+
+    assert captured["gen_data_clean"].x0_tokens_local_memory is not None
+    assert captured["gen_data_clean"].x0_tokens_local_memory[0] is local_memory
+
+
+@pytest.mark.L0
+@pytest.mark.CPU
+def test_slice_gen_data_clean_preserves_all_present_and_sparse_local_memory() -> None:
+    model = object.__new__(OmniMoTModel)
+
+    def _clean(local_memory: list[torch.Tensor]) -> GenerationDataClean:
+        return GenerationDataClean(
+            batch_size=3,
+            is_image_batch=False,
+            x0_tokens_vision=[torch.zeros(1, 1, 1, 1, 1) for _ in range(3)],
+            x0_tokens_local_memory=local_memory,
+        )
+
+    local0, local1, local2 = (torch.full((1, 2), value) for value in range(3))
+    all_present = model._slice_gen_data_clean(_clean([local0, local1, local2]), start=1, limit=3)
+    assert all_present.x0_tokens_local_memory is not None
+    assert all_present.x0_tokens_local_memory[0] is local1
+    assert all_present.x0_tokens_local_memory[1] is local2
+
+    sparse_plans = [
+        SequencePlan(has_text=True, has_local_memory=True),
+        SequencePlan(has_text=True, has_local_memory=False),
+        SequencePlan(has_text=True, has_local_memory=True),
+    ]
+    sparse = model._slice_gen_data_clean(
+        _clean([local0, local2]), start=1, limit=3, sequence_plans=sparse_plans
+    )
+    assert sparse.x0_tokens_local_memory is not None
+    assert sparse.x0_tokens_local_memory[0] is local2
 
 
 def _make_window_trainer(cp_size: int = 2) -> tuple[ImaginaireTrainer, Any]:
