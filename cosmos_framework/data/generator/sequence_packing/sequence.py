@@ -1075,12 +1075,16 @@ class SequencePlan:
     has_sound: bool = False
     condition_frame_indexes_sound: list[int] = field(default_factory=list)
 
+    # -- Local clean memory modality --
+    has_local_memory: bool = False
+
     def as_dict(self) -> dict:
         return {
             "has_text": self.has_text,
             "has_vision": self.has_vision,
             "has_action": self.has_action,
             "has_sound": self.has_sound,
+            "has_local_memory": self.has_local_memory,
             "condition_frame_indexes_vision": self.condition_frame_indexes_vision,
             "condition_frame_indexes_action": self.condition_frame_indexes_action,
             "condition_frame_indexes_sound": self.condition_frame_indexes_sound,

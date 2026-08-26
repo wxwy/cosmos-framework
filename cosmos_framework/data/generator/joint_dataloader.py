@@ -140,6 +140,7 @@ def custom_collate_fn(batch):
         "domain_id",
         "sequence_plan",
         "sound",
+        "local_memory",
         "raw_action_dim",
         "image_size",
         "action_processing_record",
@@ -156,7 +157,7 @@ def custom_collate_fn(batch):
     # remaining sound tensors mis-aligned with the plans whose ``has_sound``
     # flag was set BEFORE collation, causing ``sequence_packing`` to index
     # past the end of ``x0_tokens_sound``.
-    sparse_data_keys = {"sound"}
+    sparse_data_keys = {"sound", "local_memory"}
 
     # Handle the case where the batch is already a dictionary (e.g. column-wise batching)
     if isinstance(batch, dict):

@@ -513,11 +513,19 @@ class ActionTransformPipeline:
         idle_frames_dropout: float = 0.05,
         format_prompt_as_json: bool = False,
         format_prompt_float_seconds: bool = False,
+        local_dummy_enabled: bool = False,
+        local_dummy_tokens: int = 1,
+        local_dummy_dim: int = 32,
     ) -> None:
         self.caption_key: str = caption_key
         self.video_temporal_downsample: int = video_temporal_downsample
         self.max_action_dim: int = max_action_dim
         self.action_channel_masking: bool = action_channel_masking
+        self.local_dummy_enabled = local_dummy_enabled
+        self.local_dummy_tokens = local_dummy_tokens
+        self.local_dummy_dim = local_dummy_dim
+        if self.local_dummy_enabled and (self.local_dummy_tokens <= 0 or self.local_dummy_dim <= 0):
+            raise ValueError("local dummy token count and dimension must be positive")
         self.action_processor: ActionProcessor = ActionProcessor(
             max_action_dim=max_action_dim,
             action_channel_masking=action_channel_masking,
@@ -707,6 +715,11 @@ class ActionTransformPipeline:
             num_history_actions=num_history_actions,
         )
         data_dict["sequence_plan"] = sequence_plan
+        if self.local_dummy_enabled:
+            data_dict["local_memory"] = torch.ones(
+                (self.local_dummy_tokens, self.local_dummy_dim), dtype=torch.float32
+            )
+            sequence_plan.has_local_memory = True
 
         assert isinstance(action, torch.Tensor), "action tensor is required for action modes"
         data_dict = self.action_processor.preprocess_action(
