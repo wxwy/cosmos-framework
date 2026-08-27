@@ -428,12 +428,15 @@ class LocalDummyTransform:
     transform: the model must only consume an explicit ``local_memory`` input.
     """
 
-    def __init__(self, enabled: bool = False, tokens: int = 1, dim: int = 32) -> None:
+    def __init__(self, enabled: bool = False, tokens: int = 1, dim: int = 32, mode: str = "normal") -> None:
         self.enabled = enabled
         self.tokens = tokens
         self.dim = dim
+        self.mode = mode
         if self.enabled and (self.tokens <= 0 or self.dim <= 0):
             raise ValueError("local dummy token count and dimension must be positive")
+        if self.mode not in {"normal", "zero", "shuffle"}:
+            raise ValueError(f"unsupported local dummy mode: {self.mode}")
 
     @staticmethod
     def _scalar_index(data_dict: dict, key: str) -> int:
@@ -449,8 +452,12 @@ class LocalDummyTransform:
         episode_index = self._scalar_index(data_dict, "episode_index")
         start_frame = self._scalar_index(data_dict, "start_frame")
         sample_offset = ((episode_index * 1_000_003 + start_frame) % 8_191) / 8_191.0
-        payload = torch.arange(self.tokens * self.dim, dtype=torch.float32).reshape(self.tokens, self.dim)
-        data_dict["local_memory"] = payload / max(payload.numel() - 1, 1) + sample_offset
+        if self.mode == "zero":
+            payload = torch.zeros((self.tokens, self.dim), dtype=torch.float32)
+        else:
+            payload = torch.arange(self.tokens * self.dim, dtype=torch.float32).reshape(self.tokens, self.dim)
+            payload = payload / max(payload.numel() - 1, 1) + sample_offset
+        data_dict["local_memory"] = payload
         sequence_plan.has_local_memory = True
         return data_dict
 
@@ -551,6 +558,7 @@ class ActionTransformPipeline:
         local_dummy_enabled: bool = False,
         local_dummy_tokens: int = 1,
         local_dummy_dim: int = 32,
+        local_dummy_mode: str = "normal",
     ) -> None:
         self.caption_key: str = caption_key
         self.video_temporal_downsample: int = video_temporal_downsample
@@ -560,6 +568,7 @@ class ActionTransformPipeline:
             enabled=local_dummy_enabled,
             tokens=local_dummy_tokens,
             dim=local_dummy_dim,
+            mode=local_dummy_mode,
         )
         self.action_processor: ActionProcessor = ActionProcessor(
             max_action_dim=max_action_dim,

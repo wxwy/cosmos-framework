@@ -17,7 +17,7 @@ from cosmos_framework.data.generator.action.utils.transforms import (
 )
 from cosmos_framework.data.generator.augmentors.duration_fps_text_timestamps import DurationFPSTextTimeStamps
 from cosmos_framework.data.generator.augmentors.resolution_text_info import ResolutionTextInfo
-from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
+from cosmos_framework.data.generator.joint_dataloader import IterativeJointDataLoader, custom_collate_fn
 from cosmos_framework.data.generator.sequence_packing import SequencePlan
 
 
@@ -60,6 +60,33 @@ def test_local_memory_collate_preserves_mixed_none_alignment() -> None:
     assert result["local_memory"][1] is None
     assert result["local_memory"][2] is third
     assert [plan.has_local_memory for plan in result["sequence_plan"]] == [True, False, True]
+
+
+@pytest.mark.L0
+def test_local_dummy_zero_is_strict_and_batch_shuffle_preserves_plans() -> None:
+    zero_plan = SequencePlan(has_text=True)
+    zero_result = LocalDummyTransform(enabled=True, tokens=2, dim=3, mode="zero")(
+        {"episode_index": torch.tensor(7), "start_frame": torch.tensor(9)}, zero_plan
+    )
+    assert zero_plan.has_local_memory
+    assert torch.equal(zero_result["local_memory"], torch.zeros(2, 3))
+
+    first = torch.full((1, 2), 1.0)
+    second = torch.full((1, 2), 2.0)
+    output_batch = {
+        "local_memory": [first, None, second],
+        "sequence_plan": [
+            SequencePlan(has_text=True, has_local_memory=True),
+            SequencePlan(has_text=True, has_local_memory=False),
+            SequencePlan(has_text=True, has_local_memory=True),
+        ],
+    }
+    IterativeJointDataLoader._shuffle_local_memory_payloads(output_batch)
+
+    assert output_batch["local_memory"][0] is second
+    assert output_batch["local_memory"][1] is None
+    assert output_batch["local_memory"][2] is first
+    assert [plan.has_local_memory for plan in output_batch["sequence_plan"]] == [True, False, True]
 
 
 @pytest.mark.L0

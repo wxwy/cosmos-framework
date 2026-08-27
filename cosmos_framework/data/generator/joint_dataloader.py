@@ -914,6 +914,7 @@ class IterativeJointDataLoader(JointDataLoader):
         enable_async_batch_building: bool = False,
         async_batch_building_timeout_s: float = 1200.0,
         lazy_initialize_child_iterators: bool = False,
+        local_memory_shuffle: bool = False,
     ) -> None:
         if async_batch_building_timeout_s <= 0:
             raise ValueError(f"async_batch_building_timeout_s must be positive, got {async_batch_building_timeout_s}.")
@@ -947,6 +948,7 @@ class IterativeJointDataLoader(JointDataLoader):
         self.enable_async_batch_building: bool = enable_async_batch_building
         self.async_batch_building_timeout_s: float = float(async_batch_building_timeout_s)
         self._async_batch_builder: _AsyncBatchBuilder | None = None
+        self.local_memory_shuffle = bool(local_memory_shuffle)
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         self._initialize_child_iterators_once()
@@ -1035,9 +1037,31 @@ class IterativeJointDataLoader(JointDataLoader):
             if len(output_batch) == 0:
                 return
 
+            if self.local_memory_shuffle:
+                self._shuffle_local_memory_payloads(output_batch)
             metrics.attach_to(output_batch, buffer_size=len(self.buffers[index_id]))
             self.global_id += 1
             yield output_batch
+
+    @staticmethod
+    def _shuffle_local_memory_payloads(output_batch: dict[str, Any]) -> None:
+        """Cyclically permute present Local payloads without changing sample plans."""
+        local_memory = output_batch.get("local_memory")
+        sequence_plans = output_batch.get("sequence_plan")
+        if local_memory is None or sequence_plans is None:
+            return
+        if len(local_memory) != len(sequence_plans):
+            raise ValueError("local_memory and sequence_plan must have the same batch length for shuffle")
+        present_indexes = [
+            index
+            for index, (payload, plan) in enumerate(zip(local_memory, sequence_plans, strict=True))
+            if plan.has_local_memory and payload is not None
+        ]
+        if len(present_indexes) < 2:
+            return
+        payloads = [local_memory[index] for index in present_indexes]
+        for index, payload in zip(present_indexes, payloads[1:] + payloads[:1], strict=True):
+            local_memory[index] = payload
 
     def _start_async_batch_builder(self) -> _AsyncBatchBuilder:
         """Create the async builder and request its first batch."""

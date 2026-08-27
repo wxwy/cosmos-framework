@@ -244,6 +244,7 @@ def get_action_libero_sft_dataset(
     local_dummy_enabled: bool = False,
     local_dummy_tokens: int = 1,
     local_dummy_dim: int = 32,
+    local_dummy_mode: str = "normal",
 ) -> Dataset:
     """Build the LIBERO action-policy SFT dataset (GA reproduction defaults).
 
@@ -287,6 +288,7 @@ def get_action_libero_sft_dataset(
         local_dummy_enabled=local_dummy_enabled,
         local_dummy_tokens=local_dummy_tokens,
         local_dummy_dim=local_dummy_dim,
+        local_dummy_mode=local_dummy_mode,
     )
     sft = ActionSFTDataset(dataset, transform, resolution)
     if iterable_shuffle:
