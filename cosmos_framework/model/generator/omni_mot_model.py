@@ -1293,6 +1293,12 @@ class OmniMoTModel(ImaginaireModel):
         if os.environ.get("PSM_R07_PARITY_OUTPUT"):
             output_batch["r07_parity_preds_action"] = out_net["preds_action"]
             output_batch["r07_parity_position_ids"] = packed_sequence.position_ids
+            output_batch["r07_parity_x0_action"] = gen_data_clean.x0_tokens_action
+            output_batch["r07_parity_xt_action"] = gen_data_noised.xt_tokens_action
+            output_batch["r07_parity_text_ids"] = packed_sequence.text_ids
+            output_batch["r07_parity_text_indexes"] = packed_sequence.text_indexes
+            output_batch["r07_parity_vision_indexes"] = packed_sequence.vision.sequence_indexes
+            output_batch["r07_parity_action_indexes"] = packed_sequence.action.sequence_indexes
 
         return output_batch, loss
 

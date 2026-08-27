@@ -27,13 +27,20 @@ class R07ParityCaptureCallback(Callback):
     @staticmethod
     def _tensor_summary(tensor: torch.Tensor) -> dict[str, object]:
         value = tensor.detach().contiguous().cpu()
-        raw_bytes = value.view(torch.uint16).numpy().tobytes() if value.dtype is torch.bfloat16 else value.numpy().tobytes()
+        raw_bytes = (
+            value.view(torch.uint16).numpy().tobytes()
+            if value.dtype is torch.bfloat16
+            else value.numpy().tobytes()
+        )
+        value_float = value.float()
         return {
             "shape": list(value.shape),
             "dtype": str(value.dtype),
             "numel": value.numel(),
             "sha256": hashlib.sha256(raw_bytes).hexdigest(),
-            "max_abs": float(value.float().abs().max().item()) if value.numel() else 0.0,
+            "max_abs": float(value_float.abs().max().item()) if value.numel() else 0.0,
+            "mean": float(value_float.mean().item()) if value.numel() else 0.0,
+            "l2_norm": float(torch.linalg.vector_norm(value_float).item()) if value.numel() else 0.0,
         }
 
     @classmethod
@@ -57,6 +64,20 @@ class R07ParityCaptureCallback(Callback):
             "loss": float(loss.detach().item()),
             "flow_matching_loss_vision": float(output_batch["flow_matching_loss_vision"].detach().item()),
             "flow_matching_loss_action": float(output_batch["flow_matching_loss_action"].detach().item()),
+            "x0_vision": self._tensor_list_summary(output_batch["x0"]),
+            "xt_vision": self._tensor_list_summary(output_batch["xt"]),
+            "sigma_vision": self._tensor_summary(output_batch["sigma"]),
+            "x0_action": self._tensor_list_summary(output_batch["r07_parity_x0_action"]),
+            "xt_action": self._tensor_list_summary(output_batch["r07_parity_xt_action"]),
+            "sigma_action": self._tensor_summary(output_batch["sigma_action"]),
+            "text_ids": self._tensor_summary(output_batch["r07_parity_text_ids"]),
+            "text_indexes": self._tensor_summary(output_batch["r07_parity_text_indexes"]),
+            "vision_indexes": self._tensor_summary(output_batch["r07_parity_vision_indexes"]),
+            "action_indexes": self._tensor_summary(output_batch["r07_parity_action_indexes"]),
+            "split_lens": output_batch["split_lens"],
+            "attn_modes": output_batch["attn_modes"],
+            # Vision has already been assigned to output_batch["model_pred"]; action
+            # is exposed explicitly by the parity-only model branch above.
             "preds_vision": self._tensor_list_summary(output_batch["model_pred"]),
             "preds_action": self._tensor_list_summary(output_batch["r07_parity_preds_action"]),
             "position_ids": self._tensor_summary(output_batch["r07_parity_position_ids"]),
