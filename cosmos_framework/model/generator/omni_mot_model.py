@@ -1295,6 +1295,8 @@ class OmniMoTModel(ImaginaireModel):
             output_batch["r07_parity_position_ids"] = packed_sequence.position_ids
             output_batch["r07_parity_x0_action"] = gen_data_clean.x0_tokens_action
             output_batch["r07_parity_xt_action"] = gen_data_noised.xt_tokens_action
+            output_batch["r07_parity_sigma_vision_effective"] = gen_data_noised.sigmas_vision
+            output_batch["r07_parity_sigma_action_effective"] = gen_data_noised.sigmas_action
             output_batch["r07_parity_text_ids"] = packed_sequence.text_ids
             output_batch["r07_parity_text_indexes"] = packed_sequence.text_indexes
             output_batch["r07_parity_vision_indexes"] = packed_sequence.vision.sequence_indexes

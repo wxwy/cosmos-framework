@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import importlib
+import json
 
 import torch
 
@@ -30,3 +31,42 @@ def test_r07_parity_callback_is_not_registered_without_output_env(monkeypatch) -
     module = importlib.reload(module)
 
     assert "r07_parity_capture" not in module.action_policy_libero_edge_all["trainer"]["callbacks"]
+
+
+def test_r07_parity_callback_captures_effective_action_sigma(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("cosmos_framework.callbacks.r07_parity_capture.distributed.is_rank0", lambda: True)
+    output_path = tmp_path / "parity.json"
+    callback = R07ParityCaptureCallback(str(output_path))
+    tensor = torch.tensor([[1.0]], dtype=torch.bfloat16)
+    indexes = torch.tensor([0], dtype=torch.long)
+
+    callback.on_training_step_end(
+        model=None,
+        data_batch={},
+        output_batch={
+            "flow_matching_loss_vision": torch.tensor(1.0),
+            "flow_matching_loss_action": torch.tensor(2.0),
+            "x0": [tensor],
+            "xt": [tensor],
+            "sigma": tensor,
+            "r07_parity_sigma_vision_effective": [tensor],
+            "r07_parity_x0_action": [tensor],
+            "r07_parity_xt_action": [tensor],
+            "r07_parity_sigma_action_effective": [tensor],
+            "r07_parity_text_ids": indexes,
+            "r07_parity_text_indexes": indexes,
+            "r07_parity_vision_indexes": indexes,
+            "r07_parity_action_indexes": indexes,
+            "split_lens": [1],
+            "attn_modes": ["full"],
+            "model_pred": [tensor],
+            "r07_parity_preds_action": [tensor],
+            "r07_parity_position_ids": indexes.reshape(1, 1),
+        },
+        loss=torch.tensor(3.0),
+        iteration=1,
+    )
+
+    payload = json.loads(output_path.read_text())
+    assert "sigma_action_effective" in payload
+    assert payload["sigma_action_effective"][0]["sha256"] == R07ParityCaptureCallback._tensor_summary(tensor)["sha256"]

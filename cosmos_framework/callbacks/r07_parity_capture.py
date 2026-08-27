@@ -66,10 +66,15 @@ class R07ParityCaptureCallback(Callback):
             "flow_matching_loss_action": float(output_batch["flow_matching_loss_action"].detach().item()),
             "x0_vision": self._tensor_list_summary(output_batch["x0"]),
             "xt_vision": self._tensor_list_summary(output_batch["xt"]),
-            "sigma_vision": self._tensor_summary(output_batch["sigma"]),
+            "sigma_vision_schedule": self._tensor_summary(output_batch["sigma"]),
+            "sigma_vision_effective": self._tensor_list_summary(
+                output_batch["r07_parity_sigma_vision_effective"]
+            ),
             "x0_action": self._tensor_list_summary(output_batch["r07_parity_x0_action"]),
             "xt_action": self._tensor_list_summary(output_batch["r07_parity_xt_action"]),
-            "sigma_action": self._tensor_summary(output_batch["sigma_action"]),
+            "sigma_action_effective": self._tensor_list_summary(
+                output_batch["r07_parity_sigma_action_effective"]
+            ),
             "text_ids": self._tensor_summary(output_batch["r07_parity_text_ids"]),
             "text_indexes": self._tensor_summary(output_batch["r07_parity_text_indexes"]),
             "vision_indexes": self._tensor_summary(output_batch["r07_parity_vision_indexes"]),
