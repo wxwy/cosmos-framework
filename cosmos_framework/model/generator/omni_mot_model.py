@@ -8,6 +8,7 @@ import dataclasses
 import hashlib
 import inspect
 import json
+import os
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -1289,6 +1290,9 @@ class OmniMoTModel(ImaginaireModel):
             output_batch["sigma_action"] = sigmas_action  # [n_action, 1] — dense over action-bearing samples
         if getattr(rf_cfg, "independent_sound_schedule", False) and sigmas_sound is not None:
             output_batch["sigma_sound"] = sigmas_sound  # [n_sound, 1] — dense over sound-bearing samples
+        if os.environ.get("PSM_R07_PARITY_OUTPUT"):
+            output_batch["r07_parity_preds_action"] = out_net["preds_action"]
+            output_batch["r07_parity_position_ids"] = packed_sequence.position_ids
 
         return output_batch, loss
 
