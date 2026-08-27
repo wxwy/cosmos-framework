@@ -23,6 +23,7 @@ SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-600}"
 SERVER_PORT="${SERVER_PORT:-8000}"
 MEM_GATE_GB="${MEM_GATE_GB:-50}"
 MEM_POLL_S="${MEM_POLL_S:-60}"
+GUIDANCE="${GUIDANCE:-1.0}"
 CKPT_ITERS="${CKPT_ITERS:-2800 2600 2400 2200 2000 1800 1600 1400 1200 1000 800 600 400 200}"
 SUITES="${SUITES:-libero_spatial libero_object libero_goal libero_10}"
 REQUIRED_SUITES=(libero_spatial libero_object libero_goal libero_10)
@@ -152,7 +153,7 @@ start_server() {
   fi
 
   wait_mem "启动 $iter_dir server"
-  CHECKPOINT_PATH="$ckpt" NUM_STEPS="$NUM_STEPS" \
+  CHECKPOINT_PATH="$ckpt" NUM_STEPS="$NUM_STEPS" GUIDANCE="$GUIDANCE" \
     bash examples/launch_action_server_libero_edge_all.sh >"$server_log" 2>&1 &
   server_pid=$!
 
@@ -180,12 +181,13 @@ start_server() {
 run_suite() {
   local suite="$1"
   local out_root="$2"
+  local suite_workers="${3:-$N_WORKERS}"
   local suite_dir="$out_root/$suite"
   local task_id task_dir worker_log pid status=0
   local -a active_pids=()
 
   mkdir -p "$suite_dir/tasks"
-  log "  -> $suite：10 task × $NUM_TRIALS trials，最多 $N_WORKERS 个 worker"
+  log "  -> $suite：10 task × $NUM_TRIALS trials，最多 $suite_workers 个 worker"
   for task_id in {0..9}; do
     task_dir="$suite_dir/tasks/task_$(printf '%03d' "$task_id")"
     if task_summary_complete "$task_dir/summary.json" "$task_id"; then
@@ -193,7 +195,7 @@ run_suite() {
       continue
     fi
 
-    while (( ${#active_pids[@]} >= N_WORKERS )); do
+    while (( ${#active_pids[@]} >= suite_workers )); do
       pid="${active_pids[0]}"
       if ! wait "$pid"; then
         status=1
@@ -206,11 +208,13 @@ run_suite() {
     mkdir -p "$task_dir"
     worker_log="$suite_dir/worker_task_$(printf '%03d' "$task_id").log"
     log "     启动 task $task_id"
-    TASK_SUITE="$suite" TASK_IDS="$task_id" NUM_TRIALS="$NUM_TRIALS" \
-      OUTPUT_DIR="$task_dir" SERVER_URL="http://localhost:$SERVER_PORT" \
-      bash examples/launch_closed_loop_eval_libero_task0.sh --max_steps "$MAX_STEPS" \
-      >"$worker_log" 2>&1 &
-    active_pids+=("$!")
+    # set -u 下需用 ${VAR:-} 防御 unset 的 SAVE_GIFS/SAVE_PRED_MP4
+  TASK_SUITE="$suite" TASK_IDS="$task_id" NUM_TRIALS="$NUM_TRIALS" \
+    OUTPUT_DIR="$task_dir" SERVER_URL="http://localhost:$SERVER_PORT" \
+    SAVE_GIFS="${SAVE_GIFS:-}" SAVE_PRED_MP4="${SAVE_PRED_MP4:-}" \
+    bash examples/launch_closed_loop_eval_libero_task0.sh --max_steps "$MAX_STEPS" \
+    >"$worker_log" 2>&1 &
+  active_pids+=("$!")
   done
 
   for pid in "${active_pids[@]}"; do
@@ -252,13 +256,20 @@ run_ckpt() {
     return 0
   fi
 
-  log "=== $iter_dir 开始：steps=$NUM_STEPS, max_steps=$MAX_STEPS, trials=$NUM_TRIALS, workers=$N_WORKERS ==="
+  log "=== $iter_dir 开始：steps=$NUM_STEPS, max_steps=$MAX_STEPS, trials=$NUM_TRIALS, total_workers=$N_WORKERS (每 suite $SUITE_WORKERS，跨 suite 并发) ==="
   mkdir -p "$out_root" "outputs/train/logs"
   if ! start_server "$ckpt" "$iter_dir"; then
     return 1
   fi
+  declare -a suite_pids=()
   for suite in $SUITES; do
-    run_suite "$suite" "$out_root" || log "  !! $iter_dir/$suite 未完成，保留 task 输出供下次续跑"
+    run_suite "$suite" "$out_root" "$SUITE_WORKERS" &
+    suite_pids+=("$!")
+  done
+  for pid in "${suite_pids[@]}"; do
+    if ! wait "$pid"; then
+      log "  !! suite pid=$pid 异常退出（其余 suite 可能仍在跑）"
+    fi
   done
   stop_server
 
@@ -279,8 +290,36 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 2
 fi
 
-log "4090 acceptance 启动：ckpt 倒序=[$CKPT_ITERS]；suite 顺序=[$SUITES]；MEM_GATE=${MEM_GATE_GB}G"
+SUITE_WORKERS=$(( N_WORKERS / ${#REQUIRED_SUITES[@]} ))
+(( SUITE_WORKERS < 1 )) && SUITE_WORKERS=1
+: "${SAVE_GIFS:=}"
+: "${SAVE_PRED_MP4:=}"
+# bash ${VAR:+text} 检查 VAR 是否 null（空），"0" 是 non-null 字符串仍输出 text；
+# 故 SAVE_GIFS=0/SAVE_PRED_MP4=0 时需主动 unset，让 launch 脚本不传对应 flag。
+[[ "$SAVE_GIFS" == "0" ]] && unset SAVE_GIFS
+[[ "$SAVE_PRED_MP4" == "0" ]] && unset SAVE_PRED_MP4
+export SAVE_GIFS SAVE_PRED_MP4
+log "  SAVE_GIFS=${SAVE_GIFS:+(开)} SAVE_PRED_MP4=${SAVE_PRED_MP4:+(开)}（unset=关；--save_mp4 硬编码保留）"
+log "  GUIDANCE=${GUIDANCE}（>1.0 = 启用 CFG）"
+
+log "4090 acceptance 启动：ckpt 倒序=[$CKPT_ITERS]；suite 顺序=[$SUITES]；MEM_GATE=${MEM_GATE_GB}G；总 worker=$N_WORKERS（每 suite $SUITE_WORKERS，4 suite 跨并发）"
 for it in $CKPT_ITERS; do
   run_ckpt "$((10#$it))"
 done
 log "4090 acceptance driver 已结束"
+
+# Auto-post-sweep hook（2026-08-27 用户要求：smoke 跑完后计划要自动触发）
+# 本次 driver 实例已跑完，新加 hook 对本次不生效；未来重跑 driver 会自动走。
+# 关闭：AUTO_POST_SMOKE_HOOK=0；锁定后由 auto_post_smoke.sh 自身 sentinel 跳过。
+AUTO_POST_SMOKE_HOOK="${AUTO_POST_SMOKE_HOOK:-1}"
+if [[ "$AUTO_POST_SMOKE_HOOK" == "1" ]]; then
+  log "auto-post-smoke hook：调 tools/g0/auto_post_smoke.sh"
+  if bash /disk/rl/psm_wma/tools/g0/auto_post_smoke.sh; then
+    log "auto-post-smoke hook 完成"
+  else
+    log "!! auto-post-smoke hook 失败（不影响 driver 退出码）"
+    log "   手动重跑：bash /disk/rl/psm_wma/tools/g0/auto_post_smoke.sh"
+  fi
+else
+  log "auto-post-smoke hook 已禁用（AUTO_POST_SMOKE_HOOK=0）"
+fi

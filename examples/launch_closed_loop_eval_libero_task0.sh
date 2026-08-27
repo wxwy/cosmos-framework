@@ -35,8 +35,8 @@ exec /disk/rl/RLinf/.venv/bin/python examples/_eval_client_launcher.py \
   --action_dim 10 \
   --timeout "${EVAL_TIMEOUT:-120}" \
   --action_horizon "${ACTION_HORIZON:-8}" \
-  --save_gifs --gif_fps 20 \
+  ${SAVE_GIFS:+--save_gifs --gif_fps 20} \
   --save_mp4 --mp4_fps 20 \
-  --save_pred_mp4 \
+  ${SAVE_PRED_MP4:+--save_pred_mp4} \
   --output_dir "${OUTPUT_DIR:-results/libero_closed_loop_task0}" \
   "$@"

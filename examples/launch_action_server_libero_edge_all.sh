@@ -39,4 +39,5 @@ exec .venv/bin/python -m cosmos_framework.scripts.action_policy_server_libero \
   --no-use-ema-weights \
   --action-normalization quantile_rot \
   --action-stats-path cosmos_framework/data/generator/action/normalizer_stats/libero_native_frame_wise_relative_rot6d.json \
-  --raw-action-dim 10 --fps 20 --port 8000 --num-steps "$NUM_STEPS"
+  --raw-action-dim 10 --fps 20 --port 8000 --num-steps "$NUM_STEPS" \
+  --guidance "${GUIDANCE:-1.0}"
