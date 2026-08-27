@@ -209,6 +209,7 @@ _r07_parity_output = os.environ.get("PSM_R07_PARITY_OUTPUT")
 if _r07_parity_output:
     action_policy_libero_edge_all["trainer"]["callbacks"]["r07_parity_capture"] = L(R07ParityCaptureCallback)(
         output_path=_r07_parity_output,
+        tensor_output_path=os.environ.get("PSM_R07_PARITY_TENSOR_OUTPUT"),
     )
 
 # Disabled unless explicitly requested. The probe captures pre-normalization uint8

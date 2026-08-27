@@ -19,9 +19,10 @@ from cosmos_framework.utils.callback import Callback
 class R07ParityCaptureCallback(Callback):
     """将一次真实训练步的原生输出与 mRoPE 摘要写入 JSON。"""
 
-    def __init__(self, output_path: str) -> None:
+    def __init__(self, output_path: str, tensor_output_path: str | None = None) -> None:
         super().__init__()
         self.output_path = Path(output_path)
+        self.tensor_output_path = Path(tensor_output_path) if tensor_output_path else None
         self._written = False
 
     @staticmethod
@@ -47,6 +48,10 @@ class R07ParityCaptureCallback(Callback):
     def _tensor_list_summary(cls, tensors: list[torch.Tensor]) -> list[dict[str, object]]:
         return [cls._tensor_summary(tensor) for tensor in tensors]
 
+    @staticmethod
+    def _cpu_tensor_list(tensors: list[torch.Tensor | None]) -> list[torch.Tensor | None]:
+        return [tensor.detach().cpu() if tensor is not None else None for tensor in tensors]
+
     def on_training_step_end(
         self,
         model: ImaginaireModel,
@@ -55,7 +60,7 @@ class R07ParityCaptureCallback(Callback):
         loss: torch.Tensor,
         iteration: int = 0,
     ) -> None:
-        del model, data_batch
+        del model
         if self._written or not distributed.is_rank0():
             return
         payload = {
@@ -91,4 +96,16 @@ class R07ParityCaptureCallback(Callback):
         temporary_path = self.output_path.with_suffix(self.output_path.suffix + ".tmp")
         temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         temporary_path.replace(self.output_path)
+        if self.tensor_output_path is not None:
+            tensor_payload = {
+                "schema_version": "r07_sensitivity_tensors_v1",
+                "iteration": iteration,
+                "preds_vision": self._cpu_tensor_list(output_batch["model_pred"]),
+                "preds_action": self._cpu_tensor_list(output_batch["r07_parity_preds_action"]),
+                "local_memory": self._cpu_tensor_list(data_batch.get("local_memory", [])),
+            }
+            self.tensor_output_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_tensor_path = self.tensor_output_path.with_suffix(self.tensor_output_path.suffix + ".tmp")
+            torch.save(tensor_payload, temporary_tensor_path)
+            temporary_tensor_path.replace(self.tensor_output_path)
         self._written = True
