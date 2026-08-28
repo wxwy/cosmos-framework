@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from cosmos_framework.model.generator.mot.local_evidence import LocalEvidenceEncoder
+from cosmos_framework.model.generator.mot.local_evidence import LocalEvidenceEncoder, StatelessLocalReplayReadout
 
 
 def _inputs() -> dict[str, torch.Tensor]:
@@ -62,3 +62,27 @@ def test_state_normalization_and_shape_checks() -> None:
     inputs = _inputs()
     with pytest.raises(ValueError, match="local_history_action"):
         encoder(**{**inputs, "local_history_action": torch.zeros(2, 4, 9)})
+
+
+@pytest.mark.L0
+def test_stateless_local_replay_readout_masks_and_uses_latest_valid() -> None:
+    readout = StatelessLocalReplayReadout(evidence_dim=3, local_dim=5, hidden_dim=4)
+    evidence = torch.tensor(
+        [
+            [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [3.0, 3.0, 3.0]],
+            [[10.0, 10.0, 10.0], [20.0, 20.0, 20.0], [30.0, 30.0, 30.0]],
+            [[4.0, 4.0, 4.0], [5.0, 5.0, 5.0], [6.0, 6.0, 6.0]],
+        ]
+    )
+    mask = torch.tensor([[True, False, True], [False, False, False], [False, True, True]])
+    mean, latest, has_valid = readout.summarize(evidence, mask)
+    torch.testing.assert_close(mean, torch.tensor([[2.0, 2.0, 2.0], [0.0, 0.0, 0.0], [5.5, 5.5, 5.5]]))
+    torch.testing.assert_close(latest, torch.tensor([[3.0, 3.0, 3.0], [0.0, 0.0, 0.0], [6.0, 6.0, 6.0]]))
+    assert has_valid.tolist() == [True, False, True]
+
+    output = readout(evidence, mask)
+    assert output.shape == (3, 1, 5)
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output[1]) == 0
+    output.sum().backward()
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in readout.parameters())

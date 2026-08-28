@@ -100,3 +100,53 @@ class LocalEvidenceEncoder(nn.Module):
             raise ValueError("history_state is required when the state adapter is enabled.")
 
         return self.norm(encoded) * history_mask.to(dtype=encoded.dtype).unsqueeze(-1)
+
+
+class StatelessLocalReplayReadout(nn.Module):
+    """Read one temporary Local token from causal evidence without temporal state."""
+
+    def __init__(self, evidence_dim: int = 256, local_dim: int = 32, hidden_dim: int | None = None) -> None:
+        super().__init__()
+        if evidence_dim <= 0 or local_dim <= 0:
+            raise ValueError("evidence_dim and local_dim must be positive.")
+        hidden_dim = hidden_dim or evidence_dim
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive.")
+        self.evidence_dim = evidence_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * evidence_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, local_dim),
+        )
+
+    @staticmethod
+    def summarize(evidence_history: torch.Tensor, history_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return masked mean, latest valid evidence, and per-sample valid flags."""
+        if evidence_history.ndim != 3:
+            raise ValueError("evidence_history must have shape [B,H,D_e].")
+        batch, horizon, _ = evidence_history.shape
+        if tuple(history_mask.shape) != (batch, horizon):
+            raise ValueError(f"history_mask must have shape {(batch, horizon)}, got {tuple(history_mask.shape)}.")
+        if not torch.isfinite(evidence_history).all():
+            raise ValueError("evidence_history must be finite.")
+        mask = history_mask.bool()
+        has_valid = mask.any(dim=1)
+        mask_f = mask.to(dtype=evidence_history.dtype).unsqueeze(-1)
+        mean = (evidence_history * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1)
+        positions = torch.arange(horizon, device=evidence_history.device).expand(batch, -1)
+        latest_positions = torch.where(mask, positions, torch.full_like(positions, -1)).max(dim=1).values.clamp_min(0)
+        latest = evidence_history.gather(
+            dim=1, index=latest_positions[:, None, None].expand(-1, 1, evidence_history.shape[-1])
+        ).squeeze(1)
+        valid_f = has_valid.to(dtype=evidence_history.dtype).unsqueeze(-1)
+        return mean * valid_f, latest * valid_f, has_valid
+
+    def forward(self, evidence_history: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+        """Return one ``[B,1,D_local]`` token; all-mask samples are exact zero."""
+        if evidence_history.shape[-1] != self.evidence_dim:
+            raise ValueError(
+                f"evidence_history last dimension must be {self.evidence_dim}, got {evidence_history.shape[-1]}."
+            )
+        mean, latest, has_valid = self.summarize(evidence_history, history_mask)
+        token = self.mlp(torch.cat([mean, latest], dim=-1)).unsqueeze(1)
+        return token * has_valid.to(dtype=token.dtype).view(-1, 1, 1)
