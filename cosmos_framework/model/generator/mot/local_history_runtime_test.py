@@ -2,6 +2,7 @@ import pytest
 import torch
 import importlib
 from types import SimpleNamespace
+from torch import nn
 
 import cosmos_framework.model.generator.omni_mot_model as omni_mot_model
 from cosmos_framework.data.generator.sequence_packing.sequence import SequencePlan
@@ -11,6 +12,7 @@ from cosmos_framework.model.generator.mot.local_evidence import (
     LocalHistoryRuntime,
     StatelessLocalReplayReadout,
 )
+from cosmos_framework.utils.generator.optimizer import _build_params_with_metadata
 
 
 def _runtime() -> LocalHistoryRuntime:
@@ -61,8 +63,10 @@ def test_runtime_rejects_nonfinite_dt() -> None:
 
 def test_model_injection_h0_without_history_fields_is_absent() -> None:
     model = object.__new__(OmniMoTModel)
+    torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(local_history_horizon=0)
-    model.local_history_runtime = object()
+    model.net = nn.Module()
+    model.net.local_history_runtime = _runtime()
     plans = [SequencePlan(has_text=True, has_local_memory=True)]
     data_batch = {}
     model._inject_local_history(data_batch, plans)
@@ -75,7 +79,8 @@ def test_model_injection_preserves_one_local_token_dimension(monkeypatch: pytest
     model = object.__new__(OmniMoTModel)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(local_history_horizon=2, local_history_state_enabled=False)
-    model.local_history_runtime = _runtime()
+    model.net = nn.Module()
+    model.net.local_history_runtime = _runtime()
     plans = [SequencePlan(has_text=True), SequencePlan(has_text=True)]
     data_batch = _inputs(batch=2, horizon=2)
     data_batch["history_mask"] = torch.tensor([[True, False], [False, False]])
@@ -110,8 +115,26 @@ def test_edge_config_selects_only_r08_runtime_and_r07_local_parameters(monkeypat
     selected = recipe.action_policy_libero_edge_all["optimizer"]["keys_to_select"]
     assert "local_history_runtime" in selected
     assert {"local_memory2llm", "local_memory_modality_embed"}.issubset(selected)
-    runtime_names = [f"local_history_runtime.{name}" for name, _ in _runtime().named_parameters()]
-    local_names = ["local_memory2llm.weight", "local_memory2llm.bias", "local_memory_modality_embed"]
-    selected_names = [name for name in runtime_names + local_names if any(key in name for key in selected)]
-    assert set(selected_names) == set(runtime_names + local_names)
+    model = nn.Module()
+    model.net = nn.Module()
+    model.net.local_history_runtime = _runtime()
+    model.net.local_memory2llm = nn.Linear(5, 7)
+    model.net.local_memory_modality_embed = nn.Parameter(torch.zeros(7))
+    model.unrelated_outer_module = nn.Linear(3, 3)
+    selected_params = _build_params_with_metadata(
+        model,
+        keys_to_select=selected,
+        lr_multipliers={},
+        base_lr=1.0,
+        disable_weight_decay_for_1d_params=False,
+    )
+    selected_ids = {id(param) for param, _ in selected_params}
+    required_ids = {
+        id(param)
+        for name, param in model.net.named_parameters()
+        if name.startswith(("local_history_runtime.", "local_memory2llm", "local_memory_modality_embed"))
+    }
+    assert required_ids.issubset(selected_ids)
+    assert not any("state_proj" in name for name, _ in model.net.named_parameters())
+    assert id(model.unrelated_outer_module.weight) not in selected_ids
     assert cfg["local_history_enabled"] is True

@@ -117,19 +117,11 @@ class OmniMoTModel(ImaginaireModel):
         self.config = config
         log.info(f"OmniMoTModel: config {self.config}")
 
-        self.local_history_runtime: LocalHistoryRuntime | None = None
         if self.config.local_history_enabled:
             if not self.config.local_memory_enabled or self.config.local_memory_dim is None:
                 raise ValueError("local_history_enabled requires local_memory_enabled and local_memory_dim.")
             if self.config.local_history_state_enabled:
                 raise ValueError("R08 state runtime remains disabled until train-split statistics are available.")
-            self.local_history_runtime = LocalHistoryRuntime(
-                LocalEvidenceEncoder(evidence_dim=self.config.local_history_evidence_dim),
-                StatelessLocalReplayReadout(
-                    evidence_dim=self.config.local_history_evidence_dim,
-                    local_dim=self.config.local_memory_dim,
-                ),
-            ).to(device=DEVICE)
 
         # 0. Set up precision
         self.set_precision()
@@ -306,6 +298,14 @@ class OmniMoTModel(ImaginaireModel):
                 language_model=language_model,
                 config=network_config,
             )
+            if self.config.local_history_enabled:
+                net.local_history_runtime = LocalHistoryRuntime(
+                    LocalEvidenceEncoder(evidence_dim=self.config.local_history_evidence_dim),
+                    StatelessLocalReplayReadout(
+                        evidence_dim=self.config.local_history_evidence_dim,
+                        local_dim=self.config.local_memory_dim,
+                    ),
+                )
             net.pad_for_cuda_graphs = self.config.compile.use_cuda_graphs
 
             # Inject LoRA BEFORE FSDP wrap, while still on meta device. The
@@ -939,7 +939,8 @@ class OmniMoTModel(ImaginaireModel):
 
     def _inject_local_history(self, data_batch: dict[str, Any], sequence_plans: list[SequencePlan]) -> None:
         """Convert dataset history fields into optional clean Local payloads."""
-        if self.local_history_runtime is None:
+        local_history_runtime = getattr(self.net, "local_history_runtime", None)
+        if local_history_runtime is None:
             return
         required = (
             "history_visual_summary",
@@ -966,7 +967,7 @@ class OmniMoTModel(ImaginaireModel):
             return value.to(device=DEVICE)
 
         history_mask = _stack("history_mask").bool()
-        tokens, present, _ = self.local_history_runtime(
+        tokens, present, _ = local_history_runtime(
             history_visual_summary=_stack("history_visual_summary"),
             local_history_action=_stack("local_history_action"),
             history_age_steps=_stack("history_age_steps"),
