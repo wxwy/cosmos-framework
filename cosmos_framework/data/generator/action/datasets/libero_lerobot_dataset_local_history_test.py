@@ -64,6 +64,13 @@ def test_local_history_padding_alignment_and_normalization(dataset: LIBEROLeRobo
     assert full["history_frame_indices"].tolist() == list(range(16))
     assert full["history_age_steps"].tolist() == list(range(16, 0, -1))
     source_rows = full["history_global_row_indices"].numpy()
+    anchor_row = int(source_rows[-1]) + 1
+    current_target_rows = set(range(anchor_row, anchor_row + dataset._chunk_length))
+    assert int(source_rows.max()) == anchor_row - 1
+    assert set(source_rows).isdisjoint(current_target_rows)
+    assert (dataset._row_episode[source_rows] == dataset._row_episode[anchor_row]).all()
+    expected_dt = torch.from_numpy(dataset._row_timestamp[anchor_row] - dataset._row_timestamp[source_rows]).float()
+    torch.testing.assert_close(full["history_dt_s"].squeeze(-1), expected_dt)
     expected_raw = dataset._build_frame_wise_action(dataset._row_action[source_rows])
     expected_normalized = normalize_action(expected_raw, dataset.action_normalization, dataset._load_norm_stats())
     torch.testing.assert_close(full["local_history_action_raw"], expected_raw)
@@ -80,6 +87,19 @@ def test_local_history_padding_alignment_and_normalization(dataset: LIBEROLeRobo
     torch.testing.assert_close(full["history_visual_summary"], expected_visual)
     assert int(full["history_global_row_indices"][-1]) + 1 == int(dataset._ep_starts[0]) + 16
     assert int(full["history_frame_indices"][-1]) == 15
+
+    partial_padding = ~partial["history_mask"]
+    assert torch.equal(partial["history_frame_indices"][partial_padding], torch.full((13,), -1, dtype=torch.long))
+    assert torch.equal(partial["history_global_row_indices"][partial_padding], torch.full((13,), -1, dtype=torch.long))
+    for key in (
+        "history_visual_summary",
+        "history_state_raw",
+        "local_history_action_raw",
+        "local_history_action",
+        "history_age_steps",
+        "history_dt_s",
+    ):
+        assert torch.count_nonzero(partial[key][partial_padding]) == 0, key
 
 
 @pytest.mark.L0
