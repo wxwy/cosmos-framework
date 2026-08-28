@@ -23,6 +23,9 @@ def test_probe_records_optimizer_gradients_and_updates(monkeypatch, tmp_path) ->
     optimizer.step()
     callback.on_training_step_end(model, {}, {}, loss, iteration=1)
     payload = json.loads(output.read_text())
-    assert all(payload["optimizer_membership"].values())
-    assert all(summary["present"] and summary["finite"] for summary in payload["gradients"].values())
-    assert any(summary["max_abs"] > 0 for summary in payload["updates"].values())
+    assert payload["schema_version"] == "r08_gate_a_probe_v2"
+    assert len(payload["steps"]) == 1
+    step = payload["steps"][0]
+    assert all(step["optimizer_membership"].values())
+    assert all(summary["present"] and summary["finite"] for summary in step["gradients"].values())
+    assert any(summary["max_abs"] > 0 for summary in step["updates"].values())

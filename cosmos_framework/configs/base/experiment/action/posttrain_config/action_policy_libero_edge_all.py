@@ -226,6 +226,12 @@ if _r08_probe_output:
         output_path=_r08_probe_output,
     )
 
+_r08_device_monitor_every_n = os.environ.get("PSM_R08_GATE_A_DEVICE_MONITOR_EVERY_N")
+if _r08_device_monitor_every_n:
+    action_policy_libero_edge_all["trainer"]["callbacks"]["device_monitor"]["every_n"] = int(
+        _r08_device_monitor_every_n
+    )
+
 _r07_parity_output = os.environ.get("PSM_R07_PARITY_OUTPUT")
 if _r07_parity_output:
     action_policy_libero_edge_all["trainer"]["callbacks"]["r07_parity_capture"] = L(R07ParityCaptureCallback)(
