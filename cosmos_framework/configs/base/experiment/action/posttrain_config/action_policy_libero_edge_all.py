@@ -52,11 +52,15 @@ def _action_policy_libero_edge_model_config() -> dict:
     cfg["tokenizer"]["encode_exact_durations"] = LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS
     cfg["tokenizer"]["encode_chunk_frames"] = LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES
     local_dummy_enabled = os.environ.get("PSM_LOCAL_DUMMY_ENABLED", "0") == "1"
+    local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
+    if local_dummy_enabled and local_history_enabled:
+        raise ValueError("PSM_LOCAL_DUMMY_ENABLED and PSM_R08_LOCAL_HISTORY_ENABLED are mutually exclusive")
     local_dummy_mode = os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal")
     if local_dummy_mode not in {"normal", "zero", "shuffle"}:
         raise ValueError(f"unsupported PSM_LOCAL_DUMMY_MODE: {local_dummy_mode}")
-    cfg["local_memory_enabled"] = local_dummy_enabled
-    cfg["local_memory_dim"] = int(os.environ.get("PSM_LOCAL_DUMMY_DIM", "32")) if local_dummy_enabled else None
+    cfg["local_memory_enabled"] = local_dummy_enabled or local_history_enabled
+    cfg["local_history_enabled"] = local_history_enabled
+    cfg["local_memory_dim"] = int(os.environ.get("PSM_LOCAL_DUMMY_DIM", "32")) if cfg["local_memory_enabled"] else None
     cfg["vlm_config"]["tokenizer"].update(
         repository=None,
         revision=None,
@@ -117,6 +121,9 @@ def _action_policy_libero_edge_dataloader():
             local_dummy_tokens=int(os.environ.get("PSM_LOCAL_DUMMY_TOKENS", "1")),
             local_dummy_dim="${model.config.local_memory_dim}",
             local_dummy_mode=os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal"),
+            local_history_horizon=int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", "16"))
+            if local_history_enabled
+            else 0,
             **cache_kwargs,
         )
 

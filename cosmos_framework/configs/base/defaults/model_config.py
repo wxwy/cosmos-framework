@@ -300,6 +300,12 @@ class OmniMoTModelConfig:
     local_memory_enabled: bool = False
     local_memory_dim: int | None = None
 
+    # R08 causal history runtime. Disabled by default; when enabled, the
+    # dataset-provided history evidence is reduced to one clean Local token.
+    local_history_enabled: bool = False
+    local_history_evidence_dim: int = 256
+    local_history_state_enabled: bool = False
+
     # When False, removes bias from vae2llm, sound2llm, and the two Linear layers inside
     # time_embedder.  These biases seem to inject token-constant DC offsets that dominate
     # the MoE router input and create prompt invariant routing.  This is observed empirically

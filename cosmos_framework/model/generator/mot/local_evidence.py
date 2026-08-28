@@ -40,6 +40,7 @@ class LocalEvidenceEncoder(nn.Module):
         self.age_embedding = nn.Embedding(max_age_steps + 1, evidence_dim)
         self.dt_proj = nn.Linear(1, evidence_dim)
         self.norm = nn.LayerNorm(evidence_dim)
+        self.evidence_dim = evidence_dim
         self.max_age_steps = max_age_steps
         self.state_proj: nn.Linear | None = None
         if state_mean is not None and state_std is not None:
@@ -150,3 +151,43 @@ class StatelessLocalReplayReadout(nn.Module):
         mean, latest, has_valid = self.summarize(evidence_history, history_mask)
         token = self.mlp(torch.cat([mean, latest], dim=-1)).unsqueeze(1)
         return token * has_valid.to(dtype=token.dtype).view(-1, 1, 1)
+
+
+class LocalHistoryRuntime(nn.Module):
+    """Encode a batched causal history and gate absent samples out of Local."""
+
+    def __init__(self, encoder: LocalEvidenceEncoder, readout: StatelessLocalReplayReadout) -> None:
+        super().__init__()
+        if encoder.evidence_dim != readout.evidence_dim:
+            raise ValueError("Local history encoder/readout evidence dimensions must match.")
+        self.encoder = encoder
+        self.readout = readout
+
+    def forward(
+        self,
+        *,
+        history_visual_summary: torch.Tensor,
+        local_history_action: torch.Tensor,
+        history_age_steps: torch.Tensor,
+        history_dt_s: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(tokens [B,1,D], present [B], evidence [B,H,D])``.
+
+        A sample with no valid history is marked absent; callers must not pack its
+        zero readout token because downstream R07 projections may have bias.
+        """
+        if not torch.isfinite(history_dt_s).all():
+            raise ValueError("history_dt_s must be finite before Local runtime wiring.")
+        evidence = self.encoder(
+            history_visual_summary=history_visual_summary,
+            local_history_action=local_history_action,
+            history_age_steps=history_age_steps,
+            history_dt_s=history_dt_s,
+            history_mask=history_mask,
+            history_state=history_state,
+        )
+        tokens = self.readout(evidence, history_mask)
+        present = history_mask.bool().any(dim=1)
+        return tokens, present, evidence

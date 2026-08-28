@@ -48,6 +48,11 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
     context_parallel_broadcast_tensor_list,
 )
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
+from cosmos_framework.model.generator.mot.local_evidence import (
+    LocalEvidenceEncoder,
+    LocalHistoryRuntime,
+    StatelessLocalReplayReadout,
+)
 from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
     InferenceTextKVMemoryState,
     UndKVCache,
@@ -111,6 +116,20 @@ class OmniMoTModel(ImaginaireModel):
         self._cp_window_slot: int = 0
         self.config = config
         log.info(f"OmniMoTModel: config {self.config}")
+
+        self.local_history_runtime: LocalHistoryRuntime | None = None
+        if self.config.local_history_enabled:
+            if not self.config.local_memory_enabled or self.config.local_memory_dim is None:
+                raise ValueError("local_history_enabled requires local_memory_enabled and local_memory_dim.")
+            if self.config.local_history_state_enabled:
+                raise ValueError("R08 state runtime remains disabled until train-split statistics are available.")
+            self.local_history_runtime = LocalHistoryRuntime(
+                LocalEvidenceEncoder(evidence_dim=self.config.local_history_evidence_dim),
+                StatelessLocalReplayReadout(
+                    evidence_dim=self.config.local_history_evidence_dim,
+                    local_dim=self.config.local_memory_dim,
+                ),
+            ).to(device=DEVICE)
 
         # 0. Set up precision
         self.set_precision()
@@ -890,6 +909,7 @@ class OmniMoTModel(ImaginaireModel):
             input_video_key=self.input_video_key,
             input_image_key=self.input_image_key,
         )
+        self._inject_local_history(data_batch, sequence_plans)
         per_camera_vae_encoding = "enable_per_camera_vae_encoding" in data_batch
         gen_data_clean = self.get_data_and_condition(
             data_batch,
@@ -916,6 +936,44 @@ class OmniMoTModel(ImaginaireModel):
             # Training needs only the encoded latents after memory initialization.
             gen_data_clean.raw_state_vision = None
         return input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes
+
+    def _inject_local_history(self, data_batch: dict[str, Any], sequence_plans: list[SequencePlan]) -> None:
+        """Convert dataset history fields into optional clean Local payloads."""
+        if self.local_history_runtime is None:
+            return
+        required = (
+            "history_visual_summary",
+            "local_history_action",
+            "history_age_steps",
+            "history_dt_s",
+            "history_mask",
+        )
+        if not all(key in data_batch for key in required):
+            raise ValueError("local_history_enabled requires the complete causal history field set.")
+
+        def _stack(name: str) -> torch.Tensor:
+            value = data_batch[name]
+            if isinstance(value, list):
+                value = [item[0] if isinstance(item, list) else item for item in value]
+                value = torch.stack(value)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{name} must be a tensor or list of tensors.")
+            return value.to(device=DEVICE)
+
+        history_mask = _stack("history_mask").bool()
+        tokens, present, _ = self.local_history_runtime(
+            history_visual_summary=_stack("history_visual_summary"),
+            local_history_action=_stack("local_history_action"),
+            history_age_steps=_stack("history_age_steps"),
+            history_dt_s=_stack("history_dt_s"),
+            history_mask=history_mask,
+            history_state=_stack("history_state_raw") if self.config.local_history_state_enabled else None,
+        )
+        if len(sequence_plans) != tokens.shape[0]:
+            raise ValueError("Causal history batch size does not match sequence plans.")
+        data_batch["local_memory"] = [tokens[i, 0] if bool(present[i]) else None for i in range(tokens.shape[0])]
+        for plan, has_local in zip(sequence_plans, present.tolist(), strict=True):
+            plan.has_local_memory = bool(has_local)
 
     @staticmethod
     def _get_vae_pixel_shapes(
