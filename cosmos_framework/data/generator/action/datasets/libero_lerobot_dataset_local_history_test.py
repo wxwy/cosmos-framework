@@ -69,6 +69,15 @@ def test_local_history_padding_alignment_and_normalization(dataset: LIBEROLeRobo
     torch.testing.assert_close(full["local_history_action_raw"], expected_raw)
     torch.testing.assert_close(full["local_history_action"], expected_normalized)
     torch.testing.assert_close(full["history_state_raw"], torch.from_numpy(dataset._row_state[source_rows]).float())
+    expected_visual = torch.stack(
+        [
+            torch.nn.functional.adaptive_avg_pool2d(
+                dataset._load_cached_latent(int(dataset._ep_vals[0]), frame)[0].unsqueeze(0), output_size=(1, 2)
+            ).flatten()
+            for frame in full["history_frame_indices"].tolist()
+        ]
+    )
+    torch.testing.assert_close(full["history_visual_summary"], expected_visual)
     assert int(full["history_global_row_indices"][-1]) + 1 == int(dataset._ep_starts[0]) + 16
     assert int(full["history_frame_indices"][-1]) == 15
 
@@ -85,6 +94,17 @@ def test_local_history_h1_is_immediately_prior_frame() -> None:
     assert item["history_mask"].tolist() == [True]
     assert item["history_frame_indices"].tolist() == [2]
     assert item["history_age_steps"].tolist() == [1]
+
+
+@pytest.mark.L0
+def test_local_history_default_off_has_no_evidence_fields() -> None:
+    dataset = LIBEROLeRobotDataset(
+        root=_required_path("PSM_R08_LIBERO_ROOT"),
+        latent_cache_root=_required_path("PSM_R08_LATENT_CACHE_ROOT"),
+        split="full",
+    )
+    item = dataset._build_item(0)
+    assert not any(key.startswith("local_history_") or key.startswith("history_") for key in item)
 
 
 @pytest.mark.L0
