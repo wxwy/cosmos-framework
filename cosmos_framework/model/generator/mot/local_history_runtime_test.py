@@ -61,6 +61,23 @@ def test_runtime_rejects_nonfinite_dt() -> None:
         _runtime()(**inputs)
 
 
+def test_runtime_meta_to_empty_reset_is_finite_and_deterministic() -> None:
+    def _materialize() -> list[torch.Tensor]:
+        with torch.device("meta"):
+            runtime = _runtime()
+        runtime.to_empty(device="cpu")
+        runtime.reset_parameters()
+        values = [param.detach().clone() for param in runtime.parameters()]
+        assert all(torch.isfinite(value).all() for value in values)
+        return values
+
+    torch.manual_seed(7)
+    first = _materialize()
+    torch.manual_seed(7)
+    second = _materialize()
+    assert all(torch.equal(left, right) for left, right in zip(first, second, strict=True))
+
+
 def test_model_injection_h0_without_history_fields_is_absent() -> None:
     model = object.__new__(OmniMoTModel)
     torch.nn.Module.__init__(model)

@@ -289,6 +289,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
                 torch.nn.init.zeros_(self.local_memory2llm.bias)
             torch.nn.init.zeros_(self.local_memory_modality_embed)
 
+        if hasattr(self, "local_history_runtime"):
+            self.local_history_runtime.reset_parameters()
+
         self.language_model.init_weights(buffer_device=buffer_device)
 
     def generate_reasoner_text(

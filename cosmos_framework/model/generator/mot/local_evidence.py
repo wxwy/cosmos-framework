@@ -163,6 +163,12 @@ class LocalHistoryRuntime(nn.Module):
         self.encoder = encoder
         self.readout = readout
 
+    def reset_parameters(self) -> None:
+        """Initialize R08 parameters after meta-device materialization."""
+        for module in self.modules():
+            if module is not self and hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+
     def forward(
         self,
         *,
