@@ -245,6 +245,7 @@ def get_action_libero_sft_dataset(
     local_dummy_tokens: int = 1,
     local_dummy_dim: int = 32,
     local_dummy_mode: str = "normal",
+    local_history_horizon: int = 0,
 ) -> Dataset:
     """Build the LIBERO action-policy SFT dataset (GA reproduction defaults).
 
@@ -275,6 +276,7 @@ def get_action_libero_sft_dataset(
         latent_cache_root=latent_cache_root,
         latent_cache_verify_ratio=latent_cache_verify_ratio,
         max_episodes=max_episodes,
+        local_history_horizon=local_history_horizon,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,

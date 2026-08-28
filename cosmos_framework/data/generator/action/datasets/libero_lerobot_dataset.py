@@ -34,6 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from cosmos_framework.data.generator.action.utils.action_spec import ActionSpec, Gripper, Pos, Rot, build_action_spec
+from cosmos_framework.data.generator.action.action_normalization import normalize_action
 from cosmos_framework.data.generator.action.datasets.base_dataset import ActionBaseDataset
 from cosmos_framework.data.generator.action.libero_pose_utils import libero_action_dim, libero_rotation_format
 from cosmos_framework.data.generator.action.utils.pose_utils import convert_rotation
@@ -91,6 +92,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         latent_cache_root: str | None = None,
         latent_cache_verify_ratio: float = 0.0,
         max_episodes: int | None = None,
+        local_history_horizon: int = 0,
     ) -> None:
         if action_space != "frame_wise_relative":
             raise NotImplementedError(
@@ -144,6 +146,11 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         if max_episodes is not None and max_episodes <= 0:
             raise ValueError(f"max_episodes must be a positive integer, got {max_episodes}")
         self._max_episodes = max_episodes
+        self._local_history_horizon = int(local_history_horizon)
+        if self._local_history_horizon < 0:
+            raise ValueError(f"local_history_horizon must be non-negative, got {local_history_horizon}")
+        if self._local_history_horizon > 0 and self._latent_cache_root is None:
+            raise ValueError("local_history_horizon requires latent_cache_root for causal z0 visual summaries")
         # quantile_rot normalizes against the raw (un-orthonormalized) rotation stats
         # under "global_raw"; everything else uses "global".
         self._stats_key = "global_raw" if action_normalization == "quantile_rot" else "global"
@@ -159,14 +166,19 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         # Compact, lazy frame index (mirrors DROIDLeRobotDataset): read only the
         # columns the sample builder needs into contiguous arrays, ordered by global
         # frame index, so DataLoader worker forks share them copy-on-write.
-        index_parts, episode_parts, task_parts, ts_parts, action_parts = [], [], [], [], []
+        index_parts, episode_parts, task_parts, ts_parts, action_parts, state_parts = [], [], [], [], [], []
+        parquet_columns = ["index", "episode_index", "task_index", "timestamp", _ACTION_FEATURE]
+        if self._local_history_horizon > 0:
+            parquet_columns.append("observation.state")
         for path in sorted((self._root / "data").glob("chunk-*/file-*.parquet")):
-            table = pq.read_table(path, columns=["index", "episode_index", "task_index", "timestamp", _ACTION_FEATURE])
+            table = pq.read_table(path, columns=parquet_columns)
             index_parts.append(table["index"].to_numpy())
             episode_parts.append(table["episode_index"].to_numpy())
             task_parts.append(table["task_index"].to_numpy())
             ts_parts.append(table["timestamp"].to_numpy())
             action_parts.append(np.asarray(table[_ACTION_FEATURE].to_pylist(), dtype=np.float32))
+            if self._local_history_horizon > 0:
+                state_parts.append(np.asarray(table["observation.state"].to_pylist(), dtype=np.float32))
         if not index_parts:
             raise FileNotFoundError(f"No data parquet found under {self._root / 'data'}.")
         order = np.argsort(np.concatenate(index_parts).astype(np.int64), kind="stable")
@@ -174,6 +186,13 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         self._row_task = np.concatenate(task_parts).astype(np.int64)[order]
         self._row_timestamp = np.concatenate(ts_parts).astype(np.float64)[order]
         self._row_action = np.concatenate(action_parts, axis=0).astype(np.float32)[order]
+        self._row_state = (
+            np.concatenate(state_parts, axis=0).astype(np.float32)[order] if self._local_history_horizon > 0 else None
+        )
+        if self._row_state is not None and self._row_state.shape[1:] != (8,):
+            raise ValueError(f"Expected observation.state shape [8], got {self._row_state.shape[1:]}")
+        if self._row_state is not None and not np.isfinite(self._row_state).all():
+            raise FloatingPointError("LIBERO observation.state contains NaN/Inf")
 
         assert np.all(np.diff(self._row_episode) >= 0), "episode_index not contiguous after sorting by frame index"
         ep_vals, ep_starts, ep_counts = np.unique(self._row_episode, return_index=True, return_counts=True)
@@ -429,11 +448,82 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         }
         if video_latent is not None:
             extras["video_latent"] = video_latent
+        extras.update(
+            self._build_local_history(
+                start=start,
+                local_start_frame=local_start_frame,
+                episode_index=episode_index,
+            )
+        )
         if self._camera_mode == "concat_view":
             extras["additional_view_description"] = (
                 "The left half shows the third-person view; the right half shows the wrist-mounted camera."
             )
         return self._build_result(mode=mode, video=video, action=action, ai_caption=ai_caption, **extras)
+
+    def _build_local_history(self, *, start: int, local_start_frame: int, episode_index: int) -> dict[str, torch.Tensor]:
+        """Build fixed-width, left-padded evidence strictly from same-episode rows ``j < t``."""
+        horizon = self._local_history_horizon
+        if horizon == 0:
+            return {}
+        available = min(horizon, local_start_frame)
+        pad = horizon - available
+        source_rows = np.arange(start - available, start, dtype=np.int64)
+        source_frames = np.arange(local_start_frame - available, local_start_frame, dtype=np.int64)
+        mask = torch.zeros(horizon, dtype=torch.bool)
+        frame_indices = torch.full((horizon,), -1, dtype=torch.long)
+        global_row_indices = torch.full((horizon,), -1, dtype=torch.long)
+        age_steps = torch.zeros(horizon, dtype=torch.long)
+        dt_s = torch.zeros((horizon, 1), dtype=torch.float32)
+        action_raw = torch.zeros((horizon, self.action_dim), dtype=torch.float32)
+        action = torch.zeros_like(action_raw)
+        state_raw = torch.zeros((horizon, 8), dtype=torch.float32)
+        visual_summary = torch.zeros((horizon, 96), dtype=torch.float32)
+        if available == 0:
+            return {
+                "history_frame_indices": frame_indices,
+                "history_global_row_indices": global_row_indices,
+                "history_mask": mask,
+                "history_visual_summary": visual_summary,
+                "history_state_raw": state_raw,
+                "history_action_raw": action_raw,
+                "history_action": action,
+                "history_age_steps": age_steps,
+                "history_dt_s": dt_s,
+            }
+
+        raw_action = self._build_frame_wise_action(self._row_action[source_rows])
+        normalized_action = (
+            raw_action
+            if self.action_normalization is None
+            else normalize_action(raw_action, self.action_normalization, self._load_norm_stats())
+        )
+        if self._row_state is None:
+            raise AssertionError("history state rows were not loaded")
+        for offset, source_frame in enumerate(source_frames, start=pad):
+            latent = self._load_cached_latent(episode_index, int(source_frame))
+            if latent is None:
+                raise AssertionError("local history visual summary requires exact-window latent cache")
+            visual_summary[offset] = F.adaptive_avg_pool2d(latent[0].unsqueeze(0), output_size=(1, 2)).flatten()
+        mask[pad:] = True
+        frame_indices[pad:] = torch.from_numpy(source_frames)
+        global_row_indices[pad:] = torch.from_numpy(source_rows)
+        age_steps[pad:] = torch.arange(available, 0, -1, dtype=torch.long)
+        dt_s[pad:, 0] = torch.from_numpy(self._row_timestamp[start] - self._row_timestamp[source_rows]).float()
+        action_raw[pad:] = raw_action
+        action[pad:] = normalized_action
+        state_raw[pad:] = torch.from_numpy(self._row_state[source_rows]).float()
+        return {
+            "history_frame_indices": frame_indices,
+            "history_global_row_indices": global_row_indices,
+            "history_mask": mask,
+            "history_visual_summary": visual_summary,
+            "history_state_raw": state_raw,
+            "history_action_raw": action_raw,
+            "history_action": action,
+            "history_age_steps": age_steps,
+            "history_dt_s": dt_s,
+        }
 
     def _build_frame_wise_action(self, raw: np.ndarray) -> torch.Tensor:
         raw_t = torch.from_numpy(np.ascontiguousarray(raw)).float()  # [chunk, 7]
