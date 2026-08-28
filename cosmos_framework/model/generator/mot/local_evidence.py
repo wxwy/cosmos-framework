@@ -84,8 +84,8 @@ class LocalEvidenceEncoder(nn.Module):
         if not torch.isfinite(history_visual_summary).all() or not torch.isfinite(local_history_action).all():
             raise ValueError("Local evidence inputs must be finite.")
 
-        encoded = self.visual_proj(history_visual_summary)
-        encoded = encoded + self.action_proj(local_history_action)
+        encoded = self.visual_proj(history_visual_summary.to(dtype=self.visual_proj.weight.dtype))
+        encoded = encoded + self.action_proj(local_history_action.to(dtype=self.action_proj.weight.dtype))
         encoded = encoded + self.age_embedding(history_age_steps.long().clamp(0, self.max_age_steps))
         encoded = encoded + self.dt_proj(history_dt_s.to(dtype=encoded.dtype))
 

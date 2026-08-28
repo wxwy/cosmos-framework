@@ -61,6 +61,14 @@ def test_runtime_rejects_nonfinite_dt() -> None:
         _runtime()(**inputs)
 
 
+def test_runtime_accepts_float_history_with_bfloat16_parameters() -> None:
+    runtime = _runtime().to(dtype=torch.bfloat16)
+    tokens, present, evidence = runtime(**_inputs())
+    assert tokens.dtype is torch.bfloat16
+    assert evidence.dtype is torch.bfloat16
+    assert present.any()
+
+
 def test_runtime_meta_to_empty_reset_is_finite_and_deterministic() -> None:
     def _materialize() -> list[torch.Tensor]:
         with torch.device("meta"):
