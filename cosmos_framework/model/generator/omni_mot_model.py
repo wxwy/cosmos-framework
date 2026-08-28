@@ -948,6 +948,11 @@ class OmniMoTModel(ImaginaireModel):
             "history_dt_s",
             "history_mask",
         )
+        if self.config.local_history_horizon == 0 and not any(key in data_batch for key in required):
+            data_batch["local_memory"] = [None] * len(sequence_plans)
+            for plan in sequence_plans:
+                plan.has_local_memory = False
+            return
         if not all(key in data_batch for key in required):
             raise ValueError("local_history_enabled requires the complete causal history field set.")
 
