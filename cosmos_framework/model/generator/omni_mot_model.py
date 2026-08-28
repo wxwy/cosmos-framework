@@ -976,7 +976,7 @@ class OmniMoTModel(ImaginaireModel):
         )
         if len(sequence_plans) != tokens.shape[0]:
             raise ValueError("Causal history batch size does not match sequence plans.")
-        data_batch["local_memory"] = [tokens[i, 0] if bool(present[i]) else None for i in range(tokens.shape[0])]
+        data_batch["local_memory"] = [tokens[i] if bool(present[i]) else None for i in range(tokens.shape[0])]
         for plan, has_local in zip(sequence_plans, present.tolist(), strict=True):
             plan.has_local_memory = bool(has_local)
 

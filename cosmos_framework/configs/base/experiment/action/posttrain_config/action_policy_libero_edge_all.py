@@ -85,6 +85,8 @@ def _action_policy_libero_edge_dataloader():
     workers shard episodes disjointly within the suite.
     """
 
+    local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
+
     def _suite_dataset(_suite):
         latent_cache_root = os.environ.get("LIBERO_LATENT_CACHE_ROOT")
         cache_kwargs = (
@@ -124,7 +126,7 @@ def _action_policy_libero_edge_dataloader():
             local_dummy_tokens=int(os.environ.get("PSM_LOCAL_DUMMY_TOKENS", "1")),
             local_dummy_dim="${model.config.local_memory_dim}",
             local_dummy_mode=os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal"),
-            local_history_horizon=cfg["local_history_horizon"]
+            local_history_horizon=int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", "16"))
             if local_history_enabled
             else 0,
             **cache_kwargs,
@@ -178,6 +180,8 @@ if action_policy_libero_edge_all["model"]["config"]["local_memory_enabled"]:
         "local_memory2llm",
         "local_memory_modality_embed",
     ]
+if action_policy_libero_edge_all["model"]["config"]["local_history_enabled"]:
+    action_policy_libero_edge_all["optimizer"]["keys_to_select"].append("local_history_runtime")
 
 # 单卡多 suite：替换 RankPartitionedDataLoader（world_size>=4 断言不满足）为
 # IterativeJointDataLoader 轮询等权混合（每 grad-accum 窗口 16 批 = 4 套 × 4 次）。
