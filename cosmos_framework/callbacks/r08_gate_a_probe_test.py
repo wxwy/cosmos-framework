@@ -19,7 +19,7 @@ def test_probe_records_optimizer_gradients_and_updates(monkeypatch, tmp_path) ->
     optimizer = torch.optim.SGD(model.net.parameters(), lr=0.1)
     loss = sum(value.square().sum() for value in model.net.parameters())
     loss.backward()
-    callback.on_before_optimizer_step(model, optimizer, None, None, iteration=0)
+    callback.on_before_optimizer_step(model, type("Container", (), {"optimizers": [optimizer]})(), None, None, iteration=0)
     optimizer.step()
     callback.on_training_step_end(model, {}, {}, loss, iteration=1)
     payload = json.loads(output.read_text())

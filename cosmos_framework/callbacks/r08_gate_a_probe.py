@@ -44,7 +44,8 @@ class R08GateAProbeCallback(Callback):
     def on_before_optimizer_step(self, model, optimizer, scheduler, grad_scaler, iteration: int = 0) -> None:
         if iteration != 0 or not distributed.is_rank0():
             return
-        params = {id(param) for group in optimizer.param_groups for param in group["params"]}
+        optimizers = getattr(optimizer, "optimizers", [optimizer])
+        params = {id(param) for inner in optimizers for group in inner.param_groups for param in group["params"]}
         self.optimizer_membership = {name: id(value) in params for name, value in self._targets(model).items()}
 
     def on_training_step_end(self, model, data_batch, output_batch, loss, iteration: int = 0) -> None:
