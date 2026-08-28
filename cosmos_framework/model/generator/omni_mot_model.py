@@ -300,7 +300,7 @@ class OmniMoTModel(ImaginaireModel):
             )
             if self.config.local_history_enabled:
                 net.local_history_runtime = LocalHistoryRuntime(
-                    LocalEvidenceEncoder(evidence_dim=self.config.local_history_evidence_dim),
+                    LocalEvidenceEncoder(evidence_dim=self.config.local_history_evidence_dim, visual_dim=96),
                     StatelessLocalReplayReadout(
                         evidence_dim=self.config.local_history_evidence_dim,
                         local_dim=self.config.local_memory_dim,
@@ -961,7 +961,9 @@ class OmniMoTModel(ImaginaireModel):
             value = data_batch[name]
             if isinstance(value, list):
                 value = [item[0] if isinstance(item, list) else item for item in value]
-                value = torch.stack(value)
+                if not all(isinstance(item, torch.Tensor) for item in value):
+                    raise TypeError(f"{name} list entries must be tensors.")
+                value = torch.cat(value, dim=0)
             if not isinstance(value, torch.Tensor):
                 raise TypeError(f"{name} must be a tensor or list of tensors.")
             return value.to(device=DEVICE)

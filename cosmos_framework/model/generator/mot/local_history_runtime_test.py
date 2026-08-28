@@ -107,6 +107,20 @@ def test_model_injection_preserves_one_local_token_dimension(monkeypatch: pytest
     assert [plan.has_local_memory for plan in plans] == [True, False]
 
 
+def test_model_injection_concatenates_joint_dataloader_history_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(omni_mot_model, "DEVICE", torch.device("cpu"))
+    model = object.__new__(OmniMoTModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(local_history_horizon=2, local_history_state_enabled=False)
+    model.net = nn.Module()
+    model.net.local_history_runtime = _runtime()
+    inputs = _inputs(batch=2, horizon=2)
+    data_batch = {name: [value[index : index + 1] for index in range(2)] for name, value in inputs.items()}
+    plans = [SequencePlan(has_text=True), SequencePlan(has_text=True)]
+    model._inject_local_history(data_batch, plans)
+    assert [payload.shape if payload is not None else None for payload in data_batch["local_memory"]] == [(1, 5), None]
+
+
 def test_edge_config_history_and_dummy_are_mutually_exclusive(monkeypatch: pytest.MonkeyPatch) -> None:
     from cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_edge_all import (
         _action_policy_libero_edge_model_config,
