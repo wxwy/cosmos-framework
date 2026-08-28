@@ -129,6 +129,33 @@ def test_model_injection_concatenates_joint_dataloader_history_batches(monkeypat
     assert [payload.shape if payload is not None else None for payload in data_batch["local_memory"]] == [(1, 5), None]
 
 
+@pytest.mark.parametrize("mode", ("zero", "shuffle"))
+def test_model_injection_applies_gate_b_history_intervention(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    monkeypatch.setattr(omni_mot_model, "DEVICE", torch.device("cpu"))
+    monkeypatch.setenv("PSM_R08_HISTORY_MODE", mode)
+
+    class CaptureRuntime(nn.Module):
+        def forward(self, **kwargs):
+            self.inputs = kwargs
+            batch = kwargs["history_mask"].shape[0]
+            return torch.zeros(batch, 1, 5), torch.ones(batch, dtype=torch.bool), torch.empty(0)
+
+    model = object.__new__(OmniMoTModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(local_history_horizon=2, local_history_state_enabled=False)
+    model.net = nn.Module()
+    model.net.local_history_runtime = CaptureRuntime()
+    inputs = _inputs(batch=2, horizon=2)
+    original = inputs["local_history_action"].clone()
+    plans = [SequencePlan(has_text=True), SequencePlan(has_text=True)]
+    model._inject_local_history(inputs, plans)
+    captured = model.net.local_history_runtime.inputs["local_history_action"]
+    if mode == "zero":
+        assert torch.equal(captured, torch.zeros_like(original))
+    else:
+        torch.testing.assert_close(captured, original.roll(shifts=1, dims=0))
+
+
 def test_edge_config_history_and_dummy_are_mutually_exclusive(monkeypatch: pytest.MonkeyPatch) -> None:
     from cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_edge_all import (
         _action_policy_libero_edge_model_config,

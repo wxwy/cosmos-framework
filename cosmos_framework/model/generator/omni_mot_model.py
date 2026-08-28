@@ -969,11 +969,23 @@ class OmniMoTModel(ImaginaireModel):
             return value.to(device=DEVICE)
 
         history_mask = _stack("history_mask").bool()
+        history_mode = os.environ.get("PSM_R08_HISTORY_MODE", "normal")
+        if history_mode not in {"normal", "zero", "shuffle"}:
+            raise ValueError(f"unsupported PSM_R08_HISTORY_MODE: {history_mode}")
+
+        def _history_payload(name: str) -> torch.Tensor:
+            value = _stack(name)
+            if history_mode == "zero":
+                return torch.zeros_like(value)
+            if history_mode == "shuffle" and value.shape[0] > 1:
+                return value.roll(shifts=1, dims=0)
+            return value
+
         tokens, present, _ = local_history_runtime(
-            history_visual_summary=_stack("history_visual_summary"),
-            local_history_action=_stack("local_history_action"),
-            history_age_steps=_stack("history_age_steps"),
-            history_dt_s=_stack("history_dt_s"),
+            history_visual_summary=_history_payload("history_visual_summary"),
+            local_history_action=_history_payload("local_history_action"),
+            history_age_steps=_history_payload("history_age_steps"),
+            history_dt_s=_history_payload("history_dt_s"),
             history_mask=history_mask,
             history_state=_stack("history_state_raw") if self.config.local_history_state_enabled else None,
         )
