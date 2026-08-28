@@ -418,7 +418,7 @@ class ImaginaireTrainer:
                     iteration += 1
                     self.last_optimizer_step_timing = self._optimizer_step_timing.finish(time.monotonic())
                     # Save checkpoint.
-                    if iteration % self.config.checkpoint.save_iter == 0:
+                    if os.environ.get("PSM_R08_GATE_B_CAPTURE_ONLY", "0") != "1" and iteration % self.config.checkpoint.save_iter == 0:
                         self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
                     self.callbacks.on_training_step_end(model, data_batch, output_batch, loss, iteration=iteration)
                     # Validation.
@@ -473,6 +473,7 @@ class ImaginaireTrainer:
             output (dict[str, torch.Tensor]): The model output from the training data batch (dictionary of tensors).
             loss (torch.Tensor): The total loss of the training data batch.
         """
+        capture_only = os.environ.get("PSM_R08_GATE_B_CAPTURE_ONLY", "0") == "1"
         # Only let DDP sync gradient at the last iteration of the gradient accumulation window
         with distributed.ddp_sync_grad(model_ddp, grad_accum_iter == self.config.trainer.grad_accum_iter - 1):
             self.callbacks.on_before_forward(iteration=iteration)
@@ -483,6 +484,8 @@ class ImaginaireTrainer:
                     output_batch, loss = model_ddp.training_step(data, iteration)
             self.callbacks.on_after_forward(iteration=iteration)
             model = model_ddp.module if self.config.trainer.distributed_parallelism == "ddp" else model_ddp
+            if capture_only:
+                return output_batch, loss, 0
             self.callbacks.on_before_backward(model, loss, iteration=iteration)
             with self.training_timer("backward"):
                 with self.straggler_detector.profile_section(
