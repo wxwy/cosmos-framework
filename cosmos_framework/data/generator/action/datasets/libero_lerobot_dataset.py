@@ -486,8 +486,11 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
                 "history_mask": mask,
                 "history_visual_summary": visual_summary,
                 "history_state_raw": state_raw,
-                "history_action_raw": action_raw,
-                "history_action": action,
+                "local_history_action_raw": action_raw,
+                # `history_action` is reserved by ActionTransformPipeline for
+                # native action-prefix conditioning. R08 evidence must not
+                # alter the current action sequence or SequencePlan.
+                "local_history_action": action,
                 "history_age_steps": age_steps,
                 "history_dt_s": dt_s,
             }
@@ -519,8 +522,10 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
             "history_mask": mask,
             "history_visual_summary": visual_summary,
             "history_state_raw": state_raw,
-            "history_action_raw": action_raw,
-            "history_action": action,
+            "local_history_action_raw": action_raw,
+            # Keep the R08 evidence namespace separate from the existing
+            # native `history_action` transform input.
+            "local_history_action": action,
             "history_age_steps": age_steps,
             "history_dt_s": dt_s,
         }
