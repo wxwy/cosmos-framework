@@ -24,6 +24,7 @@ from hydra.core.config_store import ConfigStore
 from cosmos_framework.callbacks.online_vae_probe import OnlineVAEProbeCallback
 from cosmos_framework.callbacks.r07_parity_capture import R07ParityCaptureCallback
 from cosmos_framework.callbacks.r07_runtime_probe import R07RuntimeProbeCallback
+from cosmos_framework.callbacks.r08_gate_a_probe import R08GateAProbeCallback
 from cosmos_framework.callbacks.stdout_loss_logger import StdoutLossLogger
 from cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano import (
     action_policy_libero_all_nano,
@@ -217,6 +218,12 @@ _r07_probe_output = os.environ.get("PSM_R07_RUNTIME_PROBE_OUTPUT")
 if _r07_probe_output:
     action_policy_libero_edge_all["trainer"]["callbacks"]["r07_runtime_probe"] = L(R07RuntimeProbeCallback)(
         output_path=_r07_probe_output,
+    )
+
+_r08_probe_output = os.environ.get("PSM_R08_GATE_A_PROBE_OUTPUT")
+if _r08_probe_output:
+    action_policy_libero_edge_all["trainer"]["callbacks"]["r08_gate_a_probe"] = L(R08GateAProbeCallback)(
+        output_path=_r08_probe_output,
     )
 
 _r07_parity_output = os.environ.get("PSM_R07_PARITY_OUTPUT")
