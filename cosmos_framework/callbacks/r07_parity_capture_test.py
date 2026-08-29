@@ -42,7 +42,7 @@ def test_r07_parity_callback_captures_effective_action_sigma(monkeypatch, tmp_pa
 
     callback.on_training_step_end(
         model=None,
-        data_batch={},
+        data_batch={"history_mask": torch.tensor([[True]])},
         output_batch={
             "flow_matching_loss_vision": torch.tensor(1.0),
             "flow_matching_loss_action": torch.tensor(2.0),
@@ -82,7 +82,7 @@ def test_r07_parity_callback_optionally_writes_sensitivity_tensors(monkeypatch, 
 
     callback.on_training_step_end(
         model=None,
-        data_batch={"local_memory": [tensor]},
+        data_batch={"local_memory": [tensor], "history_mask": torch.tensor([[True]])},
         output_batch={
             "flow_matching_loss_vision": torch.tensor(1.0),
             "flow_matching_loss_action": torch.tensor(2.0),

@@ -48,6 +48,10 @@ class R07ParityCaptureCallback(Callback):
     def _tensor_list_summary(cls, tensors: list[torch.Tensor]) -> list[dict[str, object]]:
         return [cls._tensor_summary(tensor) for tensor in tensors]
 
+    @classmethod
+    def _tensor_or_list_summary(cls, value: torch.Tensor | list[torch.Tensor]) -> dict[str, object] | list[dict[str, object]]:
+        return cls._tensor_list_summary(value) if isinstance(value, list) else cls._tensor_summary(value)
+
     @staticmethod
     def _cpu_tensor_list(tensors: list[torch.Tensor | None]) -> list[torch.Tensor | None]:
         return [tensor.detach().cpu() if tensor is not None else None for tensor in tensors]
@@ -91,6 +95,7 @@ class R07ParityCaptureCallback(Callback):
             "preds_vision": self._tensor_list_summary(output_batch["model_pred"]),
             "preds_action": self._tensor_list_summary(output_batch["r07_parity_preds_action"]),
             "position_ids": self._tensor_summary(output_batch["r07_parity_position_ids"]),
+            "history_mask": self._tensor_or_list_summary(data_batch["history_mask"]),
         }
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = self.output_path.with_suffix(self.output_path.suffix + ".tmp")
