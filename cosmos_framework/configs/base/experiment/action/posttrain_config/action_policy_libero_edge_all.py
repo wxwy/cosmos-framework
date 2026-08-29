@@ -239,6 +239,9 @@ if _r07_parity_output:
         tensor_output_path=os.environ.get("PSM_R07_PARITY_TENSOR_OUTPUT"),
     )
 
+if os.environ.get("PSM_R08_GATE_B_CAPTURE_ONLY", "0") == "1":
+    action_policy_libero_edge_all["trainer"]["callbacks"].pop("termination_signal_checkpoint", None)
+
 # Disabled unless explicitly requested. The probe captures pre-normalization uint8
 # frames and the exact online VAE outputs for offline-cache parity verification.
 _probe_output = os.environ.get("ONLINE_VAE_PROBE_OUTPUT")
