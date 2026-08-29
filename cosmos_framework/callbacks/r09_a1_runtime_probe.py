@@ -49,7 +49,6 @@ class R09A1RuntimeProbeCallback(Callback):
             for parameter in group["params"]
         }
 
-    @torch.no_grad()
     def _state_contract(self, model) -> dict[str, object]:
         backend = model.net.local_history_runtime.recurrent_backend
         if backend is None:
@@ -57,7 +56,7 @@ class R09A1RuntimeProbeCallback(Callback):
         device = backend.cell.weight_ih.device
         dtype = backend.cell.weight_ih.dtype
         evidence = torch.arange(2 * 4 * backend.evidence_dim, device=device, dtype=dtype).view(2, 4, -1)
-        evidence = evidence / max(evidence.numel(), 1)
+        evidence = (evidence / max(evidence.numel(), 1)).requires_grad_()
         mask = torch.tensor([[True, True, True, True], [True, True, False, False]], device=device)
         full_token, full_state, full_present = backend.replay(evidence, mask)
         first_token, first_state, first_present = backend.replay(evidence[:, :2], mask[:, :2])
@@ -77,6 +76,10 @@ class R09A1RuntimeProbeCallback(Callback):
             "segment_token_max_abs_diff": float((full_token - segment_token).abs().max()),
             "segment_state_max_abs_diff": float((full_state[0] - segment_state[0]).abs().max()),
             "segment_present_equal": bool(torch.equal(full_present, segment_present)),
+            "segment_state_before_detach_requires_grad": bool(first_state[0].requires_grad),
+            "segment_state_before_detach_has_grad_fn": first_state[0].grad_fn is not None,
+            "segment_state_after_detach_requires_grad": bool(detached_state[0].requires_grad),
+            "segment_state_after_detach_has_grad_fn": detached_state[0].grad_fn is not None,
             "reset_selected_latent_zero": bool(torch.equal(reset[0][0], torch.zeros_like(reset[0][0]))),
             "reset_selected_initialized_false": not bool(reset[1][0]),
             "reset_unselected_latent_exact": bool(torch.equal(reset[0][1], full_state[0][1])),
@@ -98,20 +101,29 @@ class R09A1RuntimeProbeCallback(Callback):
             return
         targets = self._targets(model)
         optimizer_parameters = self._optimizer_parameters(optimizer)
+        target_parameters = {id(value) for value in targets.values()}
         selected_names = sorted(name for name, value in targets.items() if id(value) in optimizer_parameters)
+        missing_names = sorted(name for name, value in targets.items() if id(value) not in optimizer_parameters)
         unexpected_names = sorted(
             name for name, value in model.net.named_parameters() if id(value) in optimizer_parameters and name not in targets
         )
         gradients = {name: self._summary(value.grad) for name, value in targets.items()}
+        active_groups = {
+            "encoder": "local_history_runtime.encoder.",
+            "recurrent_backend": "local_history_runtime.recurrent_backend.",
+            "local_adapter": "local_memory",
+        }
         self.payload["representative_step"] = {
             "iteration": iteration,
             "optimizer_names": selected_names,
-            "optimizer_matches_targets": selected_names == sorted(targets),
+            "optimizer_matches_targets": optimizer_parameters == target_parameters,
+            "missing_optimizer_names": missing_names,
             "unexpected_optimizer_names": unexpected_names,
             "gradients": gradients,
-            "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-            "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
-            "cuda_device": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+            "active_group_has_nonzero_grad": {
+                group: any(record["max_abs"] not in (None, 0.0) for name, record in gradients.items() if prefix in name)
+                for group, prefix in active_groups.items()
+            },
         }
 
     def on_training_step_end(self, model, data_batch, output_batch, loss, iteration: int = 0) -> None:
@@ -119,5 +131,10 @@ class R09A1RuntimeProbeCallback(Callback):
         if "representative_step" not in self.payload:
             return
         self.payload["last_iteration"] = iteration
+        self.payload["full_run_cuda_peak"] = {
+            "allocated_bytes": torch.cuda.max_memory_allocated(),
+            "reserved_bytes": torch.cuda.max_memory_reserved(),
+            "device": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+        }
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.output_path.write_text(json.dumps(self.payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
