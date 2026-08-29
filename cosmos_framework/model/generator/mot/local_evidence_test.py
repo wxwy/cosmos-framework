@@ -101,6 +101,9 @@ def test_r09_recurrent_backend_presence_partial_reset_and_segments() -> None:
     reset = backend.reset_mask(state, torch.tensor([False, True, False]))
     assert torch.equal(reset[0][[0, 2]], latent[[0, 2]]) and torch.count_nonzero(reset[0][1]) == 0
     assert reset[1].tolist() == [True, False, True]
+    reset_tokens, _, reset_present = backend.replay(evidence[:, :1], torch.zeros(3, 1, dtype=torch.bool), reset)
+    assert reset_present.tolist() == [True, False, True]
+    assert torch.count_nonzero(reset_tokens[1]) == 0
     _, first, _ = backend.replay(evidence[:, :2], mask[:, :2])
     _, second, _ = backend.replay(evidence[:, 2:], mask[:, 2:], (first[0].detach(), first[1]))
     torch.testing.assert_close(second[0], latent, rtol=0, atol=1e-6)
