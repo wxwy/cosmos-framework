@@ -49,8 +49,13 @@ class R07ParityCaptureCallback(Callback):
         return [cls._tensor_summary(tensor) for tensor in tensors]
 
     @classmethod
-    def _tensor_or_list_summary(cls, value: torch.Tensor | list[torch.Tensor]) -> dict[str, object] | list[dict[str, object]]:
-        return cls._tensor_list_summary(value) if isinstance(value, list) else cls._tensor_summary(value)
+    def _tensor_or_list_summary(cls, value: torch.Tensor | list[torch.Tensor | list[torch.Tensor]]) -> dict[str, object] | list[dict[str, object]]:
+        if isinstance(value, torch.Tensor):
+            return cls._tensor_summary(value)
+        tensors = [item[0] if isinstance(item, list) and len(item) == 1 else item for item in value]
+        if not all(isinstance(item, torch.Tensor) for item in tensors):
+            raise TypeError("history_mask list entries must be tensors or singleton tensor lists.")
+        return cls._tensor_list_summary(tensors)
 
     @staticmethod
     def _cpu_tensor_list(tensors: list[torch.Tensor | None]) -> list[torch.Tensor | None]:

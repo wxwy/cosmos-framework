@@ -4,6 +4,7 @@
 import importlib
 import json
 
+import pytest
 import torch
 
 from cosmos_framework.callbacks.r07_parity_capture import R07ParityCaptureCallback
@@ -21,6 +22,15 @@ def test_r07_parity_summary_hashes_bfloat16_bit_patterns() -> None:
     assert summary["sha256"] != R07ParityCaptureCallback._tensor_summary(changed)["sha256"]
     assert summary["mean"] == -0.5
     assert summary["l2_norm"] > 0.0
+
+
+def test_history_mask_summary_accepts_production_batch_shapes() -> None:
+    mask = torch.tensor([[True, False]])
+    assert isinstance(R07ParityCaptureCallback._tensor_or_list_summary(mask), dict)
+    assert isinstance(R07ParityCaptureCallback._tensor_or_list_summary([mask]), list)
+    assert isinstance(R07ParityCaptureCallback._tensor_or_list_summary([[mask]]), list)
+    with pytest.raises(TypeError, match="history_mask"):
+        R07ParityCaptureCallback._tensor_or_list_summary([None])
 
 
 def test_r07_parity_callback_is_not_registered_without_output_env(monkeypatch) -> None:
