@@ -100,7 +100,7 @@ class R07ParityCaptureCallback(Callback):
             "preds_vision": self._tensor_list_summary(output_batch["model_pred"]),
             "preds_action": self._tensor_list_summary(output_batch["r07_parity_preds_action"]),
             "position_ids": self._tensor_summary(output_batch["r07_parity_position_ids"]),
-            "history_mask": self._tensor_or_list_summary(data_batch["history_mask"]),
+            "history_mask": self._tensor_or_list_summary(output_batch["r07_parity_history_mask"]),
         }
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = self.output_path.with_suffix(self.output_path.suffix + ".tmp")
