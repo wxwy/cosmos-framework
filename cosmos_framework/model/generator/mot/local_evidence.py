@@ -182,15 +182,20 @@ class RecurrentLocalMemoryBackend(nn.Module):
             raise ValueError("done must have shape [B].")
         return torch.where(done[:, None], torch.zeros_like(state), state)
 
-    def replay(self, evidence: torch.Tensor, mask: torch.Tensor, state: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def replay(self, evidence: torch.Tensor, mask: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor] | None = None) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         batch, horizon, width = evidence.shape
         if width != self.evidence_dim or tuple(mask.shape) != (batch, horizon):
             raise ValueError("evidence/mask shapes are incompatible.")
-        state = self.initial_state(batch, device=evidence.device, dtype=self.cell.weight_ih.dtype) if state is None else state
-        present = mask.bool().any(dim=1) | state.ne(0).any(dim=1)
+        if state is None:
+            latent = self.initial_state(batch, device=evidence.device, dtype=self.cell.weight_ih.dtype)
+            initialized = torch.zeros(batch, device=evidence.device, dtype=torch.bool)
+        else:
+            latent, initialized = state
+        present = initialized | mask.bool().any(dim=1)
         for index in range(horizon):
-            state, _, _ = self.step(evidence[:, index], state, mask[:, index])
-        return state[:, None] * present[:, None, None], state, present
+            latent, _, _ = self.step(evidence[:, index], latent, mask[:, index])
+        initialized = initialized | mask.bool().any(dim=1)
+        return latent[:, None] * present[:, None, None], (latent, initialized), present
 
 
 class LocalHistoryRuntime(nn.Module):

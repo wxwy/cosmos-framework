@@ -95,15 +95,16 @@ def test_r09_recurrent_backend_presence_partial_reset_and_segments() -> None:
     evidence = torch.randn(3, 4, 3)
     mask = torch.tensor([[True, True, True, True], [False, False, False, False], [True, False, True, False]])
     tokens, state, present = backend.replay(evidence, mask)
+    latent, _ = state
     assert present.tolist() == [True, False, True]
     assert torch.equal(tokens[1], torch.zeros_like(tokens[1]))
-    reset = backend.reset_mask(state, torch.tensor([False, True, False]))
-    assert torch.equal(reset[[0, 2]], state[[0, 2]]) and torch.count_nonzero(reset[1]) == 0
+    reset = backend.reset_mask(latent, torch.tensor([False, True, False]))
+    assert torch.equal(reset[[0, 2]], latent[[0, 2]]) and torch.count_nonzero(reset[1]) == 0
     _, first, _ = backend.replay(evidence[:, :2], mask[:, :2])
-    _, second, _ = backend.replay(evidence[:, 2:], mask[:, 2:], first.detach())
-    torch.testing.assert_close(second, state, rtol=0, atol=1e-6)
+    _, second, _ = backend.replay(evidence[:, 2:], mask[:, 2:], (first[0].detach(), first[1]))
+    torch.testing.assert_close(second[0], latent, rtol=0, atol=1e-6)
     carry_mask = torch.tensor([[True, False], [False, False], [False, False]])
     _, carried, _ = backend.replay(evidence[:, :2], carry_mask)
-    carry_tokens, _, carry_present = backend.replay(evidence[:, 2:], torch.zeros_like(carry_mask), carried.detach())
+    carry_tokens, _, carry_present = backend.replay(evidence[:, 2:], torch.zeros_like(carry_mask), (carried[0].detach(), carried[1]))
     assert carry_present.tolist() == [True, False, False]
-    torch.testing.assert_close(carry_tokens[0], carried[0, None], rtol=0, atol=1e-6)
+    torch.testing.assert_close(carry_tokens[0], carried[0][0, None], rtol=0, atol=1e-6)
