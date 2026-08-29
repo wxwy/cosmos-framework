@@ -15,8 +15,8 @@ class R08GateBProvenanceCallback(Callback):
         super().__init__()
         self.output_path = Path(output_path)
 
-    def on_train_start(self, model) -> None:
-        del model
+    def on_train_start(self, model, **kwargs) -> None:
+        del model, kwargs
         root = Path(__file__).resolve().parents[3]
         submodule = root / "cosmos-framework"
         git = lambda repo, arg: subprocess.check_output(["git", "-C", str(repo), "rev-parse", arg], text=True).strip()

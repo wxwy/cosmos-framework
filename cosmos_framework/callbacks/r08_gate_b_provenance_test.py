@@ -12,7 +12,7 @@ def test_provenance_is_cwd_independent(monkeypatch, tmp_path) -> None:
         "cosmos_framework.callbacks.r08_gate_b_provenance.subprocess.check_output", lambda *args, **kwargs: "abc\n"
     )
     output = tmp_path / "provenance.json"
-    R08GateBProvenanceCallback(str(output)).on_train_start(None)
+    R08GateBProvenanceCallback(str(output)).on_train_start(None, iteration=0)
     payload = json.loads(output.read_text())
     assert payload["root_revision"] == payload["submodule_revision"] == payload["gitlink_revision"] == "abc"
     assert payload["history_mode"] == "normal" and payload["capture_only"] is True
