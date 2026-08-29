@@ -177,10 +177,11 @@ class RecurrentLocalMemoryBackend(nn.Module):
         return state_out, state_out[:, None], valid.bool()
 
     @staticmethod
-    def reset_mask(state: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
-        if tuple(done.shape) != (state.shape[0],):
+    def reset_mask(state: tuple[torch.Tensor, torch.Tensor], done: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        latent, initialized = state
+        if tuple(done.shape) != (latent.shape[0],):
             raise ValueError("done must have shape [B].")
-        return torch.where(done[:, None], torch.zeros_like(state), state)
+        return torch.where(done[:, None], torch.zeros_like(latent), latent), initialized & ~done.bool()
 
     def replay(self, evidence: torch.Tensor, mask: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor] | None = None) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         batch, horizon, width = evidence.shape
