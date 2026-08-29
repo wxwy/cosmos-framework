@@ -45,4 +45,5 @@ def test_probe_records_exact_targets_gradients_and_state_contract(tmp_path) -> N
     assert payload["state_contract"]["segment_token_max_abs_diff"] == 0.0
     assert payload["state_contract"]["segment_state_before_detach_requires_grad"] is True
     assert payload["state_contract"]["segment_state_after_detach_requires_grad"] is False
+    assert payload["state_contract"]["segment_detach_value_exact"] is True
     assert payload["state_contract"]["reset_all_mask_selected_absent"] is True

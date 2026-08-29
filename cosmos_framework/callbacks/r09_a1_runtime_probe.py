@@ -80,6 +80,7 @@ class R09A1RuntimeProbeCallback(Callback):
             "segment_state_before_detach_has_grad_fn": first_state[0].grad_fn is not None,
             "segment_state_after_detach_requires_grad": bool(detached_state[0].requires_grad),
             "segment_state_after_detach_has_grad_fn": detached_state[0].grad_fn is not None,
+            "segment_detach_value_exact": bool(torch.equal(first_state[0], detached_state[0])),
             "reset_selected_latent_zero": bool(torch.equal(reset[0][0], torch.zeros_like(reset[0][0]))),
             "reset_selected_initialized_false": not bool(reset[1][0]),
             "reset_unselected_latent_exact": bool(torch.equal(reset[0][1], full_state[0][1])),
