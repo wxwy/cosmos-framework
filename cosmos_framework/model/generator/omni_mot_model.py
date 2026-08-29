@@ -969,7 +969,7 @@ class OmniMoTModel(ImaginaireModel):
             return value.to(device=DEVICE)
 
         history_mask = _stack("history_mask").bool()
-        data_batch["r07_parity_history_mask"] = history_mask
+        self._r07_parity_history_mask = history_mask
         history_mode = os.environ.get("PSM_R08_HISTORY_MODE", "normal")
         if history_mode not in {"normal", "zero", "shuffle"}:
             raise ValueError(f"unsupported PSM_R08_HISTORY_MODE: {history_mode}")
@@ -1380,7 +1380,7 @@ class OmniMoTModel(ImaginaireModel):
             output_batch["r07_parity_text_indexes"] = packed_sequence.text_indexes
             output_batch["r07_parity_vision_indexes"] = packed_sequence.vision.sequence_indexes
             output_batch["r07_parity_action_indexes"] = packed_sequence.action.sequence_indexes
-            output_batch["r07_parity_history_mask"] = data_batch["r07_parity_history_mask"]
+            output_batch["r07_parity_history_mask"] = self._r07_parity_history_mask
 
         return output_batch, loss
 
