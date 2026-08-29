@@ -202,12 +202,13 @@ class RecurrentLocalMemoryBackend(nn.Module):
 class LocalHistoryRuntime(nn.Module):
     """Encode a batched causal history and gate absent samples out of Local."""
 
-    def __init__(self, encoder: LocalEvidenceEncoder, readout: StatelessLocalReplayReadout) -> None:
+    def __init__(self, encoder: LocalEvidenceEncoder, readout: StatelessLocalReplayReadout, recurrent_backend: RecurrentLocalMemoryBackend | None = None) -> None:
         super().__init__()
         if encoder.evidence_dim != readout.evidence_dim:
             raise ValueError("Local history encoder/readout evidence dimensions must match.")
         self.encoder = encoder
         self.readout = readout
+        self.recurrent_backend = recurrent_backend
 
     def reset_parameters(self) -> None:
         """Initialize R08 parameters after meta-device materialization."""
@@ -240,6 +241,9 @@ class LocalHistoryRuntime(nn.Module):
             history_mask=history_mask,
             history_state=history_state,
         )
-        tokens = self.readout(evidence, history_mask)
-        present = history_mask.bool().any(dim=1)
+        if self.recurrent_backend is None:
+            tokens = self.readout(evidence, history_mask)
+            present = history_mask.bool().any(dim=1)
+        else:
+            tokens, _, present = self.recurrent_backend.replay(evidence, history_mask)
         return tokens, present, evidence

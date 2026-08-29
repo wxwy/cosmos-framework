@@ -51,6 +51,7 @@ from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMN
 from cosmos_framework.model.generator.mot.local_evidence import (
     LocalEvidenceEncoder,
     LocalHistoryRuntime,
+    RecurrentLocalMemoryBackend,
     StatelessLocalReplayReadout,
 )
 from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
@@ -302,6 +303,10 @@ class OmniMoTModel(ImaginaireModel):
                 net.local_history_runtime = LocalHistoryRuntime(
                     LocalEvidenceEncoder(evidence_dim=self.config.local_history_evidence_dim, visual_dim=96),
                     StatelessLocalReplayReadout(
+                        evidence_dim=self.config.local_history_evidence_dim,
+                        local_dim=self.config.local_memory_dim,
+                    ),
+                    RecurrentLocalMemoryBackend(
                         evidence_dim=self.config.local_history_evidence_dim,
                         local_dim=self.config.local_memory_dim,
                     ),
