@@ -185,6 +185,15 @@ if action_policy_libero_edge_all["model"]["config"]["local_memory_enabled"]:
 if action_policy_libero_edge_all["model"]["config"]["local_history_enabled"]:
     action_policy_libero_edge_all["optimizer"]["keys_to_select"].append("local_history_runtime")
 
+if os.environ.get("PSM_R09_A1_ENABLED", "0") == "1":
+    action_policy_libero_edge_all["optimizer"]["keys_to_select"] = [
+        "local_history_runtime.encoder",
+        "local_history_runtime.recurrent_backend",
+        "local_history_runtime.readout",
+        "local_memory2llm",
+        "local_memory_modality_embed",
+    ]
+
 # 单卡多 suite：替换 RankPartitionedDataLoader（world_size>=4 断言不满足）为
 # IterativeJointDataLoader 轮询等权混合（每 grad-accum 窗口 16 批 = 4 套 × 4 次）。
 action_policy_libero_edge_all["dataloader_train"] = _action_policy_libero_edge_dataloader()
