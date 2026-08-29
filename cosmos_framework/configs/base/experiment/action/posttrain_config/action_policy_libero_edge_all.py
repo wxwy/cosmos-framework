@@ -25,6 +25,7 @@ from cosmos_framework.callbacks.online_vae_probe import OnlineVAEProbeCallback
 from cosmos_framework.callbacks.r07_parity_capture import R07ParityCaptureCallback
 from cosmos_framework.callbacks.r07_runtime_probe import R07RuntimeProbeCallback
 from cosmos_framework.callbacks.r08_gate_a_probe import R08GateAProbeCallback
+from cosmos_framework.callbacks.r08_gate_b_provenance import R08GateBProvenanceCallback
 from cosmos_framework.callbacks.stdout_loss_logger import StdoutLossLogger
 from cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano import (
     action_policy_libero_all_nano,
@@ -241,6 +242,12 @@ if _r07_parity_output:
 
 if os.environ.get("PSM_R08_GATE_B_CAPTURE_ONLY", "0") == "1":
     action_policy_libero_edge_all["trainer"]["callbacks"].pop("termination_signal_checkpoint", None)
+
+_r08_gate_b_provenance = os.environ.get("PSM_R08_GATE_B_PROVENANCE_OUTPUT")
+if _r08_gate_b_provenance:
+    action_policy_libero_edge_all["trainer"]["callbacks"]["r08_gate_b_provenance"] = L(R08GateBProvenanceCallback)(
+        output_path=_r08_gate_b_provenance
+    )
 
 # Disabled unless explicitly requested. The probe captures pre-normalization uint8
 # frames and the exact online VAE outputs for offline-cache parity verification.
