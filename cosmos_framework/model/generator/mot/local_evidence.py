@@ -187,7 +187,7 @@ class RecurrentLocalMemoryBackend(nn.Module):
         if width != self.evidence_dim or tuple(mask.shape) != (batch, horizon):
             raise ValueError("evidence/mask shapes are incompatible.")
         state = self.initial_state(batch, device=evidence.device, dtype=self.cell.weight_ih.dtype) if state is None else state
-        present = mask.bool().any(dim=1)
+        present = mask.bool().any(dim=1) | state.ne(0).any(dim=1)
         for index in range(horizon):
             state, _, _ = self.step(evidence[:, index], state, mask[:, index])
         return state[:, None] * present[:, None, None], state, present
