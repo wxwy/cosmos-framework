@@ -204,3 +204,18 @@ def test_edge_config_selects_only_r08_runtime_and_r07_local_parameters(monkeypat
     assert not any("state_proj" in name for name, _ in model.net.named_parameters())
     assert id(model.unrelated_outer_module.weight) not in selected_ids
     assert cfg["local_history_enabled"] is True
+
+
+def test_r09_a1_config_excludes_stateless_readout_from_recurrent_optimizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PSM_R08_LOCAL_HISTORY_ENABLED", "1")
+    monkeypatch.setenv("PSM_LOCAL_DUMMY_ENABLED", "0")
+    monkeypatch.setenv("PSM_R09_A1_ENABLED", "1")
+    from cosmos_framework.configs.base.experiment.action.posttrain_config import action_policy_libero_edge_all as recipe
+
+    recipe = importlib.reload(recipe)
+    assert recipe.action_policy_libero_edge_all["optimizer"]["keys_to_select"] == [
+        "local_history_runtime.encoder",
+        "local_history_runtime.recurrent_backend",
+        "local_memory2llm",
+        "local_memory_modality_embed",
+    ]

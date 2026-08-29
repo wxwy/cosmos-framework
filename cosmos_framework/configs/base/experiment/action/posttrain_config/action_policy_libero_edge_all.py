@@ -189,7 +189,6 @@ if os.environ.get("PSM_R09_A1_ENABLED", "0") == "1":
     action_policy_libero_edge_all["optimizer"]["keys_to_select"] = [
         "local_history_runtime.encoder",
         "local_history_runtime.recurrent_backend",
-        "local_history_runtime.readout",
         "local_memory2llm",
         "local_memory_modality_embed",
     ]
