@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from cosmos_framework.model.generator.mot.local_evidence import LocalEvidenceEncoder, StatelessLocalReplayReadout
+from cosmos_framework.model.generator.mot.local_evidence import LocalEvidenceEncoder, RecurrentLocalMemoryBackend, StatelessLocalReplayReadout
 
 
 def _inputs() -> dict[str, torch.Tensor]:
@@ -86,3 +86,19 @@ def test_stateless_local_replay_readout_masks_and_uses_latest_valid() -> None:
     assert torch.count_nonzero(output[1]) == 0
     output.sum().backward()
     assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in readout.parameters())
+
+
+@pytest.mark.L0
+def test_r09_recurrent_backend_presence_partial_reset_and_segments() -> None:
+    torch.manual_seed(4)
+    backend = RecurrentLocalMemoryBackend(evidence_dim=3, local_dim=5)
+    evidence = torch.randn(3, 4, 3)
+    mask = torch.tensor([[True, True, True, True], [False, False, False, False], [True, False, True, False]])
+    tokens, state, present = backend.replay(evidence, mask)
+    assert present.tolist() == [True, False, True]
+    assert torch.equal(tokens[1], torch.zeros_like(tokens[1]))
+    reset = backend.reset_mask(state, torch.tensor([False, True, False]))
+    assert torch.equal(reset[[0, 2]], state[[0, 2]]) and torch.count_nonzero(reset[1]) == 0
+    _, first, _ = backend.replay(evidence[:, :2], mask[:, :2])
+    _, second, _ = backend.replay(evidence[:, 2:], mask[:, 2:], first.detach())
+    torch.testing.assert_close(second, state, rtol=0, atol=1e-6)

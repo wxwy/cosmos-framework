@@ -153,6 +153,46 @@ class StatelessLocalReplayReadout(nn.Module):
         return token * has_valid.to(dtype=token.dtype).view(-1, 1, 1)
 
 
+class RecurrentLocalMemoryBackend(nn.Module):
+    """R09-A CPU-contract recurrent backend; it does not wire Cosmos runtime yet."""
+
+    def __init__(self, evidence_dim: int = 256, local_dim: int = 32) -> None:
+        super().__init__()
+        if evidence_dim <= 0 or local_dim <= 0:
+            raise ValueError("evidence_dim and local_dim must be positive.")
+        self.evidence_dim = evidence_dim
+        self.local_dim = local_dim
+        self.cell = nn.GRUCell(evidence_dim, local_dim)
+
+    def initial_state(self, batch: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return torch.zeros(batch, self.local_dim, device=device, dtype=dtype)
+
+    def step(self, evidence_t: torch.Tensor, state_in: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if tuple(evidence_t.shape) != (state_in.shape[0], self.evidence_dim):
+            raise ValueError("evidence_t/state_in shapes are incompatible.")
+        if tuple(valid.shape) != (state_in.shape[0],):
+            raise ValueError("valid must have shape [B].")
+        proposed = self.cell(evidence_t.to(dtype=self.cell.weight_ih.dtype), state_in)
+        state_out = torch.where(valid[:, None], proposed, state_in)
+        return state_out, state_out[:, None], valid.bool()
+
+    @staticmethod
+    def reset_mask(state: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
+        if tuple(done.shape) != (state.shape[0],):
+            raise ValueError("done must have shape [B].")
+        return torch.where(done[:, None], torch.zeros_like(state), state)
+
+    def replay(self, evidence: torch.Tensor, mask: torch.Tensor, state: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, horizon, width = evidence.shape
+        if width != self.evidence_dim or tuple(mask.shape) != (batch, horizon):
+            raise ValueError("evidence/mask shapes are incompatible.")
+        state = self.initial_state(batch, device=evidence.device, dtype=self.cell.weight_ih.dtype) if state is None else state
+        present = mask.bool().any(dim=1)
+        for index in range(horizon):
+            state, _, _ = self.step(evidence[:, index], state, mask[:, index])
+        return state[:, None] * present[:, None, None], state, present
+
+
 class LocalHistoryRuntime(nn.Module):
     """Encode a batched causal history and gate absent samples out of Local."""
 
