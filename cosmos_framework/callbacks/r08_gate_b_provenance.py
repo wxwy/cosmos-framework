@@ -17,14 +17,20 @@ class R08GateBProvenanceCallback(Callback):
 
     def on_train_start(self, model) -> None:
         del model
-        root = Path.cwd().parent
-        submodule = Path.cwd()
+        root = Path(__file__).resolve().parents[3]
+        submodule = root / "cosmos-framework"
         git = lambda repo, arg: subprocess.check_output(["git", "-C", str(repo), "rev-parse", arg], text=True).strip()
         payload = {
             "schema_version": "r08_gate_b_capture_provenance_v1",
             "root_revision": git(root, "HEAD"),
             "submodule_revision": git(submodule, "HEAD"),
             "gitlink_revision": git(root, "HEAD:cosmos-framework"),
+            "root_clean_tracked": not subprocess.check_output(
+                ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"], text=True
+            ).strip(),
+            "submodule_clean_tracked": not subprocess.check_output(
+                ["git", "-C", str(submodule), "status", "--porcelain", "--untracked-files=no"], text=True
+            ).strip(),
             "history_mode": os.environ.get("PSM_R08_HISTORY_MODE"),
             "capture_only": os.environ.get("PSM_R08_GATE_B_CAPTURE_ONLY") == "1",
             "checkpoint_path": os.environ.get("PSM_R08_GATE_B_CHECKPOINT_PATH"),
