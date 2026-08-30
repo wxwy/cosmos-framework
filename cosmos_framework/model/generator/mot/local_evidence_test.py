@@ -131,3 +131,39 @@ def test_r09_b0_ttt_backend_contract() -> None:
     torch.testing.assert_close(split_token, token, rtol=0, atol=0)
     assert split_present.tolist() == present.tolist()
     assert all(torch.equal(left, right) for left, right in zip(split_state, state, strict=True))
+
+
+@pytest.mark.L0
+def test_r09_b0_ttt_backend_isolates_samples_and_resets_selected_state() -> None:
+    torch.manual_seed(10)
+    backend = TTTLocalMemoryBackend(evidence_dim=3, local_dim=2)
+    evidence = torch.randn(3, 6, 3)
+    mask = torch.tensor([[True] * 6, [True, True, True, True, False, False], [False] * 6])
+    token, state, present = backend.replay(evidence, mask)
+
+    permutation = torch.tensor([1, 0, 2])
+    permuted_token, permuted_state, permuted_present = backend.replay(evidence[permutation], mask[permutation])
+    inverse = torch.argsort(permutation)
+    assert torch.equal(permuted_token[inverse], token)
+    assert torch.equal(permuted_present[inverse], present)
+    assert all(torch.equal(value[inverse], reference) for value, reference in zip(permuted_state, state, strict=True))
+
+    changed = evidence.clone()
+    changed[1] = 1e5
+    isolated_token, isolated_state, _ = backend.replay(changed, mask)
+    assert torch.equal(isolated_token[0], token[0])
+    assert all(torch.equal(value[0], reference[0]) for value, reference in zip(isolated_state, state, strict=True))
+
+    continuation_token, continuation_state, continuation_present = backend.replay(
+        torch.zeros(3, 2, 3), torch.zeros(3, 2, dtype=torch.bool), state
+    )
+    assert torch.equal(continuation_token, token)
+    assert torch.equal(continuation_present, present)
+    assert all(torch.equal(value, reference) for value, reference in zip(continuation_state, state, strict=True))
+
+    partial = backend.reset_mask(state, torch.tensor([False, True, False]))
+    assert all(torch.equal(value[0], reference[0]) for value, reference in zip(partial, state, strict=True))
+    assert all(torch.count_nonzero(value[1]) == 0 for value in partial)
+    assert partial[3].tolist() == [True, False, False]
+    full = backend.reset_mask(state, torch.ones(3, dtype=torch.bool))
+    assert all(torch.count_nonzero(value) == 0 for value in full)

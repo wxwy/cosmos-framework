@@ -211,6 +211,23 @@ class TTTLocalMemoryBackend(nn.Module):
     def initial_state(self, batch: int, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return (torch.zeros(batch, self.local_dim, self.evidence_dim, device=device, dtype=torch.bfloat16), torch.zeros(batch, self.segment_steps, self.evidence_dim, device=device, dtype=torch.bfloat16), torch.zeros(batch, self.evidence_dim, device=device, dtype=torch.bfloat16), torch.zeros(batch, device=device, dtype=torch.bool), torch.zeros(batch, device=device, dtype=torch.int64))
 
+    @staticmethod
+    def reset_mask(
+        state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], done: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reset only completed samples without sharing fast state across boundaries."""
+        W, pending, last, initialized, progress = state
+        if tuple(done.shape) != (W.shape[0],):
+            raise ValueError("done must have shape [B].")
+        done = done.bool()
+        return (
+            torch.where(done[:, None, None], torch.zeros_like(W), W).detach(),
+            torch.where(done[:, None, None], torch.zeros_like(pending), pending).detach(),
+            torch.where(done[:, None], torch.zeros_like(last), last).detach(),
+            initialized & ~done,
+            torch.where(done, torch.zeros_like(progress), progress),
+        )
+
     def replay(self, evidence: torch.Tensor, mask: torch.Tensor, state=None):
         batch, horizon, width = evidence.shape
         if width != self.evidence_dim or tuple(mask.shape) != (batch, horizon):
