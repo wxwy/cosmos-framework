@@ -199,6 +199,40 @@ class RecurrentLocalMemoryBackend(nn.Module):
         return latent[:, None] * present[:, None, None], (latent, initialized), present
 
 
+class TTTLocalMemoryBackend(nn.Module):
+    """B0 CPU-only per-sample fast-weight backend; not wired into production."""
+
+    def __init__(self, evidence_dim: int = 256, local_dim: int = 32, segment_steps: int = 4) -> None:
+        super().__init__()
+        if evidence_dim <= 0 or local_dim <= 0 or segment_steps <= 0:
+            raise ValueError("TTT dimensions and segment_steps must be positive.")
+        self.evidence_dim, self.local_dim, self.segment_steps = evidence_dim, local_dim, segment_steps
+
+    def initial_state(self, batch: int, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (torch.zeros(batch, self.local_dim, self.evidence_dim, device=device, dtype=torch.bfloat16), torch.zeros(batch, self.segment_steps, self.evidence_dim, device=device, dtype=torch.bfloat16), torch.zeros(batch, self.evidence_dim, device=device, dtype=torch.bfloat16), torch.zeros(batch, device=device, dtype=torch.bool), torch.zeros(batch, device=device, dtype=torch.int64))
+
+    def replay(self, evidence: torch.Tensor, mask: torch.Tensor, state=None):
+        batch, horizon, width = evidence.shape
+        if width != self.evidence_dim or tuple(mask.shape) != (batch, horizon):
+            raise ValueError("evidence/mask shapes are incompatible.")
+        W, pending, last, initialized, progress = self.initial_state(batch, device=evidence.device) if state is None else state
+        for index in range(horizon):
+            valid = mask[:, index].bool()
+            for row in valid.nonzero(as_tuple=False).flatten().tolist():
+                value = evidence[row, index].detach().to(torch.bfloat16)
+                pending[row, progress[row]] = value
+                last[row], initialized[row], progress[row] = value, True, progress[row] + 1
+                if progress[row] == self.segment_steps:
+                    work = W[row].detach().float().requires_grad_(True)
+                    values = pending[row].detach().float()
+                    loss = ((work @ values.T).T - values[:, : self.local_dim]).square().mean()
+                    grad = torch.autograd.grad(loss, work, create_graph=False)[0]
+                    W[row] = (work - 0.1 * grad).to(torch.bfloat16).detach()
+                    pending[row].zero_(); progress[row] = 0
+        token = torch.einsum("bde,be->bd", W, last).detach()[:, None] * initialized[:, None, None]
+        return token, (W.detach(), pending.detach(), last.detach(), initialized, progress), initialized
+
+
 class LocalHistoryRuntime(nn.Module):
     """Encode a batched causal history and gate absent samples out of Local."""
 

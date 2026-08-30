@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from cosmos_framework.model.generator.mot.local_evidence import LocalEvidenceEncoder, RecurrentLocalMemoryBackend, StatelessLocalReplayReadout
+from cosmos_framework.model.generator.mot.local_evidence import LocalEvidenceEncoder, RecurrentLocalMemoryBackend, StatelessLocalReplayReadout, TTTLocalMemoryBackend
 
 
 def _inputs() -> dict[str, torch.Tensor]:
@@ -112,3 +112,22 @@ def test_r09_recurrent_backend_presence_partial_reset_and_segments() -> None:
     carry_tokens, _, carry_present = backend.replay(evidence[:, 2:], torch.zeros_like(carry_mask), (carried[0].detach(), carried[1]))
     assert carry_present.tolist() == [True, False, False]
     torch.testing.assert_close(carry_tokens[0], carried[0][0, None], rtol=0, atol=1e-6)
+
+
+@pytest.mark.L0
+def test_r09_b0_ttt_backend_contract() -> None:
+    torch.manual_seed(9)
+    backend = TTTLocalMemoryBackend(evidence_dim=3, local_dim=2)
+    evidence = torch.randn(2, 7, 3)
+    mask = torch.tensor([[True] * 7, [False] * 7])
+    token, state, present = backend.replay(evidence, mask)
+    assert present.tolist() == [True, False]
+    assert token.shape == (2, 1, 2) and torch.isfinite(token).all() and not token.requires_grad
+    assert not list(backend.named_parameters())
+    assert state[0].shape == (2, 2, 3) and state[1].shape == (2, 4, 3)
+    assert state[4].tolist() == [3, 0]
+    _, first, _ = backend.replay(evidence[:, :2], mask[:, :2])
+    split_token, split_state, split_present = backend.replay(evidence[:, 2:], mask[:, 2:], first)
+    torch.testing.assert_close(split_token, token, rtol=0, atol=0)
+    assert split_present.tolist() == present.tolist()
+    assert all(torch.equal(left, right) for left, right in zip(split_state, state, strict=True))
