@@ -53,6 +53,7 @@ from cosmos_framework.model.generator.mot.local_evidence import (
     LocalHistoryRuntime,
     RecurrentLocalMemoryBackend,
     StatelessLocalReplayReadout,
+    TTTLocalMemoryBackend,
 )
 from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
     InferenceTextKVMemoryState,
@@ -123,6 +124,8 @@ class OmniMoTModel(ImaginaireModel):
                 raise ValueError("local_history_enabled requires local_memory_enabled and local_memory_dim.")
             if self.config.local_history_state_enabled:
                 raise ValueError("R08 state runtime remains disabled until train-split statistics are available.")
+        elif self.config.local_history_backend != "recurrent":
+            raise ValueError("local_history_backend=ttt_fast_weight requires local_history_enabled=True.")
 
         # 0. Set up precision
         self.set_precision()
@@ -300,16 +303,25 @@ class OmniMoTModel(ImaginaireModel):
                 config=network_config,
             )
             if self.config.local_history_enabled:
+                if self.config.local_history_backend == "recurrent":
+                    local_backend = RecurrentLocalMemoryBackend(
+                        evidence_dim=self.config.local_history_evidence_dim,
+                        local_dim=self.config.local_memory_dim,
+                    )
+                elif self.config.local_history_backend == "ttt_fast_weight":
+                    local_backend = TTTLocalMemoryBackend(
+                        evidence_dim=self.config.local_history_evidence_dim,
+                        local_dim=self.config.local_memory_dim,
+                    )
+                else:
+                    raise ValueError(f"unsupported local_history_backend: {self.config.local_history_backend}")
                 net.local_history_runtime = LocalHistoryRuntime(
                     LocalEvidenceEncoder(evidence_dim=self.config.local_history_evidence_dim, visual_dim=96),
                     StatelessLocalReplayReadout(
                         evidence_dim=self.config.local_history_evidence_dim,
                         local_dim=self.config.local_memory_dim,
                     ),
-                    RecurrentLocalMemoryBackend(
-                        evidence_dim=self.config.local_history_evidence_dim,
-                        local_dim=self.config.local_memory_dim,
-                    ),
+                    local_backend,
                 )
             net.pad_for_cuda_graphs = self.config.compile.use_cuda_graphs
 

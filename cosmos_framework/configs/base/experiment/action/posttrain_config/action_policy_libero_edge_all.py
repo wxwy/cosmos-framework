@@ -43,6 +43,13 @@ from cosmos_framework.utils.lazy_config import LazyCall as L
 _SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 
 
+def _strict_bool_env(name: str, default: str = "0") -> bool:
+    value = os.environ.get(name, default)
+    if value not in {"0", "1"}:
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
 def _action_policy_libero_edge_model_config() -> dict:
     """Edge model config (identical to edge_warmstart): capped packed tokens,
     selective AC, compile off, fresh diffusion-expert init, local Edge tokenizer."""
@@ -56,13 +63,22 @@ def _action_policy_libero_edge_model_config() -> dict:
     cfg["tokenizer"]["encode_chunk_frames"] = LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES
     local_dummy_enabled = os.environ.get("PSM_LOCAL_DUMMY_ENABLED", "0") == "1"
     local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
+    r09_b1_ttt_enabled = _strict_bool_env("PSM_R09_B1_TTT_ENABLED")
+    r09_a1_enabled = _strict_bool_env("PSM_R09_A1_ENABLED")
     if local_dummy_enabled and local_history_enabled:
         raise ValueError("PSM_LOCAL_DUMMY_ENABLED and PSM_R08_LOCAL_HISTORY_ENABLED are mutually exclusive")
+    if r09_b1_ttt_enabled and not local_history_enabled:
+        raise ValueError("PSM_R09_B1_TTT_ENABLED requires PSM_R08_LOCAL_HISTORY_ENABLED=1")
+    if r09_b1_ttt_enabled and r09_a1_enabled:
+        raise ValueError("PSM_R09_B1_TTT_ENABLED and PSM_R09_A1_ENABLED are mutually exclusive")
+    if r09_b1_ttt_enabled and os.environ.get("PSM_R09_A1_PROBE_OUTPUT"):
+        raise ValueError("PSM_R09_B1_TTT_ENABLED and PSM_R09_A1_PROBE_OUTPUT are mutually exclusive")
     local_dummy_mode = os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal")
     if local_dummy_mode not in {"normal", "zero", "shuffle"}:
         raise ValueError(f"unsupported PSM_LOCAL_DUMMY_MODE: {local_dummy_mode}")
     cfg["local_memory_enabled"] = local_dummy_enabled or local_history_enabled
     cfg["local_history_enabled"] = local_history_enabled
+    cfg["local_history_backend"] = "ttt_fast_weight" if r09_b1_ttt_enabled else "recurrent"
     cfg["local_history_horizon"] = int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", "16"))
     if cfg["local_history_horizon"] < 0:
         raise ValueError("PSM_R08_LOCAL_HISTORY_HORIZON must be non-negative")
@@ -190,6 +206,13 @@ if os.environ.get("PSM_R09_A1_ENABLED", "0") == "1":
     action_policy_libero_edge_all["optimizer"]["keys_to_select"] = [
         "local_history_runtime.encoder",
         "local_history_runtime.recurrent_backend",
+        "local_memory2llm",
+        "local_memory_modality_embed",
+    ]
+
+if _strict_bool_env("PSM_R09_B1_TTT_ENABLED"):
+    action_policy_libero_edge_all["optimizer"]["keys_to_select"] = [
+        "local_history_runtime.encoder",
         "local_memory2llm",
         "local_memory_modality_embed",
     ]

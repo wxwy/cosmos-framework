@@ -303,6 +303,7 @@ class OmniMoTModelConfig:
     # R08 causal history runtime. Disabled by default; when enabled, the
     # dataset-provided history evidence is reduced to one clean Local token.
     local_history_enabled: bool = False
+    local_history_backend: Literal["recurrent", "ttt_fast_weight"] = "recurrent"
     local_history_horizon: int = 16
     local_history_evidence_dim: int = 256
     local_history_state_enabled: bool = False

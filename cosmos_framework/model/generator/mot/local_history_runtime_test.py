@@ -219,3 +219,23 @@ def test_r09_a1_config_excludes_stateless_readout_from_recurrent_optimizer(monke
         "local_memory2llm",
         "local_memory_modality_embed",
     ]
+
+
+def test_r09_b1_config_selects_ttt_and_excludes_a1(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PSM_R08_LOCAL_HISTORY_ENABLED", "1")
+    monkeypatch.setenv("PSM_LOCAL_DUMMY_ENABLED", "0")
+    monkeypatch.setenv("PSM_R09_B1_TTT_ENABLED", "1")
+    monkeypatch.delenv("PSM_R09_A1_ENABLED", raising=False)
+    monkeypatch.delenv("PSM_R09_A1_PROBE_OUTPUT", raising=False)
+    from cosmos_framework.configs.base.experiment.action.posttrain_config import action_policy_libero_edge_all as recipe
+
+    recipe = importlib.reload(recipe)
+    assert recipe._action_policy_libero_edge_model_config()["local_history_backend"] == "ttt_fast_weight"
+    assert recipe.action_policy_libero_edge_all["optimizer"]["keys_to_select"] == [
+        "local_history_runtime.encoder",
+        "local_memory2llm",
+        "local_memory_modality_embed",
+    ]
+    monkeypatch.setenv("PSM_R09_A1_ENABLED", "1")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        recipe._action_policy_libero_edge_model_config()

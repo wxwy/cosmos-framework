@@ -168,3 +168,16 @@ def test_r09_b0_ttt_backend_isolates_samples_and_resets_selected_state() -> None
     assert partial[3].tolist() == [True, False, False]
     full = backend.reset_mask(state, torch.ones(3, dtype=torch.bool))
     assert all(torch.count_nonzero(value) == 0 for value in full)
+
+
+@pytest.mark.L0
+def test_r09_b1_ttt_rejects_outer_no_grad_without_mutating_state() -> None:
+    backend = TTTLocalMemoryBackend(evidence_dim=3, local_dim=2)
+    evidence = torch.randn(2, 4, 3)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    _, state, _ = backend.replay(evidence, mask)
+    reference = tuple(value.clone() for value in state)
+    for context in (torch.no_grad(), torch.inference_mode()):
+        with context, pytest.raises(RuntimeError, match="training grad-mode"):
+            backend.replay(evidence, mask, state)
+        assert all(torch.equal(value, expected) for value, expected in zip(state, reference, strict=True))

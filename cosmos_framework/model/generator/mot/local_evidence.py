@@ -229,6 +229,8 @@ class TTTLocalMemoryBackend(nn.Module):
         )
 
     def replay(self, evidence: torch.Tensor, mask: torch.Tensor, state=None):
+        if not torch.is_grad_enabled():
+            raise RuntimeError("TTTLocalMemoryBackend supports training grad-mode only.")
         batch, horizon, width = evidence.shape
         if width != self.evidence_dim or tuple(mask.shape) != (batch, horizon):
             raise ValueError("evidence/mask shapes are incompatible.")
