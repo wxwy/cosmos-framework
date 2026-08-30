@@ -161,9 +161,10 @@ def test_r09_b0_ttt_backend_isolates_samples_and_resets_selected_state() -> None
     assert torch.equal(continuation_present, present)
     assert all(torch.equal(value, reference) for value, reference in zip(continuation_state, state, strict=True))
 
-    partial = backend.reset_mask(state, torch.tensor([False, True, False]))
-    assert all(torch.equal(value[0], reference[0]) for value, reference in zip(partial, state, strict=True))
-    assert all(torch.count_nonzero(value[1]) == 0 for value in partial)
+    done = torch.tensor([False, True, False])
+    partial = backend.reset_mask(state, done)
+    assert all(torch.equal(value[~done], reference[~done]) for value, reference in zip(partial, state, strict=True))
+    assert all(torch.count_nonzero(value[done]) == 0 for value in partial)
     assert partial[3].tolist() == [True, False, False]
     full = backend.reset_mask(state, torch.ones(3, dtype=torch.bool))
     assert all(torch.count_nonzero(value) == 0 for value in full)
