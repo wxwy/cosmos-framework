@@ -64,6 +64,7 @@ def _action_policy_libero_edge_model_config() -> dict:
     cfg["tokenizer"]["encode_chunk_frames"] = LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES
     local_dummy_enabled = os.environ.get("PSM_LOCAL_DUMMY_ENABLED", "0") == "1"
     local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
+    b2_manifest_root = os.environ.get("PSM_R09_B2_STREAM_MANIFEST_ROOT")
     r09_b1_ttt_enabled = _strict_bool_env("PSM_R09_B1_TTT_ENABLED")
     r09_a1_enabled = _strict_bool_env("PSM_R09_A1_ENABLED")
     if local_dummy_enabled and local_history_enabled:
@@ -106,6 +107,7 @@ def _action_policy_libero_edge_dataloader():
     """
 
     local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
+    b2_manifest_root = os.environ.get("PSM_R09_B2_STREAM_MANIFEST_ROOT")
 
     def _suite_dataset(_suite):
         latent_cache_root = os.environ.get("LIBERO_LATENT_CACHE_ROOT")
@@ -123,6 +125,8 @@ def _action_policy_libero_edge_dataloader():
             if max_episodes <= 0:
                 raise ValueError(f"LIBERO_MAX_EPISODES must be a positive integer, got {max_episodes}")
             cache_kwargs["max_episodes"] = max_episodes
+        if b2_manifest_root:
+            cache_kwargs["stream_manifest_path"] = f"{b2_manifest_root}/suites/{_suite}.jsonl"
         return L(get_action_libero_sft_dataset)(
             root="${oc.env:LIBERO_ROOT}/" + _suite,
             fps=20,
@@ -135,7 +139,7 @@ def _action_policy_libero_edge_dataloader():
             pose_coordinate_frame="native",
             action_normalization="quantile_rot",
             val_ratio=0.01,
-            iterable_shuffle=True,
+            iterable_shuffle=not bool(b2_manifest_root),
             episode_shuffle_seed=42,
             resolution=None,
             max_action_dim="${model.config.max_action_dim}",
@@ -153,6 +157,8 @@ def _action_policy_libero_edge_dataloader():
         )
 
     _num_workers = int(os.environ.get("LIBERO_NUM_WORKERS", "32"))
+    if b2_manifest_root and _num_workers != 0:
+        raise ValueError("PSM_R09_B2_STREAM_MANIFEST_ROOT requires LIBERO_NUM_WORKERS=0.")
     _prefetch_factor = int(os.environ.get("LIBERO_PREFETCH_FACTOR", "4"))
     if _num_workers > 0 and _prefetch_factor <= 0:
         raise ValueError(
@@ -175,7 +181,7 @@ def _action_policy_libero_edge_dataloader():
                 dataloader=L(torch.utils.data.DataLoader)(
                     dataset=_suite_dataset(_suite),
                     batch_size=1,
-                    in_order=False,
+                    in_order=bool(b2_manifest_root),
                     num_workers=_num_workers,
                     persistent_workers=_num_workers > 0,
                     pin_memory=True,

@@ -107,8 +107,8 @@ class B2ManifestAwareIterableDataset(IterableDataset):
         self._dataset = dataset
         self._records = [dict(record) for record in records]
         ordinals = [int(record["ordinal"]) for record in self._records]
-        if ordinals != list(range(len(ordinals))):
-            raise ValueError("B2 manifest ordinals must be contiguous and start at zero.")
+        if ordinals != sorted(set(ordinals)):
+            raise ValueError("B2 manifest ordinals must be unique and strictly increasing.")
 
     def __len__(self) -> int:
         return len(self._records)
