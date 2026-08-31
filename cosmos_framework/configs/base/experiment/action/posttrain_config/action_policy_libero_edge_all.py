@@ -157,7 +157,7 @@ def _action_policy_libero_edge_dataloader():
             **cache_kwargs,
         )
 
-    _num_workers = int(os.environ.get("LIBERO_NUM_WORKERS", "32"))
+    _num_workers = int(os.environ.get("LIBERO_NUM_WORKERS", "12"))
     if b2_manifest_root and _num_workers != 0:
         raise ValueError("PSM_R09_B2_STREAM_MANIFEST_ROOT requires LIBERO_NUM_WORKERS=0.")
     _prefetch_factor = int(os.environ.get("LIBERO_PREFETCH_FACTOR", "4"))

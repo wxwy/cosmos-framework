@@ -21,7 +21,7 @@ SESSION="${1:-sft_4in1}"
 : "${EDGE_POLICY_CHECKPOINT:=/disk/rl/models/Cosmos3-Edge-Policy-DROID}"
 : "${LIBERO_LATENT_CACHE_ROOT:=/disk/rl/data/LIBERO_LeRobot_v3_cosmos_exact_window_shared_vae_v1}"
 : "${LIBERO_LATENT_CACHE_VERIFY_RATIO:=0.001}"
-: "${LIBERO_NUM_WORKERS:=32}"
+: "${LIBERO_NUM_WORKERS:=12}"
 : "${LIBERO_PREFETCH_FACTOR:=4}"
 
 [[ -d "$LIBERO_ROOT" ]]              || { echo "ERROR: LIBERO_ROOT not found: $LIBERO_ROOT" >&2; exit 1; }
