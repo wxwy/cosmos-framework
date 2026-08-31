@@ -23,7 +23,7 @@
 #   OUTPUT_ROOT           default: outputs/train
 #   LIBERO_LATENT_CACHE_ROOT default: /disk/rl/data/LIBERO_LeRobot_v3_cosmos_exact_window_shared_vae_v1
 #   LIBERO_LATENT_CACHE_VERIFY_RATIO default: 0.001 (0 disables online verification)
-#   LIBERO_NUM_WORKERS    default: 32
+#   LIBERO_NUM_WORKERS    default: 12
 #   LIBERO_PREFETCH_FACTOR default: 4 (num_workers=0 时自动为 None)
 #   DISABLE_AUTO_RESUME   set 1 to ignore saved iter_* checkpoints and start fresh
 #   DRY_RUN               set 1 to print the resolved command without running it
