@@ -27,6 +27,7 @@ from cosmos_framework.callbacks.r07_runtime_probe import R07RuntimeProbeCallback
 from cosmos_framework.callbacks.r08_gate_a_probe import R08GateAProbeCallback
 from cosmos_framework.callbacks.r08_gate_b_provenance import R08GateBProvenanceCallback
 from cosmos_framework.callbacks.r09_a1_runtime_probe import R09A1RuntimeProbeCallback
+from cosmos_framework.callbacks.r09_b1_runtime_probe import R09B1RuntimeProbeCallback
 from cosmos_framework.callbacks.stdout_loss_logger import StdoutLossLogger
 from cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano import (
     action_policy_libero_all_nano,
@@ -263,6 +264,14 @@ _r09_a1_probe_output = os.environ.get("PSM_R09_A1_PROBE_OUTPUT")
 if _r09_a1_probe_output:
     action_policy_libero_edge_all["trainer"]["callbacks"]["r09_a1_runtime_probe"] = L(R09A1RuntimeProbeCallback)(
         output_path=_r09_a1_probe_output,
+    )
+
+_r09_b1_probe_output = os.environ.get("PSM_R09_B1_PROBE_OUTPUT")
+if _r09_b1_probe_output:
+    if not _strict_bool_env("PSM_R09_B1_TTT_ENABLED"):
+        raise ValueError("PSM_R09_B1_PROBE_OUTPUT requires PSM_R09_B1_TTT_ENABLED=1")
+    action_policy_libero_edge_all["trainer"]["callbacks"]["r09_b1_runtime_probe"] = L(R09B1RuntimeProbeCallback)(
+        output_path=_r09_b1_probe_output,
     )
 
 _r08_device_monitor_every_n = os.environ.get("PSM_R08_GATE_A_DEVICE_MONITOR_EVERY_N")
