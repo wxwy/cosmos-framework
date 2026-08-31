@@ -6,10 +6,14 @@ from contextlib import contextmanager
 import hashlib
 import json
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 
 from cosmos_framework.utils.callback import Callback
+
+
+TTT_STATE_KEYS = ("W", "pending_evidence", "last_evidence", "initialized", "segment_progress")
 
 
 @contextmanager
@@ -50,22 +54,30 @@ def snapshot_hash(value: object) -> str:
     return hashlib.sha256(repr(value).encode()).hexdigest()
 
 
+def _validate_ttt_state(ttt_state: object) -> None:
+    if not isinstance(ttt_state, dict) or tuple(sorted(ttt_state)) != tuple(sorted(TTT_STATE_KEYS)):
+        raise ValueError(f"TTT state must contain exactly {TTT_STATE_KEYS}")
+
+
 @dataclass(frozen=True)
 class IsolationSnapshot:
     parameters: str
     buffers: str
     optimizer: str
     scheduler: str
-    rng: str
+    cpu_rng: str
+    cuda_rng: str
     batch_metadata: str
     recurrent_state: str
     ttt_state: str
 
 
 def take_isolation_snapshot(*, parameters: object, buffers: object, optimizer: object, scheduler: object, batch_metadata: object, recurrent_state: object, ttt_state: object) -> IsolationSnapshot:
+    _validate_ttt_state(ttt_state)
     return IsolationSnapshot(
         parameters=snapshot_hash(parameters), buffers=snapshot_hash(buffers), optimizer=snapshot_hash(optimizer),
-        scheduler=snapshot_hash(scheduler), rng=snapshot_hash(torch.get_rng_state()),
+        scheduler=snapshot_hash(scheduler), cpu_rng=snapshot_hash(torch.get_rng_state()),
+        cuda_rng=snapshot_hash(torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
         batch_metadata=snapshot_hash(batch_metadata), recurrent_state=snapshot_hash(recurrent_state), ttt_state=snapshot_hash(ttt_state),
     )
 
@@ -76,17 +88,31 @@ def require_unchanged(before: IsolationSnapshot, after: IsolationSnapshot) -> No
         raise RuntimeError(f"non-mutating capture changed protected state: {changed}")
 
 
+def capture_with_isolation(
+    payload: list[torch.Tensor], mode: str, snapshot_provider: Callable[[], IsolationSnapshot]
+) -> list[torch.Tensor]:
+    """The sole P2 capture entrypoint; always verifies supplied protected snapshots."""
+    before = snapshot_provider()
+    try:
+        with isolated_rng():
+            return clone_local_payload(payload, mode)
+    finally:
+        require_unchanged(before, snapshot_provider())
+
+
 class R09B2NonMutatingCaptureCallback(Callback):
     """Capture detached Local payload only; never invokes the training model."""
 
-    def __init__(self, mode: str = "normal") -> None:
+    def __init__(self, mode: str, snapshot_provider: Callable[[], IsolationSnapshot]) -> None:
         self.mode = mode
+        self._snapshot_provider = snapshot_provider
 
     def on_training_step_end(self, model, data_batch, output_batch, loss, iteration: int = 0) -> None:
         del model, output_batch, loss, iteration
+        required_metadata = ("b2_stream_ordinal", "b2_stream_epoch", "b2_stream_microbatch")
+        missing = [key for key in required_metadata if key not in data_batch]
+        if missing:
+            raise ValueError(f"B2 capture batch is missing immutable metadata: {missing}")
         payload = data_batch.get("local_memory", [])
-        with isolated_rng():
-            self.last_capture = clone_local_payload(payload, self.mode)
-        self.last_ordinals = tuple(
-            int(data_batch[key].item()) for key in ("b2_stream_ordinal", "b2_stream_epoch") if key in data_batch
-        )
+        self.last_capture = capture_with_isolation(payload, self.mode, self._snapshot_provider)
+        self.last_ordinals = tuple(int(data_batch[key].item()) for key in required_metadata)

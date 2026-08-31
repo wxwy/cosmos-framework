@@ -17,6 +17,7 @@ def _record(ordinal: int, start_frame: int | None = None):
     return {
         "ordinal": ordinal,
         "epoch": 0,
+        "microbatch": ordinal,
         "dataset_flat_index": ordinal,
         "task_index": 3,
         "episode_index": 11,
@@ -29,6 +30,7 @@ def test_b2_manifest_stream_preserves_requested_ordinals():
     samples = list(B2ManifestAwareIterableDataset(_Dataset(), records, "libero_spatial"))
     assert [int(sample["b2_stream_ordinal"]) for sample in samples] == [0, 1]
     assert [int(sample["b2_stream_epoch"]) for sample in samples] == [0, 0]
+    assert [int(sample["b2_stream_microbatch"]) for sample in samples] == [0, 1]
     assert [int(sample["b2_dataset_flat_index"]) for sample in samples] == [0, 1]
 
 
