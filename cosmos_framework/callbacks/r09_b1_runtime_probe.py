@@ -42,12 +42,16 @@ class R09B1RuntimeProbeCallback(Callback):
         return {id(parameter) for child in children for group in child.param_groups for parameter in group["params"]}
 
     @staticmethod
-    def _state_members(state: tuple[torch.Tensor, ...]) -> list[dict[str, object]]:
-        names = ("W", "pending", "last", "initialized", "progress")
-        return [
-            {"name": name, "shape": list(value.shape), "dtype": str(value.dtype), "bytes": value.numel() * value.element_size()}
+    def _state_members(state: tuple[torch.Tensor, ...]) -> dict[str, dict[str, object]]:
+        names = ("W", "pending_evidence", "last_evidence", "initialized", "segment_progress")
+        return {
+            name: {
+                "shape_per_sample": list(value.shape[1:]),
+                "dtype": str(value.dtype).removeprefix("torch."),
+                "bytes_per_sample": value[0].numel() * value.element_size(),
+            }
             for name, value in zip(names, state, strict=True)
-        ]
+        }
 
     def _state_contract(self, model) -> dict[str, object]:
         backend = model.net.local_history_runtime.recurrent_backend
