@@ -16,6 +16,7 @@ class _Dataset:
 def _record(ordinal: int, start_frame: int | None = None):
     return {
         "ordinal": ordinal,
+        "epoch": 0,
         "dataset_flat_index": ordinal,
         "task_index": 3,
         "episode_index": 11,
