@@ -15,6 +15,8 @@ to ``RankPartitionedDataLoader`` (mirroring how the vision recipe uses
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import torch
@@ -295,6 +297,7 @@ def get_action_libero_sft_dataset(
     local_dummy_dim: int = 32,
     local_dummy_mode: str = "normal",
     local_history_horizon: int = 0,
+    stream_manifest_path: str | None = None,
 ) -> Dataset:
     """Build the LIBERO action-policy SFT dataset (GA reproduction defaults).
 
@@ -342,6 +345,11 @@ def get_action_libero_sft_dataset(
         local_dummy_mode=local_dummy_mode,
     )
     sft = ActionSFTDataset(dataset, transform, resolution)
+    if stream_manifest_path is not None:
+        if iterable_shuffle:
+            raise ValueError("stream_manifest_path and iterable_shuffle cannot be enabled together.")
+        records = [json.loads(line) for line in Path(stream_manifest_path).read_text().splitlines() if line]
+        return B2ManifestAwareIterableDataset(sft, records)
     if iterable_shuffle:
         return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
     return sft
