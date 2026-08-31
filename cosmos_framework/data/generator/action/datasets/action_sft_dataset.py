@@ -15,8 +15,9 @@ to ``RankPartitionedDataLoader`` (mirroring how the vision recipe uses
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable, Mapping
 
+import torch
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
@@ -87,6 +88,53 @@ class ActionIterableShuffleDataset(IterableDataset):
                 for idx in range(start, start + length):
                     yield self._dataset[idx]
             epoch += 1
+
+
+class B2ManifestAwareIterableDataset(IterableDataset):
+    """Fail-closed ordered view of an action SFT dataset for R09-B2 P1.
+
+    Each record fixes one map-style flat index and its externally auditable
+    LIBERO identity.  This deliberately does not reuse the infinite shuffled
+    worker stream: B2 requires one ordered, reproducible consumption sequence.
+    """
+
+    _IDENTITY_KEYS = ("task_index", "episode_index", "start_frame")
+
+    def __init__(self, dataset: ActionSFTDataset, records: Iterable[Mapping[str, Any]]) -> None:
+        super().__init__()
+        self._dataset = dataset
+        self._records = [dict(record) for record in records]
+        ordinals = [int(record["ordinal"]) for record in self._records]
+        if ordinals != list(range(len(ordinals))):
+            raise ValueError("B2 manifest ordinals must be contiguous and start at zero.")
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    @staticmethod
+    def _scalar(item: Mapping[str, Any], key: str) -> int:
+        value = item.get(key)
+        if not isinstance(value, torch.Tensor) or value.numel() != 1:
+            raise ValueError(f"B2 manifest sample has no scalar {key!r}.")
+        return int(value.item())
+
+    def __iter__(self):
+        if get_worker_info() is not None:
+            raise RuntimeError("B2 manifest stream requires DataLoader num_workers=0.")
+        for record in self._records:
+            flat_index = int(record["dataset_flat_index"])
+            item = self._dataset[flat_index]
+            for key in self._IDENTITY_KEYS:
+                expected = int(record[key])
+                actual = self._scalar(item, key)
+                if actual != expected:
+                    raise ValueError(
+                        f"B2 manifest identity mismatch ordinal={record['ordinal']} key={key}: "
+                        f"expected={expected}, actual={actual}."
+                    )
+            item["b2_stream_ordinal"] = torch.tensor(int(record["ordinal"]), dtype=torch.long)
+            item["b2_dataset_flat_index"] = torch.tensor(flat_index, dtype=torch.long)
+            yield item
 
 
 def get_action_droid_sft_dataset(
