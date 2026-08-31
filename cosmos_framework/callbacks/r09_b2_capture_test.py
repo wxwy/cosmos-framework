@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from cosmos_framework.callbacks.r09_b2_capture import R09B2NonMutatingCaptureCallback, clone_local_payload, isolated_rng, snapshot_hash
+from cosmos_framework.callbacks.r09_b2_capture import R09B2NonMutatingCaptureCallback, clone_local_payload, isolated_rng, require_unchanged, snapshot_hash, take_isolation_snapshot
 
 
 def test_capture_payload_modes_do_not_mutate_source():
@@ -48,3 +48,22 @@ def test_callback_never_accesses_canonical_model():
     callback.on_training_step_end(Poison(), {"local_memory": [source], "b2_stream_ordinal": torch.tensor(4)}, {}, torch.tensor(0.0))
     assert callback.last_capture[0].item() == 0.0
     assert source.item() == 3.0
+
+
+@pytest.mark.parametrize("field", ["parameters", "buffers", "optimizer", "scheduler", "batch_metadata", "recurrent_state", "ttt_state"])
+def test_isolation_snapshot_rejects_each_protected_mutation(field):
+    values = {
+        "parameters": {"weight": torch.tensor([1.0])}, "buffers": {"mean": torch.tensor([1.0])},
+        "optimizer": {"step": torch.tensor([1])}, "scheduler": {"epoch": 1},
+        "batch_metadata": {"ordinal": 3, "epoch": 0, "microbatch": 1},
+        "recurrent_state": {"hidden": torch.tensor([1.0])},
+        "ttt_state": {name: torch.tensor([1.0]) for name in ("fast_weight", "lr", "segment", "reset", "detach")},
+    }
+    before = take_isolation_snapshot(**values)
+    if isinstance(values[field], dict):
+        first = next(iter(values[field]))
+        value = values[field][first]
+        values[field][first] = value + 1 if isinstance(value, torch.Tensor) else value + 1
+    after = take_isolation_snapshot(**values)
+    with pytest.raises(RuntimeError, match="protected state"):
+        require_unchanged(before, after)

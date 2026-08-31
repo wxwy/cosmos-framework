@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+from dataclasses import dataclass
 
 import torch
 
@@ -47,6 +48,32 @@ def snapshot_hash(value: object) -> str:
     if isinstance(value, (list, tuple)):
         return hashlib.sha256(json.dumps([snapshot_hash(item) for item in value]).encode()).hexdigest()
     return hashlib.sha256(repr(value).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class IsolationSnapshot:
+    parameters: str
+    buffers: str
+    optimizer: str
+    scheduler: str
+    rng: str
+    batch_metadata: str
+    recurrent_state: str
+    ttt_state: str
+
+
+def take_isolation_snapshot(*, parameters: object, buffers: object, optimizer: object, scheduler: object, batch_metadata: object, recurrent_state: object, ttt_state: object) -> IsolationSnapshot:
+    return IsolationSnapshot(
+        parameters=snapshot_hash(parameters), buffers=snapshot_hash(buffers), optimizer=snapshot_hash(optimizer),
+        scheduler=snapshot_hash(scheduler), rng=snapshot_hash(torch.get_rng_state()),
+        batch_metadata=snapshot_hash(batch_metadata), recurrent_state=snapshot_hash(recurrent_state), ttt_state=snapshot_hash(ttt_state),
+    )
+
+
+def require_unchanged(before: IsolationSnapshot, after: IsolationSnapshot) -> None:
+    if before != after:
+        changed = [name for name in before.__dataclass_fields__ if getattr(before, name) != getattr(after, name)]
+        raise RuntimeError(f"non-mutating capture changed protected state: {changed}")
 
 
 class R09B2NonMutatingCaptureCallback(Callback):
