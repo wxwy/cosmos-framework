@@ -25,22 +25,29 @@ def _record(ordinal: int, start_frame: int | None = None):
 
 
 def test_b2_manifest_stream_preserves_requested_ordinals():
-    samples = list(B2ManifestAwareIterableDataset(_Dataset(), [_record(0), _record(1)]))
+    records = [{**_record(ordinal), "suite": "libero_spatial"} for ordinal in (0, 1)]
+    samples = list(B2ManifestAwareIterableDataset(_Dataset(), records, "libero_spatial"))
     assert [int(sample["b2_stream_ordinal"]) for sample in samples] == [0, 1]
     assert [int(sample["b2_stream_epoch"]) for sample in samples] == [0, 0]
     assert [int(sample["b2_dataset_flat_index"]) for sample in samples] == [0, 1]
 
 
 def test_b2_manifest_stream_preserves_global_ordinals_for_one_suite():
-    samples = list(B2ManifestAwareIterableDataset(_Dataset(), [_record(3), _record(7)]))
+    records = [{**_record(ordinal), "suite": "libero_spatial"} for ordinal in (3, 7)]
+    samples = list(B2ManifestAwareIterableDataset(_Dataset(), records, "libero_spatial"))
     assert [int(sample["b2_stream_ordinal"]) for sample in samples] == [3, 7]
 
 
 def test_b2_manifest_stream_rejects_duplicate_ordinals():
     with pytest.raises(ValueError, match="unique and strictly increasing"):
-        B2ManifestAwareIterableDataset(_Dataset(), [_record(3), _record(3)])
+        B2ManifestAwareIterableDataset(_Dataset(), [{**_record(3), "suite": "libero_spatial"}, {**_record(3), "suite": "libero_spatial"}], "libero_spatial")
 
 
 def test_b2_manifest_stream_rejects_identity_mismatch():
     with pytest.raises(ValueError, match="identity mismatch"):
-        list(B2ManifestAwareIterableDataset(_Dataset(), [_record(0, start_frame=4)]))
+        list(B2ManifestAwareIterableDataset(_Dataset(), [{**_record(0, start_frame=4), "suite": "libero_spatial"}], "libero_spatial"))
+
+
+def test_b2_manifest_stream_rejects_wrong_suite():
+    with pytest.raises(ValueError, match="must all belong"):
+        B2ManifestAwareIterableDataset(_Dataset(), [{**_record(0), "suite": "libero_goal"}], "libero_spatial")

@@ -127,6 +127,7 @@ def _action_policy_libero_edge_dataloader():
             cache_kwargs["max_episodes"] = max_episodes
         if b2_manifest_root:
             cache_kwargs["stream_manifest_path"] = f"{b2_manifest_root}/suites/{_suite}.jsonl"
+            cache_kwargs["stream_manifest_suite"] = _suite
         return L(get_action_libero_sft_dataset)(
             root="${oc.env:LIBERO_ROOT}/" + _suite,
             fps=20,

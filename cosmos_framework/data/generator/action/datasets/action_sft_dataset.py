@@ -102,10 +102,12 @@ class B2ManifestAwareIterableDataset(IterableDataset):
 
     _IDENTITY_KEYS = ("task_index", "episode_index", "start_frame")
 
-    def __init__(self, dataset: ActionSFTDataset, records: Iterable[Mapping[str, Any]]) -> None:
+    def __init__(self, dataset: ActionSFTDataset, records: Iterable[Mapping[str, Any]], expected_suite: str) -> None:
         super().__init__()
         self._dataset = dataset
         self._records = [dict(record) for record in records]
+        if any(record.get("suite") != expected_suite for record in self._records):
+            raise ValueError(f"B2 manifest records must all belong to suite={expected_suite!r}.")
         ordinals = [int(record["ordinal"]) for record in self._records]
         if ordinals != sorted(set(ordinals)):
             raise ValueError("B2 manifest ordinals must be unique and strictly increasing.")
@@ -298,6 +300,7 @@ def get_action_libero_sft_dataset(
     local_dummy_mode: str = "normal",
     local_history_horizon: int = 0,
     stream_manifest_path: str | None = None,
+    stream_manifest_suite: str | None = None,
 ) -> Dataset:
     """Build the LIBERO action-policy SFT dataset (GA reproduction defaults).
 
@@ -348,8 +351,10 @@ def get_action_libero_sft_dataset(
     if stream_manifest_path is not None:
         if iterable_shuffle:
             raise ValueError("stream_manifest_path and iterable_shuffle cannot be enabled together.")
+        if not stream_manifest_suite:
+            raise ValueError("stream_manifest_path requires stream_manifest_suite.")
         records = [json.loads(line) for line in Path(stream_manifest_path).read_text().splitlines() if line]
-        return B2ManifestAwareIterableDataset(sft, records)
+        return B2ManifestAwareIterableDataset(sft, records, stream_manifest_suite)
     if iterable_shuffle:
         return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
     return sft
