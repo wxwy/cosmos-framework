@@ -133,6 +133,7 @@ class B2ManifestAwareIterableDataset(IterableDataset):
                         f"expected={expected}, actual={actual}."
                     )
             item["b2_stream_ordinal"] = torch.tensor(int(record["ordinal"]), dtype=torch.long)
+            item["b2_stream_epoch"] = torch.tensor(int(record["epoch"]), dtype=torch.long)
             item["b2_dataset_flat_index"] = torch.tensor(flat_index, dtype=torch.long)
             yield item
 

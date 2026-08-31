@@ -27,6 +27,7 @@ def _record(ordinal: int, start_frame: int | None = None):
 def test_b2_manifest_stream_preserves_requested_ordinals():
     samples = list(B2ManifestAwareIterableDataset(_Dataset(), [_record(0), _record(1)]))
     assert [int(sample["b2_stream_ordinal"]) for sample in samples] == [0, 1]
+    assert [int(sample["b2_stream_epoch"]) for sample in samples] == [0, 0]
     assert [int(sample["b2_dataset_flat_index"]) for sample in samples] == [0, 1]
 
 
