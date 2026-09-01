@@ -26,6 +26,11 @@ from torch.nn.modules.module import _IncompatibleKeys
 from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
 from cosmos_framework.utils.lazy_config import LazyDict
 from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
+
+
+def build_vlm_processor(vlm_config: Any) -> Any:
+    """Construct the configured VLM processor from the shared production primitive."""
+    return lazy_instantiate(vlm_config.tokenizer)
 from cosmos_framework.utils.lazy_config.registry import locate
 from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import log, misc
@@ -194,7 +199,7 @@ class OmniMoTModel(ImaginaireModel):
         # is the source of truth.  Without the annotation, basedpyright
         # narrows the ``lazy_instantiate`` overload return to
         # ``list[Unknown]`` and reports ``apply_chat_template`` missing.
-        self.vlm_processor: Any = lazy_instantiate(self.vlm_config.tokenizer)
+        self.vlm_processor: Any = build_vlm_processor(self.vlm_config)
 
         vlm_tokenizer = self.vlm_processor.tokenizer
         vlm_tokenizer, special_tokens = add_special_tokens(vlm_tokenizer)
