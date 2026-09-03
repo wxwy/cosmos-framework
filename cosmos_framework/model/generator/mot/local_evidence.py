@@ -281,6 +281,7 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         fast_hidden_dim: int = 128,
         inner_lr: float = 0.1,
         ttt_tbptt_steps: int = 16,
+        k_local: int = 1,
     ) -> None:
         super().__init__()
         for name, value in (
@@ -289,6 +290,7 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             ("ttt_dim", ttt_dim),
             ("fast_hidden_dim", fast_hidden_dim),
             ("ttt_tbptt_steps", ttt_tbptt_steps),
+            ("k_local", k_local),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer.")
@@ -305,14 +307,20 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         self.fast_hidden_dim = fast_hidden_dim
         self.inner_lr = inner_lr
         self.ttt_tbptt_steps = ttt_tbptt_steps
+        self.k_local = k_local
         self.key_proj = nn.Linear(evidence_dim, ttt_dim)
         self.query_proj = nn.Linear(evidence_dim, ttt_dim)
         self.value_proj = nn.Linear(evidence_dim, local_dim)
+        self.slot_queries = nn.Parameter(torch.empty(k_local, ttt_dim))
         self.w0_fast_in_weight = nn.Parameter(torch.empty(fast_hidden_dim, ttt_dim))
         self.w0_fast_in_bias = nn.Parameter(torch.empty(fast_hidden_dim))
         self.w0_fast_out_weight = nn.Parameter(torch.empty(local_dim, fast_hidden_dim))
         self.w0_fast_out_bias = nn.Parameter(torch.empty(local_dim))
         self._reset_w0_parameters()
+        if k_local == 1:
+            nn.init.zeros_(self.slot_queries)
+        else:
+            nn.init.normal_(self.slot_queries, mean=0.0, std=1 / math.sqrt(ttt_dim))
 
     def _reset_w0_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.w0_fast_in_weight, a=math.sqrt(5))
@@ -365,6 +373,20 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             F.linear(evidence_fp32, self.value_proj.weight.float(), self.value_proj.bias.float()),
         )
 
+    def project_queries(self, query_base_t: torch.Tensor) -> torch.Tensor:
+        if query_base_t.ndim != 2:
+            raise ValueError("query_base_t must have shape [B,D_ttt].")
+        batch = query_base_t.shape[0]
+        if (
+            tuple(query_base_t.shape) != (batch, self.ttt_dim)
+            or query_base_t.dtype != torch.float32
+            or not torch.isfinite(query_base_t).all()
+        ):
+            raise ValueError("query_base_t must have shape [B,D_ttt], dtype float32, and finite values.")
+        if query_base_t.device != self.slot_queries.device:
+            raise ValueError("query_base_t device must match slot_queries.")
+        return query_base_t.unsqueeze(1) + self.slot_queries.float().unsqueeze(0)
+
     def _validate_state(self, state: ContinualTTTFastState, batch: int) -> None:
         if not isinstance(state, ContinualTTTFastState):
             raise ValueError("state must be ContinualTTTFastState.")
@@ -388,11 +410,31 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         hidden = F.silu(F.linear(value, state.fast_in_weight, state.fast_in_bias))
         return F.linear(hidden, state.fast_out_weight, state.fast_out_bias)
 
-    def step_projected(
+    def read_many(self, query_t: torch.Tensor, state: ContinualTTTFastState) -> torch.Tensor:
+        if query_t.ndim != 3:
+            raise ValueError("query_t must have shape [B,K_local,D_ttt].")
+        batch = query_t.shape[0]
+        expected = (batch, self.k_local, self.ttt_dim)
+        if tuple(query_t.shape) != expected or query_t.dtype != torch.float32 or not torch.isfinite(query_t).all():
+            raise ValueError(f"query_t must have shape {expected}, dtype float32, and finite values.")
+        self._validate_state(state, batch)
+        if query_t.device != state.fast_in_weight.device:
+            raise ValueError("state and query_t must share a device.")
+        return torch.stack(
+            [
+                self._fast_mlp(
+                    query_t[row],
+                    ContinualTTTFastState(*(member[row].float() for member in state)),
+                )
+                for row in range(batch)
+            ]
+        )
+
+    def step_projected_many(
         self,
         *,
         key_t: torch.Tensor,
-        query_t: torch.Tensor,
+        query_base_t: torch.Tensor,
         value_t: torch.Tensor,
         state_in: ContinualTTTFastState,
         valid: torch.Tensor,
@@ -407,7 +449,7 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         batch = key_t.shape[0]
         for name, value, shape in (
             ("key_t", key_t, (batch, self.ttt_dim)),
-            ("query_t", query_t, (batch, self.ttt_dim)),
+            ("query_base_t", query_base_t, (batch, self.ttt_dim)),
             ("value_t", value_t, (batch, self.local_dim)),
         ):
             if tuple(value.shape) != shape or value.dtype != torch.float32 or not torch.isfinite(value).all():
@@ -419,15 +461,14 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         self._validate_state(state_in, batch)
         if state_in.fast_in_weight.device != key_t.device:
             raise ValueError("state and K/Q/V must share a device.")
+        queries = self.project_queries(query_base_t)
 
         valid = valid.bool()
         state_rows: list[list[torch.Tensor]] = [[], [], [], []]
-        token_rows: list[torch.Tensor] = []
         for row in range(batch):
             if not valid[row]:
                 for output, member in zip(state_rows, state_in, strict=True):
                     output.append(member[row])
-                token_rows.append(torch.zeros(self.local_dim, device=key_t.device, dtype=torch.float32))
                 continue
 
             work = []
@@ -443,14 +484,35 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             updated = ContinualTTTFastState(
                 *(member - self.inner_lr * gradient for member, gradient in zip(work_state, gradients, strict=True))
             )
-            token_rows.append(self._fast_mlp(query_t[row], updated))
             for output, member, reference in zip(state_rows, updated, state_in, strict=True):
                 output.append(member.to(dtype=reference.dtype))
 
         state_out = ContinualTTTFastState(*(torch.stack(rows) for rows in state_rows))
-        return torch.stack(token_rows)[:, None], state_out, valid
+        tokens = self.read_many(queries, state_out)
+        return tokens * valid[:, None, None], state_out, valid
 
-    def step(
+    def step_projected(
+        self,
+        *,
+        key_t: torch.Tensor,
+        query_t: torch.Tensor,
+        value_t: torch.Tensor,
+        state_in: ContinualTTTFastState,
+        valid: torch.Tensor,
+        create_graph: bool,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        if self.k_local != 1:
+            raise ValueError("step_projected is only valid when k_local=1; use step_projected_many.")
+        return self.step_projected_many(
+            key_t=key_t,
+            query_base_t=query_t,
+            value_t=value_t,
+            state_in=state_in,
+            valid=valid,
+            create_graph=create_graph,
+        )
+
+    def step_many(
         self,
         evidence_t: torch.Tensor,
         state_in: ContinualTTTFastState,
@@ -460,17 +522,29 @@ class ContinualTTTLocalMemoryCore(nn.Module):
     ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
         if torch.is_inference_mode_enabled() or not torch.is_grad_enabled():
             raise RuntimeError("Continual TTT update requires ordinary grad mode.")
-        key_t, query_t, value_t = self.project_evidence(evidence_t)
-        return self.step_projected(
+        key_t, query_base_t, value_t = self.project_evidence(evidence_t)
+        return self.step_projected_many(
             key_t=key_t,
-            query_t=query_t,
+            query_base_t=query_base_t,
             value_t=value_t,
             state_in=state_in,
             valid=valid,
             create_graph=create_graph,
         )
 
-    def scan_segment(
+    def step(
+        self,
+        evidence_t: torch.Tensor,
+        state_in: ContinualTTTFastState,
+        valid: torch.Tensor,
+        *,
+        create_graph: bool = True,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        if self.k_local != 1:
+            raise ValueError("step is only valid when k_local=1; use step_many.")
+        return self.step_many(evidence_t, state_in, valid, create_graph=create_graph)
+
+    def scan_segment_many(
         self,
         evidence: torch.Tensor,
         valid: torch.Tensor,
@@ -478,7 +552,6 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         *,
         create_graph: bool = True,
     ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
-        """Scan a training segment and retain every timestep readout for its outer loss."""
         if torch.is_inference_mode_enabled() or not torch.is_grad_enabled():
             raise RuntimeError("Continual TTT update requires ordinary grad mode.")
         if evidence.ndim != 3:
@@ -491,12 +564,28 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         state = self.initial_state(batch, device=evidence.device) if state_in is None else state_in
         tokens, present = [], []
         for index in range(steps):
-            token, state, step_present = self.step(
+            token, state, step_present = self.step_many(
                 evidence[:, index], state, valid[:, index], create_graph=create_graph
             )
-            tokens.append(token[:, 0])
+            tokens.append(token)
             present.append(step_present)
         return torch.stack(tokens, dim=1), state, torch.stack(present, dim=1)
+
+    def scan_segment(
+        self,
+        evidence: torch.Tensor,
+        valid: torch.Tensor,
+        state_in: ContinualTTTFastState | None = None,
+        *,
+        create_graph: bool = True,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        """Scan a training segment and retain every timestep readout for its outer loss."""
+        if self.k_local != 1:
+            raise ValueError("scan_segment is only valid when k_local=1; use scan_segment_many.")
+        tokens, state, present = self.scan_segment_many(
+            evidence, valid, state_in, create_graph=create_graph
+        )
+        return tokens[:, :, 0], state, present
 
     def reset_mask(self, state: ContinualTTTFastState, done: torch.Tensor) -> ContinualTTTFastState:
         if not isinstance(state, ContinualTTTFastState):
