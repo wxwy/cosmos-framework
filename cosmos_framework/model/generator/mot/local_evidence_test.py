@@ -5,8 +5,16 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch.nn import functional as F
 
-from cosmos_framework.model.generator.mot.local_evidence import LocalEvidenceEncoder, RecurrentLocalMemoryBackend, StatelessLocalReplayReadout, TTTLocalMemoryBackend
+from cosmos_framework.model.generator.mot.local_evidence import (
+    ContinualTTTFastState,
+    ContinualTTTLocalMemoryCore,
+    LocalEvidenceEncoder,
+    RecurrentLocalMemoryBackend,
+    StatelessLocalReplayReadout,
+    TTTLocalMemoryBackend,
+)
 
 
 def _inputs() -> dict[str, torch.Tensor]:
@@ -181,3 +189,359 @@ def test_r09_b1_ttt_rejects_outer_no_grad_without_mutating_state() -> None:
         with context, pytest.raises(RuntimeError, match="training grad-mode"):
             backend.replay(evidence, mask, state)
         assert all(torch.equal(value, expected) for value, expected in zip(state, reference, strict=True))
+
+
+def _continual_ttt_core(*, ttt_tbptt_steps: int = 4) -> ContinualTTTLocalMemoryCore:
+    return ContinualTTTLocalMemoryCore(
+        evidence_dim=5,
+        local_dim=3,
+        ttt_dim=4,
+        fast_hidden_dim=6,
+        inner_lr=0.2,
+        ttt_tbptt_steps=ttt_tbptt_steps,
+    )
+
+
+def _continual_ttt_manual_read(value: torch.Tensor, state: ContinualTTTFastState) -> torch.Tensor:
+    hidden = F.silu(F.linear(value, state.fast_in_weight, state.fast_in_bias))
+    return F.linear(hidden, state.fast_out_weight, state.fast_out_bias)
+
+
+@pytest.mark.L0
+def test_continual_ttt_constructor_validation_and_configurable_tbptt() -> None:
+    assert ContinualTTTLocalMemoryCore().ttt_tbptt_steps == 16
+    actual_steps = [ContinualTTTLocalMemoryCore(ttt_tbptt_steps=value).ttt_tbptt_steps for value in (1, 7, 16)]
+    assert actual_steps == [1, 7, 16]
+    for field in ("evidence_dim", "local_dim", "ttt_dim", "fast_hidden_dim", "ttt_tbptt_steps"):
+        for value in (True, 0, -1):
+            with pytest.raises(ValueError, match=field):
+                ContinualTTTLocalMemoryCore(**{field: value})
+    for value in (0, -1, float("nan"), float("inf"), "invalid"):
+        with pytest.raises(ValueError, match="inner_lr"):
+            ContinualTTTLocalMemoryCore(inner_lr=value)
+
+
+@pytest.mark.L0
+def test_continual_ttt_parameter_registry_and_element_count() -> None:
+    core = ContinualTTTLocalMemoryCore()
+    expected = {
+        "key_proj.weight",
+        "key_proj.bias",
+        "query_proj.weight",
+        "query_proj.bias",
+        "value_proj.weight",
+        "value_proj.bias",
+        "w0_fast_in_weight",
+        "w0_fast_in_bias",
+        "w0_fast_out_weight",
+        "w0_fast_out_bias",
+    }
+    assert set(dict(core.named_parameters())) == expected
+    assert set(core.state_dict()) == expected
+    assert sum(parameter.numel() for parameter in core.parameters()) == 53_568
+    assert "inner_lr" not in core.state_dict() and "ttt_tbptt_steps" not in core.state_dict()
+
+
+@pytest.mark.L0
+def test_continual_ttt_initial_state_shape_storage_and_w0_gradient() -> None:
+    torch.manual_seed(20)
+    core = _continual_ttt_core()
+    state = core.initial_state(2, device=torch.device("cpu"), dtype=torch.float32)
+    expected_shapes = ((2, 6, 4), (2, 6), (2, 3, 6), (2, 3))
+    for value, w0, shape in zip(state, core._w0, expected_shapes, strict=True):
+        assert value.shape == shape and value.dtype == torch.float32 and value.device.type == "cpu"
+        assert torch.equal(value[0], w0) and torch.equal(value[1], w0)
+        assert value.stride(0) != 0 and value[0].data_ptr() != value[1].data_ptr()
+    sum(value.sum() for value in state).backward()
+    assert all(parameter.grad is not None for parameter in core._w0)
+    with pytest.raises(ValueError, match="batch"):
+        core.initial_state(False)
+
+
+@pytest.mark.L0
+def test_continual_ttt_step_matches_manual_kvb_and_is_functional() -> None:
+    torch.manual_seed(21)
+    core = _continual_ttt_core()
+    state = core.initial_state(1)
+    original = tuple(value.clone() for value in state)
+    key = torch.randn(1, 4)
+    query = torch.randn(1, 4)
+    value = torch.randn(1, 3)
+    work = ContinualTTTFastState(*(member[0] for member in state))
+    loss = (_continual_ttt_manual_read(key[0], work) - value[0]).square().mean()
+    gradients = torch.autograd.grad(loss, work, create_graph=True)
+    expected_state = ContinualTTTFastState(
+        *(member - core.inner_lr * gradient for member, gradient in zip(work, gradients, strict=True))
+    )
+    expected_token = _continual_ttt_manual_read(query[0], expected_state)
+    token, state_out, present = core.step_projected(
+        key_t=key, query_t=query, value_t=value, state_in=state, valid=torch.tensor([True]), create_graph=True
+    )
+    torch.testing.assert_close(token[0, 0], expected_token, atol=1e-6, rtol=1e-5)
+    for actual, expected in zip(state_out, expected_state, strict=True):
+        torch.testing.assert_close(actual[0], expected, atol=1e-6, rtol=1e-5)
+    assert present.tolist() == [True]
+    assert all(torch.equal(member, reference) for member, reference in zip(state, original, strict=True))
+
+
+@pytest.mark.L0
+def test_continual_ttt_update_is_batch_independent() -> None:
+    torch.manual_seed(22)
+    core = _continual_ttt_core()
+    key, query, value = (torch.randn(3, width) for width in (4, 4, 3))
+    batched = core.step_projected(
+        key_t=key,
+        query_t=query,
+        value_t=value,
+        state_in=core.initial_state(3),
+        valid=torch.tensor([True, True, False]),
+        create_graph=True,
+    )
+    single = core.step_projected(
+        key_t=key[:1],
+        query_t=query[:1],
+        value_t=value[:1],
+        state_in=core.initial_state(1),
+        valid=torch.tensor([True]),
+        create_graph=True,
+    )
+    torch.testing.assert_close(batched[0][0], single[0][0], atol=1e-6, rtol=1e-5)
+    for batch_member, single_member in zip(batched[1], single[1], strict=True):
+        torch.testing.assert_close(batch_member[0], single_member[0], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.L0
+def test_continual_ttt_invalid_rows_are_exactly_inert() -> None:
+    torch.manual_seed(23)
+    core = _continual_ttt_core()
+    state = core.initial_state(2)
+    key, query, value = (torch.randn(2, width) for width in (4, 4, 3))
+    token, state_out, present = core.step_projected(
+        key_t=key, query_t=query, value_t=value, state_in=state, valid=torch.tensor([True, False]), create_graph=True
+    )
+    assert present.tolist() == [True, False] and torch.count_nonzero(token[1]) == 0
+    assert all(torch.equal(output[1], source[1]) for output, source in zip(state_out, state, strict=True))
+    assert any(not torch.equal(output[0], source[0]) for output, source in zip(state_out, state, strict=True))
+
+
+@pytest.mark.L0
+def test_continual_ttt_reset_restores_complete_w0_per_sample() -> None:
+    torch.manual_seed(24)
+    core = _continual_ttt_core()
+    state = ContinualTTTFastState(*(value + torch.randn_like(value) for value in core.initial_state(3)))
+    done = torch.tensor([False, True, False])
+    reset = core.reset_mask(state, done)
+    for output, source, w0 in zip(reset, state, core._w0, strict=True):
+        assert torch.equal(output[~done], source[~done]) and torch.equal(output[1], w0)
+    full = core.reset_mask(state, torch.ones(3, dtype=torch.bool))
+    assert all(
+        torch.equal(output, w0.unsqueeze(0).expand_as(output))
+        for output, w0 in zip(full, core._w0, strict=True)
+    )
+
+
+@pytest.mark.L0
+def test_continual_ttt_detach_preserves_values_and_cuts_graph() -> None:
+    core = _continual_ttt_core()
+    state = core.initial_state(2)
+    detached = core.detach_state(state)
+    assert all(
+        torch.equal(output, source) and output.grad_fn is None and not output.requires_grad
+        for output, source in zip(detached, state, strict=True)
+    )
+    assert all(output.data_ptr() == source.data_ptr() for output, source in zip(detached, state, strict=True))
+
+
+@pytest.mark.L0
+def test_continual_ttt_scan_matches_timestep_steps() -> None:
+    torch.manual_seed(25)
+    core = _continual_ttt_core()
+    evidence = torch.randn(2, 4, 5)
+    valid = torch.tensor([[True, True, False, True], [False, True, True, False]])
+    scan_token, scan_state, scan_present = core.scan_segment(evidence, valid)
+    state = core.initial_state(2)
+    tokens, presents = [], []
+    for index in range(4):
+        token, state, present = core.step(evidence[:, index], state, valid[:, index])
+        tokens.append(token[:, 0])
+        presents.append(present)
+    torch.testing.assert_close(scan_token, torch.stack(tokens, dim=1), atol=1e-6, rtol=1e-5)
+    assert torch.equal(scan_present, torch.stack(presents, dim=1))
+    for actual, expected in zip(scan_state, state, strict=True):
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.L0
+def test_continual_ttt_detached_carry_rebuilds_graph_and_tbptt_does_not_change_values() -> None:
+    torch.manual_seed(26)
+    core = _continual_ttt_core(ttt_tbptt_steps=4)
+    evidence = torch.randn(2, 4, 5)
+    valid = torch.ones(2, 4, dtype=torch.bool)
+    _, first_state, _ = core.scan_segment(evidence[:, :2], valid[:, :2])
+    carry = core.detach_state(first_state)
+    second_token, second_state, _ = core.scan_segment(evidence[:, 2:], valid[:, 2:], carry)
+    assert all(value.requires_grad and value.grad_fn is not None for value in second_state)
+    wider = _continual_ttt_core(ttt_tbptt_steps=7)
+    wider.load_state_dict(core.state_dict())
+    wider_token, wider_state, _ = wider.scan_segment(evidence[:, 2:], valid[:, 2:], wider.detach_state(first_state))
+    torch.testing.assert_close(second_token, wider_token, atol=1e-6, rtol=1e-5)
+    for actual, expected in zip(second_state, wider_state, strict=True):
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.L0
+def test_continual_ttt_rejects_invalid_inputs_before_state_mutation() -> None:
+    torch.manual_seed(27)
+    core = _continual_ttt_core(ttt_tbptt_steps=2)
+    state = core.initial_state(1)
+    reference = tuple(value.clone() for value in state)
+    nonfinite_state = ContinualTTTFastState(state[0] * float("nan"), state[1], state[2], state[3])
+    bad_calls = (
+        lambda: core.scan_segment(torch.empty(1, 0, 5), torch.empty(1, 0, dtype=torch.bool), state),
+        lambda: core.scan_segment(torch.randn(1, 3, 5), torch.ones(1, 3, dtype=torch.bool), state),
+        lambda: core.step(torch.full((1, 5), float("nan")), state, torch.ones(1, dtype=torch.bool)),
+        lambda: core.step_projected(
+            key_t=torch.randn(1, 4),
+            query_t=torch.full((1, 4), float("inf")),
+            value_t=torch.randn(1, 3),
+            state_in=state,
+            valid=torch.ones(1, dtype=torch.bool),
+            create_graph=True,
+        ),
+        lambda: core.step_projected(
+            key_t=torch.randn(1, 4),
+            query_t=torch.randn(1, 5),
+            value_t=torch.randn(1, 3),
+            state_in=state,
+            valid=torch.ones(1, dtype=torch.bool),
+            create_graph=True,
+        ),
+        lambda: core.step_projected(
+            key_t=torch.randn(1, 4, dtype=torch.float64),
+            query_t=torch.randn(1, 4),
+            value_t=torch.randn(1, 3),
+            state_in=state,
+            valid=torch.ones(1, dtype=torch.bool),
+            create_graph=True,
+        ),
+        lambda: core.step_projected(
+            key_t=torch.randn(1, 4),
+            query_t=torch.randn(1, 4),
+            value_t=torch.randn(1, 3),
+            state_in=nonfinite_state,
+            valid=torch.ones(1, dtype=torch.bool),
+            create_graph=True,
+        ),
+        lambda: core.step_projected(
+            key_t=torch.randn(1, 4),
+            query_t=torch.randn(1, 4),
+            value_t=torch.randn(1, 3),
+            state_in=ContinualTTTFastState(state[0], state[1].double(), state[2], state[3]),
+            valid=torch.ones(1, dtype=torch.bool),
+            create_graph=True,
+        ),
+        lambda: core.step_projected(
+            key_t=torch.randn(1, 4),
+            query_t=torch.randn(1, 4),
+            value_t=torch.randn(1, 3),
+            state_in=state,
+            valid=torch.empty(1, device="meta", dtype=torch.bool),
+            create_graph=True,
+        ),
+        lambda: core.step_projected(
+            key_t=torch.randn(1, 4),
+            query_t=torch.randn(1, 4),
+            value_t=torch.randn(1, 3),
+            state_in=state,
+            valid=torch.ones(1, dtype=torch.bool),
+            create_graph=1,
+        ),
+    )
+    for call in bad_calls:
+        with pytest.raises(ValueError):
+            call()
+        assert all(torch.equal(value, expected) for value, expected in zip(state, reference, strict=True))
+
+
+@pytest.mark.L0
+def test_continual_ttt_outer_loss_reaches_kqv_and_learned_w0() -> None:
+    torch.manual_seed(28)
+    core = _continual_ttt_core()
+    token, _, _ = core.scan_segment(torch.randn(2, 3, 5), torch.ones(2, 3, dtype=torch.bool), create_graph=True)
+    token.square().sum().backward()
+    groups = (
+        (core.key_proj.weight, core.key_proj.bias),
+        (core.query_proj.weight, core.query_proj.bias),
+        (core.value_proj.weight, core.value_proj.bias),
+        core._w0,
+    )
+    for group in groups:
+        assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in group)
+        assert any(torch.count_nonzero(parameter.grad) > 0 for parameter in group)
+
+
+@pytest.mark.L0
+def test_continual_ttt_create_graph_modes_are_numerically_equal() -> None:
+    torch.manual_seed(29)
+    core = _continual_ttt_core()
+    key, query, value = (torch.randn(2, width) for width in (4, 4, 3))
+    true_result = core.step_projected(
+        key_t=key,
+        query_t=query,
+        value_t=value,
+        state_in=core.initial_state(2),
+        valid=torch.ones(2, dtype=torch.bool),
+        create_graph=True,
+    )
+    false_result = core.step_projected(
+        key_t=key,
+        query_t=query,
+        value_t=value,
+        state_in=core.initial_state(2),
+        valid=torch.ones(2, dtype=torch.bool),
+        create_graph=False,
+    )
+    torch.testing.assert_close(true_result[0], false_result[0], atol=1e-6, rtol=1e-5)
+    for left, right in zip(true_result[1], false_result[1], strict=True):
+        torch.testing.assert_close(left, right, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.L0
+def test_continual_ttt_rejects_disabled_grad_before_mutation() -> None:
+    torch.manual_seed(30)
+    core = _continual_ttt_core()
+    state = core.initial_state(1)
+    reference = tuple(value.clone() for value in state)
+    evidence = torch.randn(1, 5)
+    for context in (torch.no_grad(), torch.inference_mode()):
+        with context, pytest.raises(RuntimeError, match="ordinary grad mode"):
+            core.step(evidence, state, torch.tensor([True]))
+        assert all(torch.equal(value, expected) for value, expected in zip(state, reference, strict=True))
+
+
+@pytest.mark.L0
+def test_continual_ttt_projected_and_evidence_step_are_identical() -> None:
+    torch.manual_seed(31)
+    core = _continual_ttt_core()
+    evidence = torch.randn(2, 5)
+    valid = torch.tensor([True, False])
+    state = core.initial_state(2)
+    projected = core.project_evidence(evidence)
+    direct_result = core.step(evidence, state, valid)
+    projected_result = core.step_projected(
+        key_t=projected[0], query_t=projected[1], value_t=projected[2], state_in=state, valid=valid, create_graph=True
+    )
+    torch.testing.assert_close(direct_result[0], projected_result[0], atol=1e-6, rtol=1e-5)
+    assert torch.equal(direct_result[2], projected_result[2])
+    for left, right in zip(direct_result[1], projected_result[1], strict=True):
+        torch.testing.assert_close(left, right, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.L0
+def test_continual_ttt_fast_state_payload_formula() -> None:
+    core = ContinualTTTLocalMemoryCore()
+    state = core.initial_state(1)
+    elements = sum(value.numel() for value in state)
+    assert elements == 12_448
+    assert elements * torch.tensor([], dtype=torch.float32).element_size() == 49_792
+    assert elements * torch.tensor([], dtype=torch.bfloat16).element_size() == 24_896

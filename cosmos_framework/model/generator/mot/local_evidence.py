@@ -9,8 +9,12 @@ Cosmos wiring, and persistent-memory mechanisms belong to later R08/R09 steps.
 
 from __future__ import annotations
 
+import math
+from typing import NamedTuple
+
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class LocalEvidenceEncoder(nn.Module):
@@ -250,6 +254,270 @@ class TTTLocalMemoryBackend(nn.Module):
                     pending[row].zero_(); progress[row] = 0
         token = torch.einsum("bde,be->bd", W, last).detach()[:, None] * initialized[:, None, None]
         return token, (W.detach(), pending.detach(), last.detach(), initialized, progress), initialized
+
+
+class ContinualTTTFastState(NamedTuple):
+    """Per-sample fast MLP parameters carried across timesteps."""
+
+    fast_in_weight: torch.Tensor
+    fast_in_bias: torch.Tensor
+    fast_out_weight: torch.Tensor
+    fast_out_bias: torch.Tensor
+
+
+class ContinualTTTLocalMemoryCore(nn.Module):
+    """Functional CPU reference core for continual per-timestep KVB updates.
+
+    Each step reads one ``[B,1,D_local]`` value. The time axis returned by
+    :meth:`scan_segment` exists for outer-loss/TBPTT tests; it is not a claim
+    that production attention receives ``T`` simultaneous Memory tokens.
+    """
+
+    def __init__(
+        self,
+        evidence_dim: int = 256,
+        local_dim: int = 32,
+        ttt_dim: int = 64,
+        fast_hidden_dim: int = 128,
+        inner_lr: float = 0.1,
+        ttt_tbptt_steps: int = 16,
+    ) -> None:
+        super().__init__()
+        for name, value in (
+            ("evidence_dim", evidence_dim),
+            ("local_dim", local_dim),
+            ("ttt_dim", ttt_dim),
+            ("fast_hidden_dim", fast_hidden_dim),
+            ("ttt_tbptt_steps", ttt_tbptt_steps),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer.")
+        try:
+            inner_lr = float(inner_lr)
+        except (TypeError, ValueError) as error:
+            raise ValueError("inner_lr must be finite and positive.") from error
+        if not math.isfinite(inner_lr) or inner_lr <= 0:
+            raise ValueError("inner_lr must be finite and positive.")
+
+        self.evidence_dim = evidence_dim
+        self.local_dim = local_dim
+        self.ttt_dim = ttt_dim
+        self.fast_hidden_dim = fast_hidden_dim
+        self.inner_lr = inner_lr
+        self.ttt_tbptt_steps = ttt_tbptt_steps
+        self.key_proj = nn.Linear(evidence_dim, ttt_dim)
+        self.query_proj = nn.Linear(evidence_dim, ttt_dim)
+        self.value_proj = nn.Linear(evidence_dim, local_dim)
+        self.w0_fast_in_weight = nn.Parameter(torch.empty(fast_hidden_dim, ttt_dim))
+        self.w0_fast_in_bias = nn.Parameter(torch.empty(fast_hidden_dim))
+        self.w0_fast_out_weight = nn.Parameter(torch.empty(local_dim, fast_hidden_dim))
+        self.w0_fast_out_bias = nn.Parameter(torch.empty(local_dim))
+        self._reset_w0_parameters()
+
+    def _reset_w0_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.w0_fast_in_weight, a=math.sqrt(5))
+        nn.init.uniform_(self.w0_fast_in_bias, -1 / math.sqrt(self.ttt_dim), 1 / math.sqrt(self.ttt_dim))
+        nn.init.kaiming_uniform_(self.w0_fast_out_weight, a=math.sqrt(5))
+        nn.init.uniform_(
+            self.w0_fast_out_bias,
+            -1 / math.sqrt(self.fast_hidden_dim),
+            1 / math.sqrt(self.fast_hidden_dim),
+        )
+
+    @property
+    def _w0(self) -> ContinualTTTFastState:
+        return ContinualTTTFastState(
+            self.w0_fast_in_weight,
+            self.w0_fast_in_bias,
+            self.w0_fast_out_weight,
+            self.w0_fast_out_bias,
+        )
+
+    def initial_state(
+        self,
+        batch: int,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> ContinualTTTFastState:
+        if isinstance(batch, bool) or not isinstance(batch, int) or batch <= 0:
+            raise ValueError("batch must be a positive integer.")
+        device = self.w0_fast_in_weight.device if device is None else device
+        dtype = self.w0_fast_in_weight.dtype if dtype is None else dtype
+        return ContinualTTTFastState(
+            *(
+                value.to(device=device, dtype=dtype).unsqueeze(0).expand(batch, *value.shape).clone()
+                for value in self._w0
+            )
+        )
+
+    def project_evidence(self, evidence_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if evidence_t.ndim != 2 or tuple(evidence_t.shape) != (evidence_t.shape[0], self.evidence_dim):
+            raise ValueError(f"evidence_t must have shape [B,{self.evidence_dim}].")
+        if not evidence_t.is_floating_point() or not torch.isfinite(evidence_t).all():
+            raise ValueError("evidence_t must be floating point and finite.")
+        if evidence_t.device != self.key_proj.weight.device:
+            raise ValueError("evidence_t device must match projection parameters.")
+        evidence_fp32 = evidence_t.float()
+        return (
+            F.linear(evidence_fp32, self.key_proj.weight.float(), self.key_proj.bias.float()),
+            F.linear(evidence_fp32, self.query_proj.weight.float(), self.query_proj.bias.float()),
+            F.linear(evidence_fp32, self.value_proj.weight.float(), self.value_proj.bias.float()),
+        )
+
+    def _validate_state(self, state: ContinualTTTFastState, batch: int) -> None:
+        if not isinstance(state, ContinualTTTFastState):
+            raise ValueError("state must be ContinualTTTFastState.")
+        expected = (
+            (batch, self.fast_hidden_dim, self.ttt_dim),
+            (batch, self.fast_hidden_dim),
+            (batch, self.local_dim, self.fast_hidden_dim),
+            (batch, self.local_dim),
+        )
+        first = state.fast_in_weight
+        for name, value, shape in zip(ContinualTTTFastState._fields, state, expected, strict=True):
+            if tuple(value.shape) != shape:
+                raise ValueError(f"state.{name} must have shape {shape}.")
+            if value.device != first.device or value.dtype != first.dtype:
+                raise ValueError("state members must share device and dtype.")
+            if not value.is_floating_point() or not torch.isfinite(value).all():
+                raise ValueError(f"state.{name} must be floating point and finite.")
+
+    @staticmethod
+    def _fast_mlp(value: torch.Tensor, state: ContinualTTTFastState) -> torch.Tensor:
+        hidden = F.silu(F.linear(value, state.fast_in_weight, state.fast_in_bias))
+        return F.linear(hidden, state.fast_out_weight, state.fast_out_bias)
+
+    def step_projected(
+        self,
+        *,
+        key_t: torch.Tensor,
+        query_t: torch.Tensor,
+        value_t: torch.Tensor,
+        state_in: ContinualTTTFastState,
+        valid: torch.Tensor,
+        create_graph: bool,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        if torch.is_inference_mode_enabled() or not torch.is_grad_enabled():
+            raise RuntimeError("Continual TTT update requires ordinary grad mode.")
+        if not isinstance(create_graph, bool):
+            raise ValueError("create_graph must be bool.")
+        if key_t.ndim != 2:
+            raise ValueError("key_t must have shape [B,D_ttt].")
+        batch = key_t.shape[0]
+        for name, value, shape in (
+            ("key_t", key_t, (batch, self.ttt_dim)),
+            ("query_t", query_t, (batch, self.ttt_dim)),
+            ("value_t", value_t, (batch, self.local_dim)),
+        ):
+            if tuple(value.shape) != shape or value.dtype != torch.float32 or not torch.isfinite(value).all():
+                raise ValueError(f"{name} must have shape {shape}, dtype float32, and finite values.")
+            if value.device != key_t.device:
+                raise ValueError("K/Q/V must share a device.")
+        if tuple(valid.shape) != (batch,) or valid.device != key_t.device:
+            raise ValueError("valid must have shape [B] on the K/Q/V device.")
+        self._validate_state(state_in, batch)
+        if state_in.fast_in_weight.device != key_t.device:
+            raise ValueError("state and K/Q/V must share a device.")
+
+        valid = valid.bool()
+        state_rows: list[list[torch.Tensor]] = [[], [], [], []]
+        token_rows: list[torch.Tensor] = []
+        for row in range(batch):
+            if not valid[row]:
+                for output, member in zip(state_rows, state_in, strict=True):
+                    output.append(member[row])
+                token_rows.append(torch.zeros(self.local_dim, device=key_t.device, dtype=torch.float32))
+                continue
+
+            work = []
+            for member in state_in:
+                member_row = member[row].float()
+                if not member_row.requires_grad:
+                    member_row = member_row.detach().requires_grad_(True)
+                work.append(member_row)
+            work_state = ContinualTTTFastState(*work)
+            prediction = self._fast_mlp(key_t[row], work_state)
+            inner_loss = (prediction - value_t[row]).square().mean()
+            gradients = torch.autograd.grad(inner_loss, work_state, create_graph=create_graph)
+            updated = ContinualTTTFastState(
+                *(member - self.inner_lr * gradient for member, gradient in zip(work_state, gradients, strict=True))
+            )
+            token_rows.append(self._fast_mlp(query_t[row], updated))
+            for output, member, reference in zip(state_rows, updated, state_in, strict=True):
+                output.append(member.to(dtype=reference.dtype))
+
+        state_out = ContinualTTTFastState(*(torch.stack(rows) for rows in state_rows))
+        return torch.stack(token_rows)[:, None], state_out, valid
+
+    def step(
+        self,
+        evidence_t: torch.Tensor,
+        state_in: ContinualTTTFastState,
+        valid: torch.Tensor,
+        *,
+        create_graph: bool = True,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        if torch.is_inference_mode_enabled() or not torch.is_grad_enabled():
+            raise RuntimeError("Continual TTT update requires ordinary grad mode.")
+        key_t, query_t, value_t = self.project_evidence(evidence_t)
+        return self.step_projected(
+            key_t=key_t,
+            query_t=query_t,
+            value_t=value_t,
+            state_in=state_in,
+            valid=valid,
+            create_graph=create_graph,
+        )
+
+    def scan_segment(
+        self,
+        evidence: torch.Tensor,
+        valid: torch.Tensor,
+        state_in: ContinualTTTFastState | None = None,
+        *,
+        create_graph: bool = True,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        """Scan a training segment and retain every timestep readout for its outer loss."""
+        if torch.is_inference_mode_enabled() or not torch.is_grad_enabled():
+            raise RuntimeError("Continual TTT update requires ordinary grad mode.")
+        if evidence.ndim != 3:
+            raise ValueError("evidence must have shape [B,T,D_e].")
+        batch, steps, width = evidence.shape
+        if width != self.evidence_dim or tuple(valid.shape) != (batch, steps):
+            raise ValueError("evidence/valid shapes are incompatible.")
+        if steps <= 0 or steps > self.ttt_tbptt_steps:
+            raise ValueError("segment length must be in [1, ttt_tbptt_steps].")
+        state = self.initial_state(batch, device=evidence.device) if state_in is None else state_in
+        tokens, present = [], []
+        for index in range(steps):
+            token, state, step_present = self.step(
+                evidence[:, index], state, valid[:, index], create_graph=create_graph
+            )
+            tokens.append(token[:, 0])
+            present.append(step_present)
+        return torch.stack(tokens, dim=1), state, torch.stack(present, dim=1)
+
+    def reset_mask(self, state: ContinualTTTFastState, done: torch.Tensor) -> ContinualTTTFastState:
+        if not isinstance(state, ContinualTTTFastState):
+            raise ValueError("state must be ContinualTTTFastState.")
+        batch = state.fast_in_weight.shape[0]
+        self._validate_state(state, batch)
+        if tuple(done.shape) != (batch,) or done.device != state.fast_in_weight.device:
+            raise ValueError("done must have shape [B] on the state device.")
+        done = done.bool()
+        reset = self.initial_state(batch, device=state.fast_in_weight.device, dtype=state.fast_in_weight.dtype)
+        return ContinualTTTFastState(
+            *(
+                torch.where(done.view(batch, *([1] * (value.ndim - 1))), replacement, value)
+                for value, replacement in zip(state, reset, strict=True)
+            )
+        )
+
+    def detach_state(self, state: ContinualTTTFastState) -> ContinualTTTFastState:
+        batch = state.fast_in_weight.shape[0] if isinstance(state, ContinualTTTFastState) else 0
+        self._validate_state(state, batch)
+        return ContinualTTTFastState(*(value.detach() for value in state))
 
 
 class LocalHistoryRuntime(nn.Module):
