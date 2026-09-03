@@ -377,14 +377,12 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         if query_base_t.ndim != 2:
             raise ValueError("query_base_t must have shape [B,D_ttt].")
         batch = query_base_t.shape[0]
-        if (
-            tuple(query_base_t.shape) != (batch, self.ttt_dim)
-            or query_base_t.dtype != torch.float32
-            or not torch.isfinite(query_base_t).all()
-        ):
+        if tuple(query_base_t.shape) != (batch, self.ttt_dim) or query_base_t.dtype != torch.float32:
             raise ValueError("query_base_t must have shape [B,D_ttt], dtype float32, and finite values.")
         if query_base_t.device != self.slot_queries.device:
             raise ValueError("query_base_t device must match slot_queries.")
+        if not torch.isfinite(query_base_t).all():
+            raise ValueError("query_base_t must have shape [B,D_ttt], dtype float32, and finite values.")
         return query_base_t.unsqueeze(1) + self.slot_queries.float().unsqueeze(0)
 
     def _validate_state(self, state: ContinualTTTFastState, batch: int) -> None:
@@ -415,7 +413,11 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             raise ValueError("query_t must have shape [B,K_local,D_ttt].")
         batch = query_t.shape[0]
         expected = (batch, self.k_local, self.ttt_dim)
-        if tuple(query_t.shape) != expected or query_t.dtype != torch.float32 or not torch.isfinite(query_t).all():
+        if tuple(query_t.shape) != expected or query_t.dtype != torch.float32:
+            raise ValueError(f"query_t must have shape {expected}, dtype float32, and finite values.")
+        if query_t.device != self.slot_queries.device:
+            raise ValueError("query_t device must match slot_queries.")
+        if not torch.isfinite(query_t).all():
             raise ValueError(f"query_t must have shape {expected}, dtype float32, and finite values.")
         self._validate_state(state, batch)
         if query_t.device != state.fast_in_weight.device:
@@ -465,10 +467,12 @@ class ContinualTTTLocalMemoryCore(nn.Module):
 
         valid = valid.bool()
         state_rows: list[list[torch.Tensor]] = [[], [], [], []]
+        token_rows: list[torch.Tensor] = []
         for row in range(batch):
             if not valid[row]:
                 for output, member in zip(state_rows, state_in, strict=True):
                     output.append(member[row])
+                token_rows.append(torch.zeros(self.k_local, self.local_dim, device=key_t.device, dtype=torch.float32))
                 continue
 
             work = []
@@ -484,12 +488,12 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             updated = ContinualTTTFastState(
                 *(member - self.inner_lr * gradient for member, gradient in zip(work_state, gradients, strict=True))
             )
+            token_rows.append(self._fast_mlp(queries[row], updated))
             for output, member, reference in zip(state_rows, updated, state_in, strict=True):
                 output.append(member.to(dtype=reference.dtype))
 
         state_out = ContinualTTTFastState(*(torch.stack(rows) for rows in state_rows))
-        tokens = self.read_many(queries, state_out)
-        return tokens * valid[:, None, None], state_out, valid
+        return torch.stack(token_rows), state_out, valid
 
     def step_projected(
         self,

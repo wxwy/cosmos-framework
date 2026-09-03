@@ -686,3 +686,80 @@ def test_continual_ttt_multi_slot_permutation_isolation_and_scan_equivalence() -
     assert torch.equal(scan_present, torch.stack(present, dim=1))
     for actual, expected in zip(scan_state, state, strict=True):
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.L0
+def test_continual_ttt_multi_slot_invalid_rows_skip_fast_read_even_when_finite_values_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(36)
+    core = _continual_ttt_core(k_local=4)
+    state = core.initial_state(2)
+    for member in state:
+        member[1].fill_(1e20)
+    original = tuple(member.clone() for member in state)
+    original_fast_mlp = core._fast_mlp
+    call_shapes: list[tuple[int, ...]] = []
+
+    def counted_fast_mlp(value: torch.Tensor, fast_state: ContinualTTTFastState) -> torch.Tensor:
+        call_shapes.append(tuple(value.shape))
+        return original_fast_mlp(value, fast_state)
+
+    monkeypatch.setattr(core, "_fast_mlp", counted_fast_mlp)
+    token, state_out, present = core.step_projected_many(
+        key_t=torch.randn(2, 4),
+        query_base_t=torch.tensor([[0.0, 0.0, 0.0, 0.0], [1e20, 1e20, 1e20, 1e20]]),
+        value_t=torch.randn(2, 3),
+        state_in=state,
+        valid=torch.tensor([True, False]),
+        create_graph=True,
+    )
+    assert call_shapes == [(4,), (4, 4)]
+    assert present.tolist() == [True, False]
+    assert torch.isfinite(token[1]).all() and torch.equal(token[1], torch.zeros_like(token[1]))
+    assert all(torch.equal(output[1], source[1]) for output, source in zip(state_out, original, strict=True))
+
+
+@pytest.mark.L0
+def test_continual_ttt_multi_slot_public_validation_fails_before_any_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    core = _continual_ttt_core(k_local=4)
+    state = core.initial_state(1)
+    reference = tuple(member.clone() for member in state)
+    base = torch.randn(1, 4)
+    for value in (
+        torch.randn(1, 1, 4),
+        torch.randn(1, 5),
+        torch.randn(1, 4, dtype=torch.float64),
+        torch.full((1, 4), float("nan")),
+        torch.empty(1, 4, device="meta"),
+    ):
+        with pytest.raises(ValueError):
+            core.project_queries(value)
+    queries = core.project_queries(base)
+    for value in (
+        torch.randn(1, 3, 4),
+        torch.randn(1, 4, 4, dtype=torch.float64),
+        torch.full((1, 4, 4), float("inf")),
+        torch.empty(1, 4, 4, device="meta"),
+    ):
+        with pytest.raises(ValueError):
+            core.read_many(value, state)
+    with pytest.raises(ValueError):
+        core.read_many(queries, ContinualTTTFastState(state[0], state[1].double(), state[2], state[3]))
+
+    def unexpected_grad(*args: object, **kwargs: object) -> tuple[torch.Tensor, ...]:
+        raise AssertionError("invalid multi-slot input must not update state")
+
+    monkeypatch.setattr(torch.autograd, "grad", unexpected_grad)
+    with pytest.raises(ValueError):
+        core.step_projected_many(
+            key_t=torch.randn(1, 4),
+            query_base_t=torch.randn(1, 4, dtype=torch.float64),
+            value_t=torch.randn(1, 3),
+            state_in=state,
+            valid=torch.ones(1, dtype=torch.bool),
+            create_graph=True,
+        )
+    with pytest.raises(ValueError):
+        core.step_many(torch.full((1, 5), float("nan")), state, torch.ones(1, dtype=torch.bool))
+    assert all(torch.equal(member, expected) for member, expected in zip(state, reference, strict=True))
