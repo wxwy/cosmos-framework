@@ -30,6 +30,16 @@ def _empty_long_tensor() -> torch.Tensor:
 
 
 @dataclass
+class LocalMemoryPrefixData:
+    """Out-of-band Local payloads that never contribute native sequence rows."""
+
+    tokens_by_sample: list[torch.Tensor | None]
+
+    def to_cuda(self) -> None:
+        self.tokens_by_sample = [token.cuda() if token is not None else None for token in self.tokens_by_sample]
+
+
+@dataclass
 class PackedSequenceBuilder:
     """Mutable construction state for sequence packing.
 
@@ -112,6 +122,7 @@ class PackedSequenceBuilder:
     action: ModalityDataBuilder | None = None
     sound: ModalityDataBuilder | None = None
     local_memory: ModalityDataBuilder | None = None
+    local_memory_prefix_tokens: list[torch.Tensor | None] = field(default_factory=list)
 
     def ensure_vision(self) -> ModalityDataBuilder:
         """Return the vision builder, creating it on first use.
@@ -148,6 +159,16 @@ class PackedSequenceBuilder:
         if self.local_memory is None:
             self.local_memory = ModalityDataBuilder()
         return self.local_memory
+
+    def pack_local_memory_prefix_payload(self, input_local_memory_tokens: torch.Tensor | None) -> None:
+        """Store one Local payload without creating a native token span."""
+        if input_local_memory_tokens is not None:
+            if input_local_memory_tokens.ndim != 2 or input_local_memory_tokens.shape[0] <= 0:
+                raise ValueError(
+                    "Local Memory Prefix tokens must have shape [K_local, D_local] with K_local > 0, "
+                    f"got {tuple(input_local_memory_tokens.shape)}."
+                )
+        self.local_memory_prefix_tokens.append(input_local_memory_tokens)
 
     # Multi-control transfer: per-sample list of per-vision-item token counts.
     # For a multi-control transfer sample with N controls + 1 noisy target,
@@ -896,6 +917,11 @@ class PackedSequenceBuilder:
         )
         sound = self._finalize_modality(self.sound)
         local_memory = self._finalize_modality(self.local_memory)
+        local_memory_prefix = (
+            LocalMemoryPrefixData(tokens_by_sample=list(self.local_memory_prefix_tokens))
+            if any(token is not None for token in self.local_memory_prefix_tokens)
+            else None
+        )
 
         # Finalize position IDs.
         assert isinstance(self.position_ids, list)
@@ -926,6 +952,7 @@ class PackedSequenceBuilder:
             action=action,
             sound=sound,
             local_memory=local_memory,
+            local_memory_prefix=local_memory_prefix,
             # Temporal causal
             null_action_supertokens=self.null_action_supertokens,
             num_action_tokens_per_supertoken=self.num_action_tokens_per_supertoken,
@@ -1013,6 +1040,7 @@ class PackedSequence:
     action: ModalityData | None = None
     sound: ModalityData | None = None
     local_memory: ModalityData | None = None
+    local_memory_prefix: LocalMemoryPrefixData | None = None
 
     # Multi-control transfer: per-sample list of per-vision-item token counts.
     # For a multi-control transfer sample with N controls + 1 noisy target,
@@ -1051,6 +1079,11 @@ class PackedSequence:
             assert modality is None or isinstance(modality, ModalityData), (
                 "PackedSequence modality fields must be finalized ModalityData"
             )
+        if self.local_memory_prefix is not None:
+            assert isinstance(self.local_memory_prefix, LocalMemoryPrefixData)
+            assert len(self.local_memory_prefix.tokens_by_sample) == len(self.sample_lens), (
+                "Local Memory Prefix payload count must match packed sample count."
+            )
 
     def to_cuda(self) -> None:
         """Move all tensor fields to CUDA in-place."""
@@ -1071,6 +1104,8 @@ class PackedSequence:
             self.sound.to_cuda()
         if self.local_memory is not None:
             self.local_memory.to_cuda()
+        if self.local_memory_prefix is not None:
+            self.local_memory_prefix.to_cuda()
         self.prepare_sequence_pack_metadata()
 
     def prepare_sequence_pack_metadata(self) -> None:

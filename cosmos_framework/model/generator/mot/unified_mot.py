@@ -76,6 +76,7 @@ from cosmos_framework.model.generator.utils.load_balancing_stats import (
     LBLMetadata,
 )
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryState, MemoryValue
+from cosmos_framework.model.generator.mot.memory_prefix import MemoryPrefixContext
 from cosmos_framework.data.generator.sequence_packing.runtime import (
     SequencePack,
     from_all_seq,
@@ -605,6 +606,7 @@ class PackedAttentionMoT(nn.Module):
         packed_position_embeddings: tuple[SequencePack, SequencePack],
         natten_metadata: dict | None = None,
         memory_value: MemoryValue | None = None,
+        memory_prefix_context: MemoryPrefixContext | None = None,
     ) -> tuple[SequencePack, KVToStore | None]:
         """Forward pass with optional memory-augmented attention.
 
@@ -700,6 +702,20 @@ class PackedAttentionMoT(nn.Module):
         else:
             packed_key_states_normalized_ = None
 
+        memory_prefix_key_states = None
+        memory_prefix_value_states = None
+        memory_prefix_offsets = None
+        if memory_prefix_context is not None:
+            memory_prefix_context.validate()
+            memory_prefix_key_states = self.k_proj_moe_gen(memory_prefix_context.hidden).view(
+                -1, self.num_key_value_heads, self.head_dim
+            )
+            memory_prefix_key_states = self.k_norm_moe_gen(memory_prefix_key_states)
+            memory_prefix_value_states = self.v_proj_moe_gen(memory_prefix_context.hidden).view(
+                -1, self.num_key_value_heads, self.head_dim
+            )
+            memory_prefix_offsets = memory_prefix_context.sample_offsets
+
         packed_attn_output, kv_to_store = self.dispatch_attention_fn(
             packed_query_states_,
             packed_key_states_,
@@ -708,6 +724,9 @@ class PackedAttentionMoT(nn.Module):
             natten_metadata=natten_metadata,
             memory_value=memory_value,
             packed_key_states_normalized=packed_key_states_normalized_,
+            memory_prefix_key_states=memory_prefix_key_states,
+            memory_prefix_value_states=memory_prefix_value_states,
+            memory_prefix_sample_offsets=memory_prefix_offsets,
         )
 
         # Produce kv_to_store for MemoryState.write_for_layer() when the
@@ -975,6 +994,7 @@ def _impl_forward(
     position_ids: torch.Tensor,
     natten_metadata_list: list | None = None,
     memory: MemoryState | None = None,
+    memory_prefix_context: MemoryPrefixContext | None = None,
 ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
     """Shared training forward pass for the three MoT text models.
 
@@ -1032,6 +1052,7 @@ def _impl_forward(
             position_embeddings,
             natten_metadata=None if natten_metadata_list is None else natten_metadata_list[i],
             memory_value=memory_value,
+            memory_prefix_context=memory_prefix_context,
             gen_only=memory_gen_only,
         )
 
@@ -1174,6 +1195,7 @@ class MoTDecoderLayer(nn.Module):
 
         self.input_layernorm = layer_types.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm_moe_gen = layer_types.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
+        self.memory_input_layernorm = layer_types.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = layer_types.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm_moe_gen = layer_types.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
         self.lbl_config: LBLConfig = lbl_config or LBLConfig()
@@ -1185,6 +1207,7 @@ class MoTDecoderLayer(nn.Module):
         packed_position_embeddings: tuple[SequencePack, SequencePack],
         natten_metadata: dict | None = None,
         memory_value: MemoryValue | None = None,
+        memory_prefix_context: MemoryPrefixContext | None = None,
         gen_only: bool = False,
     ) -> tuple[SequencePack, dict[str, LBLMetadata], KVToStore | None]:
         """Forward pass with MoT routing and optional memory-augmented attention.
@@ -1209,6 +1232,12 @@ class MoTDecoderLayer(nn.Module):
             self.input_layernorm_moe_gen(get_gen_seq(input)),  # [N_gen,hidden_size]
             input,
         )  # [N_und+N_gen,hidden_size]
+
+        memory_prefix_normed = (
+            memory_prefix_context.with_hidden(self.memory_input_layernorm(memory_prefix_context.hidden))
+            if memory_prefix_context is not None
+            else None
+        )
 
         # Self Attention + Residual
         kv_to_store: KVToStore | None = None
@@ -1244,6 +1273,7 @@ class MoTDecoderLayer(nn.Module):
                 gen_position_embeddings,
                 natten_metadata=natten_metadata,
                 memory_value=memory_value,
+                memory_prefix_context=memory_prefix_normed,
             )
             gen_attn_out = get_gen_seq(pack_attn_out)
             # No residual_und here: the gen_only MLP branch below builds its own
@@ -1258,6 +1288,7 @@ class MoTDecoderLayer(nn.Module):
                 packed_position_embeddings,
                 natten_metadata=natten_metadata,
                 memory_value=memory_value,
+                memory_prefix_context=memory_prefix_normed,
             )
             residual_und = get_und_seq(input) + get_und_seq(pack_attn_out)  # [N_und,hidden_size]
             residual_gen = get_gen_seq(input) + get_gen_seq(pack_attn_out)  # [N_gen,hidden_size]

@@ -27,6 +27,7 @@ from cosmos_framework.model.generator.mot.flex_attention import (
     resolve_flex_backend,
 )
 from cosmos_framework.model.generator.mot.modeling_utils import TimestepEmbedder, has_noisy_tokens
+from cosmos_framework.model.generator.mot.memory_prefix import MemoryPrefixContext, build_memory_prefix_context
 from cosmos_framework.model.generator.utils.memory import MemoryState
 from cosmos_framework.data.generator.sequence_packing import ModalityData, PackedSequence
 from cosmos_framework.data.generator.sequence_packing.natten import verify_natten_parameter_list
@@ -941,25 +942,28 @@ class Cosmos3VFMNetwork(PreTrainedModel):
     def _encode_local_memory(
         self,
         packed_seq: PackedSequence,
-        packed_sequence: torch.Tensor,
         target_dtype: torch.dtype,
-    ) -> None:
-        """Project explicit clean Local memory into the packed GEN stream."""
-        local_memory = packed_seq.local_memory
-        if local_memory is None or local_memory.tokens is None:
-            return
+    ) -> MemoryPrefixContext | None:
+        """Project clean Local payload into an out-of-band Memory Prefix."""
+        if packed_seq.local_memory is not None:
+            raise ValueError("Legacy Local GEN spans are not supported by the Memory Prefix route.")
+        local_memory_prefix = packed_seq.local_memory_prefix
+        if local_memory_prefix is None:
+            return None
         if not self.config.local_memory_enabled:
             raise ValueError("Packed Local memory requires local_memory_enabled=True.")
-        assert isinstance(local_memory.sequence_indexes, torch.Tensor)
-        packed_tokens_local = torch.cat(local_memory.tokens, dim=0).to(target_dtype)
-        expected_dim = self.config.local_memory_dim
-        if packed_tokens_local.shape[-1] != expected_dim:
-            raise ValueError(
-                f"Local memory feature dimension {packed_tokens_local.shape[-1]} "
-                f"does not match local_memory_dim={expected_dim}."
-            )
-        packed_tokens_local = self.local_memory2llm(packed_tokens_local) + self.local_memory_modality_embed
-        packed_sequence[local_memory.sequence_indexes] = packed_tokens_local
+        for token in local_memory_prefix.tokens_by_sample:
+            if token is not None and token.shape[-1] != self.config.local_memory_dim:
+                raise ValueError(
+                    f"Local memory feature dimension {token.shape[-1]} "
+                    f"does not match local_memory_dim={self.config.local_memory_dim}."
+                )
+        return build_memory_prefix_context(
+            local_memory_prefix.tokens_by_sample,
+            self.local_memory2llm,
+            self.local_memory_modality_embed,
+            target_dtype,
+        )
 
     def _decode_sound(
         self,
@@ -1053,7 +1057,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         if self.config.sound_gen:
             self._encode_sound(packed_seq, packed_sequence, target_dtype)
 
-        self._encode_local_memory(packed_seq, packed_sequence, target_dtype)
+        memory_prefix_context = self._encode_local_memory(packed_seq, target_dtype)
+        if memory_prefix_context is not None and self.pad_for_cuda_graphs:
+            raise ValueError("Memory Prefix does not support CUDA graph padding.")
 
         assert packed_seq.attn_modes is not None
         assert packed_seq.split_lens is not None
@@ -1074,8 +1080,6 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             all_gen_indexes.append(packed_seq.action.sequence_indexes)
         if packed_seq.sound is not None and isinstance(packed_seq.sound.sequence_indexes, torch.Tensor):
             all_gen_indexes.append(packed_seq.sound.sequence_indexes)
-        if packed_seq.local_memory is not None and isinstance(packed_seq.local_memory.sequence_indexes, torch.Tensor):
-            all_gen_indexes.append(packed_seq.local_memory.sequence_indexes)
         vision_sequence_indexes = torch.cat(all_gen_indexes, dim=0) if all_gen_indexes else None  # [N_gen_tokens]
 
         # When temporal causal is enabled the buffer is [action_t0, vision_t0, action_t1, vision_t1, ...].
@@ -1104,6 +1108,8 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             and self.parallel_dims is not None
             and self.parallel_dims.cp_enabled
         )
+        if memory_prefix_context is not None and replicated_attention_io_cp:
+            raise ValueError("Memory Prefix does not support replicated attention I/O.")
         # ``sequence_sharded`` attention I/O shards the token sequence, so
         # packing must pad sequence lengths to the CP size and the input/output
         # sequence helpers need the CP mesh.  ``replicated`` attention I/O keeps
@@ -1251,6 +1257,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             position_ids=packed_position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            memory_prefix_context=memory_prefix_context,
         )
         last_hidden_state = get_context_parallel_last_hidden_state(
             packed_outputs=packed_outputs,

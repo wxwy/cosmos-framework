@@ -223,8 +223,7 @@ def pack_input_sequence(
             idx_text += 1
 
             has_generation_for_sample = (
-                sequence_plan.has_local_memory
-                or sequence_plan.has_vision
+                sequence_plan.has_vision
                 or sequence_plan.has_action
                 or sequence_plan.has_sound
             )
@@ -242,23 +241,18 @@ def pack_input_sequence(
         # Save temporal offset before vision for action tokens (action uses same offset as vision start)
         vision_start_temporal_offset = seq_builder.mrope_temporal_offset
 
-        # Local is an explicit clean conditioning modality. Its fixed text-style
-        # positions are rooted at the native vision start, but it must not advance
-        # that cursor: native Vision/Action mRoPE IDs must match No-Memory runs.
+        # Local is a K/V-only condition.  Preserve it out-of-band before native
+        # attention metadata is constructed: it must not alter native geometry.
         if sequence_plan.has_local_memory:
             assert gen_data_clean.x0_tokens_local_memory is not None, (
                 "Local memory data required when sequence plan has_local_memory=True"
             )
             input_local_memory_tokens = gen_data_clean.x0_tokens_local_memory[idx_local_memory]
             idx_local_memory += 1
-            local_split_len = seq_builder.pack_local_memory_tokens(
-                input_local_memory_tokens=input_local_memory_tokens,
-                local_temporal_offset=vision_start_temporal_offset,
-                use_float_positions=use_float_mrope_positions,
-            )
-            sample_len += local_split_len
+            seq_builder.pack_local_memory_prefix_payload(input_local_memory_tokens)
         else:
-            local_split_len = 0
+            seq_builder.pack_local_memory_prefix_payload(None)
+        local_split_len = 0
 
         # Pack vision (and optionally action) tokens
         if video_temporal_causal and sequence_plan.has_vision:
@@ -534,8 +528,7 @@ def pack_input_sequence(
         # Add end-of-generation token if needed
         eov_len = 0
         has_any_generation = (
-            sequence_plan.has_local_memory
-            or sequence_plan.has_vision
+            sequence_plan.has_vision
             or sequence_plan.has_action
             or sequence_plan.has_sound
         )

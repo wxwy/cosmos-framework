@@ -16,6 +16,7 @@ from cosmos_framework.model.attention import (
 )
 from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryValue
+from cosmos_framework.model.generator.mot.memory_prefix import concat_prefix_with_native_kv
 
 
 class SplitInfo:
@@ -183,6 +184,9 @@ def two_way_attention(
     packed_key_states_normalized: SequencePack | None = None,
     flex_block_mask: BlockMask | None = None,
     flex_backend: FlexBackend | None = None,
+    memory_prefix_key_states: torch.Tensor | None = None,
+    memory_prefix_value_states: torch.Tensor | None = None,
+    memory_prefix_sample_offsets: torch.Tensor | None = None,
 ):
     """
     Performs two-way attention with causal and full attention.
@@ -269,7 +273,32 @@ def two_way_attention(
     # [1,N_und,heads,head_dim] -> [N_und,heads,head_dim] -> [N_und,heads*head_dim]
     causal_out = causal_res.squeeze(0).flatten(-2, -1)  # type: ignore  # [N_und,heads*head_dim]
 
-    if flex_block_mask is not None:
+    if memory_prefix_key_states is not None:
+        if flex_block_mask is not None:
+            raise ValueError("Memory Prefix does not support FlexAttention.")
+        assert memory_prefix_value_states is not None and memory_prefix_sample_offsets is not None
+        prefix_k, prefix_v, prefix_offsets, max_prefix_len = concat_prefix_with_native_kv(
+            memory_prefix_key_states,
+            memory_prefix_value_states,
+            memory_prefix_sample_offsets,
+            get_all_seq(packed_key_normalized),
+            get_all_seq(packed_value_states),
+            sample_offsets,
+        )
+        full_varlen_kwargs = _varlen_kwargs(
+            sample_offsets,
+            cumulative_seqlen_Q=full_q_offsets,
+            cumulative_seqlen_KV=prefix_offsets,
+            max_seqlen_Q=packed_query_states["max_full_len"],
+            max_seqlen_KV=max_prefix_len,
+        )
+        full_res = attention(
+            full_q.unsqueeze(0),
+            prefix_k.unsqueeze(0),
+            prefix_v.unsqueeze(0),
+            **full_varlen_kwargs,
+        )
+    elif flex_block_mask is not None:
         if flex_backend is None:
             raise ValueError(
                 "flex_block_mask needs the FlexBackend it was built for: which kernels run the mask "
@@ -654,10 +683,25 @@ def dispatch_attention(
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
     packed_key_states_normalized: SequencePack | None = None,
+    memory_prefix_key_states: torch.Tensor | None = None,
+    memory_prefix_value_states: torch.Tensor | None = None,
+    memory_prefix_sample_offsets: torch.Tensor | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
     assert memory_value is None, "Base dispatch_attention does not handle MemoryValue"
+    memory_prefix_present = memory_prefix_key_states is not None
+    if memory_prefix_present:
+        if memory_prefix_value_states is None or memory_prefix_sample_offsets is None:
+            raise ValueError("Memory Prefix requires K, V and sample_offsets together.")
+        if packed_query_states.get("is_sharded", False):
+            raise ValueError("Memory Prefix does not support context parallel/Ulysses.")
     if not _is_split_info_compatible(attention_mask):
         raise TypeError(f"Unsupported attention metadata: {type(attention_mask)}")
+    if memory_prefix_present and attention_mask.is_three_way:
+        raise ValueError("Memory Prefix does not support three-way attention.")
+    if memory_prefix_present and attention_mask.control_stream_token_ranges is not None:
+        raise ValueError("Memory Prefix does not support multi-control attention.")
+    if memory_prefix_present and getattr(attention_mask, "flex_block_mask", None) is not None:
+        raise ValueError("Memory Prefix does not support FlexAttention.")
     if attention_mask.control_stream_token_ranges is not None:
         output = multi_control_two_way_attention(
             packed_query_states,
@@ -684,6 +728,9 @@ def dispatch_attention(
             # predates these fields.
             flex_block_mask=getattr(attention_mask, "flex_block_mask", None),
             flex_backend=getattr(attention_mask, "flex_backend", None),
+            memory_prefix_key_states=memory_prefix_key_states,
+            memory_prefix_value_states=memory_prefix_value_states,
+            memory_prefix_sample_offsets=memory_prefix_sample_offsets,
         )
     return output, None
 
