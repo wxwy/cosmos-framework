@@ -115,7 +115,6 @@ def test_memory_prefix_packer_preserves_native_action_generation_metadata() -> N
         torch.tensor([0.5]),
         special_tokens,
         action_dim=3,
-        include_end_of_generation_token=True,
     )
     prefix = pack_input_sequence(
         prefix_plan,
@@ -129,7 +128,6 @@ def test_memory_prefix_packer_preserves_native_action_generation_metadata() -> N
         torch.tensor([0.5]),
         special_tokens,
         action_dim=3,
-        include_end_of_generation_token=True,
     )
     for field in ("sample_lens", "split_lens", "attn_modes", "sequence_length", "text_indexes", "position_ids"):
         left, right = getattr(prefix, field), getattr(native, field)
@@ -152,7 +150,33 @@ def test_memory_prefix_packer_preserves_native_action_generation_metadata() -> N
                     assert left_item == right_item
         else:
             assert left == right
-    assert prefix.get_sequence_pack_metadata() == native.get_sequence_pack_metadata()
+    native.prepare_sequence_pack_metadata()
+    prefix.prepare_sequence_pack_metadata()
+    native_metadata = native.get_sequence_pack_metadata()
+    prefix_metadata = prefix.get_sequence_pack_metadata()
+    assert native_metadata is not None and prefix_metadata is not None
+    for field in (
+        "sample_lens",
+        "split_lens",
+        "attn_modes",
+        "device",
+        "max_sample_len",
+        "max_causal_len",
+        "max_full_len",
+        "num_causal_tokens",
+        "num_full_tokens",
+    ):
+        assert getattr(prefix_metadata, field) == getattr(native_metadata, field)
+    for field in (
+        "sample_offsets",
+        "causal_indices",
+        "full_indices",
+        "causal_seq_offsets",
+        "full_only_seq_offsets",
+        "causal_sample_ids",
+        "full_only_sample_ids",
+    ):
+        torch.testing.assert_close(getattr(prefix_metadata, field), getattr(native_metadata, field))
     assert prefix.local_memory is None
     assert prefix.local_memory_prefix is not None
     torch.testing.assert_close(prefix.local_memory_prefix.tokens_by_sample[0], torch.ones(2, 3))
