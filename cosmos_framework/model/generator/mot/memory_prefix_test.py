@@ -13,7 +13,11 @@ from cosmos_framework.model.generator.mot.memory_prefix import (
     concat_prefix_with_native_kv,
 )
 from cosmos_framework.model.generator.mot.attention import SplitInfo, dispatch_attention
-from cosmos_framework.model.generator.mot.unified_mot import LayerTypes, PackedAttentionMoT
+from cosmos_framework.model.generator.mot.unified_mot import (
+    LayerTypes,
+    PackedAttentionMoT,
+    _dispatch_attention_with_optional_memory_prefix,
+)
 from cosmos_framework.model.generator.reasoner.nemotron_3_dense_vl.configuration_nemotron_3_dense_vl import (
     Nemotron3DenseVLTextConfig,
 )
@@ -79,6 +83,24 @@ def test_memory_prefix_context_rejects_invalid_slots_and_inconsistent_k_local() 
         build_memory_prefix_context([torch.empty(0, 3)], projector, embed, torch.float32)
     with pytest.raises(ValueError, match="present"):
         MemoryPrefixContext(torch.zeros(1, 3), torch.tensor([0, 1]), torch.tensor([False])).validate()
+    with pytest.raises(ValueError, match="K_local"):
+        MemoryPrefixContext(torch.zeros(3, 3), torch.tensor([0, 1, 3]), torch.tensor([True, True])).validate()
+
+
+@pytest.mark.L0
+def test_memory_prefix_validates_all_slots_before_projecting_any_sample() -> None:
+    calls = 0
+
+    def projector(tokens: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return tokens
+
+    with pytest.raises(ValueError, match="K_local"):
+        build_memory_prefix_context(
+            [torch.ones(1, 3), torch.ones(2, 3)], projector, torch.zeros(3), torch.float32
+        )
+    assert calls == 0
 
 
 @pytest.mark.L0
@@ -183,6 +205,7 @@ def test_memory_prefix_k_uses_real_generator_norm_without_rope_or_query_projecti
         ({"is_sharded": True}, lambda info: None, "context parallel/Ulysses"),
         ({}, lambda info: setattr(info, "is_three_way", True), "three-way"),
         ({}, lambda info: setattr(info, "control_stream_token_ranges", [(0, 1)]), "multi-control"),
+        ({}, lambda info: setattr(info, "flex_block_mask", object()), "FlexAttention"),
     ],
 )
 def test_memory_prefix_dispatcher_rejects_unsupported_paths_before_attention_kernel(
@@ -199,5 +222,66 @@ def test_memory_prefix_dispatcher_rejects_unsupported_paths_before_attention_ker
             info,
             memory_prefix_key_states=prefix,
             memory_prefix_value_states=prefix,
+            memory_prefix_sample_offsets=torch.tensor([0, 1]),
+        )
+
+
+@pytest.mark.L0
+def test_memory_prefix_dispatcher_rejects_native_memory_value_before_attention_kernel() -> None:
+    info = SplitInfo([1, 1], ["causal", "full"], [2], actual_len=2)
+    prefix = torch.zeros(1, 1, 1)
+    with pytest.raises(ValueError, match="MemoryValue"):
+        dispatch_attention(
+            {},
+            {},
+            {},
+            info,
+            memory_value=object(),  # type: ignore[arg-type]
+            memory_prefix_key_states=prefix,
+            memory_prefix_value_states=prefix,
+            memory_prefix_sample_offsets=torch.tensor([0, 1]),
+        )
+
+
+@pytest.mark.L0
+def test_memory_prefix_preserves_legacy_alternate_dispatch_signature_and_fails_closed_when_present() -> None:
+    calls: list[dict[str, object]] = []
+
+    def alternate_dispatch(query: object, key: object, value: object, mask: object, **kwargs: object) -> tuple[object, None]:
+        calls.append(kwargs)
+        return query, None
+
+    result, _ = _dispatch_attention_with_optional_memory_prefix(
+        alternate_dispatch,
+        {},
+        {},
+        {},
+        object(),
+        natten_metadata=None,
+        memory_value=None,
+        packed_key_states_normalized=None,
+        memory_prefix_context=None,
+        memory_prefix_key_states=None,
+        memory_prefix_value_states=None,
+        memory_prefix_sample_offsets=None,
+    )
+    assert result == {}
+    assert len(calls) == 1
+    assert not any(key.startswith("memory_prefix_") for key in calls[0])
+
+    context = MemoryPrefixContext(torch.zeros(1, 1), torch.tensor([0, 1]), torch.tensor([True]))
+    with pytest.raises(ValueError, match="alternate attention dispatch"):
+        _dispatch_attention_with_optional_memory_prefix(
+            alternate_dispatch,
+            {},
+            {},
+            {},
+            object(),
+            natten_metadata=None,
+            memory_value=None,
+            packed_key_states_normalized=None,
+            memory_prefix_context=context,
+            memory_prefix_key_states=torch.zeros(1, 1, 1),
+            memory_prefix_value_states=torch.zeros(1, 1, 1),
             memory_prefix_sample_offsets=torch.tensor([0, 1]),
         )

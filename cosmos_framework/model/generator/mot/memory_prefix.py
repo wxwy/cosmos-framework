@@ -37,6 +37,9 @@ class MemoryPrefixContext:
         lengths = self.sample_offsets[1:] - self.sample_offsets[:-1]
         if (lengths < 0).any().item() or not torch.equal(self.present, lengths > 0):
             raise ValueError("Memory Prefix present must exactly match positive per-sample lengths.")
+        present_lengths = lengths[self.present]
+        if present_lengths.numel() == 0 or not torch.equal(present_lengths, present_lengths.new_full(present_lengths.shape, present_lengths[0])):
+            raise ValueError("All present Memory Prefix samples must use the same positive K_local.")
 
     def with_hidden(self, hidden: torch.Tensor) -> "MemoryPrefixContext":
         context = MemoryPrefixContext(hidden=hidden, sample_offsets=self.sample_offsets, present=self.present)
@@ -54,19 +57,21 @@ def build_memory_prefix_context(
     if tokens_by_sample is None or not any(token is not None for token in tokens_by_sample):
         return None
 
+    present_tokens = [token for token in tokens_by_sample if token is not None]
+    assert present_tokens
+    for token in present_tokens:
+        if token.ndim != 2 or token.shape[0] <= 0:
+            raise ValueError(f"Memory Prefix token must have shape [K_local, D_local], got {tuple(token.shape)}.")
+    k_local = present_tokens[0].shape[0]
+    if any(token.shape[0] != k_local for token in present_tokens):
+        raise ValueError("All present Memory Prefix samples must use the same K_local.")
+
     projected: list[torch.Tensor] = []
     offsets = [0]
-    k_local: int | None = None
     for token in tokens_by_sample:
         if token is None:
             offsets.append(offsets[-1])
             continue
-        if token.ndim != 2 or token.shape[0] <= 0:
-            raise ValueError(f"Memory Prefix token must have shape [K_local, D_local], got {tuple(token.shape)}.")
-        if k_local is None:
-            k_local = token.shape[0]
-        elif token.shape[0] != k_local:
-            raise ValueError("All present Memory Prefix samples must use the same K_local.")
         hidden = projector(token.to(dtype=target_dtype)) + modality_embed.to(dtype=target_dtype)
         projected.append(hidden)
         offsets.append(offsets[-1] + hidden.shape[0])

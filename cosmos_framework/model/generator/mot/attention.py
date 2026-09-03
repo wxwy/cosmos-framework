@@ -687,8 +687,10 @@ def dispatch_attention(
     memory_prefix_value_states: torch.Tensor | None = None,
     memory_prefix_sample_offsets: torch.Tensor | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
-    assert memory_value is None, "Base dispatch_attention does not handle MemoryValue"
     memory_prefix_present = memory_prefix_key_states is not None
+    if memory_prefix_present and memory_value is not None:
+        raise ValueError("Memory Prefix does not support native MemoryValue KV cache.")
+    assert memory_value is None, "Base dispatch_attention does not handle MemoryValue"
     if memory_prefix_present:
         if memory_prefix_value_states is None or memory_prefix_sample_offsets is None:
             raise ValueError("Memory Prefix requires K, V and sample_offsets together.")

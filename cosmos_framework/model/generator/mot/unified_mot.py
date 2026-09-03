@@ -93,6 +93,40 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
 torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
 
+
+def _dispatch_attention_with_optional_memory_prefix(
+    dispatch_attention_fn: Any,
+    packed_query_states: SequencePack,
+    packed_key_states: SequencePack,
+    packed_value_states: SequencePack,
+    attention_mask: Any,
+    *,
+    natten_metadata: dict | None,
+    memory_value: MemoryValue | None,
+    packed_key_states_normalized: SequencePack | None,
+    memory_prefix_context: MemoryPrefixContext | None,
+    memory_prefix_key_states: torch.Tensor | None,
+    memory_prefix_value_states: torch.Tensor | None,
+    memory_prefix_sample_offsets: torch.Tensor | None,
+) -> tuple[SequencePack, KVToStore | None]:
+    """Preserve alternate-dispatch signatures unless a Memory Prefix is present."""
+    dispatch_kwargs = {
+        "natten_metadata": natten_metadata,
+        "memory_value": memory_value,
+        "packed_key_states_normalized": packed_key_states_normalized,
+    }
+    if memory_prefix_context is not None:
+        if dispatch_attention_fn is not dispatch_attention:
+            raise ValueError("Memory Prefix does not support alternate attention dispatch.")
+        dispatch_kwargs.update(
+            memory_prefix_key_states=memory_prefix_key_states,
+            memory_prefix_value_states=memory_prefix_value_states,
+            memory_prefix_sample_offsets=memory_prefix_sample_offsets,
+        )
+    return dispatch_attention_fn(
+        packed_query_states, packed_key_states, packed_value_states, attention_mask, **dispatch_kwargs
+    )
+
 # -----------------------------------------------------------------------------
 # Unified MoT (Mixture of Transformers) implementation supporting:
 #   - Qwen3-VL Dense, Qwen3-VL MoE, and Nemotron 3 Dense VL
@@ -716,7 +750,8 @@ class PackedAttentionMoT(nn.Module):
             )
             memory_prefix_offsets = memory_prefix_context.sample_offsets
 
-        packed_attn_output, kv_to_store = self.dispatch_attention_fn(
+        packed_attn_output, kv_to_store = _dispatch_attention_with_optional_memory_prefix(
+            self.dispatch_attention_fn,
             packed_query_states_,
             packed_key_states_,
             packed_value_states_,
@@ -724,6 +759,7 @@ class PackedAttentionMoT(nn.Module):
             natten_metadata=natten_metadata,
             memory_value=memory_value,
             packed_key_states_normalized=packed_key_states_normalized_,
+            memory_prefix_context=memory_prefix_context,
             memory_prefix_key_states=memory_prefix_key_states,
             memory_prefix_value_states=memory_prefix_value_states,
             memory_prefix_sample_offsets=memory_prefix_offsets,
