@@ -45,7 +45,7 @@ def test_abort_discards_pending_candidate() -> None:
 def test_committed_chronology_rejects_skip_and_reset_restarts_epoch() -> None:
     authority, runtime, source = _runtime()
     cap0 = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
-    runtime.begin("a"); runtime.admit(cap0, source=source); runtime.commit("a")
+    runtime.begin("a"); runtime.admit(cap0, source=source); runtime.materialize("a"); runtime.commit("a")
     cap2 = authority.issue(owner_key="a", source_identity="s", source_timestep=2, source=source)
     runtime.begin("a")
     with pytest.raises(ValueError, match="contiguous"):

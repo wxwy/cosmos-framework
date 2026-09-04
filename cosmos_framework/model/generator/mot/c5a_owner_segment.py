@@ -67,6 +67,7 @@ class _Pending:
     rows: list[tuple[AdmissionCapability, dict[str, torch.Tensor]]]
     replay: dict[tuple[str, str, int, str], torch.Tensor]
     identity_index: dict[tuple[str, str, int], str]
+    phase: str = "COLLECT_RAW"
 
 
 class C5AOwnerSegmentCPU:
@@ -79,6 +80,7 @@ class C5AOwnerSegmentCPU:
         self.segment_steps = core.ttt_tbptt_steps
         self._state_by_owner: dict[str, ContinualTTTFastState] = {}
         self._last_timestep: dict[str, int] = {}
+        self._epoch_by_owner: dict[str, int] = {}
         self._pending_by_owner: dict[str, _Pending] = {}
         self._committed: dict[tuple[str, str, int, str], torch.Tensor] = {}
         self._identity_index: dict[tuple[str, str, int], str] = {}
@@ -87,7 +89,7 @@ class C5AOwnerSegmentCPU:
     def begin(self, owner_key: str) -> None:
         if owner_key in self._pending_by_owner:
             raise RuntimeError("pending transaction already exists")
-        self._pending_by_owner[owner_key] = _Pending(self._state_by_owner.get(owner_key), [], {}, {})
+        self._pending_by_owner[owner_key] = _Pending(self._state_by_owner.get(owner_key), [], {}, {}, "COLLECT_RAW")
 
     def admit(self, cap: AdmissionCapability, *, source: dict[str, torch.Tensor]) -> tuple[int, int] | torch.Tensor:
         if cap._seal is not self.authority._seal or cap.source_timestep < 0:
@@ -137,16 +139,24 @@ class C5AOwnerSegmentCPU:
             evidence, torch.ones(1, evidence.shape[1], dtype=torch.bool, device=evidence.device), state, create_graph=True
         )
         pending.base_state = candidate
+        pending.phase = "MATERIALIZED_PENDING"
         for row, (cap, _) in enumerate(pending.rows):
             pending.replay[cap.source_key] = tokens[0, row].detach().clone()
         self.c5_write_count += len(encoded)
         return tokens[0]
 
     def commit(self, owner_key: str) -> None:
+        pending = self._pending_by_owner.get(owner_key)
+        if pending is None:
+            raise RuntimeError("no pending transaction")
+        if pending.phase != "MATERIALIZED_PENDING":
+            raise RuntimeError("commit requires one successful materialize/backward")
+        pending.phase = "BACKWARD_OK"
         pending = self._pending_by_owner.pop(owner_key)
         if pending.base_state is not None:
             self._state_by_owner[owner_key] = ContinualTTTFastState(*(value.detach().clone() for value in pending.base_state))
         self._last_timestep[owner_key] = pending.rows[-1][0].source_timestep
+        self._epoch_by_owner.setdefault(owner_key, 0)
         self._committed.update({key: value.detach().clone() for key, value in pending.replay.items()})
         self._identity_index.update(pending.identity_index)
 
@@ -158,6 +168,9 @@ class C5AOwnerSegmentCPU:
             raise RuntimeError("cannot reset owner with pending transaction")
         self._state_by_owner.pop(owner_key, None)
         self._last_timestep.pop(owner_key, None)
+        self._committed = {key: value for key, value in self._committed.items() if key[0] != owner_key}
+        self._identity_index = {key: value for key, value in self._identity_index.items() if key[0] != owner_key}
+        self._epoch_by_owner[owner_key] = self._epoch_by_owner.get(owner_key, 0) + 1
 
     def finish(self, owner_key: str, *, terminal: bool) -> None:
         """Close one segment; terminal remainder is the sole short-segment exception."""
