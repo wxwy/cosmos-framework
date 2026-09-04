@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -26,10 +28,10 @@ def test_materialize_then_commit_and_replay_without_second_write() -> None:
 def test_conflicting_digest_and_forged_capability_fail_before_c5() -> None:
     authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
     runtime.begin("a"); runtime.admit(cap, source=source)
-    conflict = AdmissionCapability(cap.owner_key, cap.source_identity, cap.source_timestep, b"bad", cap.source_shape, cap.source_dtype, cap._seal)
+    conflict = replace(cap, source_bytes=b"bad")
     with pytest.raises(ValueError, match="conflicting"):
         runtime.admit(conflict, source=source)
-    forged = AdmissionCapability(cap.owner_key, cap.source_identity, cap.source_timestep, cap.source_bytes, cap.source_shape, cap.source_dtype, object())
+    forged = replace(cap, _seal=object())
     with pytest.raises(ValueError, match="untrusted"):
         runtime.admit(forged, source=source)
 

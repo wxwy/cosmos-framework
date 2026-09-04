@@ -9,6 +9,20 @@ import torch
 from .local_evidence import ContinualTTTFastState, ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
 
 
+def _canonical_source(source: dict[str, torch.Tensor]) -> bytes:
+    """Deterministic field/name/dtype/shape/bytes serialization."""
+    chunks: list[bytes] = []
+    for name in sorted(source):
+        value = source[name]
+        if not isinstance(value, torch.Tensor):
+            raise ValueError("source fields must be tensors")
+        value = value.detach().contiguous().cpu()
+        name_b, dtype_b, shape_b, raw = name.encode(), str(value.dtype).encode(), repr(tuple(value.shape)).encode(), value.numpy().tobytes()
+        for part in (name_b, dtype_b, shape_b, raw):
+            chunks.append(len(part).to_bytes(8, "little") + part)
+    return b"".join(chunks)
+
+
 @dataclass(frozen=True)
 class AdmissionCapability:
     owner_key: str
@@ -17,12 +31,13 @@ class AdmissionCapability:
     source_bytes: bytes
     source_shape: tuple[int, ...]
     source_dtype: str
+    source_schema: tuple[tuple[str, str, tuple[int, ...]], ...]
     _seal: object
 
     @property
     def digest(self) -> str:
         h = sha256()
-        for value in (self.owner_key.encode(), self.source_identity.encode(), self.source_timestep.to_bytes(8, "little", signed=True), self.source_dtype.encode(), repr(self.source_shape).encode(), self.source_bytes):
+        for value in (self.owner_key.encode(), self.source_identity.encode(), self.source_timestep.to_bytes(8, "little", signed=True), repr(self.source_schema).encode(), self.source_bytes):
             h.update(len(value).to_bytes(8, "little")); h.update(value)
         return h.hexdigest()
 
@@ -40,13 +55,10 @@ class AdmissionAuthority:
     def issue(self, *, owner_key: str, source_identity: str, source_timestep: int, source: dict[str, torch.Tensor]) -> AdmissionCapability:
         if source_timestep < 0 or not source or any(not isinstance(value, torch.Tensor) for value in source.values()):
             raise ValueError("invalid causal source")
-        chunks = []
-        for name in sorted(source):
-            value = source[name].detach().contiguous().cpu()
-            raw = value.numpy().tobytes()
-            chunks.append(name.encode() + len(raw).to_bytes(8, "little") + raw)
+        payload = _canonical_source(source)
+        schema = tuple((name, str(source[name].dtype), tuple(source[name].shape)) for name in sorted(source))
         first = next(iter(source.values()))
-        return AdmissionCapability(owner_key, source_identity, source_timestep, b"".join(chunks), tuple(first.shape), str(first.dtype), self._seal)
+        return AdmissionCapability(owner_key, source_identity, source_timestep, payload, tuple(first.shape), str(first.dtype), schema, self._seal)
 
 
 @dataclass
@@ -85,6 +97,11 @@ class C5AOwnerSegmentCPU:
         if prior_digest is not None and prior_digest != cap.digest:
             raise ValueError("conflicting source digest")
         pending = self._pending_by_owner[cap.owner_key]
+        if _canonical_source(source) != cap.source_bytes:
+            raise ValueError("source bytes do not match admission capability")
+        schema = tuple((name, str(source[name].dtype), tuple(source[name].shape)) for name in sorted(source))
+        if schema != cap.source_schema or cap.digest != AdmissionCapability(cap.owner_key, cap.source_identity, cap.source_timestep, cap.source_bytes, cap.source_shape, cap.source_dtype, cap.source_schema, cap._seal).digest:
+            raise ValueError("capability fields are not canonical")
         cached = pending.replay.get(key)
         if cached is None:
             cached = self._committed.get(key)
