@@ -13,9 +13,9 @@ def _source() -> dict[str, torch.Tensor]:
             "history_mask": torch.ones(1, 1, dtype=torch.bool)}
 
 
-def _runtime() -> tuple[AdmissionAuthority, C5AOwnerSegmentCPU, dict[str, torch.Tensor]]:
+def _runtime(*, segment_steps: int = 16) -> tuple[AdmissionAuthority, C5AOwnerSegmentCPU, dict[str, torch.Tensor]]:
     source = _source(); authority = AdmissionAuthority()
-    return authority, C5AOwnerSegmentCPU(authority, LocalEvidenceEncoder(), ContinualTTTLocalMemoryCore()), source
+    return authority, C5AOwnerSegmentCPU(authority, LocalEvidenceEncoder(), ContinualTTTLocalMemoryCore(ttt_tbptt_steps=segment_steps)), source
 
 
 def test_materialize_then_commit_and_replay_without_second_write() -> None:
@@ -147,3 +147,35 @@ def test_outer_backward_gradients_and_abort_rollback_are_observable() -> None:
     cap2 = authority.issue(owner_key="a", source_identity="s2", source_timestep=1, source=source)
     runtime.begin("a"); runtime.admit(cap2, source=source); runtime.materialize("a"); runtime.abort("a")
     assert "a" not in runtime._pending_by_owner and all(key[0] == "a" for key in runtime._identity_index)
+
+
+@pytest.mark.parametrize("segment_steps", [1, 3, 16])
+def test_segment_lengths_and_terminal_remainders(segment_steps: int) -> None:
+    authority, runtime, source = _runtime(segment_steps=segment_steps)
+    for timestep in range(segment_steps):
+        cap = authority.issue(owner_key="a", source_identity="s", source_timestep=timestep, source=source)
+        if timestep == 0:
+            runtime.begin("a")
+        runtime.admit(cap, source=source)
+    runtime.materialize("a"); runtime.mark_backward_done("a"); runtime.finish("a", terminal=False)
+    assert runtime._last_timestep["a"] == segment_steps - 1
+
+    authority2, runtime2, source2 = _runtime(segment_steps=segment_steps)
+    runtime2.begin("a")
+    for timestep in range(max(0, segment_steps - 1)):
+        cap = authority2.issue(owner_key="a", source_identity="s", source_timestep=timestep, source=source2)
+        runtime2.admit(cap, source=source2)
+    if segment_steps == 1:
+        runtime2.finish("a", terminal=True)
+    else:
+        runtime2.materialize("a"); runtime2.mark_backward_done("a"); runtime2.finish("a", terminal=True)
+    assert "a" not in runtime2._state_by_owner
+
+
+def test_fast_state_is_not_registered_as_slow_parameters() -> None:
+    _, runtime, _ = _runtime()
+    names = {name for name, _ in runtime.core.named_parameters()}
+    assert names == {
+        "slot_queries", "w0_fast_in_weight", "w0_fast_in_bias", "w0_fast_out_weight", "w0_fast_out_bias",
+        "key_proj.weight", "key_proj.bias", "query_proj.weight", "query_proj.bias", "value_proj.weight", "value_proj.bias",
+    }
