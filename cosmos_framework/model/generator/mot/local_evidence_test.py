@@ -9,6 +9,7 @@ from torch.nn import functional as F
 
 from cosmos_framework.model.generator.mot.local_evidence import (
     ContinualTTTFastState,
+    ContinualTTTFastStateTransition,
     ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
     RecurrentLocalMemoryBackend,
@@ -763,3 +764,22 @@ def test_continual_ttt_multi_slot_public_validation_fails_before_any_update(monk
     with pytest.raises(ValueError):
         core.step_many(torch.full((1, 5), float("nan")), state, torch.ones(1, dtype=torch.bool))
     assert all(torch.equal(member, expected) for member, expected in zip(state, reference, strict=True))
+
+
+@pytest.mark.L0
+def test_continual_ttt_transition_counter_reset_and_detach() -> None:
+    torch.manual_seed(37)
+    core = _continual_ttt_core(ttt_tbptt_steps=2, k_local=2)
+    runtime = ContinualTTTFastStateTransition(core)
+    evidence = torch.randn(2, 5)
+    token, state, present, counter = runtime.step(
+        evidence, None, torch.tensor([True, False]), torch.tensor([False, False]), torch.zeros(2, dtype=torch.int64)
+    )
+    assert token.shape == (2, 2, 3) and present.tolist() == [True, False] and counter.tolist() == [1, 0]
+    token2, state2, present2, counter2 = runtime.step(
+        torch.randn(2, 5), state, torch.tensor([True, True]), torch.tensor([False, True]), counter
+    )
+    assert present2.tolist() == [True, True] and counter2.tolist() == [0, 1]
+    assert all(torch.equal(member[0], member[0].detach()) for member in state2)
+    with pytest.raises(ValueError, match="counter_in"):
+        runtime.step(evidence, state, torch.ones(2, dtype=torch.bool), torch.zeros(2, dtype=torch.bool), torch.tensor([2, 0]))

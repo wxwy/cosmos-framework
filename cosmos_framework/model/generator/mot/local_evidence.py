@@ -613,6 +613,48 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         return ContinualTTTFastState(*(value.detach() for value in state))
 
 
+class ContinualTTTFastStateTransition(nn.Module):
+    """CPU contract for one already-admitted causal TTT transition."""
+
+    def __init__(self, core: ContinualTTTLocalMemoryCore) -> None:
+        super().__init__()
+        self.core = core
+
+    def step(
+        self,
+        evidence_t: torch.Tensor,
+        state_in: ContinualTTTFastState | None,
+        valid_t: torch.Tensor,
+        done_before_t: torch.Tensor,
+        counter_in: torch.Tensor,
+        *,
+        create_graph: bool = True,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor, torch.Tensor]:
+        if evidence_t.ndim != 2 or evidence_t.shape[1] != self.core.evidence_dim:
+            raise ValueError(f"evidence_t must have shape [B,{self.core.evidence_dim}].")
+        batch = evidence_t.shape[0]
+        for name, value in (("valid_t", valid_t), ("done_before_t", done_before_t)):
+            if tuple(value.shape) != (batch,) or value.dtype != torch.bool or value.device != evidence_t.device:
+                raise ValueError(f"{name} must be bool [B] on the evidence device.")
+        if tuple(counter_in.shape) != (batch,) or counter_in.dtype != torch.int64 or counter_in.device != evidence_t.device:
+            raise ValueError("counter_in must be int64 [B] on the evidence device.")
+        if (counter_in < 0).any().item() or (counter_in >= self.core.ttt_tbptt_steps).any().item():
+            raise ValueError("counter_in must satisfy 0 <= counter_in < ttt_tbptt_steps.")
+        state = self.core.initial_state(batch, device=evidence_t.device) if state_in is None else state_in
+        if state_in is None and counter_in.any().item():
+            raise ValueError("state_in=None requires zero counter_in.")
+        state = self.core.reset_mask(state, done_before_t)
+        counter = torch.where(done_before_t, torch.zeros_like(counter_in), counter_in)
+        tokens, updated, present = self.core.step_many(evidence_t, state, valid_t, create_graph=create_graph)
+        next_counter = torch.where(valid_t, counter + 1, counter)
+        detach_rows = valid_t & (next_counter == self.core.ttt_tbptt_steps)
+        state_out = ContinualTTTFastState(
+            *(torch.where(detach_rows.view(batch, *([1] * (value.ndim - 1))), value.detach(), value) for value in updated)
+        )
+        next_counter = torch.where(detach_rows, torch.zeros_like(next_counter), next_counter)
+        return tokens, state_out, present, next_counter
+
+
 class LocalHistoryRuntime(nn.Module):
     """Encode a batched causal history and gate absent samples out of Local."""
 
