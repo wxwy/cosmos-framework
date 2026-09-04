@@ -31,7 +31,9 @@ def _snapshot(adapter: C6SyntheticRuntimeAdapter, owner: str) -> tuple[object, o
     state = delegate._state_by_owner.get(owner)
     state_copy = None if state is None else tuple(value.clone() for value in state)
     committed = {key: (record.value.clone(), record.shape, record.present) for key, record in delegate._committed.items()}
-    return state_copy, delegate._last_timestep.get(owner), committed, dict(delegate._identity_index), dict(delegate._epoch_by_owner), delegate.c5_write_count
+    pending = delegate._pending_by_owner.get(owner)
+    pending_sig = None if pending is None else (pending.phase, tuple(cap.source_key for cap, _ in pending.rows), tuple(pending.valid_rows or ()), None if pending.witness is None else tuple(pending.witness.shape))
+    return state_copy, delegate._last_timestep.get(owner), committed, dict(delegate._identity_index), dict(delegate._epoch_by_owner), delegate.c5_write_count, pending_sig
 
 
 def _assert_snapshot_equal(before: tuple, after: tuple) -> None:
@@ -239,6 +241,7 @@ def test_public_backward_failure_abort_preserves_committed_snapshot() -> None:
     cap0 = authority.issue(owner_key="a", source_identity="s0:0", source_timestep=0, source=source)
     adapter.admit(cap0, source=source, segment_id="s0", row_index=0); token0 = adapter.materialize("a")
     adapter.backward_and_mark("a", token0.float().sum() * 0); adapter.finish("a", terminal=False)
+    committed_baseline = _snapshot(adapter, "a")
     adapter.begin_segment("a")
     cap1 = authority.issue(owner_key="a", source_identity="s1:1", source_timestep=1, source=source)
     adapter.admit(cap1, source=source, segment_id="s1", row_index=0); token1 = adapter.materialize("a")
@@ -249,10 +252,21 @@ def test_public_backward_failure_abort_preserves_committed_snapshot() -> None:
     after = _snapshot(adapter, "a")
     _assert_snapshot_equal(before, after)
     adapter.abort("a")
+    after_abort = _snapshot(adapter, "a")
+    assert after_abort[0] is not None and after_abort[1] == committed_baseline[1] and after_abort[3] == committed_baseline[3] and after_abort[4] == committed_baseline[4] and after_abort[6] is None
+    assert set(after_abort[2]) == set(committed_baseline[2])
+    assert all(torch.equal(after_abort[2][key][0], committed_baseline[2][key][0]) for key in committed_baseline[2])
 
 
 def test_local_disabled_parity_is_zero_write_no_memory_path() -> None:
     _, adapter = _adapter()
     assert adapter.c5_write_count == 0 and not adapter._c5a._pending_by_owner
+    sample = torch.tensor([[1.0, 2.0]])
+    disabled_packed = (sample.clone(), None)
+    baseline_packed = (sample.clone(), None)
+    disabled_loss = disabled_packed[0].square().mean()
+    baseline_loss = baseline_packed[0].square().mean()
+    assert torch.equal(disabled_packed[0], baseline_packed[0]) and disabled_packed[1] is baseline_packed[1]
+    assert torch.equal(disabled_loss, baseline_loss)
     adapter.done("disabled-owner")
-    assert adapter.c5_write_count == 0 and not adapter._c5a._state_by_owner
+    assert adapter.c5_write_count == 0 and not adapter._c5a._state_by_owner and not adapter._c5a._pending_by_owner
