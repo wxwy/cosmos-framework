@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from .c5a_owner_segment import AdmissionAuthority, AdmissionCapability, C5AOwnerSegmentCPU
-from .local_evidence import ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
+from .local_evidence import ContinualTTTLocalMemoryCore, LocalEvidenceEncoder, StatelessLocalReplayReadout
 
 
 def _source() -> dict[str, torch.Tensor]:
@@ -246,6 +246,48 @@ def test_committed_replay_remains_graph_free_after_chronology_advance() -> None:
     runtime.backward_and_mark("a", out1.float().sum()); runtime.commit("a")
     writes = runtime.c5_write_count; runtime.begin("a"); replay = runtime.admit(cap0, source=source)
     assert replay.present and replay.value.grad_fn is None and tuple(replay.value.shape) == replay.shape and runtime.c5_write_count == writes
+
+
+def test_pending_invalid_replay_preserves_presence_and_stateless_readout_is_unused(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    original = StatelessLocalReplayReadout.forward
+    def spy(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(StatelessLocalReplayReadout, "forward", spy)
+    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source)
+    result = runtime.materialize_many(["a"], valid=torch.tensor([[False]]))
+    replay = runtime.admit(cap, source=source)
+    assert not replay.present and replay.value.grad_fn is None and tuple(result.shape) == (1, 1, 32) and calls == 0
+
+
+def test_epoch_allows_same_identity_fresh_capability_and_rejects_stale() -> None:
+    authority, runtime, source = _runtime(segment_steps=1)
+    old = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source, epoch=0)
+    runtime.begin("a"); runtime.admit(old, source=source); token = runtime.materialize("a")
+    runtime.backward_and_mark("a", token.float().sum()); runtime.commit("a"); runtime.reset("a")
+    runtime.begin("a")
+    with pytest.raises(ValueError, match="epoch"):
+        runtime.admit(old, source=source)
+    fresh = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source, epoch=1)
+    assert runtime.admit(fresh, source=source) == (0, 0)
+
+
+def test_abort_exact_snapshot_preserves_committed_owner_state() -> None:
+    authority, runtime, source = _runtime(segment_steps=1)
+    cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source); token = runtime.materialize("a")
+    runtime.backward_and_mark("a", token.float().sum()); runtime.commit("a")
+    state_before = tuple(value.clone() for value in runtime._state_by_owner["a"])
+    last_before, committed_before = runtime._last_timestep["a"], dict(runtime._committed)
+    index_before, epoch_before = dict(runtime._identity_index), dict(runtime._epoch_by_owner)
+    cap1 = authority.issue(owner_key="a", source_identity="s2", source_timestep=1, source=source)
+    runtime.begin("a"); runtime.admit(cap1, source=source); runtime.abort("a")
+    assert last_before == runtime._last_timestep["a"] and epoch_before == runtime._epoch_by_owner
+    assert index_before == runtime._identity_index and set(committed_before) == set(runtime._committed)
+    assert all(torch.equal(before, after) for before, after in zip(state_before, runtime._state_by_owner["a"], strict=True))
 
 
 @pytest.mark.parametrize("segment_steps", [1, 3, 16])
