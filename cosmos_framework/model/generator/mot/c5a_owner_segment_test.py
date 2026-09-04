@@ -1,44 +1,40 @@
+import pytest
 import torch
 
-from .c5a_owner_segment import AdmissionCapability, C5AOwnerSegmentCPU
+from .c5a_owner_segment import AdmissionAuthority, AdmissionCapability, C5AOwnerSegmentCPU
 from .local_evidence import ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
 
 
-def _runtime() -> C5AOwnerSegmentCPU:
-    return C5AOwnerSegmentCPU(LocalEvidenceEncoder(evidence_dim=256, visual_dim=3, action_dim=2), ContinualTTTLocalMemoryCore())
+def _source() -> dict[str, torch.Tensor]:
+    return {"history_visual_summary": torch.zeros(1, 1, 96), "local_history_action": torch.zeros(1, 1, 10),
+            "history_age_steps": torch.zeros(1, 1, dtype=torch.long), "history_dt_s": torch.zeros(1, 1, 1),
+            "history_mask": torch.ones(1, 1, dtype=torch.bool)}
 
 
-def test_source_key_replay_precedes_new_binding() -> None:
-    runtime = _runtime()
-    cap = AdmissionCapability("o", "s", 0, b"x")
-    runtime.begin()
-    binding = runtime.admit(cap, encoded=torch.zeros(256))
-    assert binding == (0, 0, 0, 0)
-    runtime._pending.replay[cap.source_key] = torch.ones(1, 1, 32)
-    cached = runtime.admit(cap, encoded=torch.zeros(256))
-    assert torch.equal(cached, torch.ones(1, 1, 32))
-    assert len(runtime._pending.rows) == 1
+def _runtime() -> tuple[AdmissionAuthority, C5AOwnerSegmentCPU, dict[str, torch.Tensor]]:
+    source = _source(); authority = AdmissionAuthority()
+    return authority, C5AOwnerSegmentCPU(authority, LocalEvidenceEncoder(), ContinualTTTLocalMemoryCore()), source
 
 
-def test_committed_replay_is_detached_and_zero_write() -> None:
-    runtime = _runtime()
-    cap = AdmissionCapability("o", "s", 0, b"x")
-    runtime.begin()
-    runtime.admit(cap, encoded=torch.zeros(256))
-    runtime._pending.replay[cap.source_key] = torch.ones(1, 1, 32, requires_grad=True)
-    runtime.commit()
-    runtime.begin()
-    value = runtime.admit(cap, encoded=torch.zeros(256))
-    assert value.grad_fn is None and runtime.c5_write_count == 0
+def test_materialize_then_commit_and_replay_without_second_write() -> None:
+    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source); tokens = runtime.materialize("a"); runtime.commit("a")
+    writes = runtime.c5_write_count; runtime.begin("a"); replay = runtime.admit(cap, source=source)
+    assert torch.equal(replay, tokens[0].detach()) and runtime.c5_write_count == writes
 
 
-def test_forged_capability_is_rejected() -> None:
-    runtime = _runtime()
-    runtime.begin()
-    forged = AdmissionCapability("o", "s", 0, bytearray(b"x"))  # type: ignore[arg-type]
-    try:
-        runtime.admit(forged, encoded=torch.zeros(256))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("non-bytes source must be rejected")
+def test_conflicting_digest_and_forged_capability_fail_before_c5() -> None:
+    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source)
+    conflict = AdmissionCapability(cap.owner_key, cap.source_identity, cap.source_timestep, b"bad", cap.source_shape, cap.source_dtype, cap._seal)
+    with pytest.raises(ValueError, match="conflicting"):
+        runtime.admit(conflict, source=source)
+    forged = AdmissionCapability(cap.owner_key, cap.source_identity, cap.source_timestep, cap.source_bytes, cap.source_shape, cap.source_dtype, object())
+    with pytest.raises(ValueError, match="untrusted"):
+        runtime.admit(forged, source=source)
+
+
+def test_abort_discards_pending_candidate() -> None:
+    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source); runtime.materialize("a"); runtime.abort("a")
+    assert "a" not in runtime._state_by_owner and runtime.c5_write_count == 1
