@@ -23,6 +23,8 @@ class C6SyntheticRuntimeAdapter:
     def admit(self, capability: AdmissionCapability, *, source: dict[str, torch.Tensor], segment_id: str, row_index: int) -> tuple[int, int] | ReplayRecord:
         if not segment_id or row_index < 0:
             raise ValueError("invalid segment coordinates")
+        if capability.source_identity != f"{segment_id}:{capability.source_timestep}":
+            raise ValueError("segment coordinates do not match source identity")
         return self._c5a.admit(capability, source=source)
 
     def materialize(self, owner_key: str) -> torch.Tensor:
@@ -37,8 +39,8 @@ class C6SyntheticRuntimeAdapter:
     def backward_and_mark_many(self, owner_keys: list[str], segment_outer_loss: torch.Tensor) -> None:
         self._c5a.backward_and_mark_many(owner_keys, segment_outer_loss)
 
-    def commit(self, owner_key: str) -> None:
-        self._c5a.commit(owner_key)
+    def finish(self, owner_key: str, *, terminal: bool) -> None:
+        self._c5a.finish(owner_key, terminal=terminal)
 
     def abort(self, owner_key: str) -> None:
         self._c5a.abort(owner_key)
