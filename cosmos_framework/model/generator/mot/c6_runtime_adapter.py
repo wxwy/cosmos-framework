@@ -50,3 +50,9 @@ class C6SyntheticRuntimeAdapter:
 
     def done(self, owner_key: str) -> None:
         self._c5a.reset(owner_key)
+
+    @staticmethod
+    def disabled_path(sample: torch.Tensor) -> tuple[tuple[torch.Tensor, None], torch.Tensor]:
+        """Synthetic Local-disabled bypass used only for parity evidence."""
+        packed = (sample.clone(), None)
+        return packed, packed[0].square().mean()

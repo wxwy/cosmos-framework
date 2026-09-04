@@ -262,9 +262,8 @@ def test_local_disabled_parity_is_zero_write_no_memory_path() -> None:
     _, adapter = _adapter()
     assert adapter.c5_write_count == 0 and not adapter._c5a._pending_by_owner
     sample = torch.tensor([[1.0, 2.0]])
-    disabled_packed = (sample.clone(), None)
+    disabled_packed, disabled_loss = adapter.disabled_path(sample)
     baseline_packed = (sample.clone(), None)
-    disabled_loss = disabled_packed[0].square().mean()
     baseline_loss = baseline_packed[0].square().mean()
     assert torch.equal(disabled_packed[0], baseline_packed[0]) and disabled_packed[1] is baseline_packed[1]
     assert torch.equal(disabled_loss, baseline_loss)
