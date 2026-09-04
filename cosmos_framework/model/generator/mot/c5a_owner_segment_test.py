@@ -96,3 +96,36 @@ def test_reset_rejects_capability_from_previous_epoch() -> None:
     runtime.reset("a"); runtime.begin("a")
     with pytest.raises(ValueError, match="epoch"):
         runtime.admit(cap, source=source)
+
+
+def test_materialize_many_valid_done_and_row_mismatch_are_explicit() -> None:
+    torch.manual_seed(11)
+    authority, runtime, source = _runtime()
+    seen: list[tuple[tuple[int, ...], torch.Tensor]] = []
+    original = runtime.core.scan_segment_many
+
+    def spy(evidence: torch.Tensor, valid: torch.Tensor, state=None, *, create_graph=True):
+        seen.append((tuple(evidence.shape), valid.detach().clone()))
+        return original(evidence, valid, state, create_graph=create_graph)
+
+    runtime.core.scan_segment_many = spy
+    for owner in ("a", "b"):
+        owner_source = {**source, "history_visual_summary": torch.full((1, 1, 96), float(owner == "b"))}
+        cap = authority.issue(owner_key=owner, source_identity="s", source_timestep=0, source=owner_source)
+        runtime.begin(owner); runtime.admit(cap, source=owner_source)
+    runtime.materialize_many(["a", "b"], valid=torch.tensor([[True], [False]]), done_before=torch.tensor([False, True]))
+    assert seen[0][0] == (2, 1, 256) and seen[0][1].tolist() == [[True], [False]]
+    with pytest.raises(RuntimeError, match="backward"):
+        runtime.commit("a")
+    for owner in ("a", "b"):
+        runtime.mark_backward_done(owner); runtime.commit(owner)
+
+    authority2, runtime2, source2 = _runtime()
+    cap_a = authority2.issue(owner_key="a", source_identity="s", source_timestep=0, source=source2)
+    cap_b = authority2.issue(owner_key="b", source_identity="s", source_timestep=0, source=source2)
+    runtime2.begin("a"); runtime2.admit(cap_a, source=source2)
+    runtime2.begin("b"); runtime2.admit(cap_b, source=source2)
+    cap_b1 = authority2.issue(owner_key="b", source_identity="s", source_timestep=1, source=source2)
+    runtime2.admit(cap_b1, source=source2)
+    with pytest.raises(ValueError, match="equal segment lengths"):
+        runtime2.materialize_many(["a", "b"])

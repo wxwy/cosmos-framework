@@ -156,7 +156,13 @@ class C5AOwnerSegmentCPU:
         self.c5_write_count += len(encoded)
         return tokens[0]
 
-    def materialize_many(self, owner_keys: list[str]) -> torch.Tensor:
+    def materialize_many(
+        self,
+        owner_keys: list[str],
+        *,
+        valid: torch.Tensor | None = None,
+        done_before: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Gather/scatter independent owner rows as one true B>1 scan."""
         if not owner_keys or len(set(owner_keys)) != len(owner_keys):
             raise ValueError("owner_keys must be non-empty and unique")
@@ -166,6 +172,16 @@ class C5AOwnerSegmentCPU:
         steps = {len(p.rows) for p in pendings if p is not None}
         if len(steps) != 1:
             raise ValueError("materialize_many requires equal segment lengths")
+        step_count = next(iter(steps))
+        batch = len(owner_keys)
+        if valid is None:
+            valid = torch.ones(batch, step_count, dtype=torch.bool)
+        if done_before is None:
+            done_before = torch.zeros(batch, dtype=torch.bool)
+        if tuple(valid.shape) != (batch, step_count) or valid.dtype != torch.bool:
+            raise ValueError("valid must have shape [B,T] and bool dtype")
+        if tuple(done_before.shape) != (batch,) or done_before.dtype != torch.bool:
+            raise ValueError("done_before must have shape [B] and bool dtype")
         encoded_rows = []
         for pending in pendings:
             assert pending is not None
@@ -178,8 +194,9 @@ class C5AOwnerSegmentCPU:
             raise RuntimeError("owner state batch is incomplete")
         else:
             state = ContinualTTTFastState(*(torch.cat([s[i].detach() for s in states], dim=0) for i in range(4)))
+        state = self.core.reset_mask(state, done_before.to(device=evidence.device))
         tokens, candidate, present = self.core.scan_segment_many(
-            evidence, torch.ones(len(owner_keys), evidence.shape[1], dtype=torch.bool, device=evidence.device), state, create_graph=True
+            evidence, valid.to(device=evidence.device), state, create_graph=True
         )
         for batch_index, pending in enumerate(pendings):
             assert pending is not None
@@ -187,7 +204,7 @@ class C5AOwnerSegmentCPU:
             pending.phase = "MATERIALIZED_PENDING"
             for row, (cap, _) in enumerate(pending.rows):
                 pending.replay[cap.source_key] = tokens[batch_index, row].detach().clone()
-        self.c5_write_count += len(owner_keys) * evidence.shape[1]
+        self.c5_write_count += int(valid.sum().item())
         return tokens[:, -1]
 
     def commit(self, owner_key: str) -> None:
