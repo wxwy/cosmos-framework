@@ -220,6 +220,36 @@ def test_backward_failure_does_not_open_commit_phase() -> None:
                for key, record in runtime._committed.items())
 
 
+def test_backward_rejects_unrelated_scalar_graph() -> None:
+    authority, runtime, source = _runtime(segment_steps=1)
+    cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source); runtime.materialize("a")
+    unrelated = torch.ones((), requires_grad=True) * 2
+    with pytest.raises(RuntimeError, match="unrelated"):
+        runtime.backward_and_mark("a", unrelated)
+    assert runtime._pending_by_owner["a"].phase == "MATERIALIZED_PENDING"
+
+
+def test_backward_rejects_grad_free_scalar() -> None:
+    authority, runtime, source = _runtime(segment_steps=1)
+    cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source); runtime.materialize("a")
+    with pytest.raises(RuntimeError, match="scalar graph"):
+        runtime.backward_and_mark("a", torch.zeros(()))
+    assert runtime._pending_by_owner["a"].phase == "MATERIALIZED_PENDING"
+
+
+def test_backward_many_rejects_partial_owner_graph() -> None:
+    authority, runtime, source = _runtime(segment_steps=1)
+    for owner in ("a", "b"):
+        cap = authority.issue(owner_key=owner, source_identity="s", source_timestep=0, source=source)
+        runtime.begin(owner); runtime.admit(cap, source=source)
+    runtime.materialize_many(["a", "b"])
+    with pytest.raises(RuntimeError, match="unrelated"):
+        runtime.backward_and_mark_many(["a", "b"], runtime._pending_by_owner["a"].witness.float().sum())
+    assert all(runtime._pending_by_owner[owner].phase == "MATERIALIZED_PENDING" for owner in ("a", "b"))
+
+
 def test_done_before_requires_owner_epoch_reset() -> None:
     authority, runtime, source = _runtime(segment_steps=1)
     cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)

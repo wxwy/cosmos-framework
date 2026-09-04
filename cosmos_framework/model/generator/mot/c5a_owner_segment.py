@@ -86,7 +86,6 @@ class _Pending:
     replay: dict[tuple[str, str, int, str], ReplayRecord]
     identity_index: dict[tuple[str, str, int], str]
     phase: str = "COLLECT_RAW"
-    witness_grad_fn: object | None = None
     witness: torch.Tensor | None = None
     witness_leaf: torch.Tensor | None = None
     valid_rows: list[bool] | None = None
@@ -113,7 +112,7 @@ class C5AOwnerSegmentCPU:
             raise RuntimeError("pending transaction already exists")
         self._pending_by_owner[owner_key] = _Pending(self._state_by_owner.get(owner_key), [], {}, {}, "COLLECT_RAW")
 
-    def admit(self, cap: AdmissionCapability, *, source: dict[str, torch.Tensor]) -> tuple[int, int] | torch.Tensor:
+    def admit(self, cap: AdmissionCapability, *, source: dict[str, torch.Tensor]) -> tuple[int, int] | ReplayRecord:
         self.authority.verify(cap)
         if cap.source_timestep < 0 or cap.epoch != self._epoch_by_owner.get(cap.owner_key, 0) or cap.provenance_class != "R08_COMPLETED_CAUSAL":
             raise ValueError("stale admission capability epoch")
@@ -169,7 +168,6 @@ class C5AOwnerSegmentCPU:
         pending.valid_rows = [True] * len(pending.rows)
         pending.witness_leaf = torch.ones((), device=tokens.device, requires_grad=True)
         pending.witness = tokens + pending.witness_leaf * 0
-        pending.witness_grad_fn = pending.witness.grad_fn
         pending.phase = "MATERIALIZED_PENDING"
         for row, (cap, _) in enumerate(pending.rows):
             value = tokens[0, row].detach().clone()
@@ -236,7 +234,6 @@ class C5AOwnerSegmentCPU:
             pending.valid_rows = [bool(value) for value in valid[batch_index].tolist()]
             pending.witness_leaf = torch.ones((), device=tokens.device, requires_grad=True)
             pending.witness = tokens[batch_index] + pending.witness_leaf * 0
-            pending.witness_grad_fn = pending.witness.grad_fn
             for row, (cap, _) in enumerate(pending.rows):
                 value = tokens[batch_index, row].detach().clone()
                 pending.replay[cap.source_key] = ReplayRecord(value, tuple(value.shape), bool(present[batch_index, row]))
