@@ -218,6 +218,21 @@ def test_done_before_requires_owner_epoch_reset() -> None:
         runtime.materialize_many(["a"], done_before=torch.tensor([True]))
 
 
+def test_validity_hole_rejected_before_encoder_and_prefix_commits_contiguously() -> None:
+    authority, runtime, source = _runtime(segment_steps=3)
+    runtime.begin("a")
+    for timestep in range(3):
+        cap = authority.issue(owner_key="a", source_identity="s", source_timestep=timestep, source=source)
+        runtime.admit(cap, source=source)
+    with pytest.raises(ValueError, match="contiguous prefix"):
+        runtime.materialize_many(["a"], valid=torch.tensor([[True, False, True]]))
+    assert runtime.c5_write_count == 0 and runtime._pending_by_owner["a"].phase == "COLLECT_RAW"
+    runtime.materialize_many(["a"], valid=torch.tensor([[True, True, False]]))
+    runtime.backward_and_mark("a", runtime._pending_by_owner["a"].witness.float().sum())
+    runtime.commit("a")
+    assert runtime._last_timestep["a"] == 1 and all(key[2] < 2 for key in runtime._committed)
+
+
 def test_provenance_class_tampering_rejects_before_work() -> None:
     authority, runtime, source = _runtime()
     cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)

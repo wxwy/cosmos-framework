@@ -203,6 +203,13 @@ class C5AOwnerSegmentCPU:
             raise ValueError("valid must have shape [B,T] and bool dtype")
         if tuple(done_before.shape) != (batch,) or done_before.dtype != torch.bool:
             raise ValueError("done_before must have shape [B] and bool dtype")
+        for row in valid.tolist():
+            seen_invalid = False
+            for is_valid in row:
+                if not is_valid:
+                    seen_invalid = True
+                elif seen_invalid:
+                    raise ValueError("valid rows must form a contiguous prefix")
         for owner, done in zip(owner_keys, done_before.tolist(), strict=True):
             if done and (owner in self._state_by_owner or owner in self._last_timestep or any(key[0] == owner for key in self._committed)):
                 raise RuntimeError("done_before requires explicit owner reset")
