@@ -48,6 +48,7 @@ def test_checkpoint_is_slow_only_and_cloned() -> None:
     expected = {"recurrent_backend.q.weight": value}
     assert torch.equal(strict_restore(payload, expected, config)["recurrent_backend.q.weight"], value)
     owner = _Owner()
+    owner.readout = nn.Identity(); owner.recurrent_backend = nn.Identity()
     own_expected = {"local_history_runtime.encoder.weight": owner.encoder.weight.detach().clone(), "local_history_runtime.encoder.bias": owner.encoder.bias.detach().clone()}
     own_payload = slow_checkpoint_payload(own_expected, config)
     strict_restore_into(owner, own_payload, own_expected, config, runtime_encoder=owner.encoder, runtime_backend=owner.recurrent_backend)
