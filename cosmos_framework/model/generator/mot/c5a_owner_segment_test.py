@@ -130,3 +130,20 @@ def test_materialize_many_valid_done_and_row_mismatch_are_explicit() -> None:
     runtime2.admit(cap_b1, source=source2)
     with pytest.raises(ValueError, match="equal segment lengths"):
         runtime2.materialize_many(["a", "b"])
+
+
+def test_outer_backward_gradients_and_abort_rollback_are_observable() -> None:
+    torch.manual_seed(19)
+    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source)
+    token = runtime.materialize("a")[0]
+    loss = token.float().square().mean(); loss.backward()
+    grads = [parameter.grad for parameter in list(runtime.encoder.parameters()) + list(runtime.core.parameters())]
+    assert any(gradient is not None and torch.isfinite(gradient).all() and gradient.abs().sum() > 0 for gradient in grads)
+    runtime.mark_backward_done("a"); runtime.commit("a")
+    with pytest.raises(RuntimeError, match="no pending"):
+        runtime.commit("a")
+
+    cap2 = authority.issue(owner_key="a", source_identity="s2", source_timestep=1, source=source)
+    runtime.begin("a"); runtime.admit(cap2, source=source); runtime.materialize("a"); runtime.abort("a")
+    assert "a" not in runtime._pending_by_owner and all(key[0] == "a" for key in runtime._identity_index)
