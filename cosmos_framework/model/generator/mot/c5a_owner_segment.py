@@ -231,7 +231,7 @@ class C5AOwnerSegmentCPU:
                 value = tokens[batch_index, row].detach().clone()
                 pending.replay[cap.source_key] = ReplayRecord(value, tuple(value.shape), bool(present[batch_index, row]))
         self.c5_write_count += int(valid.sum().item())
-        return tokens[:, -1]
+        return torch.stack([pending.witness[-1] for pending in pendings], dim=0)
 
     def commit(self, owner_key: str) -> None:
         pending = self._pending_by_owner.get(owner_key)

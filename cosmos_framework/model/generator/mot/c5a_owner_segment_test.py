@@ -114,11 +114,11 @@ def test_materialize_many_valid_done_and_row_mismatch_are_explicit() -> None:
         owner_source = {**source, "history_visual_summary": torch.full((1, 1, 96), float(owner == "b"))}
         cap = authority.issue(owner_key=owner, source_identity="s", source_timestep=0, source=owner_source)
         runtime.begin(owner); runtime.admit(cap, source=owner_source)
-    runtime.materialize_many(["a", "b"], valid=torch.tensor([[True], [False]]), done_before=torch.tensor([False, True]))
+    result = runtime.materialize_many(["a", "b"], valid=torch.tensor([[True], [False]]), done_before=torch.tensor([False, True]))
     assert seen[0][0] == (2, 1, 256) and seen[0][1].tolist() == [[True], [False]]
     with pytest.raises(RuntimeError, match="backward"):
         runtime.commit("a")
-    batch_loss = sum(pending.witness.float().sum() for pending in runtime._pending_by_owner.values()) * 0
+    batch_loss = result.float().sum() * 0
     runtime.backward_and_mark_many(["a", "b"], batch_loss)
     for owner in ("a", "b"):
         runtime.commit(owner)
@@ -223,6 +223,29 @@ def test_provenance_class_tampering_rejects_before_work() -> None:
     with pytest.raises(ValueError, match="untrusted"):
         runtime.admit(replace(cap, provenance_class="FUTURE_OR_GT"), source=source)
     assert runtime.c5_write_count == 0 and not runtime._pending_by_owner["a"].rows
+
+
+@pytest.mark.parametrize("field", ["owner_key", "source_identity", "source_timestep", "source_schema", "source_shape", "source_dtype"])
+def test_issued_capability_field_mutations_fail_before_allocation(field: str) -> None:
+    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a")
+    replacement = {"owner_key": "b", "source_identity": "other", "source_timestep": 1,
+                   "source_schema": ("tampered",), "source_shape": (9,), "source_dtype": "torch.int64"}[field]
+    with pytest.raises(ValueError, match="untrusted"):
+        runtime.admit(replace(cap, **{field: replacement}), source=source)
+    assert not runtime._pending_by_owner["a"].rows and runtime.c5_write_count == 0
+
+
+def test_committed_replay_remains_graph_free_after_chronology_advance() -> None:
+    authority, runtime, source = _runtime(segment_steps=1)
+    cap0 = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap0, source=source); out = runtime.materialize("a")
+    runtime.backward_and_mark("a", out.float().sum()); runtime.commit("a")
+    cap1 = authority.issue(owner_key="a", source_identity="s", source_timestep=1, source=source)
+    runtime.begin("a"); runtime.admit(cap1, source=source); out1 = runtime.materialize("a")
+    runtime.backward_and_mark("a", out1.float().sum()); runtime.commit("a")
+    writes = runtime.c5_write_count; runtime.begin("a"); replay = runtime.admit(cap0, source=source)
+    assert replay.present and replay.value.grad_fn is None and tuple(replay.value.shape) == replay.shape and runtime.c5_write_count == writes
 
 
 @pytest.mark.parametrize("segment_steps", [1, 3, 16])
