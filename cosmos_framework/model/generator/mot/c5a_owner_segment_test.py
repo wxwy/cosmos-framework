@@ -197,14 +197,27 @@ def test_materialized_segment_rejects_unseen_admission_but_allows_exact_replay()
 
 
 def test_backward_failure_does_not_open_commit_phase() -> None:
-    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
-    runtime.begin("a"); runtime.admit(cap, source=source); runtime.materialize("a")
+    authority, runtime, source = _runtime(segment_steps=1)
+    cap0 = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap0, source=source); token0 = runtime.materialize("a")
+    runtime.backward_and_mark("a", token0.float().sum() * 0); runtime.commit("a")
+    state_before = tuple(value.clone() for value in runtime._state_by_owner["a"])
+    last_before = runtime._last_timestep["a"]
+    committed_before = {key: (record.value.clone(), record.shape, record.present) for key, record in runtime._committed.items()}
+    index_before, epoch_before = dict(runtime._identity_index), dict(runtime._epoch_by_owner)
+    cap1 = authority.issue(owner_key="a", source_identity="s", source_timestep=1, source=source)
+    runtime.begin("a"); runtime.admit(cap1, source=source); runtime.materialize("a")
     loss = runtime._pending_by_owner["a"].witness.float().sum()
     loss.register_hook(lambda _: (_ for _ in ()).throw(RuntimeError("boom")))
     with pytest.raises(RuntimeError, match="boom"):
         runtime.backward_and_mark("a", loss)
     with pytest.raises(RuntimeError, match="backward"):
         runtime.commit("a")
+    assert runtime._last_timestep["a"] == last_before and runtime._identity_index == index_before and runtime._epoch_by_owner == epoch_before
+    assert all(torch.equal(before, after) for before, after in zip(state_before, runtime._state_by_owner["a"], strict=True))
+    assert set(runtime._committed) == set(committed_before)
+    assert all(torch.equal(committed_before[key][0], record.value) and record.shape == committed_before[key][1] and record.present == committed_before[key][2]
+               for key, record in runtime._committed.items())
 
 
 def test_done_before_requires_owner_epoch_reset() -> None:
@@ -277,7 +290,7 @@ def test_pending_invalid_replay_preserves_presence_and_stateless_readout_is_unus
     runtime.begin("a"); runtime.admit(cap, source=source)
     result = runtime.materialize_many(["a"], valid=torch.tensor([[False]]))
     writes = runtime.c5_write_count; replay = runtime.admit(cap, source=source)
-    assert not replay.present and replay.value.grad_fn is None and tuple(replay.value.shape) == replay.shape and tuple(result.shape) == (1, 1, 32) and calls == 0 and runtime.c5_write_count == writes
+    assert not replay.present and replay.value.grad_fn is None and tuple(replay.value.shape) == replay.shape and torch.equal(replay.value, result[0, 0].reshape_as(replay.value)) and tuple(result.shape) == (1, 1, 32) and calls == 0 and runtime.c5_write_count == writes
 
 
 def test_epoch_allows_same_identity_fresh_capability_and_rejects_stale() -> None:
@@ -290,6 +303,9 @@ def test_epoch_allows_same_identity_fresh_capability_and_rejects_stale() -> None
         runtime.admit(old, source=source)
     fresh = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source, epoch=1)
     assert runtime.admit(fresh, source=source) == (0, 0)
+    changed = {**source, "history_visual_summary": torch.ones(1, 1, 96)}
+    changed_cap = authority.issue(owner_key="a", source_identity="s", source_timestep=1, source=changed, epoch=1)
+    assert runtime.admit(changed_cap, source=changed) == (1, 1)
 
 
 def test_abort_exact_snapshot_preserves_committed_owner_state() -> None:
@@ -304,6 +320,7 @@ def test_abort_exact_snapshot_preserves_committed_owner_state() -> None:
     runtime.begin("a"); runtime.admit(cap1, source=source); runtime.abort("a")
     assert last_before == runtime._last_timestep["a"] and epoch_before == runtime._epoch_by_owner
     assert index_before == runtime._identity_index and set(committed_before) == set(runtime._committed)
+    assert all(torch.equal(committed_before[key].value, runtime._committed[key].value) and committed_before[key].shape == runtime._committed[key].shape and committed_before[key].present == runtime._committed[key].present for key in committed_before)
     assert all(torch.equal(before, after) for before, after in zip(state_before, runtime._state_by_owner["a"], strict=True))
 
 
