@@ -32,12 +32,13 @@ class AdmissionCapability:
     source_shape: tuple[int, ...]
     source_dtype: str
     source_schema: tuple[tuple[str, str, tuple[int, ...]], ...]
+    epoch: int
     _seal: object
 
     @property
     def digest(self) -> str:
         h = sha256()
-        for value in (self.owner_key.encode(), self.source_identity.encode(), self.source_timestep.to_bytes(8, "little", signed=True), repr(self.source_schema).encode(), self.source_bytes):
+        for value in (self.owner_key.encode(), self.source_identity.encode(), self.source_timestep.to_bytes(8, "little", signed=True), self.epoch.to_bytes(8, "little", signed=True), repr(self.source_schema).encode(), self.source_bytes):
             h.update(len(value).to_bytes(8, "little")); h.update(value)
         return h.hexdigest()
 
@@ -50,15 +51,22 @@ class AdmissionAuthority:
     """Trusted synthetic producer; callers cannot construct a sealed capability."""
 
     def __init__(self) -> None:
-        self._seal = object()
+        self._issued: dict[int, tuple[AdmissionCapability, bytes]] = {}
 
-    def issue(self, *, owner_key: str, source_identity: str, source_timestep: int, source: dict[str, torch.Tensor]) -> AdmissionCapability:
-        if source_timestep < 0 or not source or any(not isinstance(value, torch.Tensor) for value in source.values()):
+    def issue(self, *, owner_key: str, source_identity: str, source_timestep: int, source: dict[str, torch.Tensor], epoch: int = 0) -> AdmissionCapability:
+        if source_timestep < 0 or epoch < 0 or not source or any(not isinstance(value, torch.Tensor) for value in source.values()):
             raise ValueError("invalid causal source")
         payload = _canonical_source(source)
         schema = tuple((name, str(source[name].dtype), tuple(source[name].shape)) for name in sorted(source))
         first = next(iter(source.values()))
-        return AdmissionCapability(owner_key, source_identity, source_timestep, payload, tuple(first.shape), str(first.dtype), schema, self._seal)
+        cap = AdmissionCapability(owner_key, source_identity, source_timestep, payload, tuple(first.shape), str(first.dtype), schema, epoch, object())
+        self._issued[id(cap._seal)] = (cap, payload)
+        return cap
+
+    def verify(self, cap: AdmissionCapability) -> None:
+        record = self._issued.get(id(cap._seal))
+        if record is None or record[0] != cap:
+            raise ValueError("untrusted admission capability")
 
 
 @dataclass
@@ -92,8 +100,9 @@ class C5AOwnerSegmentCPU:
         self._pending_by_owner[owner_key] = _Pending(self._state_by_owner.get(owner_key), [], {}, {}, "COLLECT_RAW")
 
     def admit(self, cap: AdmissionCapability, *, source: dict[str, torch.Tensor]) -> tuple[int, int] | torch.Tensor:
-        if cap._seal is not self.authority._seal or cap.source_timestep < 0:
-            raise ValueError("untrusted admission capability")
+        self.authority.verify(cap)
+        if cap.source_timestep < 0 or cap.epoch != self._epoch_by_owner.get(cap.owner_key, 0):
+            raise ValueError("stale admission capability epoch")
         if cap.owner_key not in self._pending_by_owner:
             raise RuntimeError("begin() required")
         key = cap.source_key
@@ -105,7 +114,7 @@ class C5AOwnerSegmentCPU:
         if _canonical_source(source) != cap.source_bytes:
             raise ValueError("source bytes do not match admission capability")
         schema = tuple((name, str(source[name].dtype), tuple(source[name].shape)) for name in sorted(source))
-        if schema != cap.source_schema or cap.digest != AdmissionCapability(cap.owner_key, cap.source_identity, cap.source_timestep, cap.source_bytes, cap.source_shape, cap.source_dtype, cap.source_schema, cap._seal).digest:
+        if schema != cap.source_schema:
             raise ValueError("capability fields are not canonical")
         cached = pending.replay.get(key)
         if cached is None:
@@ -126,6 +135,8 @@ class C5AOwnerSegmentCPU:
         pending = self._pending_by_owner.get(owner_key)
         if pending is None or not pending.rows:
             raise RuntimeError("no pending rows")
+        if pending.phase != "COLLECT_RAW":
+            raise RuntimeError("materialize already completed")
         encoded = []
         for _, source in pending.rows:
             value = self.encoder(**source)
@@ -146,19 +157,45 @@ class C5AOwnerSegmentCPU:
         return tokens[0]
 
     def materialize_many(self, owner_keys: list[str]) -> torch.Tensor:
-        """Gather/scatter independent owner rows; temporal axes never become batch state."""
+        """Gather/scatter independent owner rows as one true B>1 scan."""
         if not owner_keys or len(set(owner_keys)) != len(owner_keys):
             raise ValueError("owner_keys must be non-empty and unique")
-        rows = [self.materialize(owner_key)[-1] for owner_key in owner_keys]
-        return torch.stack(rows, dim=0)
+        pendings = [self._pending_by_owner.get(owner) for owner in owner_keys]
+        if any(p is None or not p.rows or p.phase != "COLLECT_RAW" for p in pendings):
+            raise RuntimeError("all owners require raw pending rows")
+        steps = {len(p.rows) for p in pendings if p is not None}
+        if len(steps) != 1:
+            raise ValueError("materialize_many requires equal segment lengths")
+        encoded_rows = []
+        for pending in pendings:
+            assert pending is not None
+            encoded_rows.append(torch.stack([self.encoder(**source)[:, -1] for _, source in pending.rows], dim=1)[0])
+        evidence = torch.stack(encoded_rows, dim=0)
+        states = [p.base_state for p in pendings]
+        if all(state is None for state in states):
+            state = self.core.initial_state(len(owner_keys), device=evidence.device)
+        elif any(state is None for state in states):
+            raise RuntimeError("owner state batch is incomplete")
+        else:
+            state = ContinualTTTFastState(*(torch.cat([s[i].detach() for s in states], dim=0) for i in range(4)))
+        tokens, candidate, present = self.core.scan_segment_many(
+            evidence, torch.ones(len(owner_keys), evidence.shape[1], dtype=torch.bool, device=evidence.device), state, create_graph=True
+        )
+        for batch_index, pending in enumerate(pendings):
+            assert pending is not None
+            pending.base_state = ContinualTTTFastState(*(value[batch_index : batch_index + 1] for value in candidate))
+            pending.phase = "MATERIALIZED_PENDING"
+            for row, (cap, _) in enumerate(pending.rows):
+                pending.replay[cap.source_key] = tokens[batch_index, row].detach().clone()
+        self.c5_write_count += len(owner_keys) * evidence.shape[1]
+        return tokens[:, -1]
 
     def commit(self, owner_key: str) -> None:
         pending = self._pending_by_owner.get(owner_key)
         if pending is None:
             raise RuntimeError("no pending transaction")
-        if pending.phase != "MATERIALIZED_PENDING":
+        if pending.phase != "BACKWARD_OK":
             raise RuntimeError("commit requires one successful materialize/backward")
-        pending.phase = "BACKWARD_OK"
         pending = self._pending_by_owner.pop(owner_key)
         if pending.base_state is not None:
             self._state_by_owner[owner_key] = ContinualTTTFastState(*(value.detach().clone() for value in pending.base_state))
@@ -166,6 +203,12 @@ class C5AOwnerSegmentCPU:
         self._epoch_by_owner.setdefault(owner_key, 0)
         self._committed.update({key: value.detach().clone() for key, value in pending.replay.items()})
         self._identity_index.update(pending.identity_index)
+
+    def mark_backward_done(self, owner_key: str) -> None:
+        pending = self._pending_by_owner.get(owner_key)
+        if pending is None or pending.phase != "MATERIALIZED_PENDING":
+            raise RuntimeError("backward requires one successful materialize")
+        pending.phase = "BACKWARD_OK"
 
     def abort(self, owner_key: str) -> None:
         self._pending_by_owner.pop(owner_key)
@@ -192,6 +235,7 @@ class C5AOwnerSegmentCPU:
         if count == 0 or count > self.segment_steps or (not terminal and count != self.segment_steps):
             raise ValueError("invalid segment length")
         self.materialize(owner_key)
+        self.mark_backward_done(owner_key)
         self.commit(owner_key)
         if terminal:
             self.reset(owner_key)
