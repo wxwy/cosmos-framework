@@ -26,6 +26,22 @@ def _commit(adapter: C6SyntheticRuntimeAdapter, authority: AdmissionAuthority, s
     adapter.finish(owner, terminal=False)
 
 
+def _snapshot(adapter: C6SyntheticRuntimeAdapter, owner: str) -> tuple[object, object, dict, dict, dict, int]:
+    delegate = adapter._c5a
+    state = delegate._state_by_owner.get(owner)
+    state_copy = None if state is None else tuple(value.clone() for value in state)
+    committed = {key: (record.value.clone(), record.shape, record.present) for key, record in delegate._committed.items()}
+    return state_copy, delegate._last_timestep.get(owner), committed, dict(delegate._identity_index), dict(delegate._epoch_by_owner), delegate.c5_write_count
+
+
+def _assert_snapshot_equal(before: tuple, after: tuple) -> None:
+    assert before[1] == after[1] and before[3:] == after[3:] and set(before[2]) == set(after[2])
+    assert all(torch.equal(before[2][key][0], after[2][key][0]) and before[2][key][1:] == after[2][key][1:] for key in before[2])
+    assert (before[0] is None) == (after[0] is None)
+    if before[0] is not None and after[0] is not None:
+        assert all(torch.equal(x, y) for x, y in zip(before[0], after[0], strict=True))
+
+
 def test_adapter_delegates_segment_and_preserves_prefix_shape() -> None:
     authority, adapter = _adapter()
     source = _source(); adapter.begin_segment("ep/0")
@@ -204,3 +220,39 @@ def test_public_backward_failure_and_abort_leave_no_committed_candidate() -> Non
     with pytest.raises(RuntimeError, match="backward"):
         adapter.finish("a", terminal=False)
     adapter.abort("a")
+
+
+def test_pending_done_preserves_complete_public_seam_snapshot() -> None:
+    authority, adapter = _adapter(); source = _source(); adapter.begin_segment("a")
+    cap = authority.issue(owner_key="a", source_identity="s0:0", source_timestep=0, source=source)
+    adapter.admit(cap, source=source, segment_id="s0", row_index=0)
+    before = _snapshot(adapter, "a")
+    with pytest.raises(RuntimeError, match="pending"):
+        adapter.done("a")
+    after = _snapshot(adapter, "a")
+    _assert_snapshot_equal(before, after)
+    adapter.abort("a")
+
+
+def test_public_backward_failure_abort_preserves_committed_snapshot() -> None:
+    authority, adapter = _adapter(); source = _source(); adapter.begin_segment("a")
+    cap0 = authority.issue(owner_key="a", source_identity="s0:0", source_timestep=0, source=source)
+    adapter.admit(cap0, source=source, segment_id="s0", row_index=0); token0 = adapter.materialize("a")
+    adapter.backward_and_mark("a", token0.float().sum() * 0); adapter.finish("a", terminal=False)
+    adapter.begin_segment("a")
+    cap1 = authority.issue(owner_key="a", source_identity="s1:1", source_timestep=1, source=source)
+    adapter.admit(cap1, source=source, segment_id="s1", row_index=0); token1 = adapter.materialize("a")
+    before = _snapshot(adapter, "a")
+    loss = token1.float().sum(); loss.register_hook(lambda _: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError, match="boom"):
+        adapter.backward_and_mark("a", loss)
+    after = _snapshot(adapter, "a")
+    _assert_snapshot_equal(before, after)
+    adapter.abort("a")
+
+
+def test_local_disabled_parity_is_zero_write_no_memory_path() -> None:
+    _, adapter = _adapter()
+    assert adapter.c5_write_count == 0 and not adapter._c5a._pending_by_owner
+    adapter.done("disabled-owner")
+    assert adapter.c5_write_count == 0 and not adapter._c5a._state_by_owner
