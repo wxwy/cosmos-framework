@@ -47,6 +47,13 @@ class AdmissionCapability:
         return (self.owner_key, self.source_identity, self.source_timestep, self.digest)
 
 
+@dataclass(frozen=True)
+class ReplayRecord:
+    value: torch.Tensor
+    shape: tuple[int, ...]
+    present: bool
+
+
 class AdmissionAuthority:
     """Trusted synthetic producer; callers cannot construct a sealed capability."""
 
@@ -73,7 +80,7 @@ class AdmissionAuthority:
 class _Pending:
     base_state: ContinualTTTFastState | None
     rows: list[tuple[AdmissionCapability, dict[str, torch.Tensor]]]
-    replay: dict[tuple[str, str, int, str], torch.Tensor]
+    replay: dict[tuple[str, str, int, str], ReplayRecord]
     identity_index: dict[tuple[str, str, int], str]
     phase: str = "COLLECT_RAW"
 
@@ -121,6 +128,8 @@ class C5AOwnerSegmentCPU:
             cached = self._committed.get(key)
         if cached is not None:
             return cached
+        if pending.phase != "COLLECT_RAW":
+            raise RuntimeError("unseen admission after materialize")
         payload = {name: value.detach().clone() for name, value in source.items()}
         if not payload or any(value.requires_grad for value in payload.values()):
             raise ValueError("source payload must be immutable and graph-free")
@@ -146,13 +155,14 @@ class C5AOwnerSegmentCPU:
         # 时间轴显式保留为 [B=1,T,D]；每个 timestep 顺序消费同一 owner 的候选 state。
         evidence = torch.stack(encoded, dim=1)
         state = pending.base_state or self.core.initial_state(1, device=evidence.device)
-        tokens, candidate, _ = self.core.scan_segment_many(
+        tokens, candidate, present = self.core.scan_segment_many(
             evidence, torch.ones(1, evidence.shape[1], dtype=torch.bool, device=evidence.device), state, create_graph=True
         )
         pending.base_state = candidate
         pending.phase = "MATERIALIZED_PENDING"
         for row, (cap, _) in enumerate(pending.rows):
-            pending.replay[cap.source_key] = tokens[0, row].detach().clone()
+            value = tokens[0, row].detach().clone()
+            pending.replay[cap.source_key] = ReplayRecord(value, tuple(value.shape), bool(present[0, row]))
         self.c5_write_count += len(encoded)
         return tokens[0]
 
@@ -182,6 +192,9 @@ class C5AOwnerSegmentCPU:
             raise ValueError("valid must have shape [B,T] and bool dtype")
         if tuple(done_before.shape) != (batch,) or done_before.dtype != torch.bool:
             raise ValueError("done_before must have shape [B] and bool dtype")
+        for owner, done in zip(owner_keys, done_before.tolist(), strict=True):
+            if done and (owner in self._state_by_owner or owner in self._last_timestep or any(key[0] == owner for key in self._committed)):
+                raise RuntimeError("done_before requires explicit owner reset")
         encoded_rows = []
         for pending in pendings:
             assert pending is not None
@@ -203,7 +216,8 @@ class C5AOwnerSegmentCPU:
             pending.base_state = ContinualTTTFastState(*(value[batch_index : batch_index + 1] for value in candidate))
             pending.phase = "MATERIALIZED_PENDING"
             for row, (cap, _) in enumerate(pending.rows):
-                pending.replay[cap.source_key] = tokens[batch_index, row].detach().clone()
+                value = tokens[batch_index, row].detach().clone()
+                pending.replay[cap.source_key] = ReplayRecord(value, tuple(value.shape), bool(present[batch_index, row]))
         self.c5_write_count += int(valid.sum().item())
         return tokens[:, -1]
 
@@ -218,13 +232,17 @@ class C5AOwnerSegmentCPU:
             self._state_by_owner[owner_key] = ContinualTTTFastState(*(value.detach().clone() for value in pending.base_state))
         self._last_timestep[owner_key] = pending.rows[-1][0].source_timestep
         self._epoch_by_owner.setdefault(owner_key, 0)
-        self._committed.update({key: value.detach().clone() for key, value in pending.replay.items()})
+        self._committed.update({key: ReplayRecord(record.value.detach().clone(), record.shape, record.present) for key, record in pending.replay.items()})
         self._identity_index.update(pending.identity_index)
 
-    def mark_backward_done(self, owner_key: str) -> None:
+    def backward_and_mark(self, owner_key: str, loss: torch.Tensor) -> None:
         pending = self._pending_by_owner.get(owner_key)
         if pending is None or pending.phase != "MATERIALIZED_PENDING":
             raise RuntimeError("backward requires one successful materialize")
+        try:
+            loss.backward()
+        except Exception:
+            raise
         pending.phase = "BACKWARD_OK"
 
     def abort(self, owner_key: str) -> None:

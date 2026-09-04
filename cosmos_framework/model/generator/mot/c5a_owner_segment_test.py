@@ -20,9 +20,9 @@ def _runtime(*, segment_steps: int = 16) -> tuple[AdmissionAuthority, C5AOwnerSe
 
 def test_materialize_then_commit_and_replay_without_second_write() -> None:
     authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
-    runtime.begin("a"); runtime.admit(cap, source=source); tokens = runtime.materialize("a"); runtime.mark_backward_done("a"); runtime.commit("a")
+    runtime.begin("a"); runtime.admit(cap, source=source); tokens = runtime.materialize("a"); runtime.backward_and_mark("a", tokens.float().sum()); runtime.commit("a")
     writes = runtime.c5_write_count; runtime.begin("a"); replay = runtime.admit(cap, source=source)
-    assert torch.equal(replay, tokens[0].detach()) and runtime.c5_write_count == writes
+    assert torch.equal(replay.value, tokens[0].detach()) and replay.present and runtime.c5_write_count == writes
 
 
 def test_conflicting_digest_and_forged_capability_fail_before_c5() -> None:
@@ -45,7 +45,7 @@ def test_abort_discards_pending_candidate() -> None:
 def test_committed_chronology_rejects_skip_and_reset_restarts_epoch() -> None:
     authority, runtime, source = _runtime()
     cap0 = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
-    runtime.begin("a"); runtime.admit(cap0, source=source); runtime.materialize("a"); runtime.mark_backward_done("a"); runtime.commit("a")
+    runtime.begin("a"); runtime.admit(cap0, source=source); token0 = runtime.materialize("a"); runtime.backward_and_mark("a", token0.float().sum()); runtime.commit("a")
     cap2 = authority.issue(owner_key="a", source_identity="s", source_timestep=2, source=source)
     runtime.begin("a")
     with pytest.raises(ValueError, match="contiguous"):
@@ -61,7 +61,7 @@ def test_finish_rejects_nonterminal_short_and_accepts_terminal_remainder() -> No
     runtime.begin("a"); runtime.admit(cap, source=source)
     with pytest.raises(ValueError, match="segment length"):
         runtime.finish("a", terminal=False)
-    runtime.materialize("a"); runtime.mark_backward_done("a")
+    runtime.materialize("a"); runtime.backward_and_mark("a", torch.tensor(0.0, requires_grad=True))
     runtime.finish("a", terminal=True)
     assert "a" not in runtime._state_by_owner
 
@@ -89,7 +89,7 @@ def test_materialize_requires_explicit_backward_and_rejects_second_materialize()
         runtime.materialize("a")
     with pytest.raises(RuntimeError, match="backward"):
         runtime.commit("a")
-    runtime.mark_backward_done("a"); runtime.commit("a")
+    runtime.backward_and_mark("a", torch.tensor(0.0, requires_grad=True)); runtime.commit("a")
 
 
 def test_reset_rejects_capability_from_previous_epoch() -> None:
@@ -119,7 +119,7 @@ def test_materialize_many_valid_done_and_row_mismatch_are_explicit() -> None:
     with pytest.raises(RuntimeError, match="backward"):
         runtime.commit("a")
     for owner in ("a", "b"):
-        runtime.mark_backward_done(owner); runtime.commit(owner)
+        runtime.backward_and_mark(owner, torch.tensor(0.0, requires_grad=True)); runtime.commit(owner)
 
     authority2, runtime2, source2 = _runtime()
     cap_a = authority2.issue(owner_key="a", source_identity="s", source_timestep=0, source=source2)
@@ -140,7 +140,7 @@ def test_outer_backward_gradients_and_abort_rollback_are_observable() -> None:
     loss = token.float().square().mean(); loss.backward()
     grads = [parameter.grad for parameter in list(runtime.encoder.parameters()) + list(runtime.core.parameters())]
     assert any(gradient is not None and torch.isfinite(gradient).all() and gradient.abs().sum() > 0 for gradient in grads)
-    runtime.mark_backward_done("a"); runtime.commit("a")
+    runtime.backward_and_mark("a", torch.tensor(0.0, requires_grad=True)); runtime.commit("a")
     with pytest.raises(RuntimeError, match="no pending"):
         runtime.commit("a")
 
@@ -157,7 +157,7 @@ def test_segment_lengths_and_terminal_remainders(segment_steps: int) -> None:
         if timestep == 0:
             runtime.begin("a")
         runtime.admit(cap, source=source)
-    runtime.materialize("a"); runtime.mark_backward_done("a"); runtime.finish("a", terminal=False)
+    runtime.materialize("a"); runtime.backward_and_mark("a", torch.tensor(0.0, requires_grad=True)); runtime.finish("a", terminal=False)
     assert runtime._last_timestep["a"] == segment_steps - 1
 
     authority2, runtime2, source2 = _runtime(segment_steps=segment_steps)
@@ -168,7 +168,7 @@ def test_segment_lengths_and_terminal_remainders(segment_steps: int) -> None:
     if segment_steps == 1:
         runtime2.finish("a", terminal=True)
     else:
-        runtime2.materialize("a"); runtime2.mark_backward_done("a"); runtime2.finish("a", terminal=True)
+        runtime2.materialize("a"); runtime2.backward_and_mark("a", torch.tensor(0.0, requires_grad=True)); runtime2.finish("a", terminal=True)
     assert "a" not in runtime2._state_by_owner
 
 
@@ -179,3 +179,36 @@ def test_fast_state_is_not_registered_as_slow_parameters() -> None:
         "slot_queries", "w0_fast_in_weight", "w0_fast_in_bias", "w0_fast_out_weight", "w0_fast_out_bias",
         "key_proj.weight", "key_proj.bias", "query_proj.weight", "query_proj.bias", "value_proj.weight", "value_proj.bias",
     }
+
+
+def test_materialized_segment_rejects_unseen_admission_but_allows_exact_replay() -> None:
+    authority, runtime, source = _runtime(); cap0 = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap0, source=source); token = runtime.materialize("a")
+    writes = runtime.c5_write_count
+    assert torch.equal(runtime.admit(cap0, source=source).value, token[0].detach())
+    cap1 = authority.issue(owner_key="a", source_identity="s", source_timestep=1, source=source)
+    with pytest.raises(RuntimeError, match="unseen admission"):
+        runtime.admit(cap1, source=source)
+    assert len(runtime._pending_by_owner["a"].rows) == 1 and runtime.c5_write_count == writes
+
+
+def test_backward_failure_does_not_open_commit_phase() -> None:
+    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source); runtime.materialize("a")
+    loss = torch.tensor(1.0, requires_grad=True)
+    loss.register_hook(lambda _: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError, match="boom"):
+        runtime.backward_and_mark("a", loss)
+    with pytest.raises(RuntimeError, match="backward"):
+        runtime.commit("a")
+
+
+def test_done_before_requires_owner_epoch_reset() -> None:
+    authority, runtime, source = _runtime(segment_steps=1)
+    cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source); token = runtime.materialize("a")
+    runtime.backward_and_mark("a", token.float().sum()); runtime.commit("a")
+    cap_next = authority.issue(owner_key="a", source_identity="s2", source_timestep=1, source=source)
+    runtime.begin("a"); runtime.admit(cap_next, source=source)
+    with pytest.raises(RuntimeError, match="explicit owner reset"):
+        runtime.materialize_many(["a"], done_before=torch.tensor([True]))
