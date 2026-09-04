@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch import nn
 
-from .config_checkpoint_contract import LocalMemoryConfig, slow_checkpoint_payload, strict_restore, strict_restore_into, validate_optimizer_membership, validate_slow_inventory
+from .config_checkpoint_contract import LocalMemoryConfig, canonical_slow_inventory, slow_checkpoint_payload, strict_restore, strict_restore_into, validate_exact_optimizer_membership, validate_optimizer_membership, validate_slow_inventory
 
 
 class _Owner(nn.Module):
@@ -19,7 +19,7 @@ def test_config_defaults_and_validation() -> None:
     LocalMemoryConfig(ttt_tbptt_steps=1, k_local=8).validate()
 
 
-@pytest.mark.parametrize("kwargs", [{"inner_lr": 0}, {"inner_lr": float("nan")}, {"ttt_tbptt_steps": 0}, {"runtime_evidence_steps": 2}, {"ttt_tbptt_steps": True}, {"k_local": 2}])
+@pytest.mark.parametrize("kwargs", [{"inner_lr": 0}, {"inner_lr": float("nan")}, {"ttt_tbptt_steps": 0}, {"runtime_evidence_steps": 2}, {"ttt_tbptt_steps": True}, {"k_local": 2}, {"inner_lr": True}, {"runtime_evidence_steps": 1.0}])
 def test_config_rejects_invalid_values(kwargs: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         LocalMemoryConfig(**kwargs).validate()
@@ -49,7 +49,7 @@ def test_checkpoint_is_slow_only_and_cloned() -> None:
     assert torch.equal(strict_restore(payload, expected, config)["recurrent_backend.q.weight"], value)
     owner = _Owner()
     owner.readout = nn.Identity(); owner.recurrent_backend = nn.Identity()
-    own_expected = {"local_history_runtime.encoder.weight": owner.encoder.weight.detach().clone(), "local_history_runtime.encoder.bias": owner.encoder.bias.detach().clone()}
+    own_expected = {f"local_history_runtime.{name}": value.detach().clone() for name, value in owner.named_parameters()}
     own_payload = slow_checkpoint_payload(own_expected, config)
     strict_restore_into(owner, own_payload, own_expected, config, runtime_encoder=owner.encoder, runtime_backend=owner.recurrent_backend)
     for bad in ({}, {**payload["parameters"], "extra": value}, {"recurrent_backend.q.weight": torch.ones(3)}, {"recurrent_backend.q.weight": value.to(torch.float64)}):
@@ -65,3 +65,8 @@ def test_optimizer_membership_is_exact() -> None:
         validate_optimizer_membership(values, {})
     with pytest.raises(ValueError):
         validate_optimizer_membership({**values, "other.weight": torch.ones(1)}, external)
+    owner = _Owner(); owner.readout = nn.Identity(); owner.recurrent_backend = nn.Identity()
+    expected = canonical_slow_inventory(owner, nn.Linear(2, 2), nn.Parameter(torch.ones(2)))
+    validate_exact_optimizer_membership(expected, expected)
+    with pytest.raises(ValueError):
+        validate_exact_optimizer_membership({key: value for key, value in expected.items() if key != next(iter(expected))}, expected)
