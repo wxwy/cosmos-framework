@@ -77,6 +77,7 @@ class C5AOwnerSegmentCPU:
             raise ValueError("encoder/core evidence dimensions must match")
         self.authority, self.encoder, self.core = authority, encoder, core
         self._state_by_owner: dict[str, ContinualTTTFastState] = {}
+        self._last_timestep: dict[str, int] = {}
         self._pending_by_owner: dict[str, _Pending] = {}
         self._committed: dict[tuple[str, str, int, str], torch.Tensor] = {}
         self._identity_index: dict[tuple[str, str, int], str] = {}
@@ -111,7 +112,8 @@ class C5AOwnerSegmentCPU:
         payload = {name: value.detach().clone() for name, value in source.items()}
         if not payload or any(value.requires_grad for value in payload.values()):
             raise ValueError("source payload must be immutable and graph-free")
-        if pending.rows and cap.source_timestep != pending.rows[-1][0].source_timestep + 1:
+        expected = self._last_timestep.get(cap.owner_key, -1) + len(pending.rows) + 1
+        if cap.source_timestep != expected:
             raise ValueError("source timestep must be contiguous")
         pending.identity_index[identity] = cap.digest
         pending.rows.append((cap, payload))
@@ -143,8 +145,15 @@ class C5AOwnerSegmentCPU:
         pending = self._pending_by_owner.pop(owner_key)
         if pending.base_state is not None:
             self._state_by_owner[owner_key] = ContinualTTTFastState(*(value.detach().clone() for value in pending.base_state))
+        self._last_timestep[owner_key] = pending.rows[-1][0].source_timestep
         self._committed.update({key: value.detach().clone() for key, value in pending.replay.items()})
         self._identity_index.update(pending.identity_index)
 
     def abort(self, owner_key: str) -> None:
         self._pending_by_owner.pop(owner_key)
+
+    def reset(self, owner_key: str) -> None:
+        if owner_key in self._pending_by_owner:
+            raise RuntimeError("cannot reset owner with pending transaction")
+        self._state_by_owner.pop(owner_key, None)
+        self._last_timestep.pop(owner_key, None)
