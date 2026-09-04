@@ -109,14 +109,17 @@ class C5AOwnerSegmentCPU:
             if value.ndim != 3 or value.shape[0] != 1 or value.shape[-1] != self.core.evidence_dim:
                 raise ValueError("C5 evidence must be [B,256]")
             encoded.append(value[:, -1])
-        evidence = torch.cat(encoded, dim=0)
-        state = pending.base_state or self.core.initial_state(len(encoded), device=evidence.device)
-        tokens, candidate, _ = self.core.step_many(evidence, state, torch.ones(len(encoded), dtype=torch.bool), create_graph=True)
+        # 时间轴显式保留为 [B=1,T,D]；每个 timestep 顺序消费同一 owner 的候选 state。
+        evidence = torch.stack(encoded, dim=1)
+        state = pending.base_state or self.core.initial_state(1, device=evidence.device)
+        tokens, candidate, _ = self.core.scan_segment_many(
+            evidence, torch.ones(1, evidence.shape[1], dtype=torch.bool, device=evidence.device), state, create_graph=True
+        )
         pending.base_state = candidate
         for row, (cap, _) in enumerate(pending.rows):
-            pending.replay[cap.source_key] = tokens[row].detach().clone()
+            pending.replay[cap.source_key] = tokens[0, row].detach().clone()
         self.c5_write_count += len(encoded)
-        return tokens
+        return tokens[0]
 
     def commit(self, owner_key: str) -> None:
         pending = self._pending_by_owner.pop(owner_key)
@@ -126,4 +129,3 @@ class C5AOwnerSegmentCPU:
 
     def abort(self, owner_key: str) -> None:
         self._pending_by_owner.pop(owner_key)
-
