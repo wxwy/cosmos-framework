@@ -122,6 +122,8 @@ def test_materialize_many_valid_done_and_row_mismatch_are_explicit() -> None:
     runtime.backward_and_mark_many(["a", "b"], batch_loss)
     for owner in ("a", "b"):
         runtime.commit(owner)
+    assert runtime._last_timestep["a"] == 0 and "b" not in runtime._last_timestep
+    assert all(key[0] != "b" for key in runtime._committed) and runtime.c5_write_count == 1
 
     authority2, runtime2, source2 = _runtime()
     cap_a = authority2.issue(owner_key="a", source_identity="s", source_timestep=0, source=source2)
@@ -259,8 +261,8 @@ def test_pending_invalid_replay_preserves_presence_and_stateless_readout_is_unus
     authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
     runtime.begin("a"); runtime.admit(cap, source=source)
     result = runtime.materialize_many(["a"], valid=torch.tensor([[False]]))
-    replay = runtime.admit(cap, source=source)
-    assert not replay.present and replay.value.grad_fn is None and tuple(result.shape) == (1, 1, 32) and calls == 0
+    writes = runtime.c5_write_count; replay = runtime.admit(cap, source=source)
+    assert not replay.present and replay.value.grad_fn is None and tuple(replay.value.shape) == replay.shape and tuple(result.shape) == (1, 1, 32) and calls == 0 and runtime.c5_write_count == writes
 
 
 def test_epoch_allows_same_identity_fresh_capability_and_rejects_stale() -> None:

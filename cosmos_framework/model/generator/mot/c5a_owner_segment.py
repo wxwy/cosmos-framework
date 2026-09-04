@@ -89,6 +89,7 @@ class _Pending:
     witness_grad_fn: object | None = None
     witness: torch.Tensor | None = None
     witness_leaf: torch.Tensor | None = None
+    valid_rows: list[bool] | None = None
 
 
 class C5AOwnerSegmentCPU:
@@ -165,6 +166,7 @@ class C5AOwnerSegmentCPU:
             evidence, torch.ones(1, evidence.shape[1], dtype=torch.bool, device=evidence.device), state, create_graph=True
         )
         pending.base_state = candidate
+        pending.valid_rows = [True] * len(pending.rows)
         pending.witness_leaf = torch.ones((), device=tokens.device, requires_grad=True)
         pending.witness = tokens + pending.witness_leaf * 0
         pending.witness_grad_fn = pending.witness.grad_fn
@@ -224,6 +226,7 @@ class C5AOwnerSegmentCPU:
             assert pending is not None
             pending.base_state = ContinualTTTFastState(*(value[batch_index : batch_index + 1] for value in candidate))
             pending.phase = "MATERIALIZED_PENDING"
+            pending.valid_rows = [bool(value) for value in valid[batch_index].tolist()]
             pending.witness_leaf = torch.ones((), device=tokens.device, requires_grad=True)
             pending.witness = tokens[batch_index] + pending.witness_leaf * 0
             pending.witness_grad_fn = pending.witness.grad_fn
@@ -240,12 +243,16 @@ class C5AOwnerSegmentCPU:
         if pending.phase != "BACKWARD_OK":
             raise RuntimeError("commit requires one successful materialize/backward")
         pending = self._pending_by_owner.pop(owner_key)
-        if pending.base_state is not None:
+        valid_rows = pending.valid_rows or [True] * len(pending.rows)
+        valid_indices = [index for index, is_valid in enumerate(valid_rows) if is_valid]
+        if pending.base_state is not None and valid_indices:
             self._state_by_owner[owner_key] = ContinualTTTFastState(*(value.detach().clone() for value in pending.base_state))
-        self._last_timestep[owner_key] = pending.rows[-1][0].source_timestep
+        if valid_indices:
+            self._last_timestep[owner_key] = pending.rows[valid_indices[-1]][0].source_timestep
         self._epoch_by_owner.setdefault(owner_key, 0)
-        self._committed.update({key: ReplayRecord(record.value.detach().clone(), record.shape, record.present) for key, record in pending.replay.items()})
-        self._identity_index.update(pending.identity_index)
+        valid_keys = {pending.rows[index][0].source_key for index in valid_indices}
+        self._committed.update({key: ReplayRecord(record.value.detach().clone(), record.shape, record.present) for key, record in pending.replay.items() if key in valid_keys})
+        self._identity_index.update({identity: digest for index, (cap, _) in enumerate(pending.rows) if index in valid_indices for identity, digest in [(cap.source_key[:3], cap.digest)]})
 
     def backward_and_mark(self, owner_key: str, loss: torch.Tensor) -> None:
         pending = self._pending_by_owner.get(owner_key)
