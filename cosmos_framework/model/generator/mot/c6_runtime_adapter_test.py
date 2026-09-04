@@ -136,3 +136,71 @@ def test_batch_row_mismatch_is_delegated() -> None:
     with pytest.raises(ValueError, match="equal segment lengths"):
         adapter.materialize_many(["a", "b"])
     adapter.abort("a"); adapter.abort("b")
+
+
+@pytest.mark.parametrize("steps", [1, 3, 16])
+def test_public_n_matrix_uses_one_segment_closure(steps: int) -> None:
+    authority, adapter = _adapter(segment_steps=steps); source = _source(); adapter.begin_segment("a")
+    for timestep in range(steps):
+        cap = authority.issue(owner_key="a", source_identity=f"s0:{timestep}", source_timestep=timestep, source=source)
+        adapter.admit(cap, source=source, segment_id="s0", row_index=timestep)
+    output = adapter.materialize("a")
+    assert tuple(output.shape) == (steps, 1, 32)
+    adapter.backward_and_mark("a", output.float().sum() * 0); adapter.finish("a", terminal=False)
+
+
+@pytest.mark.parametrize("rows", [0, 1, 3])
+def test_public_terminal_remainder_matrix(rows: int) -> None:
+    authority, adapter = _adapter(segment_steps=3); source = _source(); adapter.begin_segment("a")
+    for timestep in range(rows):
+        cap = authority.issue(owner_key="a", source_identity=f"s0:{timestep}", source_timestep=timestep, source=source)
+        adapter.admit(cap, source=source, segment_id="s0", row_index=timestep)
+    if rows == 0:
+        adapter.finish("a", terminal=True)
+        return
+    output = adapter.materialize("a"); adapter.backward_and_mark("a", output.float().sum() * 0); adapter.finish("a", terminal=True)
+
+
+def test_pending_done_rejects_without_mutation_and_fresh_epoch_replays() -> None:
+    authority, adapter = _adapter(); source = _source(); adapter.begin_segment("a")
+    cap = authority.issue(owner_key="a", source_identity="s0:0", source_timestep=0, source=source)
+    adapter.admit(cap, source=source, segment_id="s0", row_index=0)
+    writes = adapter.c5_write_count
+    with pytest.raises(RuntimeError, match="pending"):
+        adapter.done("a")
+    assert adapter.c5_write_count == writes
+    adapter.abort("a"); adapter.done("a"); adapter.begin_segment("a")
+    changed = _source(2.0)
+    fresh = authority.issue(owner_key="a", source_identity="s0:0", source_timestep=0, source=changed, epoch=1)
+    assert adapter.admit(fresh, source=changed, segment_id="s0", row_index=0) == (0, 0)
+
+
+def test_public_segment_loss_negative_fixtures_are_fail_closed() -> None:
+    authority, adapter = _adapter(); source = _source(); adapter.begin_segment("a")
+    cap = authority.issue(owner_key="a", source_identity="s0:0", source_timestep=0, source=source)
+    adapter.admit(cap, source=source, segment_id="s0", row_index=0); output = adapter.materialize("a")
+    with pytest.raises(RuntimeError, match="unrelated"):
+        adapter.backward_and_mark("a", torch.ones((), requires_grad=True) * 2)
+    with pytest.raises(RuntimeError, match="scalar graph"):
+        adapter.backward_and_mark("a", torch.zeros(()))
+    adapter.abort("a")
+    authority, adapter = _adapter(); adapter.begin_segment("a"); adapter.begin_segment("b")
+    for owner in ("a", "b"):
+        cap = authority.issue(owner_key=owner, source_identity="s0:0", source_timestep=0, source=source)
+        adapter.admit(cap, source=source, segment_id="s0", row_index=0)
+    output_a = adapter.materialize("a"); adapter.materialize("b")
+    with pytest.raises(RuntimeError, match="unrelated"):
+        adapter.backward_and_mark_many(["a", "b"], output_a.float().sum())
+    adapter.abort("a"); adapter.abort("b")
+
+
+def test_public_backward_failure_and_abort_leave_no_committed_candidate() -> None:
+    authority, adapter = _adapter(); source = _source(); adapter.begin_segment("a")
+    cap = authority.issue(owner_key="a", source_identity="s0:0", source_timestep=0, source=source)
+    adapter.admit(cap, source=source, segment_id="s0", row_index=0); output = adapter.materialize("a")
+    loss = output.float().sum(); loss.register_hook(lambda _: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError, match="boom"):
+        adapter.backward_and_mark("a", loss)
+    with pytest.raises(RuntimeError, match="backward"):
+        adapter.finish("a", terminal=False)
+    adapter.abort("a")
