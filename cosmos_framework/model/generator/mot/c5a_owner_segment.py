@@ -33,12 +33,13 @@ class AdmissionCapability:
     source_dtype: str
     source_schema: tuple[tuple[str, str, tuple[int, ...]], ...]
     epoch: int
+    provenance_class: str
     _seal: object
 
     @property
     def digest(self) -> str:
         h = sha256()
-        for value in (self.owner_key.encode(), self.source_identity.encode(), self.source_timestep.to_bytes(8, "little", signed=True), self.epoch.to_bytes(8, "little", signed=True), repr(self.source_schema).encode(), self.source_bytes):
+        for value in (self.owner_key.encode(), self.source_identity.encode(), self.source_timestep.to_bytes(8, "little", signed=True), self.epoch.to_bytes(8, "little", signed=True), self.provenance_class.encode(), repr(self.source_schema).encode(), self.source_bytes):
             h.update(len(value).to_bytes(8, "little")); h.update(value)
         return h.hexdigest()
 
@@ -60,13 +61,15 @@ class AdmissionAuthority:
     def __init__(self) -> None:
         self._issued: dict[int, tuple[AdmissionCapability, bytes]] = {}
 
-    def issue(self, *, owner_key: str, source_identity: str, source_timestep: int, source: dict[str, torch.Tensor], epoch: int = 0) -> AdmissionCapability:
+    def issue(self, *, owner_key: str, source_identity: str, source_timestep: int, source: dict[str, torch.Tensor], epoch: int = 0, provenance_class: str = "R08_COMPLETED_CAUSAL") -> AdmissionCapability:
         if source_timestep < 0 or epoch < 0 or not source or any(not isinstance(value, torch.Tensor) for value in source.values()):
             raise ValueError("invalid causal source")
         payload = _canonical_source(source)
         schema = tuple((name, str(source[name].dtype), tuple(source[name].shape)) for name in sorted(source))
         first = next(iter(source.values()))
-        cap = AdmissionCapability(owner_key, source_identity, source_timestep, payload, tuple(first.shape), str(first.dtype), schema, epoch, object())
+        if provenance_class != "R08_COMPLETED_CAUSAL":
+            raise ValueError("unsupported provenance class")
+        cap = AdmissionCapability(owner_key, source_identity, source_timestep, payload, tuple(first.shape), str(first.dtype), schema, epoch, provenance_class, object())
         self._issued[id(cap._seal)] = (cap, payload)
         return cap
 
@@ -83,6 +86,9 @@ class _Pending:
     replay: dict[tuple[str, str, int, str], ReplayRecord]
     identity_index: dict[tuple[str, str, int], str]
     phase: str = "COLLECT_RAW"
+    witness_grad_fn: object | None = None
+    witness: torch.Tensor | None = None
+    witness_leaf: torch.Tensor | None = None
 
 
 class C5AOwnerSegmentCPU:
@@ -108,7 +114,7 @@ class C5AOwnerSegmentCPU:
 
     def admit(self, cap: AdmissionCapability, *, source: dict[str, torch.Tensor]) -> tuple[int, int] | torch.Tensor:
         self.authority.verify(cap)
-        if cap.source_timestep < 0 or cap.epoch != self._epoch_by_owner.get(cap.owner_key, 0):
+        if cap.source_timestep < 0 or cap.epoch != self._epoch_by_owner.get(cap.owner_key, 0) or cap.provenance_class != "R08_COMPLETED_CAUSAL":
             raise ValueError("stale admission capability epoch")
         if cap.owner_key not in self._pending_by_owner:
             raise RuntimeError("begin() required")
@@ -159,12 +165,15 @@ class C5AOwnerSegmentCPU:
             evidence, torch.ones(1, evidence.shape[1], dtype=torch.bool, device=evidence.device), state, create_graph=True
         )
         pending.base_state = candidate
+        pending.witness_leaf = torch.ones((), device=tokens.device, requires_grad=True)
+        pending.witness = tokens + pending.witness_leaf * 0
+        pending.witness_grad_fn = pending.witness.grad_fn
         pending.phase = "MATERIALIZED_PENDING"
         for row, (cap, _) in enumerate(pending.rows):
             value = tokens[0, row].detach().clone()
             pending.replay[cap.source_key] = ReplayRecord(value, tuple(value.shape), bool(present[0, row]))
         self.c5_write_count += len(encoded)
-        return tokens[0]
+        return pending.witness[0]
 
     def materialize_many(
         self,
@@ -215,6 +224,9 @@ class C5AOwnerSegmentCPU:
             assert pending is not None
             pending.base_state = ContinualTTTFastState(*(value[batch_index : batch_index + 1] for value in candidate))
             pending.phase = "MATERIALIZED_PENDING"
+            pending.witness_leaf = torch.ones((), device=tokens.device, requires_grad=True)
+            pending.witness = tokens[batch_index] + pending.witness_leaf * 0
+            pending.witness_grad_fn = pending.witness.grad_fn
             for row, (cap, _) in enumerate(pending.rows):
                 value = tokens[batch_index, row].detach().clone()
                 pending.replay[cap.source_key] = ReplayRecord(value, tuple(value.shape), bool(present[batch_index, row]))
@@ -239,11 +251,43 @@ class C5AOwnerSegmentCPU:
         pending = self._pending_by_owner.get(owner_key)
         if pending is None or pending.phase != "MATERIALIZED_PENDING":
             raise RuntimeError("backward requires one successful materialize")
+        if not isinstance(loss, torch.Tensor) or loss.ndim != 0 or loss.grad_fn is None:
+            raise RuntimeError("backward loss must be a scalar graph")
+        if not self._loss_reaches(loss, pending.witness_leaf):
+            raise RuntimeError("backward loss is unrelated to materialized segment")
         try:
             loss.backward()
         except Exception:
             raise
         pending.phase = "BACKWARD_OK"
+
+    @staticmethod
+    def _loss_reaches(loss: torch.Tensor, witness_leaf: torch.Tensor | None) -> bool:
+        stack = [loss.grad_fn]
+        while stack:
+            function = stack.pop()
+            if function is None:
+                continue
+            variable = getattr(function, "variable", None)
+            if variable is not None and witness_leaf is not None and variable.data_ptr() == witness_leaf.data_ptr():
+                return True
+            stack.extend(next_function for next_function, _ in function.next_functions if next_function is not None)
+        return False
+
+    def backward_and_mark_many(self, owner_keys: list[str], loss: torch.Tensor) -> None:
+        if not owner_keys or len(set(owner_keys)) != len(owner_keys):
+            raise ValueError("owner_keys must be non-empty and unique")
+        pendings = [self._pending_by_owner.get(owner) for owner in owner_keys]
+        if any(p is None or p.phase != "MATERIALIZED_PENDING" for p in pendings):
+            raise RuntimeError("backward requires materialized owners")
+        if not isinstance(loss, torch.Tensor) or loss.ndim != 0 or loss.grad_fn is None:
+            raise RuntimeError("backward loss must be a scalar graph")
+        if any(not self._loss_reaches(loss, pending.witness_leaf) for pending in pendings if pending is not None):
+            raise RuntimeError("backward loss is unrelated to materialized segment")
+        loss.backward()
+        for pending in pendings:
+            assert pending is not None
+            pending.phase = "BACKWARD_OK"
 
     def abort(self, owner_key: str) -> None:
         self._pending_by_owner.pop(owner_key)
