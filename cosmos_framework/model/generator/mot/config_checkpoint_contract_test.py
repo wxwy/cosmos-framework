@@ -57,6 +57,32 @@ def test_checkpoint_is_slow_only_and_cloned() -> None:
             strict_restore({"config": config, "parameters": bad}, expected, config)
 
 
+def test_strict_restore_round_trips_all_four_slow_groups_into_same_objects() -> None:
+    config = LocalMemoryConfig(k_local=4)
+    owner = _Owner()
+    owner.readout = nn.Identity()
+    projector = nn.Linear(2, 2)
+    modality = nn.Parameter(torch.ones(2))
+    expected = canonical_slow_inventory(owner, projector, modality)
+    assert set(expected) == {"local_history_runtime.encoder.weight", "local_history_runtime.encoder.bias", "local_history_runtime.recurrent_backend.weight", "local_history_runtime.recurrent_backend.bias", "local_memory2llm.weight", "local_memory2llm.bias", "local_memory_modality_embed"}
+    payload = slow_checkpoint_payload(expected, config)
+    snapshot = {name: value.detach().clone() for name, value in expected.items()}
+    encoder_ref, backend_ref = owner.encoder, owner.recurrent_backend
+    with torch.no_grad():
+        for value in expected.values():
+            value.add_(torch.full_like(value, 3.0))
+    assert any(not torch.equal(value, snapshot[name]) for name, value in expected.items())
+    strict_restore_into(owner, payload, expected, config, runtime_encoder=owner.encoder, runtime_backend=owner.recurrent_backend, local_memory2llm=projector, modality=modality)
+    for name, value in expected.items():
+        assert torch.equal(value, snapshot[name]), name
+    assert owner.encoder is encoder_ref and owner.recurrent_backend is backend_ref
+    assert canonical_slow_inventory(owner, projector, modality)["local_memory_modality_embed"] is modality
+    with pytest.raises(ValueError, match="local_memory2llm"):
+        strict_restore_into(owner, payload, expected, config, runtime_encoder=owner.encoder, runtime_backend=owner.recurrent_backend)
+    with pytest.raises(ValueError, match="local_memory_modality_embed"):
+        strict_restore_into(owner, payload, expected, config, runtime_encoder=owner.encoder, runtime_backend=owner.recurrent_backend, local_memory2llm=projector)
+
+
 def test_optimizer_membership_is_exact() -> None:
     values = {"local_history_runtime.encoder.weight": torch.ones(1), "local_history_runtime.recurrent_backend.weight": torch.ones(1)}
     external = {"local_memory2llm.weight": torch.ones(1), "local_memory_modality_embed": torch.ones(1)}

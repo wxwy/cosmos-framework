@@ -88,10 +88,21 @@ def strict_restore(payload: Mapping[str, object], expected: Mapping[str, torch.T
     return restored
 
 
-def strict_restore_into(module: nn.Module, payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, runtime_encoder: nn.Module, runtime_backend: nn.Module) -> nn.Module:
+def strict_restore_into(module: nn.Module, payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, runtime_encoder: nn.Module, runtime_backend: nn.Module, local_memory2llm: nn.Module | None = None, modality: nn.Parameter | None = None) -> nn.Module:
     restored = strict_restore(payload, expected, config)
     prefix = "local_history_runtime."
-    state = {name[len(prefix):] if name.startswith(prefix) else name: value for name, value in restored.items()}
+    projector_prefix = "local_memory2llm."
+    state = {name[len(prefix):]: value for name, value in restored.items() if name.startswith(prefix)}
+    projector_state = {name[len(projector_prefix):]: value for name, value in restored.items() if name.startswith(projector_prefix)}
+    if projector_state:
+        if local_memory2llm is None:
+            raise ValueError("checkpoint contains local_memory2llm but no destination module was given")
+        local_memory2llm.load_state_dict(projector_state, strict=True)
+    if "local_memory_modality_embed" in restored:
+        if modality is None:
+            raise ValueError("checkpoint contains local_memory_modality_embed but no destination parameter was given")
+        with torch.no_grad():
+            modality.copy_(restored["local_memory_modality_embed"])
     module.load_state_dict(state, strict=True)
     validate_slow_inventory(module, runtime_encoder=runtime_encoder, runtime_backend=runtime_backend)
     return module
