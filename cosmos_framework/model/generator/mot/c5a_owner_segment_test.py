@@ -61,6 +61,7 @@ def test_finish_rejects_nonterminal_short_and_accepts_terminal_remainder() -> No
     runtime.begin("a"); runtime.admit(cap, source=source)
     with pytest.raises(ValueError, match="segment length"):
         runtime.finish("a", terminal=False)
+    runtime.materialize("a"); runtime.mark_backward_done("a")
     runtime.finish("a", terminal=True)
     assert "a" not in runtime._state_by_owner
 

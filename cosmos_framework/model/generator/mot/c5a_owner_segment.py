@@ -251,8 +251,12 @@ class C5AOwnerSegmentCPU:
             return
         if count == 0 or count > self.segment_steps or (not terminal and count != self.segment_steps):
             raise ValueError("invalid segment length")
-        self.materialize(owner_key)
-        self.mark_backward_done(owner_key)
+        if pending.phase == "COLLECT_RAW":
+            raise RuntimeError("finish requires materialize and backward")
+        if pending.phase == "MATERIALIZED_PENDING":
+            raise RuntimeError("finish requires backward")
+        if pending.phase != "BACKWARD_OK":
+            raise RuntimeError("invalid finish phase")
         self.commit(owner_key)
         if terminal:
             self.reset(owner_key)
