@@ -145,6 +145,13 @@ class C5AOwnerSegmentCPU:
         self.c5_write_count += len(encoded)
         return tokens[0]
 
+    def materialize_many(self, owner_keys: list[str]) -> torch.Tensor:
+        """Gather/scatter independent owner rows; temporal axes never become batch state."""
+        if not owner_keys or len(set(owner_keys)) != len(owner_keys):
+            raise ValueError("owner_keys must be non-empty and unique")
+        rows = [self.materialize(owner_key)[-1] for owner_key in owner_keys]
+        return torch.stack(rows, dim=0)
+
     def commit(self, owner_key: str) -> None:
         pending = self._pending_by_owner.get(owner_key)
         if pending is None:

@@ -63,3 +63,14 @@ def test_finish_rejects_nonterminal_short_and_accepts_terminal_remainder() -> No
         runtime.finish("a", terminal=False)
     runtime.finish("a", terminal=True)
     assert "a" not in runtime._state_by_owner
+
+
+def test_materialize_many_permutation_preserves_owner_rows() -> None:
+    authority, runtime, source = _runtime()
+    cap_a = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    cap_b = authority.issue(owner_key="b", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap_a, source=source)
+    runtime.begin("b"); runtime.admit(cap_b, source=source)
+    first = runtime.materialize_many(["a", "b"])
+    runtime.commit("a"); runtime.commit("b")
+    assert first.shape[0] == 2
