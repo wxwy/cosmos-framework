@@ -303,9 +303,11 @@ def test_epoch_allows_same_identity_fresh_capability_and_rejects_stale() -> None
         runtime.admit(old, source=source)
     fresh = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source, epoch=1)
     assert runtime.admit(fresh, source=source) == (0, 0)
+    runtime.abort("a")
     changed = {**source, "history_visual_summary": torch.ones(1, 1, 96)}
-    changed_cap = authority.issue(owner_key="a", source_identity="s", source_timestep=1, source=changed, epoch=1)
-    assert runtime.admit(changed_cap, source=changed) == (1, 1)
+    changed_cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=changed, epoch=1)
+    runtime.begin("a")
+    assert runtime.admit(changed_cap, source=changed) == (0, 0)
 
 
 def test_abort_exact_snapshot_preserves_committed_owner_state() -> None:
