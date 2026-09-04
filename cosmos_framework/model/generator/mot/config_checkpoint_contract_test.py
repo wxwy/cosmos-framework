@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch import nn
 
-from .config_checkpoint_contract import LocalMemoryConfig, slow_checkpoint_payload, strict_restore, validate_optimizer_membership, validate_slow_inventory
+from .config_checkpoint_contract import LocalMemoryConfig, slow_checkpoint_payload, strict_restore, strict_restore_into, validate_optimizer_membership, validate_slow_inventory
 
 
 class _Owner(nn.Module):
@@ -16,6 +16,7 @@ class _Owner(nn.Module):
 def test_config_defaults_and_validation() -> None:
     config = LocalMemoryConfig(); config.validate()
     assert config.ttt_tbptt_steps == 16 and config.inner_lr == 0.1 and config.k_local == 1
+    LocalMemoryConfig(ttt_tbptt_steps=1, k_local=8).validate()
 
 
 @pytest.mark.parametrize("kwargs", [{"inner_lr": 0}, {"inner_lr": float("nan")}, {"ttt_tbptt_steps": 0}, {"runtime_evidence_steps": 2}, {"ttt_tbptt_steps": True}, {"k_local": 2}])
@@ -26,6 +27,7 @@ def test_config_rejects_invalid_values(kwargs: dict[str, object]) -> None:
 
 def test_inventory_requires_identity_and_excludes_dormant_readout() -> None:
     owner = _Owner()
+    owner.readout = nn.Identity(); owner.recurrent_backend = nn.Identity()
     names = validate_slow_inventory(owner, runtime_encoder=owner.encoder, runtime_backend=owner.recurrent_backend)
     assert names and all(not name.startswith("readout.") for name in names)
 
@@ -45,6 +47,10 @@ def test_checkpoint_is_slow_only_and_cloned() -> None:
         slow_checkpoint_payload({"fast_state": value}, config)
     expected = {"recurrent_backend.q.weight": value}
     assert torch.equal(strict_restore(payload, expected, config)["recurrent_backend.q.weight"], value)
+    owner = _Owner()
+    own_expected = {"local_history_runtime.encoder.weight": owner.encoder.weight.detach().clone(), "local_history_runtime.encoder.bias": owner.encoder.bias.detach().clone()}
+    own_payload = slow_checkpoint_payload(own_expected, config)
+    strict_restore_into(owner, own_payload, own_expected, config, runtime_encoder=owner.encoder, runtime_backend=owner.recurrent_backend)
     for bad in ({}, {**payload["parameters"], "extra": value}, {"recurrent_backend.q.weight": torch.ones(3)}, {"recurrent_backend.q.weight": value.to(torch.float64)}):
         with pytest.raises(ValueError):
             strict_restore({"config": config, "parameters": bad}, expected, config)

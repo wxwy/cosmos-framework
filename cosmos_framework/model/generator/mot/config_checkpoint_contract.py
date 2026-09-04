@@ -39,8 +39,6 @@ def validate_slow_inventory(module: nn.Module, *, runtime_encoder: nn.Module, ru
     if not isinstance(module, nn.Module) or module.encoder is not runtime_encoder or module.recurrent_backend is not runtime_backend:
         raise ValueError("runtime must reference the registered Local module objects")
     names = tuple(f"local_history_runtime.{name}" for name, _ in module.named_parameters() if not name.startswith("readout."))
-    if any(name.startswith("readout.") for name in names):
-        raise ValueError("dormant readout must not enter the Local optimizer inventory")
     return names
 
 
@@ -76,3 +74,12 @@ def strict_restore(payload: Mapping[str, object], expected: Mapping[str, torch.T
             raise ValueError("checkpoint tensor mismatch")
         restored[name] = value.detach().clone()
     return restored
+
+
+def strict_restore_into(module: nn.Module, payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, runtime_encoder: nn.Module, runtime_backend: nn.Module) -> nn.Module:
+    restored = strict_restore(payload, expected, config)
+    prefix = "local_history_runtime."
+    state = {name[len(prefix):] if name.startswith(prefix) else name: value for name, value in restored.items()}
+    module.load_state_dict(state, strict=True)
+    validate_slow_inventory(module, runtime_encoder=runtime_encoder, runtime_backend=runtime_backend)
+    return module
