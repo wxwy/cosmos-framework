@@ -214,3 +214,40 @@ def test_done_before_requires_owner_epoch_reset() -> None:
     runtime.begin("a"); runtime.admit(cap_next, source=source)
     with pytest.raises(RuntimeError, match="explicit owner reset"):
         runtime.materialize_many(["a"], done_before=torch.tensor([True]))
+
+
+def test_provenance_class_tampering_rejects_before_work() -> None:
+    authority, runtime, source = _runtime()
+    cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a")
+    with pytest.raises(ValueError, match="untrusted"):
+        runtime.admit(replace(cap, provenance_class="FUTURE_OR_GT"), source=source)
+    assert runtime.c5_write_count == 0 and not runtime._pending_by_owner["a"].rows
+
+
+@pytest.mark.parametrize("segment_steps", [1, 3, 16])
+def test_terminal_full_segment_r_equals_n(segment_steps: int) -> None:
+    authority, runtime, source = _runtime(segment_steps=segment_steps); runtime.begin("a")
+    for timestep in range(segment_steps):
+        cap = authority.issue(owner_key="a", source_identity="s", source_timestep=timestep, source=source)
+        runtime.admit(cap, source=source)
+    runtime.materialize("a")
+    runtime.backward_and_mark("a", runtime._pending_by_owner["a"].witness.float().sum())
+    runtime.finish("a", terminal=True)
+    assert "a" not in runtime._state_by_owner
+
+
+def test_each_frozen_slow_parameter_group_receives_gradient() -> None:
+    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source); witness = runtime.materialize("a")[0]
+    runtime.backward_and_mark("a", witness.float().square().mean())
+    groups = {
+        "encoder": list(runtime.encoder.parameters()),
+        "query": [runtime.core.query_proj.weight, runtime.core.query_proj.bias],
+        "key": [runtime.core.key_proj.weight, runtime.core.key_proj.bias],
+        "value": [runtime.core.value_proj.weight, runtime.core.value_proj.bias],
+        "slot": [runtime.core.slot_queries],
+        "w0": [runtime.core.w0_fast_in_weight, runtime.core.w0_fast_in_bias, runtime.core.w0_fast_out_weight, runtime.core.w0_fast_out_bias],
+    }
+    for name, parameters in groups.items():
+        assert any(parameter.grad is not None and torch.isfinite(parameter.grad).all() and parameter.grad.abs().sum() > 0 for parameter in parameters), name
