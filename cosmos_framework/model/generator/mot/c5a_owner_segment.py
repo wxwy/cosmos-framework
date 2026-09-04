@@ -66,6 +66,7 @@ class _Pending:
     base_state: ContinualTTTFastState | None
     rows: list[tuple[AdmissionCapability, dict[str, torch.Tensor]]]
     replay: dict[tuple[str, str, int, str], torch.Tensor]
+    identity_index: dict[tuple[str, str, int], str]
 
 
 class C5AOwnerSegmentCPU:
@@ -84,7 +85,7 @@ class C5AOwnerSegmentCPU:
     def begin(self, owner_key: str) -> None:
         if owner_key in self._pending_by_owner:
             raise RuntimeError("pending transaction already exists")
-        self._pending_by_owner[owner_key] = _Pending(self._state_by_owner.get(owner_key), [], {})
+        self._pending_by_owner[owner_key] = _Pending(self._state_by_owner.get(owner_key), [], {}, {})
 
     def admit(self, cap: AdmissionCapability, *, source: dict[str, torch.Tensor]) -> tuple[int, int] | torch.Tensor:
         if cap._seal is not self.authority._seal or cap.source_timestep < 0:
@@ -93,10 +94,10 @@ class C5AOwnerSegmentCPU:
             raise RuntimeError("begin() required")
         key = cap.source_key
         identity = (cap.owner_key, cap.source_identity, cap.source_timestep)
-        prior_digest = self._identity_index.get(identity)
+        pending = self._pending_by_owner[cap.owner_key]
+        prior_digest = pending.identity_index.get(identity) or self._identity_index.get(identity)
         if prior_digest is not None and prior_digest != cap.digest:
             raise ValueError("conflicting source digest")
-        pending = self._pending_by_owner[cap.owner_key]
         if _canonical_source(source) != cap.source_bytes:
             raise ValueError("source bytes do not match admission capability")
         schema = tuple((name, str(source[name].dtype), tuple(source[name].shape)) for name in sorted(source))
@@ -110,9 +111,9 @@ class C5AOwnerSegmentCPU:
         payload = {name: value.detach().clone() for name, value in source.items()}
         if not payload or any(value.requires_grad for value in payload.values()):
             raise ValueError("source payload must be immutable and graph-free")
-        self._identity_index[identity] = cap.digest
         if pending.rows and cap.source_timestep != pending.rows[-1][0].source_timestep + 1:
             raise ValueError("source timestep must be contiguous")
+        pending.identity_index[identity] = cap.digest
         pending.rows.append((cap, payload))
         return (len(pending.rows) - 1, cap.source_timestep)
 
@@ -143,6 +144,7 @@ class C5AOwnerSegmentCPU:
         if pending.base_state is not None:
             self._state_by_owner[owner_key] = ContinualTTTFastState(*(value.detach().clone() for value in pending.base_state))
         self._committed.update({key: value.detach().clone() for key, value in pending.replay.items()})
+        self._identity_index.update(pending.identity_index)
 
     def abort(self, owner_key: str) -> None:
         self._pending_by_owner.pop(owner_key)
