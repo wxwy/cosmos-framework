@@ -76,6 +76,7 @@ class C5AOwnerSegmentCPU:
         if encoder.evidence_dim != core.evidence_dim:
             raise ValueError("encoder/core evidence dimensions must match")
         self.authority, self.encoder, self.core = authority, encoder, core
+        self.segment_steps = core.ttt_tbptt_steps
         self._state_by_owner: dict[str, ContinualTTTFastState] = {}
         self._last_timestep: dict[str, int] = {}
         self._pending_by_owner: dict[str, _Pending] = {}
@@ -157,3 +158,20 @@ class C5AOwnerSegmentCPU:
             raise RuntimeError("cannot reset owner with pending transaction")
         self._state_by_owner.pop(owner_key, None)
         self._last_timestep.pop(owner_key, None)
+
+    def finish(self, owner_key: str, *, terminal: bool) -> None:
+        """Close one segment; terminal remainder is the sole short-segment exception."""
+        pending = self._pending_by_owner.get(owner_key)
+        if pending is None:
+            raise RuntimeError("no pending transaction")
+        count = len(pending.rows)
+        if count == 0 and terminal:
+            self.abort(owner_key)
+            self.reset(owner_key)
+            return
+        if count == 0 or count > self.segment_steps or (not terminal and count != self.segment_steps):
+            raise ValueError("invalid segment length")
+        self.materialize(owner_key)
+        self.commit(owner_key)
+        if terminal:
+            self.reset(owner_key)

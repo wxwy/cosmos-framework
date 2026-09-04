@@ -54,3 +54,12 @@ def test_committed_chronology_rejects_skip_and_reset_restarts_epoch() -> None:
     cap0b = authority.issue(owner_key="a", source_identity="s2", source_timestep=0, source=source)
     runtime.begin("a")
     assert runtime.admit(cap0b, source=source) == (0, 0)
+
+
+def test_finish_rejects_nonterminal_short_and_accepts_terminal_remainder() -> None:
+    authority, runtime, source = _runtime(); cap = authority.issue(owner_key="a", source_identity="s", source_timestep=0, source=source)
+    runtime.begin("a"); runtime.admit(cap, source=source)
+    with pytest.raises(ValueError, match="segment length"):
+        runtime.finish("a", terminal=False)
+    runtime.finish("a", terminal=True)
+    assert "a" not in runtime._state_by_owner
