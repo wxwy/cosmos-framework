@@ -767,19 +767,141 @@ def test_continual_ttt_multi_slot_public_validation_fails_before_any_update(monk
 
 
 @pytest.mark.L0
-def test_continual_ttt_transition_counter_reset_and_detach() -> None:
+def test_continual_ttt_transition_row_selective_detach_preserves_current_token_gradients() -> None:
     torch.manual_seed(37)
     core = _continual_ttt_core(ttt_tbptt_steps=2, k_local=2)
     runtime = ContinualTTTFastStateTransition(core)
-    evidence = torch.randn(2, 5)
-    token, state, present, counter = runtime.step(
-        evidence, None, torch.tensor([True, False]), torch.tensor([False, False]), torch.zeros(2, dtype=torch.int64)
+    state1 = ContinualTTTFastState(
+        *(value.detach().clone().requires_grad_(True) for value in core.initial_state(2))
     )
-    assert token.shape == (2, 2, 3) and present.tolist() == [True, False] and counter.tolist() == [1, 0]
+    counter1 = torch.tensor([1, 0], dtype=torch.int64)
+    evidence2 = torch.randn(2, 5, requires_grad=True)
     token2, state2, present2, counter2 = runtime.step(
-        torch.randn(2, 5), state, torch.tensor([True, True]), torch.tensor([False, True]), counter
+        evidence2,
+        state1,
+        torch.tensor([True, True]),
+        torch.tensor([False, False]),
+        counter1,
     )
-    assert present2.tolist() == [True, True] and counter2.tolist() == [0, 1]
-    assert all(torch.equal(member[0], member[0].detach()) for member in state2)
-    with pytest.raises(ValueError, match="counter_in"):
-        runtime.step(evidence, state, torch.ones(2, dtype=torch.bool), torch.zeros(2, dtype=torch.bool), torch.tensor([2, 0]))
+    _, updated2, _ = core.step_many(evidence2, state1, torch.tensor([True, True]), create_graph=True)
+
+    assert token2.shape == (2, 2, 3) and present2.tolist() == [True, True] and counter2.tolist() == [0, 1]
+    for output, updated in zip(state2, updated2, strict=True):
+        torch.testing.assert_close(output, updated, atol=1e-6, rtol=1e-5)
+
+    detached_gradients = torch.autograd.grad(
+        sum(value[0].square().sum() for value in state2), tuple(state1), allow_unused=True, retain_graph=True
+    )
+    assert all(gradient is None or torch.count_nonzero(gradient) == 0 for gradient in detached_gradients)
+    live_gradients = torch.autograd.grad(
+        sum(value[1].square().sum() for value in state2), tuple(state1), allow_unused=True, retain_graph=True
+    )
+    assert any(
+        gradient is not None and torch.isfinite(gradient).all() and torch.count_nonzero(gradient[1]) > 0
+        for gradient in live_gradients
+    )
+
+    boundary_token, _, _, _ = runtime.step(
+        evidence2[:1],
+        core.initial_state(1),
+        torch.tensor([True]),
+        torch.tensor([False]),
+        torch.tensor([1], dtype=torch.int64),
+    )
+    slow_gradients = torch.autograd.grad(boundary_token.square().sum(), tuple(core.parameters()), allow_unused=True)
+    assert all(gradient is not None and torch.isfinite(gradient).all() for gradient in slow_gradients)
+    assert all(torch.count_nonzero(gradient) > 0 for gradient in slow_gradients if gradient is not None)
+    assert {name for name, _ in runtime.named_parameters()} == {
+        f"core.{name}" for name, _ in core.named_parameters()
+    }
+
+
+@pytest.mark.L0
+def test_continual_ttt_transition_n1_returns_updated_read_and_detached_carry() -> None:
+    torch.manual_seed(38)
+    core = _continual_ttt_core(ttt_tbptt_steps=1, k_local=2)
+    runtime = ContinualTTTFastStateTransition(core)
+    evidence = torch.randn(1, 5)
+    reference_token, reference_state, reference_present = core.step_many(
+        evidence, core.initial_state(1), torch.tensor([True]), create_graph=True
+    )
+    token, state, present, counter = runtime.step(
+        evidence,
+        None,
+        torch.tensor([True]),
+        torch.tensor([False]),
+        torch.zeros(1, dtype=torch.int64),
+    )
+    torch.testing.assert_close(token, reference_token, atol=1e-6, rtol=1e-5)
+    assert present.tolist() == reference_present.tolist() == [True] and counter.tolist() == [0]
+    for output, expected in zip(state, reference_state, strict=True):
+        torch.testing.assert_close(output, expected, atol=1e-6, rtol=1e-5)
+        gradient = torch.autograd.grad(output.square().sum(), core._w0, allow_unused=True, retain_graph=True)
+        assert all(value is None or torch.count_nonzero(value) == 0 for value in gradient)
+
+
+@pytest.mark.L0
+def test_continual_ttt_transition_counter_progression_for_default_and_nondefault_lengths() -> None:
+    torch.manual_seed(39)
+    for steps, expected in ((3, [1, 2, 0, 1, 2]), (16, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0])):
+        core = _continual_ttt_core(ttt_tbptt_steps=steps)
+        runtime = ContinualTTTFastStateTransition(core)
+        state: ContinualTTTFastState | None = None
+        counter = torch.zeros(1, dtype=torch.int64)
+        observed = []
+        for _ in expected:
+            _, state, present, counter = runtime.step(
+                torch.randn(1, 5), state, torch.tensor([True]), torch.tensor([False]), counter
+            )
+            assert present.tolist() == [True]
+            observed.append(counter.item())
+        assert observed == expected
+
+
+@pytest.mark.L0
+def test_continual_ttt_transition_reset_invalid_rows_are_exactly_isolated() -> None:
+    torch.manual_seed(40)
+    core = _continual_ttt_core(ttt_tbptt_steps=3)
+    runtime = ContinualTTTFastStateTransition(core)
+    state = ContinualTTTFastState(*(value + torch.randn_like(value) for value in core.initial_state(2)))
+    token, state_out, present, counter = runtime.step(
+        torch.randn(2, 5),
+        state,
+        torch.tensor([False, False]),
+        torch.tensor([True, False]),
+        torch.tensor([1, 2], dtype=torch.int64),
+    )
+    assert torch.equal(token, torch.zeros_like(token)) and present.tolist() == [False, False] and counter.tolist() == [0, 2]
+    for output, source, w0 in zip(state_out, state, core._w0, strict=True):
+        torch.testing.assert_close(output[0], w0, atol=0, rtol=0)
+        torch.testing.assert_close(output[1], source[1], atol=0, rtol=0)
+
+
+@pytest.mark.L0
+def test_continual_ttt_transition_counter_grammar_fails_before_core_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    core = _continual_ttt_core(ttt_tbptt_steps=2)
+    runtime = ContinualTTTFastStateTransition(core)
+    calls = 0
+
+    def unexpected_step_many(*args: object, **kwargs: object) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid counter grammar must not reach core.step_many")
+
+    monkeypatch.setattr(core, "step_many", unexpected_step_many)
+    evidence = torch.randn(1, 5)
+    valid = torch.tensor([True])
+    done = torch.tensor([False])
+    state = core.initial_state(1)
+    bad_calls = (
+        lambda: runtime.step(evidence, state, valid, done, torch.tensor([-1], dtype=torch.int64)),
+        lambda: runtime.step(evidence, state, valid, done, torch.tensor([2], dtype=torch.int64)),
+        lambda: runtime.step(evidence, state, valid, done, torch.zeros(1, dtype=torch.int32)),
+        lambda: runtime.step(evidence, state, valid, done, torch.zeros(1, 1, dtype=torch.int64)),
+        lambda: runtime.step(evidence, state, valid, done, torch.empty(1, dtype=torch.int64, device="meta")),
+        lambda: runtime.step(evidence, None, valid, done, torch.ones(1, dtype=torch.int64)),
+    )
+    for call in bad_calls:
+        with pytest.raises(ValueError):
+            call()
+    assert calls == 0
