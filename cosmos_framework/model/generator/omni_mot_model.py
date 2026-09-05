@@ -54,6 +54,7 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
 )
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
 from cosmos_framework.model.generator.mot.local_evidence import (
+    ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
     LocalHistoryRuntime,
     RecurrentLocalMemoryBackend,
@@ -69,6 +70,7 @@ from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
 )
 from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
+from cosmos_framework.model.generator.mot.ttt_lifecycle import TTTLifecycle
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
@@ -105,6 +107,18 @@ from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelU
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
 from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_linears_on_meta
+
+
+def _flatten_batch_scalars(value: Any) -> list[Any]:
+    """Flatten tensor/list nesting into a flat list of python scalars."""
+    if isinstance(value, torch.Tensor):
+        return value.reshape(-1).tolist()
+    if isinstance(value, (list, tuple)):
+        flattened: list[Any] = []
+        for item in value:
+            flattened.extend(_flatten_batch_scalars(item))
+        return flattened
+    return [value]
 
 
 class OmniMoTModel(ImaginaireModel):
@@ -314,10 +328,20 @@ class OmniMoTModel(ImaginaireModel):
                         local_dim=self.config.local_memory_dim,
                     )
                 elif self.config.local_history_backend == "ttt_fast_weight":
-                    local_backend = TTTLocalMemoryBackend(
-                        evidence_dim=self.config.local_history_evidence_dim,
-                        local_dim=self.config.local_memory_dim,
-                    )
+                    if self.config.local_ttt_enabled:
+                        local_backend = ContinualTTTLocalMemoryCore(
+                            evidence_dim=self.config.local_history_evidence_dim,
+                            local_dim=self.config.local_memory_dim,
+                            inner_lr=self.config.ttt_inner_lr,
+                            ttt_tbptt_steps=self.config.ttt_tbptt_steps,
+                            k_local=self.config.k_local,
+                        )
+                    else:
+                        # B1-only bounded smoke keeps the parameter-free placeholder backend.
+                        local_backend = TTTLocalMemoryBackend(
+                            evidence_dim=self.config.local_history_evidence_dim,
+                            local_dim=self.config.local_memory_dim,
+                        )
                 else:
                     raise ValueError(f"unsupported local_history_backend: {self.config.local_history_backend}")
                 net.local_history_runtime = LocalHistoryRuntime(
@@ -1004,6 +1028,20 @@ class OmniMoTModel(ImaginaireModel):
                 return value.roll(shifts=1, dims=0)
             return value
 
+        if getattr(self.config, "local_ttt_enabled", False):
+            local_memory = self._ttt_local_memory_tokens(
+                data_batch,
+                history_mask,
+                _history_payload,
+                _stack("history_state_raw") if self.config.local_history_state_enabled else None,
+            )
+            if len(sequence_plans) != len(local_memory):
+                raise ValueError("Causal history batch size does not match sequence plans.")
+            data_batch["local_memory"] = local_memory
+            for plan, token in zip(sequence_plans, local_memory, strict=True):
+                plan.has_local_memory = token is not None
+            return
+
         tokens, present, _ = local_history_runtime(
             history_visual_summary=_history_payload("history_visual_summary"),
             local_history_action=_history_payload("local_history_action"),
@@ -1017,6 +1055,67 @@ class OmniMoTModel(ImaginaireModel):
         data_batch["local_memory"] = [tokens[i] if bool(present[i]) else None for i in range(tokens.shape[0])]
         for plan, has_local in zip(sequence_plans, present.tolist(), strict=True):
             plan.has_local_memory = bool(has_local)
+
+    def _ttt_local_memory_tokens(
+        self,
+        data_batch: dict[str, Any],
+        history_mask: torch.Tensor,
+        history_payload: Callable[[str], torch.Tensor],
+        history_state: torch.Tensor | None,
+    ) -> list[torch.Tensor | None]:
+        """R09-B TTT seam: advance one native window (one evidence row) per sample.
+
+        Intermediate windows return the detached read of the candidate fast
+        state (graph-free); a closing window (segment full or terminal
+        remainder) returns the pre-write witness token carrying the segment's
+        differentiable graph so the trainer's single backward produces exactly
+        one meta-gradient. ``N_valid_window=0`` samples get ``None`` (no
+        admit/read/prefix), matching the LocalHistoryRuntime present semantics.
+        """
+        lifecycle = getattr(self, "_ttt_lifecycle", None)
+        if lifecycle is None:
+            # Built lazily at the first TTT forward so the lifecycle binds the
+            # post-parallelize/materialization parameter objects, never meta
+            # or pre-FSDP tensors. ``local_ttt_enabled=False`` never creates it.
+            lifecycle = TTTLifecycle.from_registered_modules(self.net)
+            self._ttt_lifecycle = lifecycle
+        for key in ("is_episode_end", "episode_index", "dataset_name"):
+            if key not in data_batch:
+                raise ValueError(
+                    f"local_ttt_enabled requires data_batch['{key}'] (manifest-route terminal provenance)."
+                )
+        batch = history_mask.shape[0]
+        dataset_names = data_batch["dataset_name"]
+        if isinstance(dataset_names, str):
+            dataset_names = [dataset_names] * batch
+        else:
+            dataset_names = [str(value) for value in _flatten_batch_scalars(dataset_names)]
+        episode_indices = [int(value) for value in _flatten_batch_scalars(data_batch["episode_index"])]
+        episode_ends = [bool(value) for value in _flatten_batch_scalars(data_batch["is_episode_end"])]
+        if not (len(dataset_names) == len(episode_indices) == len(episode_ends) == batch):
+            raise ValueError("TTT provenance fields must be per-sample and match the history batch size.")
+        payloads = {
+            "history_visual_summary": history_payload("history_visual_summary"),
+            "local_history_action": history_payload("local_history_action"),
+            "history_age_steps": history_payload("history_age_steps"),
+            "history_dt_s": history_payload("history_dt_s"),
+            "history_mask": history_mask,
+        }
+        if history_state is not None:
+            payloads["history_state"] = history_state
+        valid_flags = history_mask.any(dim=1)
+        tokens: list[torch.Tensor | None] = []
+        for index in range(batch):
+            source = {name: value[index : index + 1] for name, value in payloads.items()}
+            tokens.append(
+                lifecycle.process_sample(
+                    owner_key=f"{dataset_names[index]}#{episode_indices[index]}",
+                    terminal=episode_ends[index],
+                    valid=bool(valid_flags[index].item()),
+                    source=source,
+                )
+            )
+        return tokens
 
     @staticmethod
     def _get_vae_pixel_shapes(

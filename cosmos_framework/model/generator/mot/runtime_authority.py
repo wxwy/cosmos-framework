@@ -146,12 +146,14 @@ class ProductionRuntimeAuthority:
         pending.rows.append((cap, payload))
         return (len(pending.rows) - 1, cap.source_timestep)
 
-    def materialize(self, owner_key: str) -> torch.Tensor:
+    def materialize(self, owner_key: str, *, emit_prewrite_tokens: bool = False) -> torch.Tensor:
         pending = self._pending_by_owner.get(owner_key)
         if pending is None or not pending.rows:
             raise RuntimeError("no pending rows")
         if pending.phase != "COLLECT_RAW":
             raise RuntimeError("materialize already completed")
+        if not isinstance(emit_prewrite_tokens, bool):
+            raise ValueError("emit_prewrite_tokens must be bool.")
         encoded = []
         for _, source in pending.rows:
             value = self.encoder(**source)
@@ -161,8 +163,16 @@ class ProductionRuntimeAuthority:
         # 时间轴显式保留为 [B=1,T,D]；每个 timestep 顺序消费同一 owner 的候选 state。
         evidence = torch.stack(encoded, dim=1)
         state = pending.base_state or self.core.initial_state(1, device=evidence.device)
+        # The legacy default path keeps the exact HEAD call shape (no new kwargs)
+        # so instance-level spies on scan_segment_many keep working.
+        scan_kwargs: dict[str, bool] = {"create_graph": True}
+        if emit_prewrite_tokens:
+            scan_kwargs["emit_prewrite_tokens"] = True
         tokens, candidate, present = self.core.scan_segment_many(
-            evidence, torch.ones(1, evidence.shape[1], dtype=torch.bool, device=evidence.device), state, create_graph=True
+            evidence,
+            torch.ones(1, evidence.shape[1], dtype=torch.bool, device=evidence.device),
+            state,
+            **scan_kwargs,
         )
         pending.base_state = candidate
         pending.valid_rows = [True] * len(pending.rows)
@@ -181,8 +191,11 @@ class ProductionRuntimeAuthority:
         *,
         valid: torch.Tensor | None = None,
         done_before: torch.Tensor | None = None,
+        emit_prewrite_tokens: bool = False,
     ) -> torch.Tensor:
         """Gather/scatter independent owner rows as one true B>1 scan."""
+        if not isinstance(emit_prewrite_tokens, bool):
+            raise ValueError("emit_prewrite_tokens must be bool.")
         if not owner_keys or len(set(owner_keys)) != len(owner_keys):
             raise ValueError("owner_keys must be non-empty and unique")
         pendings = [self._pending_by_owner.get(owner) for owner in owner_keys]
@@ -224,8 +237,13 @@ class ProductionRuntimeAuthority:
         else:
             state = ContinualTTTFastState(*(torch.cat([s[i].detach() for s in states], dim=0) for i in range(4)))
         state = self.core.reset_mask(state, done_before.to(device=evidence.device))
+        # The legacy default path keeps the exact HEAD call shape (no new kwargs)
+        # so instance-level spies on scan_segment_many keep working.
+        scan_kwargs: dict[str, bool] = {"create_graph": True}
+        if emit_prewrite_tokens:
+            scan_kwargs["emit_prewrite_tokens"] = True
         tokens, candidate, present = self.core.scan_segment_many(
-            evidence, valid.to(device=evidence.device), state, create_graph=True
+            evidence, valid.to(device=evidence.device), state, **scan_kwargs
         )
         for batch_index, pending in enumerate(pendings):
             assert pending is not None
@@ -284,6 +302,22 @@ class ProductionRuntimeAuthority:
                 return True
             stack.extend(next_function for next_function, _ in function.next_functions if next_function is not None)
         return False
+
+    def mark_external_backward(self, owner_key: str, *, loss: torch.Tensor) -> None:
+        """Mark one armed segment after the trainer's single external backward.
+
+        Two independent evidences, both fail-closed: (1) the unscaled native
+        loss of this micro-batch is finite; (2) that backward actually
+        traversed the witness graph (``witness_leaf.grad is not None``).
+        """
+        pending = self._pending_by_owner.get(owner_key)
+        if pending is None or pending.phase != "MATERIALIZED_PENDING":
+            raise RuntimeError("external backward requires a materialized pending segment")
+        if not isinstance(loss, torch.Tensor) or not bool(torch.isfinite(loss.detach()).all()):
+            raise ValueError("external backward loss must be a finite tensor")
+        if pending.witness_leaf is None or pending.witness_leaf.grad is None:
+            raise RuntimeError("external backward did not traverse the witness graph")
+        pending.phase = "BACKWARD_OK"
 
     def backward_and_mark_many(self, owner_keys: list[str], loss: torch.Tensor) -> None:
         if not owner_keys or len(set(owner_keys)) != len(owner_keys):

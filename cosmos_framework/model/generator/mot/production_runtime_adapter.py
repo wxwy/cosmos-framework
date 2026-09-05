@@ -15,6 +15,11 @@ class ProductionLocalMemoryRuntime:
         self._runtime = ProductionRuntimeAuthority(authority, encoder, core)
 
     @property
+    def runtime_authority(self) -> ProductionRuntimeAuthority:
+        """The shared production authority; references the registered encoder/core objects."""
+        return self._runtime
+
+    @property
     def write_count(self) -> int:
         return self._runtime.c5_write_count
 
@@ -25,11 +30,14 @@ class ProductionLocalMemoryRuntime:
         capability = self.authority.issue(owner_key=owner_key, source_identity=source_identity, source_timestep=source_timestep, source=source, epoch=epoch)
         return self._runtime.admit(capability, source=source)
 
-    def materialize(self, owner_key: str) -> torch.Tensor:
-        return self._runtime.materialize(owner_key)
+    def materialize(self, owner_key: str, *, emit_prewrite_tokens: bool = False) -> torch.Tensor:
+        return self._runtime.materialize(owner_key, emit_prewrite_tokens=emit_prewrite_tokens)
 
     def backward(self, owner_key: str, loss: torch.Tensor) -> None:
         self._runtime.backward_and_mark(owner_key, loss)
+
+    def mark_external_backward(self, owner_key: str, *, loss: torch.Tensor) -> None:
+        self._runtime.mark_external_backward(owner_key, loss=loss)
 
     def finish(self, owner_key: str, *, terminal: bool) -> None:
         self._runtime.finish(owner_key, terminal=terminal)

@@ -492,7 +492,17 @@ class ImaginaireTrainer:
                     "bwd", self.config.trainer.straggler_detection.analyze_backward
                 ):
                     loss_scaled = grad_scaler.scale(loss / self.config.trainer.grad_accum_iter)
-                    loss_scaled.backward()
+                    ttt_lifecycle = getattr(model, "_ttt_lifecycle", None)
+                    try:
+                        loss_scaled.backward()
+                    except Exception:
+                        # R09-B TTT external-backward abort route: roll every open
+                        # segment back to the last committed state, then re-raise
+                        # the original exception unchanged. Exact no-op when
+                        # local_ttt_enabled=False (no lifecycle exists).
+                        if ttt_lifecycle is not None:
+                            ttt_lifecycle.abort_open_segments()
+                        raise
                     model.on_after_backward()
             self.callbacks.on_after_backward(model, iteration=iteration)
         grad_accum_iter += 1
@@ -523,6 +533,17 @@ class ImaginaireTrainer:
         """Execute the optimizer step. Override to customise (e.g. PhaseOptimizer)."""
         grad_scaler.step(optimizer)
         grad_scaler.update()
+        ttt_lifecycle = getattr(model, "_ttt_lifecycle", None)
+        if ttt_lifecycle is not None:
+            # R09-B TTT Option B semantics: a scaler skip leaves prior fast
+            # commits valid, but the slow side must not advance — drop the four
+            # Local groups' .grad and do not step the scheduler.
+            from cosmos_framework.model.generator.mot.ttt_lifecycle import RESOLUTION_SCALER_SKIP, RESOLUTION_SUCCESS
+
+            if grad_scaler.is_enabled() and ttt_lifecycle.scaler_found_inf(grad_scaler, optimizer):
+                ttt_lifecycle.resolve_transaction(RESOLUTION_SCALER_SKIP)
+                return
+            ttt_lifecycle.resolve_transaction(RESOLUTION_SUCCESS)
         scheduler.step()
 
     def _zero_grad(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, iteration: int) -> None:

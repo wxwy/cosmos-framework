@@ -3,6 +3,8 @@
 
 from typing import Any, Literal
 
+import math
+
 import attrs
 
 from cosmos_framework.utils.lazy_config import LazyDict
@@ -141,6 +143,39 @@ class FixedStepSamplerConfig:
     t_list: list[float] = [0.999, 0.75, 0.5, 0.25]
     # Distilled fixed-step sampling uses stochastic re-noising at each step.
     sample_type: str = "sde"
+
+
+# R09-B TTT field validators, aligned with
+# ``cosmos_framework.model.generator.mot.config_checkpoint_contract.LocalMemoryConfig``.
+# attrs field validators are called as ``validator(instance, attribute, value)``.
+def _require_ttt_bool(inst: object, attr: attrs.Attribute, value: object) -> None:
+    del inst
+    if not isinstance(value, bool):
+        raise ValueError(f"{attr.name} must be a bool.")
+
+
+def _require_ttt_positive_int(inst: object, attr: attrs.Attribute, value: object) -> None:
+    del inst
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{attr.name} must be a positive integer.")
+
+
+def _require_ttt_finite_positive_scalar(inst: object, attr: attrs.Attribute, value: object) -> None:
+    del inst
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
+        raise ValueError(f"{attr.name} must be finite and positive.")
+
+
+def _require_ttt_k_local(inst: object, attr: attrs.Attribute, value: object) -> None:
+    del inst
+    if isinstance(value, bool) or value not in (1, 4, 8):
+        raise ValueError(f"{attr.name} must be a positive integer in {{1, 4, 8}}.")
+
+
+def _require_ttt_runtime_evidence_steps(inst: object, attr: attrs.Attribute, value: object) -> None:
+    del inst
+    if isinstance(value, bool) or not isinstance(value, int) or value != 1:
+        raise ValueError(f"{attr.name} is fixed at 1.")
 
 
 # Don't have any defaults and init only in config file.
@@ -308,6 +343,18 @@ class OmniMoTModelConfig:
     local_history_evidence_dim: int = 256
     local_history_state_enabled: bool = False
 
+    # R09-B TTT active training wiring. Disabled by default so No-Memory and
+    # R08/B1 checkpoints and runtime behavior remain unchanged. Validation
+    # mirrors config_checkpoint_contract.LocalMemoryConfig: positive int /
+    # finite positive scalar / k_local in {1,4,8} / runtime_evidence_steps
+    # fixed at 1 / bool rejected. ``local_ttt_enabled=True`` requires
+    # ``local_history_enabled=True`` and ``local_history_backend="ttt_fast_weight"``.
+    local_ttt_enabled: bool = attrs.field(default=False, validator=_require_ttt_bool)
+    ttt_tbptt_steps: int = attrs.field(default=16, validator=_require_ttt_positive_int)
+    ttt_inner_lr: float = attrs.field(default=0.1, validator=_require_ttt_finite_positive_scalar)
+    k_local: int = attrs.field(default=1, validator=_require_ttt_k_local)
+    runtime_evidence_steps: int = attrs.field(default=1, validator=_require_ttt_runtime_evidence_steps)
+
     # When False, removes bias from vae2llm, sound2llm, and the two Linear layers inside
     # time_embedder.  These biases seem to inject token-constant DC offsets that dominate
     # the MoE router input and create prompt invariant routing.  This is observed empirically
@@ -324,3 +371,11 @@ class OmniMoTModelConfig:
     # backbone).  Generation-pathway (``_moe_gen``) and VFM heads are saved /
     # loaded as usual.
     exclude_reasoner_weights_from_checkpoint: bool = False
+
+    def __attrs_post_init__(self) -> None:
+        if self.local_ttt_enabled and (
+            not self.local_history_enabled or self.local_history_backend != "ttt_fast_weight"
+        ):
+            raise ValueError(
+                "local_ttt_enabled requires local_history_enabled=True and local_history_backend='ttt_fast_weight'."
+            )

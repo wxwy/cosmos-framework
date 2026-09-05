@@ -332,6 +332,17 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             1 / math.sqrt(self.fast_hidden_dim),
         )
 
+    def reset_parameters(self) -> None:
+        """Initialize TTT core parameters after meta-device materialization; mirrors ``__init__``."""
+        self.key_proj.reset_parameters()
+        self.query_proj.reset_parameters()
+        self.value_proj.reset_parameters()
+        self._reset_w0_parameters()
+        if self.k_local == 1:
+            nn.init.zeros_(self.slot_queries)
+        else:
+            nn.init.normal_(self.slot_queries, mean=0.0, std=1 / math.sqrt(self.ttt_dim))
+
     @property
     def _w0(self) -> ContinualTTTFastState:
         return ContinualTTTFastState(
@@ -441,11 +452,12 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         state_in: ContinualTTTFastState,
         valid: torch.Tensor,
         create_graph: bool,
+        emit_prewrite_tokens: bool = False,
     ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
         if torch.is_inference_mode_enabled() or not torch.is_grad_enabled():
             raise RuntimeError("Continual TTT update requires ordinary grad mode.")
-        if not isinstance(create_graph, bool):
-            raise ValueError("create_graph must be bool.")
+        if not isinstance(create_graph, bool) or not isinstance(emit_prewrite_tokens, bool):
+            raise ValueError("create_graph and emit_prewrite_tokens must be bool.")
         if key_t.ndim != 2:
             raise ValueError("key_t must have shape [B,D_ttt].")
         batch = key_t.shape[0]
@@ -488,10 +500,17 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             updated = ContinualTTTFastState(
                 *(member - self.inner_lr * gradient for member, gradient in zip(work_state, gradients, strict=True))
             )
-            token_rows.append(self._fast_mlp(queries[row], updated))
+            if emit_prewrite_tokens:
+                # Pre-write witness token: read the state BEFORE this row's write,
+                # i.e. read(S_{t-1}); the post-write candidate S_t is still returned
+                # separately as state_out. Same values as ``read_many`` on state_in.
+                token_rows.append(
+                    self._fast_mlp(queries[row], ContinualTTTFastState(*(member[row].float() for member in state_in)))
+                )
+            else:
+                token_rows.append(self._fast_mlp(queries[row], updated))
             for output, member, reference in zip(state_rows, updated, state_in, strict=True):
                 output.append(member.to(dtype=reference.dtype))
-
         state_out = ContinualTTTFastState(*(torch.stack(rows) for rows in state_rows))
         return torch.stack(token_rows), state_out, valid
 
@@ -523,6 +542,7 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         valid: torch.Tensor,
         *,
         create_graph: bool = True,
+        emit_prewrite_tokens: bool = False,
     ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
         if torch.is_inference_mode_enabled() or not torch.is_grad_enabled():
             raise RuntimeError("Continual TTT update requires ordinary grad mode.")
@@ -534,6 +554,7 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             state_in=state_in,
             valid=valid,
             create_graph=create_graph,
+            emit_prewrite_tokens=emit_prewrite_tokens,
         )
 
     def step(
@@ -555,6 +576,7 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         state_in: ContinualTTTFastState | None = None,
         *,
         create_graph: bool = True,
+        emit_prewrite_tokens: bool = False,
     ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
         if torch.is_inference_mode_enabled() or not torch.is_grad_enabled():
             raise RuntimeError("Continual TTT update requires ordinary grad mode.")
@@ -569,7 +591,11 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         tokens, present = [], []
         for index in range(steps):
             token, state, step_present = self.step_many(
-                evidence[:, index], state, valid[:, index], create_graph=create_graph
+                evidence[:, index],
+                state,
+                valid[:, index],
+                create_graph=create_graph,
+                emit_prewrite_tokens=emit_prewrite_tokens,
             )
             tokens.append(token)
             present.append(step_present)

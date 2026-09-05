@@ -35,6 +35,8 @@ from cosmos_framework.configs.base.experiment.action.posttrain_config.action_pol
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
 from cosmos_framework.data.generator.action.datasets.action_sft_dataset import get_action_libero_sft_dataset
 from cosmos_framework.data.generator.joint_dataloader import IterativeJointDataLoader
+from cosmos_framework.model.generator.mot.config_checkpoint_contract import SELECTORS as TTT_SLOW_GROUP_SELECTORS
+from cosmos_framework.model.generator.mot.ttt_lifecycle import TTTLifecycleCallback
 from cosmos_framework.model.generator.vision_vae import (
     LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES,
     LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS,
@@ -67,6 +69,7 @@ def _action_policy_libero_edge_model_config() -> dict:
     b2_manifest_root = os.environ.get("PSM_R09_B2_STREAM_MANIFEST_ROOT")
     r09_b1_ttt_enabled = _strict_bool_env("PSM_R09_B1_TTT_ENABLED")
     r09_a1_enabled = _strict_bool_env("PSM_R09_A1_ENABLED")
+    r09_b_ttt_enabled = _strict_bool_env("PSM_R09_B_TTT_ENABLED")
     if local_dummy_enabled and local_history_enabled:
         raise ValueError("PSM_LOCAL_DUMMY_ENABLED and PSM_R08_LOCAL_HISTORY_ENABLED are mutually exclusive")
     if r09_b1_ttt_enabled and not local_history_enabled:
@@ -75,12 +78,24 @@ def _action_policy_libero_edge_model_config() -> dict:
         raise ValueError("PSM_R09_B1_TTT_ENABLED and PSM_R09_A1_ENABLED are mutually exclusive")
     if r09_b1_ttt_enabled and os.environ.get("PSM_R09_A1_PROBE_OUTPUT"):
         raise ValueError("PSM_R09_B1_TTT_ENABLED and PSM_R09_A1_PROBE_OUTPUT are mutually exclusive")
+    if r09_b_ttt_enabled and not local_history_enabled:
+        raise ValueError("PSM_R09_B_TTT_ENABLED requires PSM_R08_LOCAL_HISTORY_ENABLED=1")
+    if r09_b_ttt_enabled and r09_b1_ttt_enabled:
+        raise ValueError("PSM_R09_B_TTT_ENABLED and PSM_R09_B1_TTT_ENABLED are mutually exclusive")
+    if r09_b_ttt_enabled and r09_a1_enabled:
+        raise ValueError("PSM_R09_B_TTT_ENABLED and PSM_R09_A1_ENABLED are mutually exclusive")
+    if r09_b_ttt_enabled and os.environ.get("PSM_R09_A1_PROBE_OUTPUT"):
+        raise ValueError("PSM_R09_B_TTT_ENABLED and PSM_R09_A1_PROBE_OUTPUT are mutually exclusive")
     local_dummy_mode = os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal")
     if local_dummy_mode not in {"normal", "zero", "shuffle"}:
         raise ValueError(f"unsupported PSM_LOCAL_DUMMY_MODE: {local_dummy_mode}")
     cfg["local_memory_enabled"] = local_dummy_enabled or local_history_enabled
     cfg["local_history_enabled"] = local_history_enabled
-    cfg["local_history_backend"] = "ttt_fast_weight" if r09_b1_ttt_enabled else "recurrent"
+    cfg["local_history_backend"] = "ttt_fast_weight" if (r09_b1_ttt_enabled or r09_b_ttt_enabled) else "recurrent"
+    # R09-B TTT active wiring: default stays False, so the composed config is
+    # identical to baseline unless PSM_R09_B_TTT_ENABLED=1; the four TTT
+    # hyperparameters keep their frozen defaults (16 / 0.1 / 1 / 1).
+    cfg["local_ttt_enabled"] = r09_b_ttt_enabled
     cfg["local_history_horizon"] = int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", "16"))
     if cfg["local_history_horizon"] < 0:
         raise ValueError("PSM_R08_LOCAL_HISTORY_HORIZON must be non-negative")
@@ -225,6 +240,10 @@ if _strict_bool_env("PSM_R09_B1_TTT_ENABLED"):
         "local_memory_modality_embed",
     ]
 
+if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
+    # R09-B TTT active wiring trains exactly the four frozen slow groups.
+    action_policy_libero_edge_all["optimizer"]["keys_to_select"] = list(TTT_SLOW_GROUP_SELECTORS)
+
 # 单卡多 suite：替换 RankPartitionedDataLoader（world_size>=4 断言不满足）为
 # IterativeJointDataLoader 轮询等权混合（每 grad-accum 窗口 16 批 = 4 套 × 4 次）。
 action_policy_libero_edge_all["dataloader_train"] = _action_policy_libero_edge_dataloader()
@@ -280,6 +299,11 @@ if _r09_b1_probe_output:
     action_policy_libero_edge_all["trainer"]["callbacks"]["r09_b1_runtime_probe"] = L(R09B1RuntimeProbeCallback)(
         output_path=_r09_b1_probe_output,
     )
+
+if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
+    # External-backward lifecycle seam: records the unscaled native loss before
+    # the single backward, then marks/commits armed segments after it.
+    action_policy_libero_edge_all["trainer"]["callbacks"]["r09_b_ttt_lifecycle"] = L(TTTLifecycleCallback)()
 
 _r08_device_monitor_every_n = os.environ.get("PSM_R08_GATE_A_DEVICE_MONITOR_EVERY_N")
 if _r08_device_monitor_every_n:
