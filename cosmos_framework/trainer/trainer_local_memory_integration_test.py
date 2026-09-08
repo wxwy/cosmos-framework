@@ -173,5 +173,17 @@ def test_local_memory_segment_retry_executes_suffix_and_skip_retains_fast_histor
     retry = LocalMemoryTransaction(original.suffix_recovery, scheduler)
     loss = trainer._run_local_memory_segment_backward(retry.plan, 0, torch.tensor(5.0, requires_grad=True), torch.tensor(2.0, requires_grad=True), 3, transaction=retry, identity=identities[1], clear_slow_grads=lambda: None)
     assert loss.item() == 7.0 and retry.plan.ga_effective == 1
+    exposure = dict(scheduler.cumulative_valid_consumer_exposure)
     with pytest.raises(RuntimeError, match="LOCAL_MEM_GRAD_SCALER_SKIP"):
         trainer._run_local_memory_segment_backward(retry.plan, 1, torch.tensor(1.0, requires_grad=True), torch.tensor(0.0), 3, transaction=retry, identity=identities[1], clear_slow_grads=lambda: None, grad_scaler_skip=True)
+    assert scheduler.cumulative_valid_consumer_exposure == exposure
+    assert retry.slow_grads_cleared and retry.slow_optimizer_steps == retry.slow_lr_scheduler_steps == 0
+    with pytest.raises(RuntimeError, match="closed"):
+        retry.slow_optimizer_step_succeeded()
+
+
+def test_local_memory_segment_recovery_objective_has_one_ga_division() -> None:
+    plan = GAWindowPlan(((0, "episode", 0), (0, "episode", 1)), (2, 3), attempt=1)
+    first = plan.objective(0, torch.tensor(2.0), torch.tensor(4.0), 2)
+    second = plan.objective(1, torch.tensor(5.0), torch.tensor(4.0), 3)
+    torch.testing.assert_close(first + second, torch.tensor(7.8))

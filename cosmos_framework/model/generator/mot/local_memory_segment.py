@@ -227,15 +227,15 @@ class LocalMemoryTransaction:
         if failed_index != len(self.completed_members):
             raise ValueError("failure index must follow completed members.")
         self.slow_grads_cleared = True
-        return self.plan.suffix_after_failure(failed_index)
+        self.suffix_recovery = self.plan.suffix_after_failure(failed_index)
+        self._closed = True
+        return self.suffix_recovery
 
     def recover_transient(self, failed_index: int) -> GAWindowPlan:
         self._require_open()
         if self.suffix_recovery is not None:
             raise RuntimeError("local memory suffix recovery already exists.")
-        self.suffix_recovery = self.fail_transient(failed_index)
-        self._closed = True
-        return self.suffix_recovery
+        return self.fail_transient(failed_index)
 
     def terminal_failure(self, code: str) -> None:
         """Suppress the unexecuted suffix without rolling back prior fast commits."""
