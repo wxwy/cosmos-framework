@@ -86,9 +86,60 @@ def test_canonical_evidence_encoder_removes_disabled_features() -> None:
         encoder(
             history_visual_summary=visual,
             local_history_action=action,
+            history_age_steps=torch.zeros(2, 3, dtype=torch.long),
             history_mask=torch.ones(2, 3, dtype=torch.bool),
             history_dt_s=torch.zeros(2, 3, 1),
         )
+
+
+@pytest.mark.L0
+def test_legacy_encoder_signature_and_output_remain_compatible() -> None:
+    encoder = LocalEvidenceEncoder(evidence_dim=16)
+    inputs = _inputs()
+    inputs.pop("history_state")
+    with pytest.raises(TypeError):
+        encoder(
+            history_visual_summary=inputs["history_visual_summary"],
+            local_history_action=inputs["local_history_action"],
+            history_mask=inputs["history_mask"],
+        )
+    clone = LocalEvidenceEncoder(evidence_dim=16)
+    clone.load_state_dict(encoder.state_dict())
+    torch.testing.assert_close(encoder(**inputs), clone(**inputs), rtol=0, atol=0)
+
+
+@pytest.mark.L0
+def test_encoded_masked_scan_selects_rows_before_encoder_or_state_values() -> None:
+    core = _continual_ttt_core(ttt_tbptt_steps=3)
+    encoder = LocalEvidenceEncoder(
+        evidence_dim=5,
+        feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG,
+    )
+    visual = torch.randn(2, 3, 96)
+    action = torch.randn(2, 3, 10)
+    # Invalid dense values and invalid fast-state bytes are opaque and must never
+    # reach encoder/project/read/write validation.
+    visual[1, 0].fill_(float("nan"))
+    action[:, 1].fill_(float("nan"))
+    valid = torch.tensor([[True, False, True], [False, False, False]])
+    before = core.initial_state(2)
+    opaque = ContinualTTTFastState(*(value.clone() for value in before))
+    opaque.fast_in_weight[1].fill_(float("nan"))
+    calls = 0
+    project = core.project_evidence
+
+    def counted(evidence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        nonlocal calls
+        calls += 1
+        return project(evidence)
+
+    core.project_evidence = counted  # type: ignore[method-assign]
+    tokens, after, present = core.scan_segment_masked_encoded_many(
+        encoder, visual, action, valid, opaque, create_graph=False
+    )
+    assert calls == 2 and present.tolist() == valid.tolist()
+    assert torch.count_nonzero(tokens[~valid]) == 0
+    torch.testing.assert_close(after.fast_in_weight[1], opaque.fast_in_weight[1], equal_nan=True)
 
 
 @pytest.mark.L0

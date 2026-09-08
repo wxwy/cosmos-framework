@@ -69,8 +69,19 @@ class SegmentBatch:
             raise ValueError("evidence cannot be valid for PAD consumers.")
         if torch.any(valid & self.consumer_step.eq(0) & evidence_valid):
             raise ValueError("consumer step0 must have absent evidence.")
+        if torch.any(valid & self.consumer_step.lt(0)):
+            raise ValueError("valid consumers must have non-negative consumer_step.")
+        non_s0 = valid & self.consumer_step.gt(0)
+        if torch.any(non_s0 & ~evidence_valid):
+            raise ValueError("valid non-S0 consumers require previous evidence.")
         if torch.any(evidence_valid & self.evidence_source_step.ne(self.consumer_step - 1)):
             raise ValueError("evidence_source_step must equal consumer_step - 1.")
+        for row in range(batch):
+            for index in range(steps):
+                if bool(valid[row, index]) and self.consumer_payload[row][index] is None:
+                    raise ValueError("valid consumers require an opaque payload.")
+                if not bool(valid[row, index]) and self.consumer_payload[row][index] is not None:
+                    raise ValueError("PAD consumer payload must be absent.")
 
     def gather_consumers(self, local_tokens: torch.Tensor, local_present: torch.Tensor) -> tuple[list[Any], list[torch.Tensor | None], list[tuple[int, str, int]]]:
         batch, steps = self.consumer_valid.shape
@@ -85,9 +96,13 @@ class SegmentBatch:
             for index in range(steps):
                 if not bool(self.consumer_valid[row, index]):
                     continue
+                step = int(self.consumer_step[row, index])
+                is_s0 = step == 0
+                if bool(local_present[row, index]) != (not is_s0):
+                    raise ValueError("only valid S0 consumers may have an absent Local payload.")
                 payloads.append(self.consumer_payload[row][index])
                 local.append(local_tokens[row, index] if bool(local_present[row, index]) else None)
-                identities.append((int(self.slot_id[row]), self.episode_id[row], int(self.consumer_step[row, index])))
+                identities.append((int(self.slot_id[row]), self.episode_id[row], step))
         return payloads, local, identities
 
 
@@ -96,10 +111,16 @@ class GAWindowPlan:
     members: tuple[tuple[int, str, int], ...]
     planned_n_valid: tuple[int, ...]
     attempt: int = 0
+    plan_chain_id: str = "local-memory-plan"
+    suffix_snapshot: tuple[tuple[int, str, int], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.members or len(self.members) != len(self.planned_n_valid) or any(value <= 0 for value in self.planned_n_valid):
             raise ValueError("GAWindowPlan requires non-empty positive planned counts.")
+        if self.attempt not in (0, 1) or not self.plan_chain_id:
+            raise ValueError("GAWindowPlan attempt/plan_chain_id are invalid.")
+        if self.suffix_snapshot and self.suffix_snapshot != self.members:
+            raise ValueError("suffix_snapshot must describe this plan's members.")
 
     @property
     def n_window(self) -> int:
@@ -114,6 +135,21 @@ class GAWindowPlan:
             raise ValueError("actual gathered count must equal planned count.")
         return (self.planned_n_valid[index] / self.n_window) * consumer_loss + auxiliary_loss / self.ga_effective
 
+    def suffix_after_failure(self, failed_index: int) -> "GAWindowPlan":
+        """Return the one permitted immutable suffix retry plan."""
+        if failed_index < 0 or failed_index >= self.ga_effective:
+            raise ValueError("failed_index is outside GAWindowPlan.")
+        if self.attempt == 1:
+            raise RuntimeError("LOCAL_MEM_RETRY_EXHAUSTED")
+        members = self.members[failed_index:]
+        return GAWindowPlan(
+            members=members,
+            planned_n_valid=self.planned_n_valid[failed_index:],
+            attempt=1,
+            plan_chain_id=self.plan_chain_id,
+            suffix_snapshot=members,
+        )
+
 
 @dataclass(frozen=True)
 class SegmentIdentity:
@@ -124,6 +160,73 @@ class SegmentIdentity:
     segment_id: int
     source_digest: str
     training_stream_end: bool = False
+
+
+@dataclass(frozen=True)
+class LocalMemoryTransactionSnapshot:
+    """Pure-Python record for one planned GA chain; it owns no trainer state."""
+
+    plan_chain_id: str
+    attempt: int
+    completed_members: tuple[SegmentIdentity, ...]
+    slow_grads_cleared: bool
+    slow_optimizer_steps: int
+    slow_lr_scheduler_steps: int
+
+
+class LocalMemoryTransaction:
+    """Static model of GA failure/retry and GradScaler separation.
+
+    Each successful backward commits episode chronology through the rank-local
+    scheduler.  Slow optimizer/LR state is deliberately separate: a scaler skip
+    preserves those commits but clears partial slow gradients and takes no slow
+    step.  This class is a CPU contract double, never a trainer integration.
+    """
+
+    def __init__(self, plan: GAWindowPlan, scheduler: "RankLocalSegmentScheduler") -> None:
+        self.plan = plan
+        self.scheduler = scheduler
+        self.completed_members: list[SegmentIdentity] = []
+        self.slow_grads_cleared = False
+        self.slow_optimizer_steps = 0
+        self.slow_lr_scheduler_steps = 0
+
+    def successful_backward(self, index: int, identity: SegmentIdentity, actual_n_valid: int) -> None:
+        if index != len(self.completed_members) or self.plan.members[index] != (
+            identity.slot_id,
+            identity.episode_id,
+            identity.cursor,
+        ):
+            raise ValueError("successful backward must follow the frozen GA plan order.")
+        if actual_n_valid != self.plan.planned_n_valid[index]:
+            raise ValueError("actual gathered count must equal planned count.")
+        self.scheduler.commit(identity, actual_n_valid)
+        self.completed_members.append(identity)
+
+    def fail_transient(self, failed_index: int) -> GAWindowPlan:
+        """Discard only partial slow grads and expose exactly one suffix retry."""
+        if failed_index != len(self.completed_members):
+            raise ValueError("failure index must follow completed members.")
+        self.slow_grads_cleared = True
+        return self.plan.suffix_after_failure(failed_index)
+
+    def grad_scaler_skip(self) -> None:
+        self.slow_grads_cleared = True
+
+    def slow_optimizer_step_succeeded(self) -> None:
+        self.slow_optimizer_steps += 1
+        self.slow_lr_scheduler_steps += 1
+        self.slow_grads_cleared = False
+
+    def snapshot(self) -> LocalMemoryTransactionSnapshot:
+        return LocalMemoryTransactionSnapshot(
+            plan_chain_id=self.plan.plan_chain_id,
+            attempt=self.plan.attempt,
+            completed_members=tuple(self.completed_members),
+            slow_grads_cleared=self.slow_grads_cleared,
+            slow_optimizer_steps=self.slow_optimizer_steps,
+            slow_lr_scheduler_steps=self.slow_lr_scheduler_steps,
+        )
 
 
 class RankLocalSegmentScheduler:
@@ -140,8 +243,17 @@ class RankLocalSegmentScheduler:
         self.target_distribution = {key: value / total for key, value in target_distribution.items()}
         self.cumulative_valid_consumer_exposure = {key: 0 for key in self.target_distribution}
         self.admission_order: list[SegmentIdentity] = []
+        self.committed_identities: list[SegmentIdentity] = []
+        self.stable_slots: dict[int, SegmentIdentity] = {}
+        self.queue_seed: int | None = None
+        self.queue_epoch: int | None = None
+        self.queue_permutation: tuple[int, ...] = ()
+        self.segment_provenance: SegmentProvenance | None = None
+        self.stream_closed = False
 
     def admit(self, candidates: Iterable[SegmentIdentity]) -> SegmentIdentity:
+        if self.stream_closed:
+            raise RuntimeError("training_stream_end already committed; scheduler requires rebind.")
         eligible = [item for item in candidates if item.category in self.target_distribution]
         if not eligible:
             raise ValueError("no candidate has a configured category.")
@@ -151,12 +263,52 @@ class RankLocalSegmentScheduler:
             return (self.target_distribution[item.category] - observed, item.category, item.slot_id, item.episode_id, item.cursor)
         chosen = max(eligible, key=deficit)
         self.admission_order.append(chosen)
+        self.stable_slots[chosen.slot_id] = chosen
         return chosen
 
     def commit(self, identity: SegmentIdentity, valid_consumers: int) -> None:
-        if valid_consumers <= 0 or not self.admission_order or self.admission_order[-1] != identity:
-            raise ValueError("only the latest admitted identity may commit a positive valid count.")
+        if valid_consumers <= 0 or identity not in self.admission_order or identity in self.committed_identities:
+            raise ValueError("only one admitted identity may commit a positive valid count.")
         self.cumulative_valid_consumer_exposure[identity.category] += valid_consumers
+        self.committed_identities.append(identity)
+        if identity.training_stream_end:
+            self.training_stream_end(identity)
+
+    def configure_queue(self, *, seed: int, epoch: int, permutation: Iterable[int], provenance: SegmentProvenance) -> None:
+        if seed < 0 or epoch < 0:
+            raise ValueError("queue seed/epoch must be non-negative.")
+        self.queue_seed = seed
+        self.queue_epoch = epoch
+        self.queue_permutation = tuple(permutation)
+        self.segment_provenance = provenance
+
+    def terminal_rebind(self, identity: SegmentIdentity, replacement: SegmentIdentity) -> None:
+        if identity.slot_id != replacement.slot_id or not identity.training_stream_end:
+            raise ValueError("terminal rebind requires the terminal stable slot.")
+        self.stable_slots[identity.slot_id] = replacement
+
+    def training_stream_end(self, identity: SegmentIdentity) -> None:
+        if not identity.training_stream_end:
+            raise ValueError("training_stream_end requires terminal identity.")
+        self.stream_closed = True
+
+    @classmethod
+    def rebuild(cls, snapshot: dict[str, object]) -> "RankLocalSegmentScheduler":
+        scheduler = cls(
+            rank=int(snapshot["rank"]),
+            target_distribution=dict(snapshot["target_distribution"]),
+            num_workers=int(snapshot["num_workers"]),
+        )
+        scheduler.cumulative_valid_consumer_exposure = dict(snapshot["cumulative_valid_consumer_exposure"])
+        scheduler.admission_order = list(snapshot["admission_order"])
+        scheduler.committed_identities = list(snapshot["committed_identities"])
+        scheduler.stable_slots = dict(snapshot["stable_slots"])
+        scheduler.queue_seed = snapshot["queue_seed"]
+        scheduler.queue_epoch = snapshot["queue_epoch"]
+        scheduler.queue_permutation = tuple(snapshot["queue_permutation"])
+        scheduler.segment_provenance = snapshot["segment_provenance"]
+        scheduler.stream_closed = bool(snapshot["stream_closed"])
+        return scheduler
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -165,4 +317,11 @@ class RankLocalSegmentScheduler:
             "target_distribution": dict(self.target_distribution),
             "cumulative_valid_consumer_exposure": dict(self.cumulative_valid_consumer_exposure),
             "admission_order": tuple(self.admission_order),
+            "committed_identities": tuple(self.committed_identities),
+            "stable_slots": dict(self.stable_slots),
+            "queue_seed": self.queue_seed,
+            "queue_epoch": self.queue_epoch,
+            "queue_permutation": self.queue_permutation,
+            "segment_provenance": self.segment_provenance,
+            "stream_closed": self.stream_closed,
         }

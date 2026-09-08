@@ -92,9 +92,9 @@ class LocalEvidenceEncoder(nn.Module):
         *,
         history_visual_summary: torch.Tensor,
         local_history_action: torch.Tensor,
+        history_age_steps: torch.Tensor,
+        history_dt_s: torch.Tensor,
         history_mask: torch.Tensor,
-        history_age_steps: torch.Tensor | None = None,
-        history_dt_s: torch.Tensor | None = None,
         history_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return ``[B,H,D_e]`` with every masked position exactly zero."""
@@ -112,12 +112,8 @@ class LocalEvidenceEncoder(nn.Module):
         )
         self._check_shape(local_history_action, (batch, horizon, self.action_proj.in_features), "local_history_action")
         if self.feature_config.age:
-            if history_age_steps is None:
-                raise ValueError("history_age_steps is required when the age feature is enabled.")
             self._check_shape(history_age_steps, (batch, horizon), "history_age_steps")
         if self.feature_config.dt:
-            if history_dt_s is None:
-                raise ValueError("history_dt_s is required when the dt feature is enabled.")
             self._check_shape(history_dt_s, (batch, horizon, 1), "history_dt_s")
         self._check_shape(history_mask, (batch, horizon), "history_mask")
         if not torch.isfinite(history_visual_summary).all() or not torch.isfinite(local_history_action).all():
@@ -449,6 +445,19 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         return query_base_t.unsqueeze(1) + self.slot_queries.float().unsqueeze(0)
 
     def _validate_state(self, state: ContinualTTTFastState, batch: int) -> None:
+        self._validate_state_structure(state, batch)
+        for name, value in zip(ContinualTTTFastState._fields, state, strict=True):
+            if not value.is_floating_point() or not torch.isfinite(value).all():
+                raise ValueError(f"state.{name} must be floating point and finite.")
+
+    def _validate_state_structure(self, state: ContinualTTTFastState, batch: int) -> None:
+        """Validate metadata without reading state values.
+
+        ``scan_segment_masked_many`` must be able to carry invalid/PAD rows whose
+        value bytes are deliberately opaque (including NaN sentinels) until those
+        rows become valid.  Keep this structural check separate from the normal
+        finite-value validation used by all existing dense APIs.
+        """
         if not isinstance(state, ContinualTTTFastState):
             raise ValueError("state must be ContinualTTTFastState.")
         expected = (
@@ -463,8 +472,6 @@ class ContinualTTTLocalMemoryCore(nn.Module):
                 raise ValueError(f"state.{name} must have shape {shape}.")
             if value.device != first.device or value.dtype != first.dtype:
                 raise ValueError("state members must share device and dtype.")
-            if not value.is_floating_point() or not torch.isfinite(value).all():
-                raise ValueError(f"state.{name} must be floating point and finite.")
 
     @staticmethod
     def _fast_mlp(value: torch.Tensor, state: ContinualTTTFastState) -> torch.Tensor:
@@ -682,7 +689,7 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         if steps <= 0 or steps > self.ttt_tbptt_steps:
             raise ValueError("segment length must be in [1, ttt_tbptt_steps].")
         state = self.initial_state(batch, device=evidence.device) if state_in is None else state_in
-        self._validate_state(state, batch)
+        self._validate_state_structure(state, batch)
         tokens, present = [], []
         for index in range(steps):
             rows = valid[:, index].bool().nonzero(as_tuple=False).flatten()
@@ -691,6 +698,60 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             if rows.numel():
                 compact_state = self._select_rows(state, rows)
                 compact_evidence = evidence[:, index].index_select(0, rows)
+                key_t, query_base_t, value_t = self.project_evidence(compact_evidence)
+                compact_token, compact_state, _ = self.step_projected_many(
+                    key_t=key_t,
+                    query_base_t=query_base_t,
+                    value_t=value_t,
+                    state_in=compact_state,
+                    valid=torch.ones(rows.numel(), dtype=torch.bool, device=rows.device),
+                    create_graph=create_graph,
+                )
+                state = self._scatter_rows(state, rows, compact_state)
+                token = token.index_copy(0, rows, compact_token)
+                step_present = step_present.index_fill(0, rows, True)
+            tokens.append(token)
+            present.append(step_present)
+        return torch.stack(tokens, dim=1), state, torch.stack(present, dim=1)
+
+    def scan_segment_masked_encoded_many(
+        self,
+        encoder: LocalEvidenceEncoder,
+        visual_summary: torch.Tensor,
+        executed_action: torch.Tensor,
+        valid: torch.Tensor,
+        state_in: ContinualTTTFastState | None = None,
+        *,
+        create_graph: bool = True,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        """Canonical encoder + scan seam with compact-row-first ordering.
+
+        The method is synthetic-only: it deliberately does not wire a dataset or
+        model forward.  Selecting rows before calling ``encode_segment`` proves
+        that invalid dense visual/action values cannot be finite-checked or
+        projected by the canonical encoder.
+        """
+        if encoder.feature_config != CANONICAL_EVIDENCE_FEATURE_CONFIG:
+            raise ValueError("masked encoded scan requires the canonical evidence encoder.")
+        if visual_summary.ndim != 3 or executed_action.ndim != 3:
+            raise ValueError("visual_summary/executed_action must have shape [B,T,D].")
+        batch, steps, _ = visual_summary.shape
+        if tuple(executed_action.shape[:2]) != (batch, steps) or tuple(valid.shape) != (batch, steps):
+            raise ValueError("encoded scan inputs have incompatible [B,T] shapes.")
+        if steps <= 0 or steps > self.ttt_tbptt_steps:
+            raise ValueError("segment length must be in [1, ttt_tbptt_steps].")
+        state = self.initial_state(batch, device=visual_summary.device) if state_in is None else state_in
+        self._validate_state_structure(state, batch)
+        tokens, present = [], []
+        for index in range(steps):
+            rows = valid[:, index].bool().nonzero(as_tuple=False).flatten()
+            token = torch.zeros(batch, self.k_local, self.local_dim, device=state.fast_in_weight.device, dtype=torch.float32)
+            step_present = torch.zeros(batch, dtype=torch.bool, device=state.fast_in_weight.device)
+            if rows.numel():
+                compact_visual = visual_summary[:, index].index_select(0, rows).unsqueeze(1)
+                compact_action = executed_action[:, index].index_select(0, rows).unsqueeze(1)
+                compact_evidence = encoder.encode_segment(compact_visual, compact_action).squeeze(1)
+                compact_state = self._select_rows(state, rows)
                 key_t, query_base_t, value_t = self.project_evidence(compact_evidence)
                 compact_token, compact_state, _ = self.step_projected_many(
                     key_t=key_t,
