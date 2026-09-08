@@ -71,6 +71,10 @@ from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
 from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
 from cosmos_framework.model.generator.mot.ttt_lifecycle import TTTLifecycle
+from cosmos_framework.model.generator.mot.production_segment_wiring import (
+    CanonicalSegmentWiring,
+    run_native_forward_for_test,
+)
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
@@ -1257,6 +1261,38 @@ class OmniMoTModel(ImaginaireModel):
         self._cp_window_slot = (cp_window_slot + 1) % cp_size
         return input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes
 
+    def _canonical_local_memory_segment_forward(
+        self, data_batch: dict[str, Any], iteration: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Test-only canonical segment marker route; bypasses legacy lifecycle."""
+        required = (
+            "canonical_segment",
+            "canonical_identity",
+            "canonical_transaction",
+            "canonical_wiring",
+            "canonical_member_index",
+        )
+        if any(key not in data_batch for key in required):
+            raise ValueError("canonical local-memory marker requires complete fixture fields.")
+        wiring = data_batch["canonical_wiring"]
+        if not isinstance(wiring, CanonicalSegmentWiring):
+            raise TypeError("canonical_wiring must be a CanonicalSegmentWiring.")
+        transaction = data_batch["canonical_transaction"]
+        identity = data_batch["canonical_identity"]
+        forward = wiring.prepare(data_batch["canonical_segment"], identity, transaction)
+        primary, auxiliary = run_native_forward_for_test(forward.payloads, forward.locals)
+        output = {
+            "canonical_segment_forward": forward,
+            "canonical_wiring": wiring,
+            "canonical_transaction": transaction,
+            "canonical_member_index": int(data_batch["canonical_member_index"]),
+            "canonical_identity": identity,
+            "primary_consumer_mean": primary,
+            "auxiliary_loss": auxiliary,
+            "actual_n_valid": len(forward.payloads),
+        }
+        return output, primary + auxiliary
+
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -1281,6 +1317,9 @@ class OmniMoTModel(ImaginaireModel):
                 - Tensor: The computed loss for the training step as a PyTorch Tensor.
 
         """
+        if self.config.local_ttt_enabled and data_batch.get("canonical_local_memory_segment") is True:
+            return self._canonical_local_memory_segment_forward(data_batch, iteration)
+
         input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes = (
             self._get_training_inputs(data_batch, iteration)
         )

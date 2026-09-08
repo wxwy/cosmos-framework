@@ -51,6 +51,11 @@ class CanonicalLocalMemorySegmentAdapter:
         self.encoder, self.core, self.sidecar = encoder, core, sidecar
         self._pending_scan: tuple[SegmentIdentity, LocalMemoryTransaction, SegmentScanResult] | None = None
 
+    @property
+    def pending_scan(self) -> tuple[SegmentIdentity, LocalMemoryTransaction, SegmentScanResult] | None:
+        """Read-only pending capability for the CPU/static wiring bridge."""
+        return self._pending_scan
+
     def scan(
         self, segment: SegmentBatch, *, identity: SegmentIdentity, transaction: LocalMemoryTransaction
     ) -> SegmentScanResult:

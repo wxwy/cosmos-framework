@@ -491,18 +491,21 @@ class ImaginaireTrainer:
                 with self.straggler_detector.profile_section(
                     "bwd", self.config.trainer.straggler_detection.analyze_backward
                 ):
-                    loss_scaled = grad_scaler.scale(loss / self.config.trainer.grad_accum_iter)
-                    ttt_lifecycle = getattr(model, "_ttt_lifecycle", None)
-                    try:
-                        loss_scaled.backward()
-                    except Exception:
-                        # R09-B TTT external-backward abort route: roll every open
-                        # segment back to the last committed state, then re-raise
-                        # the original exception unchanged. Exact no-op when
-                        # local_ttt_enabled=False (no lifecycle exists).
-                        if ttt_lifecycle is not None:
-                            ttt_lifecycle.abort_open_segments()
-                        raise
+                    if "canonical_segment_forward" in output_batch:
+                        self._run_canonical_segment_backward(output_batch)
+                    else:
+                        loss_scaled = grad_scaler.scale(loss / self.config.trainer.grad_accum_iter)
+                        ttt_lifecycle = getattr(model, "_ttt_lifecycle", None)
+                        try:
+                            loss_scaled.backward()
+                        except Exception:
+                            # R09-B TTT external-backward abort route: roll every open
+                            # segment back to the last committed state, then re-raise
+                            # the original exception unchanged. Exact no-op when
+                            # local_ttt_enabled=False (no lifecycle exists).
+                            if ttt_lifecycle is not None:
+                                ttt_lifecycle.abort_open_segments()
+                            raise
                     model.on_after_backward()
             self.callbacks.on_after_backward(model, iteration=iteration)
         grad_accum_iter += 1
@@ -594,6 +597,29 @@ class ImaginaireTrainer:
                 raise
             transaction.terminal_failure("LOCAL_MEM_OUTER_FAILURE")
             raise RuntimeError("LOCAL_MEM_OUTER_FAILURE") from error
+        return loss
+
+    def _run_canonical_segment_backward(self, output_batch: dict[str, object]) -> torch.Tensor:
+        """Delegate canonical wiring exactly once to the existing transaction seam."""
+        required = (
+            "canonical_segment_forward", "canonical_wiring", "canonical_transaction", "canonical_member_index",
+            "canonical_identity", "primary_consumer_mean", "auxiliary_loss", "actual_n_valid",
+        )
+        if any(name not in output_batch for name in required):
+            raise RuntimeError("canonical segment capability is incomplete.")
+        forward = output_batch["canonical_segment_forward"]
+        wiring = output_batch["canonical_wiring"]
+        transaction = output_batch["canonical_transaction"]
+        identity = output_batch["canonical_identity"]
+        pending = wiring.adapter.pending_scan
+        if pending is None or pending[0] != identity or pending[1] is not transaction or pending[2] is not forward.result:
+            raise RuntimeError("canonical segment capability identity is invalid.")
+        loss = self._run_local_memory_segment_backward(
+            transaction.plan, output_batch["canonical_member_index"], output_batch["primary_consumer_mean"],
+            output_batch["auxiliary_loss"], output_batch["actual_n_valid"], transaction=transaction,
+            identity=identity, clear_slow_grads=wiring.clear_local_slow_grads,
+        )
+        wiring.adapter.commit(identity, forward.result, transaction=transaction)
         return loss
 
     def _zero_grad(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, iteration: int) -> None:
