@@ -196,9 +196,15 @@ class LocalMemoryTransaction:
         self.terminal_failure_code: str | None = None
         self.remaining_members_suppressed = False
         self.suffix_recovery: GAWindowPlan | None = None
+        self._closed = False
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("local memory transaction is closed.")
 
     def validate_success(self, index: int, identity: SegmentIdentity, actual_n_valid: int) -> None:
         """Validate frozen GA identity/count before the member backward runs."""
+        self._require_open()
         if index != len(self.completed_members) or self.plan.members[index] != (
             identity.slot_id,
             identity.episode_id,
@@ -222,6 +228,7 @@ class LocalMemoryTransaction:
 
     def recover_transient(self, failed_index: int) -> GAWindowPlan:
         self.suffix_recovery = self.fail_transient(failed_index)
+        self._closed = True
         return self.suffix_recovery
 
     def terminal_failure(self, code: str) -> None:
@@ -229,11 +236,14 @@ class LocalMemoryTransaction:
         self.slow_grads_cleared = True
         self.terminal_failure_code = code
         self.remaining_members_suppressed = True
+        self._closed = True
 
     def grad_scaler_skip(self) -> None:
         self.slow_grads_cleared = True
+        self._closed = True
 
     def slow_optimizer_step_succeeded(self) -> None:
+        self._require_open()
         self.slow_optimizer_steps += 1
         self.slow_lr_scheduler_steps += 1
         self.slow_grads_cleared = False

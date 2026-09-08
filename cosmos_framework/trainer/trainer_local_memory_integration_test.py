@@ -131,3 +131,18 @@ def test_local_memory_segment_grad_scaler_skip_clears_slow_side_without_fast_com
     snapshot = transaction.snapshot()
     assert events == ["clear"] and snapshot.completed_members == ()
     assert snapshot.slow_grads_cleared and snapshot.slow_optimizer_steps == snapshot.slow_lr_scheduler_steps == 0
+    with pytest.raises(RuntimeError, match="closed"):
+        transaction.slow_optimizer_step_succeeded()
+
+
+def test_local_memory_segment_numerical_and_backward_failures_are_terminal() -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    identity = SegmentIdentity(0, "episode", "suite", 0, 0, "digest")
+    plan = GAWindowPlan(((0, "episode", 0),), (1,))
+    for primary, expected in ((torch.tensor(float("nan"), requires_grad=True), "LOCAL_MEM_NUMERICAL_FAILURE"),):
+        scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+        scheduler.admit([identity]); transaction = LocalMemoryTransaction(plan, scheduler)
+        with pytest.raises(RuntimeError, match=expected):
+            trainer._run_local_memory_segment_backward(plan, 0, primary, torch.tensor(0.0), 1, transaction=transaction, identity=identity, clear_slow_grads=lambda: None)
+        with pytest.raises(RuntimeError, match="closed"):
+            transaction.validate_success(0, identity, 1)

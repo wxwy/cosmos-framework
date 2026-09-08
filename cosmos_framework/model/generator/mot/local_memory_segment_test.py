@@ -171,8 +171,8 @@ def test_ga_transaction_suffix_retry_and_grad_scaler_skip_semantics() -> None:
     transaction.grad_scaler_skip()
     assert scheduler.cumulative_valid_consumer_exposure == exposure
     assert transaction.slow_optimizer_steps == transaction.slow_lr_scheduler_steps == 0
-    transaction.slow_optimizer_step_succeeded()
-    assert transaction.slow_optimizer_steps == transaction.slow_lr_scheduler_steps == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        transaction.slow_optimizer_step_succeeded()
 
 
 @pytest.mark.parametrize("failed_index, expected_members", [(0, 2), (1, 1)])
