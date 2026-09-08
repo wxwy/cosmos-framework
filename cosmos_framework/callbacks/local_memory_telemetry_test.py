@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import copy
 from types import MappingProxyType
 
 import pytest
@@ -121,3 +121,34 @@ def test_snapshot_count_and_token_contract_fail_closed() -> None:
         producer.record(_snapshot(local_tokens=torch.ones(2, 2)))
     with pytest.raises(ValueError, match="local_present_count"):
         producer.record(_snapshot(local_present_count=5))
+
+
+def test_successful_record_does_not_mutate_or_retain_snapshot_tensors() -> None:
+    local_tokens = torch.tensor([[[3.0, 4.0], [5.0, 12.0]]], requires_grad=True)
+    fast_state = torch.tensor([[3.0, 4.0]], requires_grad=True)
+    fast_update = torch.tensor([[8.0, 15.0]], requires_grad=True)
+    tensors = (local_tokens, fast_state, fast_update)
+    for tensor in tensors:
+        tensor.grad = torch.full_like(tensor, 2.0)
+    values = tuple(tensor.detach().clone() for tensor in tensors)
+    grads = tuple(tensor.grad.detach().clone() for tensor in tensors)
+    versions = tuple(tensor._version for tensor in tensors)
+    requires_grad = tuple(tensor.requires_grad for tensor in tensors)
+    external_metadata = {"owner": "fixture", "nested": ["unchanged", 3]}
+    metadata_before = copy.deepcopy(external_metadata)
+    rng_before = torch.get_rng_state().clone()
+    snapshot = _snapshot(local_tokens=local_tokens, fast_state=fast_state, fast_update=fast_update)
+    producer = LocalMemoryTelemetryProducer()
+
+    first = producer.record(snapshot)
+    second = producer.record(snapshot)
+
+    assert dict(first) == dict(second)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert external_metadata == metadata_before
+    assert producer.__dict__ == {}
+    for tensor, value, grad, version, requires in zip(tensors, values, grads, versions, requires_grad, strict=True):
+        assert torch.equal(tensor.detach(), value)
+        assert tensor.requires_grad is requires
+        assert tensor._version == version
+        assert tensor.grad is not None and torch.equal(tensor.grad, grad)
