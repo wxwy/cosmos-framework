@@ -1280,7 +1280,11 @@ class OmniMoTModel(ImaginaireModel):
         transaction = data_batch["canonical_transaction"]
         identity = data_batch["canonical_identity"]
         forward = wiring.prepare(data_batch["canonical_segment"], identity, transaction)
-        primary, auxiliary = run_native_forward_for_test(forward.payloads, forward.locals)
+        if "canonical_plan" in data_batch:
+            raise ValueError("canonical local-memory marker must not supply an external plan.")
+        primary, auxiliary = run_native_forward_for_test(
+            forward.payloads, forward.locals, forward.result.local_tokens, wiring.local_slow_parameters
+        )
         output = {
             "canonical_segment_forward": forward,
             "canonical_wiring": wiring,

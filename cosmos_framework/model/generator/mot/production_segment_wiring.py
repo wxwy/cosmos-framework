@@ -14,6 +14,7 @@ from .local_memory_segment_adapter import CanonicalLocalMemorySegmentAdapter, Se
 class CanonicalSegmentForward:
     """Exact graph-bearing scan result and gathered consumer ABI."""
 
+    wiring: "CanonicalSegmentWiring"
     result: SegmentScanResult
     payloads: tuple[Any, ...]
     locals: tuple[torch.Tensor | None, ...]
@@ -42,7 +43,7 @@ class CanonicalSegmentWiring:
         transaction: LocalMemoryTransaction,
     ) -> CanonicalSegmentForward:
         result = self.adapter.scan(segment, identity=identity, transaction=transaction)
-        return CanonicalSegmentForward(result, result.payloads, result.locals, result.identities)
+        return CanonicalSegmentForward(self, result, result.payloads, result.locals, result.identities)
 
     def clear_local_slow_grads(self) -> None:
         for parameter in self.local_slow_parameters:
@@ -50,12 +51,21 @@ class CanonicalSegmentWiring:
 
 
 def run_native_forward_for_test(
-    payloads: tuple[Any, ...], locals: tuple[torch.Tensor | None, ...]
+    payloads: tuple[Any, ...],
+    locals: tuple[torch.Tensor | None, ...],
+    all_local_tokens: torch.Tensor,
+    local_slow_parameters: tuple[torch.nn.Parameter, ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pure tensor spy; never invokes a model, data loader, or filesystem."""
     if len(payloads) != len(locals):
         raise ValueError("payload/local cardinality must match.")
-    local_sum = sum((token.sum() for token in locals if token is not None), torch.zeros(()))
+    if not local_slow_parameters:
+        raise ValueError("canonical test spy requires a Local slow-parameter graph anchor.")
+    present_tokens = tuple(token for token in locals if token is not None)
+    # A valid S0 consumer has no Local payload by contract.  The synthetic spy
+    # still needs the scan graph as its unique CPU/static loss witness.
+    local_sum = sum((token.sum() for token in present_tokens), all_local_tokens.sum()) if present_tokens else all_local_tokens.sum()
+    local_sum = local_sum + sum((parameter.sum() * 0 for parameter in local_slow_parameters))
     return local_sum, torch.zeros_like(local_sum)
 
 

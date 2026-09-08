@@ -67,3 +67,27 @@ def test_default_setup_loads_vision_tokenizer(monkeypatch: pytest.MonkeyPatch) -
 
     assert model.tokenizer_vision_gen is vision_tokenizer
     vision_tokenizer.reset_dtype.assert_called_once_with()
+
+
+def test_canonical_marker_has_disable_first_precedence_without_legacy_lifecycle() -> None:
+    from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
+
+    sentinel = object()
+    lifecycle = SimpleNamespace(process_sample=Mock())
+    enabled = SimpleNamespace(
+        config=SimpleNamespace(local_ttt_enabled=True),
+        _canonical_local_memory_segment_forward=Mock(return_value=sentinel),
+        _ttt_lifecycle=lifecycle,
+    )
+    assert OmniMoTModel.training_step(enabled, {"canonical_local_memory_segment": True}, 0) is sentinel
+    enabled._canonical_local_memory_segment_forward.assert_called_once()
+    lifecycle.process_sample.assert_not_called()
+
+    disabled = SimpleNamespace(
+        config=SimpleNamespace(local_ttt_enabled=False),
+        _canonical_local_memory_segment_forward=Mock(side_effect=AssertionError("canonical marker must be disabled")),
+        _get_training_inputs=Mock(side_effect=RuntimeError("native path reached")),
+    )
+    with pytest.raises(RuntimeError, match="native path reached"):
+        OmniMoTModel.training_step(disabled, {"canonical_local_memory_segment": True}, 0)
+    disabled._canonical_local_memory_segment_forward.assert_not_called()

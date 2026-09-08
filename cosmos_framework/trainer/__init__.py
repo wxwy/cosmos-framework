@@ -607,12 +607,22 @@ class ImaginaireTrainer:
         )
         if any(name not in output_batch for name in required):
             raise RuntimeError("canonical segment capability is incomplete.")
+        if "canonical_plan" in output_batch:
+            raise RuntimeError("canonical segment must not supply an external plan.")
+        from cosmos_framework.model.generator.mot.production_segment_wiring import (
+            CanonicalSegmentForward,
+            CanonicalSegmentWiring,
+        )
+
         forward = output_batch["canonical_segment_forward"]
         wiring = output_batch["canonical_wiring"]
         transaction = output_batch["canonical_transaction"]
         identity = output_batch["canonical_identity"]
+        if not isinstance(forward, CanonicalSegmentForward) or not isinstance(wiring, CanonicalSegmentWiring):
+            raise RuntimeError("canonical segment capability identity is invalid.")
         pending = wiring.adapter.pending_scan
-        if pending is None or pending[0] != identity or pending[1] is not transaction or pending[2] is not forward.result:
+        if (forward.wiring is not wiring or pending is None or pending[0] != identity
+                or pending[1] is not transaction or pending[2] is not forward.result):
             raise RuntimeError("canonical segment capability identity is invalid.")
         loss = self._run_local_memory_segment_backward(
             transaction.plan, output_batch["canonical_member_index"], output_batch["primary_consumer_mean"],
