@@ -37,6 +37,8 @@ def test_sidecar_uses_canonical_cursor_and_terminal_reset() -> None:
     assert carried is not None and not carried[0].requires_grad
     with pytest.raises(ValueError, match="canonical continuation"):
         sidecar.read(SegmentIdentity(2, "episode", "suite", 2, 2, "source"))
+    with pytest.raises(ValueError, match="canonical continuation"):
+        sidecar.read(SegmentIdentity(2, "episode", "suite", 1, 1, "other-source"))
     terminal = SegmentIdentity(2, "episode", "suite", 1, 1, "source", training_stream_end=True)
     sidecar.commit(terminal, _state())
     assert sidecar.read(SegmentIdentity(2, "replacement", "suite", 0, 2, "source")) is None
@@ -95,3 +97,47 @@ def test_adapter_rejects_grad_scaler_skip_sidecar_write() -> None:
     with pytest.raises(RuntimeError, match="successful trainer transaction"):
         adapter.commit(identity, result, transaction=transaction)
     assert adapter.sidecar.read(SegmentIdentity(2, "replacement", "suite", 0, 1, "source")) is None
+
+
+def test_adapter_rejects_terminal_failure_without_replacing_committed_carry() -> None:
+    identity = SegmentIdentity(2, "episode", "suite", 0, 0, "source")
+    failed = SegmentIdentity(2, "episode", "suite", 1, 1, "source")
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit((identity,))
+    scheduler.admit((failed,))
+    transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 1),), (1,)), scheduler)
+    transaction.terminal_failure("LOCAL_MEM_OUTER_FAILURE")
+    adapter = CanonicalLocalMemorySegmentAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(), LocalMemorySegmentSidecar(),
+    )
+    adapter.sidecar.commit(identity, _state())
+    result = SegmentScanResult(torch.zeros(1, 1, 1, 32), torch.zeros(1, 1, dtype=torch.bool), _state(), (), (), ())
+    with pytest.raises(RuntimeError, match="successful trainer transaction"):
+        adapter.commit(failed, result, transaction=transaction)
+    assert adapter.sidecar.read(failed) is not None
+    with pytest.raises(ValueError, match="canonical continuation"):
+        adapter.sidecar.read(SegmentIdentity(2, "episode", "suite", 2, 2, "source"))
+
+
+def test_adapter_terminal_success_deletes_carry_after_trainer_seam() -> None:
+    previous = SegmentIdentity(2, "episode", "suite", 0, 0, "source")
+    terminal = SegmentIdentity(2, "episode", "suite", 1, 1, "source", training_stream_end=True)
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit((previous,))
+    assert scheduler.admit((terminal,)) == terminal
+    transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 1),), (1,)), scheduler)
+    adapter = CanonicalLocalMemorySegmentAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(), LocalMemorySegmentSidecar(),
+    )
+    adapter.sidecar.commit(previous, _state())
+    state = _state()
+    result = SegmentScanResult(torch.zeros(1, 1, 1, 32), torch.zeros(1, 1, dtype=torch.bool), state, (), (), ())
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer._run_local_memory_segment_backward(
+        transaction.plan, 0, torch.ones((), requires_grad=True), torch.zeros((), requires_grad=True), 1,
+        transaction=transaction, identity=terminal, clear_slow_grads=lambda: None,
+    )
+    adapter.commit(terminal, result, transaction=transaction)
+    assert adapter.sidecar.read(SegmentIdentity(2, "replacement", "suite", 0, 2, "source")) is None
