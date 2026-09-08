@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import os
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Optional
 
 import torch
@@ -11,6 +13,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 
 from cosmos_framework.model._base import ImaginaireModel
+from cosmos_framework.model.generator.mot.config_checkpoint_contract import SELECTORS as LOCAL_SLOW_SELECTORS
 from cosmos_framework.utils import distributed, log, misc
 from cosmos_framework.utils.callback import Callback
 from cosmos_framework.utils.easy_io import easy_io
@@ -20,6 +23,52 @@ try:
     from apex.contrib.layer_norm import FastLayerNorm
 except ImportError:
     FastLayerNorm = None
+
+
+LOCAL_SLOW_SELECTOR_GROUPS = MappingProxyType(
+    {
+        "encoder": (f"{LOCAL_SLOW_SELECTORS[0]}.",),
+        "core": (f"{LOCAL_SLOW_SELECTORS[1]}.",),
+        "projector": (f"{LOCAL_SLOW_SELECTORS[2]}.",),
+        "modality_embed": (LOCAL_SLOW_SELECTORS[3],),
+    }
+)
+
+
+def _validate_selector_groups(groups: Mapping[str, tuple[str, ...]]) -> MappingProxyType:
+    copied: dict[str, tuple[str, ...]] = {}
+    owners: dict[str, str] = {}
+    for group, prefixes in groups.items():
+        if not group or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in group):
+            raise ValueError("selector group name is invalid")
+        if not isinstance(prefixes, tuple) or not prefixes or any(not isinstance(prefix, str) or not prefix for prefix in prefixes):
+            raise ValueError("selector group prefixes are invalid")
+        copied[group] = tuple(prefixes)
+        for prefix in prefixes:
+            if any(prefix.startswith(other) or other.startswith(prefix) for other in owners):
+                raise ValueError("selector groups overlap")
+            owners[prefix] = group
+    if copied != dict(LOCAL_SLOW_SELECTOR_GROUPS):
+        raise ValueError("selector groups must match the canonical Local slow inventory")
+    return MappingProxyType(copied)
+
+
+def _selector_group_for_name(groups: Mapping[str, tuple[str, ...]], param_name: str) -> str | None:
+    matches = [
+        group
+        for group, prefixes in groups.items()
+        for prefix in prefixes
+        if (param_name == prefix if group == "modality_embed" else param_name.startswith(prefix))
+    ]
+    if len(matches) > 1:
+        raise ValueError("parameter matches multiple selector groups")
+    return matches[0] if matches else None
+
+
+def _group_metric_values(payload: torch.Tensor) -> tuple[float, float | None]:
+    """Return parameter L2 and optional gradient L2 from a reduced group payload."""
+    param_sq_sum, grad_sq_sum, grad_present_count = payload.tolist()
+    return param_sq_sum**0.5, None if grad_present_count == 0 else grad_sq_sum**0.5
 
 
 class NormMonitor(Callback):
@@ -32,6 +81,7 @@ class NormMonitor(Callback):
         log_stat_wandb: bool = False,
         save_s3: bool = False,
         track_activations: bool = False,
+        parameter_selector_groups: Mapping[str, tuple[str, ...]] | None = None,
     ):
         """Monitor and log parameter/gradient/activation norms during training.
 
@@ -56,6 +106,9 @@ class NormMonitor(Callback):
         self.log_stat_wandb = log_stat_wandb
         self.save_s3 = save_s3
         self.track_activations = track_activations
+        self.parameter_selector_groups = (
+            None if parameter_selector_groups is None else _validate_selector_groups(parameter_selector_groups)
+        )
         self.name = self.__class__.__name__
 
         # Storage for activation statistics (populated by hooks)
@@ -213,7 +266,15 @@ class NormMonitor(Callback):
     def _should_track_param(self, param_name: str) -> bool:
         """Check if parameter should be tracked based on naming conventions."""
         # Track generation tower params and und→gen cross-attention norms; exclude EMA params
-        return ("moe_gen" in param_name or "k_norm_und_for_gen" in param_name) and "net_ema" not in param_name
+        if self.parameter_selector_groups is not None:
+            return "net_ema" not in param_name and _selector_group_for_name(self.parameter_selector_groups, param_name) is not None
+        return self._should_track_legacy_param(param_name)
+
+    @staticmethod
+    def _should_track_legacy_param(param_name: str) -> bool:
+        if "net_ema" in param_name:
+            return False
+        return "moe_gen" in param_name or "k_norm_und_for_gen" in param_name
 
     def _compute_l2_stats(self, tensor: torch.Tensor, detach: bool = True) -> dict[str, torch.Tensor]:
         """Compute statistics (squared sum and max) for a tensor.
@@ -259,7 +320,7 @@ class NormMonitor(Callback):
         per_grad_stats: dict[str, dict[str, torch.Tensor]] = {}
 
         for param_name, param in named_parameters.items():
-            if not self._should_track_param(param_name):
+            if not self._should_track_legacy_param(param_name):
                 continue
 
             # Compute local statistics on this rank's shard
@@ -270,9 +331,24 @@ class NormMonitor(Callback):
                 per_grad_stats[param_name] = self._compute_l2_stats(param.grad, detach=False)
                 local_grad_sq_sum += per_grad_stats[param_name]["sq_sum"]
 
+        group_payloads: dict[str, torch.Tensor] = {}
+        if self.parameter_selector_groups is not None:
+            for group in self.parameter_selector_groups:
+                group_payloads[group] = torch.zeros(3, device="cuda", dtype=torch.float32)
+            for param_name, param in named_parameters.items():
+                group = _selector_group_for_name(self.parameter_selector_groups, param_name)
+                if group is None or "net_ema" in param_name:
+                    continue
+                group_payloads[group][0] += self._compute_l2_stats(param)["sq_sum"]
+                if param.grad is not None:
+                    group_payloads[group][1] += self._compute_l2_stats(param.grad, detach=False)["sq_sum"]
+                    group_payloads[group][2] += 1
+
         # All-reduce to aggregate statistics across all FSDP ranks
         dist.all_reduce(local_param_sq_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_grad_sq_sum, op=dist.ReduceOp.SUM)
+        for payload in group_payloads.values():
+            dist.all_reduce(payload, op=dist.ReduceOp.SUM)
 
         # All-reduce per-parameter stats
         for param_name, stats_dict in per_param_stats.items():
@@ -301,6 +377,11 @@ class NormMonitor(Callback):
             }
             if local_grad_sq_sum > 0:
                 important_info["total_grad_l2_norm"] = local_grad_sq_sum.sqrt().item()
+            for group, payload in group_payloads.items():
+                param_l2, grad_l2 = _group_metric_values(payload)
+                important_info[f"local/slow/{group}_param_l2"] = param_l2
+                if grad_l2 is not None:
+                    important_info[f"local/slow/{group}_grad_l2"] = grad_l2
 
             stats = {}
             for param_name, stats_dict in per_param_stats.items():
