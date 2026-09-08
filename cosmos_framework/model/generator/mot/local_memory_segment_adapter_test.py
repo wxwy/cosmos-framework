@@ -49,10 +49,13 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     )
     encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
     core = ContinualTTTLocalMemoryCore(ttt_tbptt_steps=3)
-    result = CanonicalLocalMemorySegmentAdapter(encoder, core, LocalMemorySegmentSidecar()).scan(
-        segment, identity=SegmentIdentity(2, "episode", "suite", 0, 0, "source")
-    )
+    adapter = CanonicalLocalMemorySegmentAdapter(encoder, core, LocalMemorySegmentSidecar())
+    identity = SegmentIdentity(2, "episode", "suite", 0, 0, "source")
+    result = adapter.scan(segment, identity=identity)
     assert result.payloads == (payload0, payload1)
     assert result.locals[0] is None and result.locals[1] is not None
     assert result.identities == ((2, "episode", 0), (2, "episode", 1))
     assert result.state_out.fast_in_weight.requires_grad
+    adapter.commit(identity, result)
+    carried = adapter.sidecar.read(SegmentIdentity(2, "episode", "suite", 1, 1, "source"))
+    assert carried is not None and not carried.fast_in_weight.requires_grad
