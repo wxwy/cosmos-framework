@@ -554,30 +554,30 @@ class ImaginaireTrainer:
         auxiliary_loss: torch.Tensor,
         actual_n_valid: int,
         *,
-        identity_valid: bool = True,
-        commit_fast: Callable[[], None] | None = None,
-        clear_slow_grads: Callable[[], None] | None = None,
+        identity_valid: bool,
+        commit_fast: Callable[[], None],
+        clear_slow_grads: Callable[[], None],
     ) -> torch.Tensor:
         """CPU/static-only canonical Local primary/auxiliary loss seam."""
         from cosmos_framework.model.generator.mot.c6_runtime_adapter import CanonicalSegmentRuntimeAdapter
 
         if not identity_valid:
-            if clear_slow_grads is not None:
-                clear_slow_grads()
+            clear_slow_grads()
             raise RuntimeError("LOCAL_MEM_IDENTITY_CONTRACT_FAILURE")
         try:
             loss = CanonicalSegmentRuntimeAdapter.objective(
                 plan, member_index, primary_consumer_mean, auxiliary_loss, actual_n_valid
             )
             loss.backward()
+        except ValueError as error:
+            clear_slow_grads()
+            raise RuntimeError("LOCAL_MEM_IDENTITY_CONTRACT_FAILURE") from error
         except RuntimeError as error:
-            if clear_slow_grads is not None:
-                clear_slow_grads()
+            clear_slow_grads()
             if str(error) == "LOCAL_MEM_NUMERICAL_FAILURE":
                 raise
             raise RuntimeError("LOCAL_MEM_OUTER_FAILURE") from error
-        if commit_fast is not None:
-            commit_fast()
+        commit_fast()
         return loss
 
     def _zero_grad(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, iteration: int) -> None:
