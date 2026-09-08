@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from .local_evidence import ContinualTTTFastState, ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
-from .local_memory_segment import SegmentBatch, SegmentIdentity
+from .local_memory_segment import LocalMemoryTransaction, SegmentBatch, SegmentIdentity
 
 
 @dataclass(frozen=True)
@@ -60,6 +60,9 @@ class CanonicalLocalMemorySegmentAdapter:
         payloads, locals_, identities = segment.gather_consumers(tokens, present)
         return SegmentScanResult(tokens, present, state_out, tuple(payloads), tuple(locals_), tuple(identities))
 
-    def commit(self, identity: SegmentIdentity, result: SegmentScanResult) -> None:
+    def commit(self, identity: SegmentIdentity, result: SegmentScanResult, *, transaction: LocalMemoryTransaction) -> None:
         """Persist detached fast state only after the trainer transaction succeeds."""
+        if (transaction.terminal_failure_code is not None or transaction.slow_grads_cleared
+                or not transaction.completed_members or transaction.completed_members[-1] != identity):
+            raise RuntimeError("segment sidecar commit requires successful trainer transaction.")
         self.sidecar.commit(identity, result.state_out)

@@ -9,7 +9,14 @@ from cosmos_framework.model.generator.mot.local_evidence import (
     ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
 )
-from cosmos_framework.model.generator.mot.local_memory_segment import SegmentBatch, SegmentIdentity, SegmentProvenance
+from cosmos_framework.model.generator.mot.local_memory_segment import (
+    GAWindowPlan,
+    LocalMemoryTransaction,
+    RankLocalSegmentScheduler,
+    SegmentBatch,
+    SegmentIdentity,
+    SegmentProvenance,
+)
 from cosmos_framework.model.generator.mot.local_memory_segment_adapter import (
     CanonicalLocalMemorySegmentAdapter,
     LocalMemorySegmentSidecar,
@@ -56,6 +63,12 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     assert result.locals[0] is None and result.locals[1] is not None
     assert result.identities == ((2, "episode", 0), (2, "episode", 1))
     assert result.state_out.fast_in_weight.requires_grad
-    adapter.commit(identity, result)
+    with pytest.raises(TypeError):
+        adapter.commit(identity, result)
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    assert scheduler.admit((identity,)) == identity
+    transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (2,)), scheduler)
+    transaction.successful_backward(0, identity, 2)
+    adapter.commit(identity, result, transaction=transaction)
     carried = adapter.sidecar.read(SegmentIdentity(2, "episode", "suite", 1, 1, "source"))
     assert carried is not None and not carried.fast_in_weight.requires_grad
