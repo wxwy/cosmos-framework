@@ -94,6 +94,8 @@ def test_local_memory_segment_transient_recovers_exact_suffix_and_preserves_prio
     first_suffix = snapshot.suffix_recovery
     with pytest.raises(RuntimeError, match="closed"):
         transaction.recover_transient(1)
+    with pytest.raises(RuntimeError, match="closed"):
+        transaction.successful_backward(1, identities[1], 3)
     assert transaction.snapshot().suffix_recovery is first_suffix
 
 
@@ -187,3 +189,19 @@ def test_local_memory_segment_recovery_objective_has_one_ga_division() -> None:
     first = plan.objective(0, torch.tensor(2.0), torch.tensor(4.0), 2)
     second = plan.objective(1, torch.tensor(5.0), torch.tensor(4.0), 3)
     torch.testing.assert_close(first + second, torch.tensor(7.8))
+
+
+def test_local_memory_segment_two_member_suffix_uses_trainer_scaling_once() -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    identities = tuple(SegmentIdentity(0, "episode", "suite", index, 0, "digest") for index in range(3))
+    original_plan = GAWindowPlan(tuple((item.slot_id, item.episode_id, item.cursor) for item in identities), (2, 3, 4))
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    for identity in identities:
+        scheduler.admit([identity])
+    original = LocalMemoryTransaction(original_plan, scheduler)
+    trainer._run_local_memory_segment_backward(original_plan, 0, torch.tensor(2.0, requires_grad=True), torch.tensor(1.0, requires_grad=True), 2, transaction=original, identity=identities[0], clear_slow_grads=lambda: None)
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_SUFFIX_RECOVERY"):
+        trainer._run_local_memory_segment_backward(original_plan, 1, torch.tensor(0.0, requires_grad=True), torch.tensor(0.0), 3, transaction=original, identity=identities[1], clear_slow_grads=lambda: None, failure_kind="LOAD_DECODE_TRANSIENT")
+    retry = LocalMemoryTransaction(original.suffix_recovery, scheduler)
+    losses = [trainer._run_local_memory_segment_backward(retry.plan, index, torch.tensor(primary, requires_grad=True), torch.tensor(auxiliary, requires_grad=True), valid, transaction=retry, identity=identity, clear_slow_grads=lambda: None) for index, (identity, primary, auxiliary, valid) in enumerate(((identities[1], 5.0, 2.0, 3), (identities[2], 7.0, 4.0, 4)))]
+    torch.testing.assert_close(sum(losses), torch.tensor((3 / 7) * 5 + 2 / 2 + (4 / 7) * 7 + 4 / 2))
