@@ -62,9 +62,10 @@ def run_native_forward_for_test(
     if not local_slow_parameters:
         raise ValueError("canonical test spy requires a Local slow-parameter graph anchor.")
     present_tokens = tuple(token for token in locals if token is not None)
-    # A valid S0 consumer has no Local payload by contract.  The synthetic spy
-    # still needs the scan graph as its unique CPU/static loss witness.
-    local_sum = sum((token.sum() for token in present_tokens), all_local_tokens.sum()) if present_tokens else all_local_tokens.sum()
+    # A valid S0 consumer has no Local payload by contract.  Its zero-valued
+    # scan/slow-owner anchors preserve a graph without changing a visible
+    # consumer's exactly-once Local contribution.
+    local_sum = sum((token.sum() for token in present_tokens), all_local_tokens.sum() * 0)
     local_sum = local_sum + sum((parameter.sum() * 0 for parameter in local_slow_parameters))
     return local_sum, torch.zeros_like(local_sum)
 

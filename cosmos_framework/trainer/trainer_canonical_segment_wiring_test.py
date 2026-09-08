@@ -110,3 +110,12 @@ def test_canonical_trainer_rejects_stale_result_before_backward() -> None:
         object.__new__(ImaginaireTrainer)._run_canonical_segment_backward(output)
     assert current.result is wiring.adapter.pending_scan[2]
     assert transaction.snapshot().completed_members == ()
+
+
+def test_two_step_marker_to_trainer_keeps_visible_local_primary_exactly_once() -> None:
+    wiring, segment, identity, transaction = _fixture(two_steps=True)
+    output, _ = _model_marker_output(wiring, segment, identity, transaction)
+    expected = sum(token.sum() for token in output["canonical_segment_forward"].locals if token is not None)
+    torch.testing.assert_close(output["primary_consumer_mean"], expected)
+    object.__new__(ImaginaireTrainer)._run_canonical_segment_backward(output)
+    assert transaction.snapshot().completed_members == (identity,)
