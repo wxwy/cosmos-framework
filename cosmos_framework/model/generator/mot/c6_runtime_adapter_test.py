@@ -86,6 +86,14 @@ def test_canonical_adapter_uses_partitioned_objective_and_rejects_nonfinite() ->
         CanonicalSegmentRuntimeAdapter.objective(plan, 0, torch.tensor(float("nan")), torch.tensor(1.0), 2)
 
 
+def test_canonical_adapter_failure_taxonomy_allows_only_first_transient_retry() -> None:
+    assert CanonicalSegmentRuntimeAdapter.classify_failure("LOAD_DECODE_TRANSIENT", 0) == ("LOAD_DECODE_TRANSIENT", True)
+    assert CanonicalSegmentRuntimeAdapter.classify_failure("LOAD_DECODE_TRANSIENT", 1) == ("LOCAL_MEM_RETRY_EXHAUSTED", False)
+    assert CanonicalSegmentRuntimeAdapter.classify_failure("IDENTITY", 0) == ("LOCAL_MEM_IDENTITY_CONTRACT_FAILURE", False)
+    assert CanonicalSegmentRuntimeAdapter.classify_failure("NUMERICAL", 0) == ("LOCAL_MEM_NUMERICAL_FAILURE", False)
+    assert CanonicalSegmentRuntimeAdapter.classify_failure("OUTER", 0) == ("LOCAL_MEM_OUTER_FAILURE", False)
+
+
 def test_batch_permutation_is_owner_keyed() -> None:
     authority, adapter = _adapter()
     for owner, value in (("a", 0.0), ("b", 1.0)):

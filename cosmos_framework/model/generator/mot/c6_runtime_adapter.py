@@ -79,3 +79,16 @@ class CanonicalSegmentRuntimeAdapter:
         if not torch.isfinite(primary_consumer_mean).all() or not torch.isfinite(auxiliary_loss).all():
             raise RuntimeError("LOCAL_MEM_NUMERICAL_FAILURE")
         return plan.objective(member_index, primary_consumer_mean, auxiliary_loss, actual_n_valid)
+
+    @staticmethod
+    def classify_failure(kind: str, attempt: int) -> tuple[str, bool]:
+        if kind == "LOAD_DECODE_TRANSIENT" and attempt == 0:
+            return kind, True
+        if kind == "LOAD_DECODE_TRANSIENT":
+            return "LOCAL_MEM_RETRY_EXHAUSTED", False
+        mapping = {
+            "IDENTITY": "LOCAL_MEM_IDENTITY_CONTRACT_FAILURE",
+            "NUMERICAL": "LOCAL_MEM_NUMERICAL_FAILURE",
+            "OUTER": "LOCAL_MEM_OUTER_FAILURE",
+        }
+        return mapping.get(kind, "LOCAL_MEM_OUTER_FAILURE"), False
