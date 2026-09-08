@@ -20,6 +20,7 @@ from cosmos_framework.model.generator.mot.local_memory_segment import (
 from cosmos_framework.model.generator.mot.local_memory_segment_adapter import (
     CanonicalLocalMemorySegmentAdapter,
     LocalMemorySegmentSidecar,
+    SegmentScanResult,
 )
 from cosmos_framework.trainer import ImaginaireTrainer
 
@@ -77,3 +78,20 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     adapter.commit(identity, result, transaction=transaction)
     carried = adapter.sidecar.read(SegmentIdentity(2, "episode", "suite", 1, 1, "source"))
     assert carried is not None and not carried.fast_in_weight.requires_grad
+
+
+def test_adapter_rejects_grad_scaler_skip_sidecar_write() -> None:
+    identity = SegmentIdentity(2, "episode", "suite", 0, 0, "source")
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit((identity,))
+    transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (1,)), scheduler)
+    transaction.grad_scaler_skip()
+    state = _state()
+    result = SegmentScanResult(torch.zeros(1, 1, 1, 32), torch.zeros(1, 1, dtype=torch.bool), state, (), (), ())
+    adapter = CanonicalLocalMemorySegmentAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(), LocalMemorySegmentSidecar(),
+    )
+    with pytest.raises(RuntimeError, match="successful trainer transaction"):
+        adapter.commit(identity, result, transaction=transaction)
+    assert adapter.sidecar.read(SegmentIdentity(2, "replacement", "suite", 0, 1, "source")) is None
