@@ -62,21 +62,29 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     core = ContinualTTTLocalMemoryCore(ttt_tbptt_steps=3)
     adapter = CanonicalLocalMemorySegmentAdapter(encoder, core, LocalMemorySegmentSidecar())
     identity = SegmentIdentity(2, "episode", "suite", 0, 0, "source")
-    result = adapter.scan(segment, identity=identity)
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    assert scheduler.admit((identity,)) == identity
+    transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (3,)), scheduler)
+    with pytest.raises(TypeError):
+        adapter.scan(segment, identity=identity)
+    result = adapter.scan(segment, identity=identity, transaction=transaction)
     assert result.payloads == (payload0, payload1, payload2)
     assert result.locals[0] is None and result.locals[1] is not None
     assert result.identities == ((2, "episode", 0), (2, "episode", 1), (3, "other", 0))
     assert result.state_out.fast_in_weight.requires_grad
     with pytest.raises(TypeError):
         adapter.commit(identity, result)
-    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
-    assert scheduler.admit((identity,)) == identity
-    transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (3,)), scheduler)
     trainer = object.__new__(ImaginaireTrainer)
     trainer._run_local_memory_segment_backward(
         transaction.plan, 0, result.locals[1].sum(), torch.zeros((), requires_grad=True), 3,
         transaction=transaction, identity=identity, clear_slow_grads=lambda: None,
     )
+    other_scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    assert other_scheduler.admit((identity,)) == identity
+    other_transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (3,)), other_scheduler)
+    other_transaction.successful_backward(0, identity, 3)
+    with pytest.raises(RuntimeError, match="successful trainer transaction"):
+        adapter.commit(identity, result, transaction=other_transaction)
     adapter.commit(identity, result, transaction=transaction)
     carried = adapter.sidecar.read(SegmentIdentity(2, "episode", "suite", 1, 1, "source"))
     assert carried is not None and not carried.fast_in_weight.requires_grad
@@ -127,13 +135,22 @@ def test_adapter_terminal_success_deletes_carry_after_trainer_seam() -> None:
     scheduler.admit((previous,))
     assert scheduler.admit((terminal,)) == terminal
     transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 1),), (1,)), scheduler)
+    core = ContinualTTTLocalMemoryCore()
     adapter = CanonicalLocalMemorySegmentAdapter(
-        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
-        ContinualTTTLocalMemoryCore(), LocalMemorySegmentSidecar(),
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), core, LocalMemorySegmentSidecar(),
     )
-    adapter.sidecar.commit(previous, _state())
-    state = _state()
-    result = SegmentScanResult(torch.zeros(1, 1, 1, 32), torch.zeros(1, 1, dtype=torch.bool), state, (), (), ())
+    adapter.sidecar.commit(previous, core.initial_state(1, device=torch.device("cpu")))
+    result = adapter.scan(
+        SegmentBatch(
+            consumer_visual_summary=torch.zeros(1, 1, 96), consumer_payload=((object(),),),
+            consumer_valid=torch.tensor([[True]]), consumer_step=torch.tensor([[0]]),
+            evidence_visual_summary_prev=torch.zeros(1, 1, 96), evidence_executed_action_prev=torch.zeros(1, 1, 10),
+            evidence_valid=torch.tensor([[False]]), evidence_source_step=torch.tensor([[-1]]),
+            slot_id=torch.tensor([2]), episode_id=("episode",), category=("suite",),
+            segment_provenance=SegmentProvenance("m", "c", "source", 1),
+        ),
+        identity=terminal, transaction=transaction,
+    )
     trainer = object.__new__(ImaginaireTrainer)
     trainer._run_local_memory_segment_backward(
         transaction.plan, 0, torch.ones((), requires_grad=True), torch.zeros((), requires_grad=True), 1,

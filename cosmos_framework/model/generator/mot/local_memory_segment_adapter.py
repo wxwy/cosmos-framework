@@ -49,8 +49,15 @@ class LocalMemorySegmentSidecar:
 class CanonicalLocalMemorySegmentAdapter:
     def __init__(self, encoder: LocalEvidenceEncoder, core: ContinualTTTLocalMemoryCore, sidecar: LocalMemorySegmentSidecar) -> None:
         self.encoder, self.core, self.sidecar = encoder, core, sidecar
+        self._pending_scan: tuple[SegmentIdentity, LocalMemoryTransaction] | None = None
 
-    def scan(self, segment: SegmentBatch, *, identity: SegmentIdentity) -> SegmentScanResult:
+    def scan(
+        self, segment: SegmentBatch, *, identity: SegmentIdentity, transaction: LocalMemoryTransaction
+    ) -> SegmentScanResult:
+        if identity not in transaction.scheduler.admission_order or (
+            identity.slot_id, identity.episode_id, identity.cursor
+        ) not in transaction.plan.members:
+            raise ValueError("segment scan requires an admitted identity in its transaction plan.")
         segment.validate(self.core.ttt_tbptt_steps)
         state_in = self.sidecar.read(identity)
         tokens, state_out, present = self.core.scan_segment_masked_encoded_many(
@@ -58,11 +65,14 @@ class CanonicalLocalMemorySegmentAdapter:
             segment.evidence_valid, state_in, create_graph=True,
         )
         payloads, locals_, identities = segment.gather_consumers(tokens, present)
+        self._pending_scan = (identity, transaction)
         return SegmentScanResult(tokens, present, state_out, tuple(payloads), tuple(locals_), tuple(identities))
 
     def commit(self, identity: SegmentIdentity, result: SegmentScanResult, *, transaction: LocalMemoryTransaction) -> None:
         """Persist detached fast state only after the trainer transaction succeeds."""
         if (transaction.terminal_failure_code is not None or transaction.slow_grads_cleared
-                or not transaction.completed_members or transaction.completed_members[-1] != identity):
+                or not transaction.completed_members or transaction.completed_members[-1] != identity
+                or self._pending_scan != (identity, transaction)):
             raise RuntimeError("segment sidecar commit requires successful trainer transaction.")
         self.sidecar.commit(identity, result.state_out)
+        self._pending_scan = None
