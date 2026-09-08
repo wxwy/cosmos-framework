@@ -21,6 +21,7 @@ from cosmos_framework.model.generator.mot.local_memory_segment_adapter import (
     CanonicalLocalMemorySegmentAdapter,
     LocalMemorySegmentSidecar,
 )
+from cosmos_framework.trainer import ImaginaireTrainer
 
 
 def _state() -> ContinualTTTFastState:
@@ -68,7 +69,11 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
     assert scheduler.admit((identity,)) == identity
     transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (2,)), scheduler)
-    transaction.successful_backward(0, identity, 2)
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer._run_local_memory_segment_backward(
+        transaction.plan, 0, result.locals[1].sum(), torch.zeros((), requires_grad=True), 2,
+        transaction=transaction, identity=identity, clear_slow_grads=lambda: None,
+    )
     adapter.commit(identity, result, transaction=transaction)
     carried = adapter.sidecar.read(SegmentIdentity(2, "episode", "suite", 1, 1, "source"))
     assert carried is not None and not carried.fast_in_weight.requires_grad
