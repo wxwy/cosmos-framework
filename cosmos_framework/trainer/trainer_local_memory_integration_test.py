@@ -91,6 +91,10 @@ def test_local_memory_segment_transient_recovers_exact_suffix_and_preserves_prio
     assert snapshot.completed_members == (identities[0],)
     assert snapshot.suffix_recovery is not None and snapshot.suffix_recovery.members == (plan.members[1],)
     assert snapshot.terminal_failure_code is None and not snapshot.remaining_members_suppressed
+    first_suffix = snapshot.suffix_recovery
+    with pytest.raises(RuntimeError, match="closed"):
+        transaction.recover_transient(1)
+    assert transaction.snapshot().suffix_recovery is first_suffix
 
 
 @pytest.mark.parametrize(
@@ -146,3 +150,28 @@ def test_local_memory_segment_numerical_and_backward_failures_are_terminal() -> 
             trainer._run_local_memory_segment_backward(plan, 0, primary, torch.tensor(0.0), 1, transaction=transaction, identity=identity, clear_slow_grads=lambda: None)
         with pytest.raises(RuntimeError, match="closed"):
             transaction.validate_success(0, identity, 1)
+
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit([identity]); transaction = LocalMemoryTransaction(plan, scheduler)
+    primary = torch.tensor(1.0, requires_grad=True)
+    primary.register_hook(lambda _: (_ for _ in ()).throw(RuntimeError("backward boom")))
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_OUTER_FAILURE"):
+        trainer._run_local_memory_segment_backward(plan, 0, primary, torch.tensor(0.0), 1, transaction=transaction, identity=identity, clear_slow_grads=lambda: None)
+
+
+def test_local_memory_segment_retry_executes_suffix_and_skip_retains_fast_history() -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    identities = (SegmentIdentity(0, "episode", "suite", 0, 0, "digest"), SegmentIdentity(0, "episode", "suite", 1, 0, "digest"))
+    plan = GAWindowPlan(((0, "episode", 0), (0, "episode", 1)), (2, 3))
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    for identity in identities:
+        scheduler.admit([identity])
+    original = LocalMemoryTransaction(plan, scheduler)
+    trainer._run_local_memory_segment_backward(plan, 0, torch.tensor(2.0, requires_grad=True), torch.tensor(1.0, requires_grad=True), 2, transaction=original, identity=identities[0], clear_slow_grads=lambda: None)
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_SUFFIX_RECOVERY"):
+        trainer._run_local_memory_segment_backward(plan, 1, torch.tensor(5.0, requires_grad=True), torch.tensor(2.0, requires_grad=True), 3, transaction=original, identity=identities[1], clear_slow_grads=lambda: None, failure_kind="LOAD_DECODE_TRANSIENT")
+    retry = LocalMemoryTransaction(original.suffix_recovery, scheduler)
+    loss = trainer._run_local_memory_segment_backward(retry.plan, 0, torch.tensor(5.0, requires_grad=True), torch.tensor(2.0, requires_grad=True), 3, transaction=retry, identity=identities[1], clear_slow_grads=lambda: None)
+    assert loss.item() == 7.0 and retry.plan.ga_effective == 1
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_GRAD_SCALER_SKIP"):
+        trainer._run_local_memory_segment_backward(retry.plan, 1, torch.tensor(1.0, requires_grad=True), torch.tensor(0.0), 3, transaction=retry, identity=identities[1], clear_slow_grads=lambda: None, grad_scaler_skip=True)
