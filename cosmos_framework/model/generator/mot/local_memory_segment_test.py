@@ -107,20 +107,41 @@ def test_rank_local_scheduler_is_deterministic_and_commits_exposure() -> None:
         RankLocalSegmentScheduler(rank=0, target_distribution={"a": 1.0}, num_workers=1)
 
 
-def test_scheduler_snapshot_rebuild_terminal_rebind_and_tail_close() -> None:
-    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"a": 1.0})
+def test_scheduler_terminal_rebind_is_per_slot_and_snapshot_safe() -> None:
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"a": 1.0, "b": 1.0})
     provenance = SegmentProvenance("manifest", "config", "source", 3)
     scheduler.configure_queue(seed=7, epoch=2, permutation=(3, 1, 2), provenance=provenance)
-    terminal = SegmentIdentity(0, "episode", "a", 4, 3, "source", training_stream_end=True)
+    first = SegmentIdentity(0, "episode", "a", 0, 3, "source")
+    other = SegmentIdentity(1, "other", "b", 0, 3, "source")
+    assert scheduler.admit((first,)) == first
+    scheduler.commit(first, 1)
+    assert scheduler.admit((other,)) == other
+    scheduler.commit(other, 1)
+    terminal = SegmentIdentity(0, "episode", "a", 1, 4, "source", training_stream_end=True)
     assert scheduler.admit((terminal,)) == terminal
     scheduler.commit(terminal, 1)  # tail may contain a single valid consumer; PAD is absent from this count.
     rebuilt = RankLocalSegmentScheduler.rebuild(scheduler.snapshot())
     assert rebuilt.snapshot() == scheduler.snapshot()
-    with pytest.raises(RuntimeError, match="training_stream_end"):
+    with pytest.raises(ValueError, match="admissible"):
         rebuilt.admit((terminal,))
+    other_continuation = SegmentIdentity(1, "other", "b", 1, 4, "source")
+    assert rebuilt.admit((other_continuation,)) == other_continuation
+    rebuilt.commit(other_continuation, 1)
     replacement = SegmentIdentity(0, "next", "a", 0, 4, "source")
     rebuilt.terminal_rebind(terminal, replacement)
     assert rebuilt.stable_slots[0] == replacement
+    rebuilt.commit(replacement, 1)
+
+
+def test_scheduler_rejects_slot_switches_and_noncontiguous_cursor() -> None:
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"a": 1.0, "b": 1.0})
+    first = SegmentIdentity(0, "episode", "a", 0, 0, "source")
+    assert scheduler.admit((first,)) == first
+    scheduler.commit(first, 1)
+    switched = SegmentIdentity(0, "other", "b", 1, 1, "source")
+    skipped = SegmentIdentity(0, "episode", "a", 2, 1, "source")
+    with pytest.raises(ValueError, match="admissible"):
+        scheduler.admit((switched, skipped))
 
 
 def test_ga_transaction_suffix_retry_and_grad_scaler_skip_semantics() -> None:

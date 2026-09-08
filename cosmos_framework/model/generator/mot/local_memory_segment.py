@@ -245,18 +245,16 @@ class RankLocalSegmentScheduler:
         self.admission_order: list[SegmentIdentity] = []
         self.committed_identities: list[SegmentIdentity] = []
         self.stable_slots: dict[int, SegmentIdentity] = {}
+        self.terminal_slots: dict[int, SegmentIdentity] = {}
         self.queue_seed: int | None = None
         self.queue_epoch: int | None = None
         self.queue_permutation: tuple[int, ...] = ()
         self.segment_provenance: SegmentProvenance | None = None
-        self.stream_closed = False
 
     def admit(self, candidates: Iterable[SegmentIdentity]) -> SegmentIdentity:
-        if self.stream_closed:
-            raise RuntimeError("training_stream_end already committed; scheduler requires rebind.")
-        eligible = [item for item in candidates if item.category in self.target_distribution]
+        eligible = [item for item in candidates if self._is_admissible(item)]
         if not eligible:
-            raise ValueError("no candidate has a configured category.")
+            raise ValueError("no candidate is admissible for its stable stream slot.")
         total = sum(self.cumulative_valid_consumer_exposure.values())
         def deficit(item: SegmentIdentity) -> tuple[float, str, int, str, int]:
             observed = self.cumulative_valid_consumer_exposure[item.category] / max(total, 1)
@@ -266,8 +264,25 @@ class RankLocalSegmentScheduler:
         self.stable_slots[chosen.slot_id] = chosen
         return chosen
 
+    def _is_admissible(self, identity: SegmentIdentity) -> bool:
+        if identity.category not in self.target_distribution or identity.slot_id in self.terminal_slots:
+            return False
+        previous = self.stable_slots.get(identity.slot_id)
+        if previous is None:
+            return identity.cursor == 0
+        return (
+            identity.category == previous.category
+            and identity.episode_id == previous.episode_id
+            and identity.source_digest == previous.source_digest
+            and identity.cursor == previous.cursor + 1
+        )
+
     def commit(self, identity: SegmentIdentity, valid_consumers: int) -> None:
-        if valid_consumers <= 0 or identity not in self.admission_order or identity in self.committed_identities:
+        if (
+            valid_consumers <= 0
+            or identity not in self.admission_order
+            or identity in self.committed_identities
+        ):
             raise ValueError("only one admitted identity may commit a positive valid count.")
         self.cumulative_valid_consumer_exposure[identity.category] += valid_consumers
         self.committed_identities.append(identity)
@@ -283,14 +298,21 @@ class RankLocalSegmentScheduler:
         self.segment_provenance = provenance
 
     def terminal_rebind(self, identity: SegmentIdentity, replacement: SegmentIdentity) -> None:
-        if identity.slot_id != replacement.slot_id or not identity.training_stream_end:
+        if (
+            identity.slot_id != replacement.slot_id
+            or self.terminal_slots.get(identity.slot_id) != identity
+            or replacement.category not in self.target_distribution
+            or replacement.cursor != 0
+        ):
             raise ValueError("terminal rebind requires the terminal stable slot.")
+        del self.terminal_slots[identity.slot_id]
         self.stable_slots[identity.slot_id] = replacement
+        self.admission_order.append(replacement)
 
     def training_stream_end(self, identity: SegmentIdentity) -> None:
-        if not identity.training_stream_end:
+        if not identity.training_stream_end or self.stable_slots.get(identity.slot_id) != identity:
             raise ValueError("training_stream_end requires terminal identity.")
-        self.stream_closed = True
+        self.terminal_slots[identity.slot_id] = identity
 
     @classmethod
     def rebuild(cls, snapshot: dict[str, object]) -> "RankLocalSegmentScheduler":
@@ -303,11 +325,11 @@ class RankLocalSegmentScheduler:
         scheduler.admission_order = list(snapshot["admission_order"])
         scheduler.committed_identities = list(snapshot["committed_identities"])
         scheduler.stable_slots = dict(snapshot["stable_slots"])
+        scheduler.terminal_slots = dict(snapshot["terminal_slots"])
         scheduler.queue_seed = snapshot["queue_seed"]
         scheduler.queue_epoch = snapshot["queue_epoch"]
         scheduler.queue_permutation = tuple(snapshot["queue_permutation"])
         scheduler.segment_provenance = snapshot["segment_provenance"]
-        scheduler.stream_closed = bool(snapshot["stream_closed"])
         return scheduler
 
     def snapshot(self) -> dict[str, object]:
@@ -319,9 +341,9 @@ class RankLocalSegmentScheduler:
             "admission_order": tuple(self.admission_order),
             "committed_identities": tuple(self.committed_identities),
             "stable_slots": dict(self.stable_slots),
+            "terminal_slots": dict(self.terminal_slots),
             "queue_seed": self.queue_seed,
             "queue_epoch": self.queue_epoch,
             "queue_permutation": self.queue_permutation,
             "segment_provenance": self.segment_provenance,
-            "stream_closed": self.stream_closed,
         }
