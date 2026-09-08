@@ -43,17 +43,17 @@ def test_sidecar_uses_canonical_cursor_and_terminal_reset() -> None:
 
 
 def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
-    payload0, payload1 = object(), object()
+    payload0, payload1, payload2 = object(), object(), object()
     segment = SegmentBatch(
-        consumer_visual_summary=torch.randn(1, 3, 96),
-        consumer_payload=((payload0, payload1, None),),
-        consumer_valid=torch.tensor([[True, True, False]]),
-        consumer_step=torch.tensor([[0, 1, -1]]),
-        evidence_visual_summary_prev=torch.randn(1, 3, 96),
-        evidence_executed_action_prev=torch.randn(1, 3, 10),
-        evidence_valid=torch.tensor([[False, True, False]]),
-        evidence_source_step=torch.tensor([[-1, 0, -1]]),
-        slot_id=torch.tensor([2]), episode_id=("episode",), category=("suite",),
+        consumer_visual_summary=torch.randn(2, 3, 96),
+        consumer_payload=((payload0, payload1, None), (payload2, None, None)),
+        consumer_valid=torch.tensor([[True, True, False], [True, False, False]]),
+        consumer_step=torch.tensor([[0, 1, -1], [0, -1, -1]]),
+        evidence_visual_summary_prev=torch.randn(2, 3, 96),
+        evidence_executed_action_prev=torch.randn(2, 3, 10),
+        evidence_valid=torch.tensor([[False, True, False], [False, False, False]]),
+        evidence_source_step=torch.tensor([[-1, 0, -1], [-1, -1, -1]]),
+        slot_id=torch.tensor([2, 3]), episode_id=("episode", "other"), category=("suite", "suite"),
         segment_provenance=SegmentProvenance("m", "c", "source", 0),
     )
     encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
@@ -61,18 +61,18 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     adapter = CanonicalLocalMemorySegmentAdapter(encoder, core, LocalMemorySegmentSidecar())
     identity = SegmentIdentity(2, "episode", "suite", 0, 0, "source")
     result = adapter.scan(segment, identity=identity)
-    assert result.payloads == (payload0, payload1)
+    assert result.payloads == (payload0, payload1, payload2)
     assert result.locals[0] is None and result.locals[1] is not None
-    assert result.identities == ((2, "episode", 0), (2, "episode", 1))
+    assert result.identities == ((2, "episode", 0), (2, "episode", 1), (3, "other", 0))
     assert result.state_out.fast_in_weight.requires_grad
     with pytest.raises(TypeError):
         adapter.commit(identity, result)
     scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
     assert scheduler.admit((identity,)) == identity
-    transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (2,)), scheduler)
+    transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (3,)), scheduler)
     trainer = object.__new__(ImaginaireTrainer)
     trainer._run_local_memory_segment_backward(
-        transaction.plan, 0, result.locals[1].sum(), torch.zeros((), requires_grad=True), 2,
+        transaction.plan, 0, result.locals[1].sum(), torch.zeros((), requires_grad=True), 3,
         transaction=transaction, identity=identity, clear_slow_grads=lambda: None,
     )
     adapter.commit(identity, result, transaction=transaction)
