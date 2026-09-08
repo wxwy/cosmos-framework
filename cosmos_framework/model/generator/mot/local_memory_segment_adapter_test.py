@@ -69,6 +69,7 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (3,)), scheduler)
     with pytest.raises(TypeError):
         adapter.scan(segment, identity=identity)
+    stale_result = adapter.scan(segment, identity=identity, transaction=transaction)
     result = adapter.scan(segment, identity=identity, transaction=transaction)
     assert result.payloads == (payload0, payload1, payload2)
     assert result.locals[0] is None and result.locals[1] is not None
@@ -87,6 +88,8 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     other_transaction.successful_backward(0, identity, 3)
     with pytest.raises(RuntimeError, match="successful trainer transaction"):
         adapter.commit(identity, result, transaction=other_transaction)
+    with pytest.raises(RuntimeError, match="successful trainer transaction"):
+        adapter.commit(identity, stale_result, transaction=transaction)
     adapter.commit(identity, result, transaction=transaction)
     carried = adapter.sidecar.read(SegmentIdentity(2, "episode", "suite", 1, 1, "source"))
     assert carried is not None and not carried.fast_in_weight.requires_grad

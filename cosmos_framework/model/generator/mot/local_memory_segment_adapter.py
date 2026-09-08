@@ -49,7 +49,7 @@ class LocalMemorySegmentSidecar:
 class CanonicalLocalMemorySegmentAdapter:
     def __init__(self, encoder: LocalEvidenceEncoder, core: ContinualTTTLocalMemoryCore, sidecar: LocalMemorySegmentSidecar) -> None:
         self.encoder, self.core, self.sidecar = encoder, core, sidecar
-        self._pending_scan: tuple[SegmentIdentity, LocalMemoryTransaction] | None = None
+        self._pending_scan: tuple[SegmentIdentity, LocalMemoryTransaction, SegmentScanResult] | None = None
 
     def scan(
         self, segment: SegmentBatch, *, identity: SegmentIdentity, transaction: LocalMemoryTransaction
@@ -65,14 +65,16 @@ class CanonicalLocalMemorySegmentAdapter:
             segment.evidence_valid, state_in, create_graph=True,
         )
         payloads, locals_, identities = segment.gather_consumers(tokens, present)
-        self._pending_scan = (identity, transaction)
-        return SegmentScanResult(tokens, present, state_out, tuple(payloads), tuple(locals_), tuple(identities))
+        result = SegmentScanResult(tokens, present, state_out, tuple(payloads), tuple(locals_), tuple(identities))
+        self._pending_scan = (identity, transaction, result)
+        return result
 
     def commit(self, identity: SegmentIdentity, result: SegmentScanResult, *, transaction: LocalMemoryTransaction) -> None:
         """Persist detached fast state only after the trainer transaction succeeds."""
+        pending = self._pending_scan
         if (transaction.terminal_failure_code is not None or transaction.slow_grads_cleared
                 or not transaction.completed_members or transaction.completed_members[-1] != identity
-                or self._pending_scan != (identity, transaction)):
+                or pending is None or pending[0] != identity or pending[1] is not transaction or pending[2] is not result):
             raise RuntimeError("segment sidecar commit requires successful trainer transaction.")
         self.sidecar.commit(identity, result.state_out)
         self._pending_scan = None
