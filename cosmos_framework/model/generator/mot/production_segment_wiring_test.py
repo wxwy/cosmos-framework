@@ -32,10 +32,15 @@ def _fixture(two_steps: bool = False) -> tuple[CanonicalSegmentWiring, SegmentBa
     scheduler.admit((identity,))
     n_valid = 2 if two_steps else 1
     transaction = LocalMemoryTransaction(GAWindowPlan(((0, "episode", 0),), (n_valid,)), scheduler)
-    adapter = CanonicalLocalMemorySegmentAdapter(
-        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
-        ContinualTTTLocalMemoryCore(), LocalMemorySegmentSidecar(),
-    )
+    if two_steps:
+        with torch.random.fork_rng():
+            torch.manual_seed(0)
+            encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
+            core = ContinualTTTLocalMemoryCore()
+    else:
+        encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
+        core = ContinualTTTLocalMemoryCore()
+    adapter = CanonicalLocalMemorySegmentAdapter(encoder, core, LocalMemorySegmentSidecar())
     local = torch.nn.Parameter(torch.ones(()))
     steps = 2 if two_steps else 1
     evidence_visual = torch.full((1, steps, 96), float("nan"))
@@ -94,4 +99,5 @@ def test_non_s0_spy_counts_visible_local_exactly_once() -> None:
         forward.payloads, forward.locals, forward.result.local_tokens, wiring.local_slow_parameters
     )
     expected = sum(token.sum() for token in forward.locals if token is not None)
+    assert expected.abs() > 1e-6
     torch.testing.assert_close(primary, expected)
