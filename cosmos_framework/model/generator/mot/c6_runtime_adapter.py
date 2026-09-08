@@ -5,6 +5,7 @@ import torch
 
 from .c5a_owner_segment import AdmissionAuthority, AdmissionCapability, C5AOwnerSegmentCPU, ReplayRecord
 from .local_evidence import ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
+from .local_memory_segment import GAWindowPlan, SegmentBatch
 
 
 class C6SyntheticRuntimeAdapter:
@@ -56,3 +57,25 @@ class C6SyntheticRuntimeAdapter:
         """Synthetic Local-disabled bypass used only for parity evidence."""
         packed = (sample.clone(), None)
         return packed, packed[0].square().mean()
+
+
+class CanonicalSegmentRuntimeAdapter:
+    """CPU/static adapter for the canonical SegmentBatch gather/loss seam."""
+
+    @staticmethod
+    def gather(
+        segment: SegmentBatch, local_tokens: torch.Tensor, local_present: torch.Tensor
+    ) -> tuple[list[object], list[torch.Tensor | None], list[tuple[int, str, int]]]:
+        return segment.gather_consumers(local_tokens, local_present)
+
+    @staticmethod
+    def objective(
+        plan: GAWindowPlan,
+        member_index: int,
+        primary_consumer_mean: torch.Tensor,
+        auxiliary_loss: torch.Tensor,
+        actual_n_valid: int,
+    ) -> torch.Tensor:
+        if not torch.isfinite(primary_consumer_mean).all() or not torch.isfinite(auxiliary_loss).all():
+            raise RuntimeError("LOCAL_MEM_NUMERICAL_FAILURE")
+        return plan.objective(member_index, primary_consumer_mean, auxiliary_loss, actual_n_valid)

@@ -2,8 +2,9 @@ import pytest
 import torch
 
 from .c5a_owner_segment import AdmissionAuthority
-from .c6_runtime_adapter import C6SyntheticRuntimeAdapter
+from .c6_runtime_adapter import C6SyntheticRuntimeAdapter, CanonicalSegmentRuntimeAdapter
 from .local_evidence import ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
+from .local_memory_segment import GAWindowPlan
 
 
 def _source(value: float = 0.0) -> dict[str, torch.Tensor]:
@@ -75,6 +76,14 @@ def test_reset_rejects_pending_then_explicit_abort_opens_new_epoch() -> None:
 
 def test_done_without_pending_is_reset_alias() -> None:
     _, adapter = _adapter(); adapter.done("ep/0"); adapter.reset("ep/0")
+
+
+def test_canonical_adapter_uses_partitioned_objective_and_rejects_nonfinite() -> None:
+    plan = GAWindowPlan(members=((0, "episode", 0),), planned_n_valid=(2,))
+    result = CanonicalSegmentRuntimeAdapter.objective(plan, 0, torch.tensor(6.0), torch.tensor(4.0), 2)
+    assert result.item() == 10.0
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_NUMERICAL_FAILURE"):
+        CanonicalSegmentRuntimeAdapter.objective(plan, 0, torch.tensor(float("nan")), torch.tensor(1.0), 2)
 
 
 def test_batch_permutation_is_owner_keyed() -> None:
