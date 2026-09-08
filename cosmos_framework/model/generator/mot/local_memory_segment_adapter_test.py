@@ -22,6 +22,7 @@ from cosmos_framework.model.generator.mot.local_memory_segment_adapter import (
     LocalMemorySegmentSidecar,
     SegmentScanResult,
 )
+from cosmos_framework.model.generator.mot.production_runtime_adapter import ProductionLocalMemoryRuntime
 from cosmos_framework.trainer import ImaginaireTrainer
 
 
@@ -74,6 +75,14 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     assert result.payloads == (payload0, payload1, payload2)
     assert result.locals[0] is None and result.locals[1] is not None
     assert result.identities == ((2, "episode", 0), (2, "episode", 1), (3, "other", 0))
+    calls: list[tuple[object, torch.Tensor | None]] = []
+
+    def consumer_spy(payload: object, local: torch.Tensor | None) -> None:
+        calls.append((payload, local))
+
+    for payload, local in zip(result.payloads, result.locals, strict=True):
+        consumer_spy(payload, local)
+    assert calls == [(payload0, None), (payload1, result.locals[1]), (payload2, None)]
     assert result.state_out.fast_in_weight.requires_grad
     with pytest.raises(TypeError):
         adapter.commit(identity, result)
@@ -134,18 +143,41 @@ def test_adapter_rejects_terminal_failure_without_replacing_committed_carry() ->
     scheduler.admit((identity,))
     scheduler.admit((failed,))
     transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 1),), (1,)), scheduler)
-    transaction.terminal_failure("LOCAL_MEM_OUTER_FAILURE")
+    core = ContinualTTTLocalMemoryCore()
     adapter = CanonicalLocalMemorySegmentAdapter(
         LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
-        ContinualTTTLocalMemoryCore(), LocalMemorySegmentSidecar(),
+        core, LocalMemorySegmentSidecar(),
     )
-    adapter.sidecar.commit(identity, _state())
-    result = SegmentScanResult(torch.zeros(1, 1, 1, 32), torch.zeros(1, 1, dtype=torch.bool), _state(), (), (), ())
+    adapter.sidecar.commit(identity, core.initial_state(1, device=torch.device("cpu")))
+    result = adapter.scan(
+        SegmentBatch(torch.zeros(1, 1, 96), ((object(),),), torch.tensor([[True]]), torch.tensor([[0]]),
+                     torch.full((1, 1, 96), float("nan")), torch.full((1, 1, 10), float("nan")),
+                     torch.tensor([[False]]), torch.tensor([[-1]]), torch.tensor([2]), ("episode",), ("suite",),
+                     SegmentProvenance("m", "c", "source", 1)),
+        identity=failed, transaction=transaction,
+    )
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_OUTER_FAILURE"):
+        object.__new__(ImaginaireTrainer)._run_local_memory_segment_backward(
+            transaction.plan, 0, torch.ones((), requires_grad=True), torch.zeros((), requires_grad=True), 1,
+            transaction=transaction, identity=failed, clear_slow_grads=lambda: None, failure_kind="OUTER",
+        )
     with pytest.raises(RuntimeError, match="successful trainer transaction"):
         adapter.commit(failed, result, transaction=transaction)
     assert adapter.sidecar.read(failed) is not None
     with pytest.raises(ValueError, match="canonical continuation"):
         adapter.sidecar.read(SegmentIdentity(2, "episode", "suite", 2, 2, "source"))
+
+
+def test_disabled_path_preserves_native_payload_loss_and_gradient() -> None:
+    sample = torch.tensor([2.0], requires_grad=True)
+    legacy_packed, legacy_loss = ProductionLocalMemoryRuntime.disabled_path(sample)
+    native = sample.clone()
+    native_loss = native.square().mean()
+    torch.testing.assert_close(legacy_packed[0], native)
+    assert legacy_packed[1] is None
+    torch.testing.assert_close(legacy_loss, native_loss)
+    legacy_loss.backward()
+    torch.testing.assert_close(sample.grad, torch.tensor([4.0]))
 
 
 def test_adapter_terminal_success_deletes_carry_after_trainer_seam() -> None:
