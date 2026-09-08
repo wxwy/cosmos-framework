@@ -8,6 +8,7 @@ import torch
 from torch.nn import functional as F
 
 from cosmos_framework.model.generator.mot.local_evidence import (
+    CANONICAL_EVIDENCE_FEATURE_CONFIG,
     ContinualTTTFastState,
     ContinualTTTFastStateTransition,
     ContinualTTTLocalMemoryCore,
@@ -71,6 +72,23 @@ def test_state_normalization_and_shape_checks() -> None:
     inputs = _inputs()
     with pytest.raises(ValueError, match="local_history_action"):
         encoder(**{**inputs, "local_history_action": torch.zeros(2, 4, 9)})
+
+
+@pytest.mark.L0
+def test_canonical_evidence_encoder_removes_disabled_features() -> None:
+    encoder = LocalEvidenceEncoder(evidence_dim=16, feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
+    names = set(encoder.state_dict())
+    assert not any(name.startswith(("state_proj", "state_mean", "state_std", "dt_proj", "age_embedding")) for name in names)
+    visual = torch.randn(2, 3, 96)
+    action = torch.randn(2, 3, 10)
+    assert encoder.encode_segment(visual, action).shape == (2, 3, 16)
+    with pytest.raises(ValueError, match="history_dt_s is disabled"):
+        encoder(
+            history_visual_summary=visual,
+            local_history_action=action,
+            history_mask=torch.ones(2, 3, dtype=torch.bool),
+            history_dt_s=torch.zeros(2, 3, 1),
+        )
 
 
 @pytest.mark.L0
@@ -221,6 +239,20 @@ def test_continual_ttt_constructor_validation_and_configurable_tbptt() -> None:
     for value in (0, -1, float("nan"), float("inf"), "invalid"):
         with pytest.raises(ValueError, match="inner_lr"):
             ContinualTTTLocalMemoryCore(inner_lr=value)
+
+
+@pytest.mark.L0
+def test_continual_ttt_masked_scan_never_projects_invalid_rows() -> None:
+    core = _continual_ttt_core(ttt_tbptt_steps=3)
+    evidence = torch.randn(2, 3, 5)
+    evidence[1, 0].fill_(float("nan"))
+    evidence[:, 1].fill_(float("nan"))
+    valid = torch.tensor([[True, False, True], [False, False, False]])
+    before = core.initial_state(2)
+    tokens, after, present = core.scan_segment_masked_many(evidence, valid, before, create_graph=False)
+    assert present.tolist() == valid.tolist()
+    assert torch.count_nonzero(tokens[~valid]) == 0
+    assert all(torch.equal(current[1], initial[1]) for current, initial in zip(after, before, strict=True))
 
 
 @pytest.mark.L0

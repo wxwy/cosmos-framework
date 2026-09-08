@@ -10,11 +10,25 @@ Cosmos wiring, and persistent-memory mechanisms belong to later R08/R09 steps.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+@dataclass(frozen=True)
+class EvidenceFeatureConfig:
+    """Construction-time feature inventory for :class:`LocalEvidenceEncoder`."""
+
+    state: bool
+    dt: bool
+    age: bool
+
+
+LEGACY_EVIDENCE_FEATURE_CONFIG = EvidenceFeatureConfig(state=True, dt=True, age=True)
+CANONICAL_EVIDENCE_FEATURE_CONFIG = EvidenceFeatureConfig(state=False, dt=False, age=False)
 
 
 class LocalEvidenceEncoder(nn.Module):
@@ -30,6 +44,7 @@ class LocalEvidenceEncoder(nn.Module):
         state_mean: torch.Tensor | None = None,
         state_std: torch.Tensor | None = None,
         state_std_floor: float = 1e-6,
+        feature_config: EvidenceFeatureConfig = LEGACY_EVIDENCE_FEATURE_CONFIG,
     ) -> None:
         super().__init__()
         if evidence_dim <= 0 or visual_dim <= 0 or action_dim <= 0 or state_dim <= 0 or max_age_steps < 0:
@@ -38,16 +53,24 @@ class LocalEvidenceEncoder(nn.Module):
             raise ValueError("state_mean and state_std must be provided together.")
         if state_std_floor <= 0:
             raise ValueError("state_std_floor must be positive.")
+        if not isinstance(feature_config, EvidenceFeatureConfig):
+            raise ValueError("feature_config must be EvidenceFeatureConfig.")
+        if not feature_config.state and (state_mean is not None or state_std is not None):
+            raise ValueError("state_mean/state_std are disabled by feature_config.")
 
         self.visual_proj = nn.Linear(visual_dim, evidence_dim)
         self.action_proj = nn.Linear(action_dim, evidence_dim)
-        self.age_embedding = nn.Embedding(max_age_steps + 1, evidence_dim)
-        self.dt_proj = nn.Linear(1, evidence_dim)
         self.norm = nn.LayerNorm(evidence_dim)
         self.evidence_dim = evidence_dim
         self.max_age_steps = max_age_steps
-        self.state_proj: nn.Linear | None = None
-        if state_mean is not None and state_std is not None:
+        self.feature_config = feature_config
+        if feature_config.age:
+            self.age_embedding = nn.Embedding(max_age_steps + 1, evidence_dim)
+        if feature_config.dt:
+            self.dt_proj = nn.Linear(1, evidence_dim)
+        if feature_config.state:
+            self.state_proj: nn.Linear | None = None
+        if feature_config.state and state_mean is not None and state_std is not None:
             if tuple(state_mean.shape) != (state_dim,) or tuple(state_std.shape) != (state_dim,):
                 raise ValueError(f"state_mean/state_std must have shape [{state_dim}].")
             if not torch.isfinite(state_mean).all() or not torch.isfinite(state_std).all():
@@ -55,7 +78,7 @@ class LocalEvidenceEncoder(nn.Module):
             self.register_buffer("state_mean", state_mean.detach().float().clone())
             self.register_buffer("state_std", state_std.detach().float().clamp_min(state_std_floor).clone())
             self.state_proj = nn.Linear(state_dim, evidence_dim)
-        else:
+        elif feature_config.state:
             self.register_buffer("state_mean", None, persistent=False)
             self.register_buffer("state_std", None, persistent=False)
 
@@ -69,12 +92,18 @@ class LocalEvidenceEncoder(nn.Module):
         *,
         history_visual_summary: torch.Tensor,
         local_history_action: torch.Tensor,
-        history_age_steps: torch.Tensor,
-        history_dt_s: torch.Tensor,
         history_mask: torch.Tensor,
+        history_age_steps: torch.Tensor | None = None,
+        history_dt_s: torch.Tensor | None = None,
         history_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return ``[B,H,D_e]`` with every masked position exactly zero."""
+        if not self.feature_config.state and history_state is not None:
+            raise ValueError("history_state is disabled by feature_config.")
+        if not self.feature_config.dt and history_dt_s is not None:
+            raise ValueError("history_dt_s is disabled by feature_config.")
+        if not self.feature_config.age and history_age_steps is not None:
+            raise ValueError("history_age_steps is disabled by feature_config.")
         if history_visual_summary.ndim != 3:
             raise ValueError("history_visual_summary must have shape [B,H,D_v].")
         batch, horizon, _ = history_visual_summary.shape
@@ -82,18 +111,26 @@ class LocalEvidenceEncoder(nn.Module):
             history_visual_summary, (batch, horizon, self.visual_proj.in_features), "history_visual_summary"
         )
         self._check_shape(local_history_action, (batch, horizon, self.action_proj.in_features), "local_history_action")
-        self._check_shape(history_age_steps, (batch, horizon), "history_age_steps")
-        self._check_shape(history_dt_s, (batch, horizon, 1), "history_dt_s")
+        if self.feature_config.age:
+            if history_age_steps is None:
+                raise ValueError("history_age_steps is required when the age feature is enabled.")
+            self._check_shape(history_age_steps, (batch, horizon), "history_age_steps")
+        if self.feature_config.dt:
+            if history_dt_s is None:
+                raise ValueError("history_dt_s is required when the dt feature is enabled.")
+            self._check_shape(history_dt_s, (batch, horizon, 1), "history_dt_s")
         self._check_shape(history_mask, (batch, horizon), "history_mask")
         if not torch.isfinite(history_visual_summary).all() or not torch.isfinite(local_history_action).all():
             raise ValueError("Local evidence inputs must be finite.")
 
         encoded = self.visual_proj(history_visual_summary.to(dtype=self.visual_proj.weight.dtype))
         encoded = encoded + self.action_proj(local_history_action.to(dtype=self.action_proj.weight.dtype))
-        encoded = encoded + self.age_embedding(history_age_steps.long().clamp(0, self.max_age_steps))
-        encoded = encoded + self.dt_proj(history_dt_s.to(dtype=encoded.dtype))
+        if self.feature_config.age:
+            encoded = encoded + self.age_embedding(history_age_steps.long().clamp(0, self.max_age_steps))
+        if self.feature_config.dt:
+            encoded = encoded + self.dt_proj(history_dt_s.to(dtype=encoded.dtype))
 
-        if history_state is not None:
+        if self.feature_config.state and history_state is not None:
             if self.state_proj is None or self.state_mean is None or self.state_std is None:
                 raise ValueError("history_state requires explicit training-split state_mean/state_std.")
             self._check_shape(history_state, (batch, horizon, self.state_proj.in_features), "history_state")
@@ -101,10 +138,25 @@ class LocalEvidenceEncoder(nn.Module):
                 raise ValueError("history_state must be finite.")
             normalized_state = (history_state.to(dtype=encoded.dtype) - self.state_mean) / self.state_std
             encoded = encoded + self.state_proj(normalized_state)
-        elif self.state_proj is not None:
+        elif self.feature_config.state and self.state_proj is not None:
             raise ValueError("history_state is required when the state adapter is enabled.")
 
         return self.norm(encoded) * history_mask.to(dtype=encoded.dtype).unsqueeze(-1)
+
+    def encode_segment(self, visual_summary: torch.Tensor, executed_action: torch.Tensor) -> torch.Tensor:
+        """Encode canonical Local-Memory evidence without state/dt/age features."""
+        if self.feature_config != CANONICAL_EVIDENCE_FEATURE_CONFIG:
+            raise ValueError("encode_segment requires CANONICAL_EVIDENCE_FEATURE_CONFIG.")
+        if visual_summary.ndim != 3:
+            raise ValueError("visual_summary must have shape [B,T,D_v].")
+        batch, steps, _ = visual_summary.shape
+        self._check_shape(visual_summary, (batch, steps, self.visual_proj.in_features), "visual_summary")
+        self._check_shape(executed_action, (batch, steps, self.action_proj.in_features), "executed_action")
+        if not torch.isfinite(visual_summary).all() or not torch.isfinite(executed_action).all():
+            raise ValueError("canonical Local evidence inputs must be finite.")
+        encoded = self.visual_proj(visual_summary.to(dtype=self.visual_proj.weight.dtype))
+        encoded = encoded + self.action_proj(executed_action.to(dtype=encoded.dtype))
+        return self.norm(encoded)
 
 
 class StatelessLocalReplayReadout(nn.Module):
@@ -597,6 +649,60 @@ class ContinualTTTLocalMemoryCore(nn.Module):
                 create_graph=create_graph,
                 emit_prewrite_tokens=emit_prewrite_tokens,
             )
+            tokens.append(token)
+            present.append(step_present)
+        return torch.stack(tokens, dim=1), state, torch.stack(present, dim=1)
+
+    @staticmethod
+    def _select_rows(state: ContinualTTTFastState, rows: torch.Tensor) -> ContinualTTTFastState:
+        return ContinualTTTFastState(*(value.index_select(0, rows) for value in state))
+
+    @staticmethod
+    def _scatter_rows(
+        state: ContinualTTTFastState, rows: torch.Tensor, replacement: ContinualTTTFastState
+    ) -> ContinualTTTFastState:
+        return ContinualTTTFastState(*(value.index_copy(0, rows, update) for value, update in zip(state, replacement, strict=True)))
+
+    def scan_segment_masked_many(
+        self,
+        evidence: torch.Tensor,
+        valid: torch.Tensor,
+        state_in: ContinualTTTFastState | None = None,
+        *,
+        create_graph: bool = True,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        """Scan only valid rows, before any evidence projection or finite check."""
+        if torch.is_inference_mode_enabled() or not torch.is_grad_enabled():
+            raise RuntimeError("Continual TTT update requires ordinary grad mode.")
+        if evidence.ndim != 3:
+            raise ValueError("evidence must have shape [B,T,D_e].")
+        batch, steps, width = evidence.shape
+        if width != self.evidence_dim or tuple(valid.shape) != (batch, steps):
+            raise ValueError("evidence/valid shapes are incompatible.")
+        if steps <= 0 or steps > self.ttt_tbptt_steps:
+            raise ValueError("segment length must be in [1, ttt_tbptt_steps].")
+        state = self.initial_state(batch, device=evidence.device) if state_in is None else state_in
+        self._validate_state(state, batch)
+        tokens, present = [], []
+        for index in range(steps):
+            rows = valid[:, index].bool().nonzero(as_tuple=False).flatten()
+            token = torch.zeros(batch, self.k_local, self.local_dim, device=state.fast_in_weight.device, dtype=torch.float32)
+            step_present = torch.zeros(batch, dtype=torch.bool, device=state.fast_in_weight.device)
+            if rows.numel():
+                compact_state = self._select_rows(state, rows)
+                compact_evidence = evidence[:, index].index_select(0, rows)
+                key_t, query_base_t, value_t = self.project_evidence(compact_evidence)
+                compact_token, compact_state, _ = self.step_projected_many(
+                    key_t=key_t,
+                    query_base_t=query_base_t,
+                    value_t=value_t,
+                    state_in=compact_state,
+                    valid=torch.ones(rows.numel(), dtype=torch.bool, device=rows.device),
+                    create_graph=create_graph,
+                )
+                state = self._scatter_rows(state, rows, compact_state)
+                token = token.index_copy(0, rows, compact_token)
+                step_present = step_present.index_fill(0, rows, True)
             tokens.append(token)
             present.append(step_present)
         return torch.stack(tokens, dim=1), state, torch.stack(present, dim=1)
