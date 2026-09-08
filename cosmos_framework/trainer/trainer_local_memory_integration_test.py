@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from cosmos_framework.model.generator.mot.local_memory_segment import GAWindowPlan, LocalMemoryTransaction, RankLocalSegmentScheduler, SegmentIdentity
+from cosmos_framework.model.generator.mot.local_memory_segment import (
+    GAWindowPlan,
+    LocalMemoryTransaction,
+    RankLocalSegmentScheduler,
+    SegmentIdentity,
+)
 from cosmos_framework.trainer import ImaginaireTrainer
 
 
@@ -28,7 +33,8 @@ def test_local_memory_segment_terminal_failures_clear_without_fast_commit() -> N
     trainer = object.__new__(ImaginaireTrainer)
     identity = SegmentIdentity(0, "episode", "suite", 0, 0, "digest")
     plan = GAWindowPlan(members=((0, "episode", 0),), planned_n_valid=(1,))
-    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0}); scheduler.admit([identity])
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit([identity])
     transaction = LocalMemoryTransaction(plan, scheduler)
     events: list[str] = []
     with pytest.raises(RuntimeError, match="LOCAL_MEM_IDENTITY_CONTRACT_FAILURE"):
@@ -37,13 +43,17 @@ def test_local_memory_segment_terminal_failures_clear_without_fast_commit() -> N
             transaction=transaction, identity=SegmentIdentity(1, "other", "suite", 0, 0, "digest"), clear_slow_grads=lambda: events.append("clear"),
         )
     assert events == ["clear"]
+    snapshot = transaction.snapshot()
+    assert snapshot.terminal_failure_code == "LOCAL_MEM_IDENTITY_CONTRACT_FAILURE"
+    assert snapshot.remaining_members_suppressed
 
 
 def test_local_memory_segment_planned_actual_mismatch_is_identity_terminal() -> None:
     trainer = object.__new__(ImaginaireTrainer)
     identity = SegmentIdentity(0, "episode", "suite", 0, 0, "digest")
     plan = GAWindowPlan(members=((0, "episode", 0),), planned_n_valid=(2,))
-    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0}); scheduler.admit([identity])
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit([identity])
     transaction = LocalMemoryTransaction(plan, scheduler)
     events: list[str] = []
     with pytest.raises(RuntimeError, match="LOCAL_MEM_IDENTITY_CONTRACT_FAILURE"):
@@ -52,3 +62,72 @@ def test_local_memory_segment_planned_actual_mismatch_is_identity_terminal() -> 
             transaction=transaction, identity=identity, clear_slow_grads=lambda: events.append("clear"),
         )
     assert events == ["clear"]
+
+
+def test_local_memory_segment_transient_recovers_exact_suffix_and_preserves_prior_fast_commit() -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    identities = (
+        SegmentIdentity(0, "episode", "suite", 0, 0, "digest"),
+        SegmentIdentity(0, "episode", "suite", 1, 0, "digest"),
+    )
+    plan = GAWindowPlan(tuple((item.slot_id, item.episode_id, item.cursor) for item in identities), (2, 3), plan_chain_id="chain")
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    for identity in identities:
+        scheduler.admit([identity])
+    transaction = LocalMemoryTransaction(plan, scheduler)
+    trainer._run_local_memory_segment_backward(
+        plan, 0, torch.tensor(1.0, requires_grad=True), torch.tensor(0.0), 2,
+        transaction=transaction, identity=identities[0], clear_slow_grads=lambda: None,
+    )
+    events: list[str] = []
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_SUFFIX_RECOVERY"):
+        trainer._run_local_memory_segment_backward(
+            plan, 1, torch.tensor(1.0, requires_grad=True), torch.tensor(0.0), 3,
+            transaction=transaction, identity=identities[1], clear_slow_grads=lambda: events.append("clear"),
+            failure_kind="LOAD_DECODE_TRANSIENT",
+        )
+    snapshot = transaction.snapshot()
+    assert events == ["clear"]
+    assert snapshot.completed_members == (identities[0],)
+    assert snapshot.suffix_recovery is not None and snapshot.suffix_recovery.members == (plan.members[1],)
+    assert snapshot.terminal_failure_code is None and not snapshot.remaining_members_suppressed
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected"),
+    [("LOAD_DECODE_TRANSIENT", "LOCAL_MEM_RETRY_EXHAUSTED"), ("NUMERICAL", "LOCAL_MEM_NUMERICAL_FAILURE"), ("OUTER", "LOCAL_MEM_OUTER_FAILURE")],
+)
+def test_local_memory_segment_terminal_taxonomy_clears_and_suppresses(failure_kind: str, expected: str) -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    identity = SegmentIdentity(0, "episode", "suite", 0, 0, "digest")
+    plan = GAWindowPlan(((0, "episode", 0),), (1,), attempt=1 if failure_kind == "LOAD_DECODE_TRANSIENT" else 0)
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit([identity])
+    transaction = LocalMemoryTransaction(plan, scheduler)
+    events: list[str] = []
+    with pytest.raises(RuntimeError, match=expected):
+        trainer._run_local_memory_segment_backward(
+            plan, 0, torch.tensor(1.0, requires_grad=True), torch.tensor(0.0), 1,
+            transaction=transaction, identity=identity, clear_slow_grads=lambda: events.append("clear"), failure_kind=failure_kind,
+        )
+    snapshot = transaction.snapshot()
+    assert events == ["clear"] and snapshot.completed_members == ()
+    assert snapshot.terminal_failure_code == expected and snapshot.remaining_members_suppressed
+
+
+def test_local_memory_segment_grad_scaler_skip_clears_slow_side_without_fast_commit() -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    identity = SegmentIdentity(0, "episode", "suite", 0, 0, "digest")
+    plan = GAWindowPlan(((0, "episode", 0),), (1,))
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit([identity])
+    transaction = LocalMemoryTransaction(plan, scheduler)
+    events: list[str] = []
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_GRAD_SCALER_SKIP"):
+        trainer._run_local_memory_segment_backward(
+            plan, 0, torch.tensor(1.0, requires_grad=True), torch.tensor(0.0), 1,
+            transaction=transaction, identity=identity, clear_slow_grads=lambda: events.append("clear"), grad_scaler_skip=True,
+        )
+    snapshot = transaction.snapshot()
+    assert events == ["clear"] and snapshot.completed_members == ()
+    assert snapshot.slow_grads_cleared and snapshot.slow_optimizer_steps == snapshot.slow_lr_scheduler_steps == 0

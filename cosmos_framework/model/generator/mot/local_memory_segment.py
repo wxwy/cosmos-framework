@@ -172,6 +172,9 @@ class LocalMemoryTransactionSnapshot:
     slow_grads_cleared: bool
     slow_optimizer_steps: int
     slow_lr_scheduler_steps: int
+    terminal_failure_code: str | None
+    remaining_members_suppressed: bool
+    suffix_recovery: GAWindowPlan | None
 
 
 class LocalMemoryTransaction:
@@ -190,8 +193,12 @@ class LocalMemoryTransaction:
         self.slow_grads_cleared = False
         self.slow_optimizer_steps = 0
         self.slow_lr_scheduler_steps = 0
+        self.terminal_failure_code: str | None = None
+        self.remaining_members_suppressed = False
+        self.suffix_recovery: GAWindowPlan | None = None
 
-    def successful_backward(self, index: int, identity: SegmentIdentity, actual_n_valid: int) -> None:
+    def validate_success(self, index: int, identity: SegmentIdentity, actual_n_valid: int) -> None:
+        """Validate frozen GA identity/count before the member backward runs."""
         if index != len(self.completed_members) or self.plan.members[index] != (
             identity.slot_id,
             identity.episode_id,
@@ -200,6 +207,9 @@ class LocalMemoryTransaction:
             raise ValueError("successful backward must follow the frozen GA plan order.")
         if actual_n_valid != self.plan.planned_n_valid[index]:
             raise ValueError("actual gathered count must equal planned count.")
+
+    def successful_backward(self, index: int, identity: SegmentIdentity, actual_n_valid: int) -> None:
+        self.validate_success(index, identity, actual_n_valid)
         self.scheduler.commit(identity, actual_n_valid)
         self.completed_members.append(identity)
 
@@ -209,6 +219,16 @@ class LocalMemoryTransaction:
             raise ValueError("failure index must follow completed members.")
         self.slow_grads_cleared = True
         return self.plan.suffix_after_failure(failed_index)
+
+    def recover_transient(self, failed_index: int) -> GAWindowPlan:
+        self.suffix_recovery = self.fail_transient(failed_index)
+        return self.suffix_recovery
+
+    def terminal_failure(self, code: str) -> None:
+        """Suppress the unexecuted suffix without rolling back prior fast commits."""
+        self.slow_grads_cleared = True
+        self.terminal_failure_code = code
+        self.remaining_members_suppressed = True
 
     def grad_scaler_skip(self) -> None:
         self.slow_grads_cleared = True
@@ -226,6 +246,9 @@ class LocalMemoryTransaction:
             slow_grads_cleared=self.slow_grads_cleared,
             slow_optimizer_steps=self.slow_optimizer_steps,
             slow_lr_scheduler_steps=self.slow_lr_scheduler_steps,
+            terminal_failure_code=self.terminal_failure_code,
+            remaining_members_suppressed=self.remaining_members_suppressed,
+            suffix_recovery=self.suffix_recovery,
         )
 
 

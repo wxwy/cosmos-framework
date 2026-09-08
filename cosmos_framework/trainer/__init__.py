@@ -557,23 +557,42 @@ class ImaginaireTrainer:
         transaction: object,
         identity: object,
         clear_slow_grads: Callable[[], None],
+        failure_kind: str | None = None,
+        grad_scaler_skip: bool = False,
     ) -> torch.Tensor:
         """CPU/static-only canonical Local primary/auxiliary loss seam."""
         from cosmos_framework.model.generator.mot.c6_runtime_adapter import CanonicalSegmentRuntimeAdapter
+
+        if failure_kind is not None:
+            code, retry = CanonicalSegmentRuntimeAdapter.classify_failure(failure_kind, transaction.plan.attempt)
+            clear_slow_grads()
+            if retry:
+                transaction.recover_transient(member_index)
+                raise RuntimeError("LOCAL_MEM_SUFFIX_RECOVERY")
+            transaction.terminal_failure(code)
+            raise RuntimeError(code)
+        if grad_scaler_skip:
+            clear_slow_grads()
+            transaction.grad_scaler_skip()
+            raise RuntimeError("LOCAL_MEM_GRAD_SCALER_SKIP")
 
         try:
             loss = CanonicalSegmentRuntimeAdapter.objective(
                 plan, member_index, primary_consumer_mean, auxiliary_loss, actual_n_valid
             )
-            transaction.successful_backward(member_index, identity, actual_n_valid)
+            transaction.validate_success(member_index, identity, actual_n_valid)
             loss.backward()
+            transaction.successful_backward(member_index, identity, actual_n_valid)
         except ValueError as error:
             clear_slow_grads()
+            transaction.terminal_failure("LOCAL_MEM_IDENTITY_CONTRACT_FAILURE")
             raise RuntimeError("LOCAL_MEM_IDENTITY_CONTRACT_FAILURE") from error
         except RuntimeError as error:
             clear_slow_grads()
             if str(error) == "LOCAL_MEM_NUMERICAL_FAILURE":
+                transaction.terminal_failure("LOCAL_MEM_NUMERICAL_FAILURE")
                 raise
+            transaction.terminal_failure("LOCAL_MEM_OUTER_FAILURE")
             raise RuntimeError("LOCAL_MEM_OUTER_FAILURE") from error
         return loss
 
