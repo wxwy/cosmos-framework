@@ -127,10 +127,16 @@ def test_scheduler_terminal_rebind_is_per_slot_and_snapshot_safe() -> None:
     other_continuation = SegmentIdentity(1, "other", "b", 1, 4, "source")
     assert rebuilt.admit((other_continuation,)) == other_continuation
     rebuilt.commit(other_continuation, 1)
-    replacement = SegmentIdentity(0, "next", "a", 0, 4, "source")
-    rebuilt.terminal_rebind(terminal, replacement)
-    assert rebuilt.stable_slots[0] == replacement
-    rebuilt.commit(replacement, 1)
+    replacement = SegmentIdentity(0, "next-a", "a", 0, 4, "source")
+    scheduled = SegmentIdentity(0, "next-b", "b", 0, 4, "source")
+    rebuilt.terminal_rebind(terminal)
+    assert 0 not in rebuilt.terminal_slots and 0 not in rebuilt.stable_slots
+    with pytest.raises(ValueError, match="only one admitted"):
+        rebuilt.commit(replacement, 1)
+    assert rebuilt.admit((replacement, scheduled)) == scheduled
+    rebuilt.commit(scheduled, 1)
+    rebound = RankLocalSegmentScheduler.rebuild(rebuilt.snapshot())
+    assert rebound.snapshot() == rebuilt.snapshot()
 
 
 def test_scheduler_rejects_slot_switches_and_noncontiguous_cursor() -> None:

@@ -297,17 +297,11 @@ class RankLocalSegmentScheduler:
         self.queue_permutation = tuple(permutation)
         self.segment_provenance = provenance
 
-    def terminal_rebind(self, identity: SegmentIdentity, replacement: SegmentIdentity) -> None:
-        if (
-            identity.slot_id != replacement.slot_id
-            or self.terminal_slots.get(identity.slot_id) != identity
-            or replacement.category not in self.target_distribution
-            or replacement.cursor != 0
-        ):
+    def terminal_rebind(self, identity: SegmentIdentity) -> None:
+        if self.terminal_slots.get(identity.slot_id) != identity:
             raise ValueError("terminal rebind requires the terminal stable slot.")
         del self.terminal_slots[identity.slot_id]
-        self.stable_slots[identity.slot_id] = replacement
-        self.admission_order.append(replacement)
+        del self.stable_slots[identity.slot_id]
 
     def training_stream_end(self, identity: SegmentIdentity) -> None:
         if not identity.training_stream_end or self.stable_slots.get(identity.slot_id) != identity:
