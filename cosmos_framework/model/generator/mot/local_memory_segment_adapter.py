@@ -59,3 +59,7 @@ class CanonicalLocalMemorySegmentAdapter:
         )
         payloads, locals_, identities = segment.gather_consumers(tokens, present)
         return SegmentScanResult(tokens, present, state_out, tuple(payloads), tuple(locals_), tuple(identities))
+
+    def commit(self, identity: SegmentIdentity, result: SegmentScanResult) -> None:
+        """Persist detached fast state only after the trainer transaction succeeds."""
+        self.sidecar.commit(identity, result.state_out)
