@@ -51,13 +51,15 @@ def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
         consumer_payload=((payload0, payload1, None), (payload2, None, None)),
         consumer_valid=torch.tensor([[True, True, False], [True, False, False]]),
         consumer_step=torch.tensor([[0, 1, -1], [0, -1, -1]]),
-        evidence_visual_summary_prev=torch.randn(2, 3, 96),
-        evidence_executed_action_prev=torch.randn(2, 3, 10),
+        evidence_visual_summary_prev=torch.tensor(float("nan")).expand(2, 3, 96).clone(),
+        evidence_executed_action_prev=torch.tensor(float("nan")).expand(2, 3, 10).clone(),
         evidence_valid=torch.tensor([[False, True, False], [False, False, False]]),
         evidence_source_step=torch.tensor([[-1, 0, -1], [-1, -1, -1]]),
         slot_id=torch.tensor([2, 3]), episode_id=("episode", "other"), category=("suite", "suite"),
         segment_provenance=SegmentProvenance("m", "c", "source", 0),
     )
+    segment.evidence_visual_summary_prev[0, 1] = torch.randn(96)
+    segment.evidence_executed_action_prev[0, 1] = torch.randn(10)
     encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
     core = ContinualTTTLocalMemoryCore(ttt_tbptt_steps=3)
     adapter = CanonicalLocalMemorySegmentAdapter(encoder, core, LocalMemorySegmentSidecar())
@@ -95,13 +97,28 @@ def test_adapter_rejects_grad_scaler_skip_sidecar_write() -> None:
     scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
     scheduler.admit((identity,))
     transaction = LocalMemoryTransaction(GAWindowPlan(((2, "episode", 0),), (1,)), scheduler)
-    transaction.grad_scaler_skip()
-    state = _state()
-    result = SegmentScanResult(torch.zeros(1, 1, 1, 32), torch.zeros(1, 1, dtype=torch.bool), state, (), (), ())
+    core = ContinualTTTLocalMemoryCore()
     adapter = CanonicalLocalMemorySegmentAdapter(
-        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
-        ContinualTTTLocalMemoryCore(), LocalMemorySegmentSidecar(),
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), core, LocalMemorySegmentSidecar(),
     )
+    result = adapter.scan(
+        SegmentBatch(
+            consumer_visual_summary=torch.zeros(1, 1, 96), consumer_payload=((object(),),),
+            consumer_valid=torch.tensor([[True]]), consumer_step=torch.tensor([[0]]),
+            evidence_visual_summary_prev=torch.full((1, 1, 96), float("nan")),
+            evidence_executed_action_prev=torch.full((1, 1, 10), float("nan")),
+            evidence_valid=torch.tensor([[False]]), evidence_source_step=torch.tensor([[-1]]),
+            slot_id=torch.tensor([2]), episode_id=("episode",), category=("suite",),
+            segment_provenance=SegmentProvenance("m", "c", "source", 0),
+        ),
+        identity=identity, transaction=transaction,
+    )
+    trainer = object.__new__(ImaginaireTrainer)
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_GRAD_SCALER_SKIP"):
+        trainer._run_local_memory_segment_backward(
+            transaction.plan, 0, torch.ones((), requires_grad=True), torch.zeros((), requires_grad=True), 1,
+            transaction=transaction, identity=identity, clear_slow_grads=lambda: None, grad_scaler_skip=True,
+        )
     with pytest.raises(RuntimeError, match="successful trainer transaction"):
         adapter.commit(identity, result, transaction=transaction)
     assert adapter.sidecar.read(SegmentIdentity(2, "replacement", "suite", 0, 1, "source")) is None
