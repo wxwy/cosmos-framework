@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Optional
 
@@ -69,6 +69,45 @@ def _group_metric_values(payload: torch.Tensor) -> tuple[float, float | None]:
     """Return parameter L2 and optional gradient L2 from a reduced group payload."""
     param_sq_sum, grad_sq_sum, grad_present_count = payload.tolist()
     return param_sq_sum**0.5, None if grad_present_count == 0 else grad_sq_sum**0.5
+
+
+def _local_sq_sum(tensor: torch.Tensor, *, detach: bool) -> torch.Tensor:
+    data = tensor.detach() if detach else tensor
+    if isinstance(data, DTensor):
+        data = data.to_local()
+    return (data.float() ** 2).sum()
+
+
+def _build_group_payloads(
+    groups: Mapping[str, tuple[str, ...]],
+    named_parameters: Mapping[str, nn.Parameter],
+    *,
+    device: torch.device | str | None = None,
+) -> dict[str, torch.Tensor]:
+    """Build one local packed norm payload for each canonical Local slow group."""
+    payloads = {group: torch.zeros(3, device=device, dtype=torch.float32) for group in groups}
+    assigned_names: set[str] = set()
+    for param_name, param in named_parameters.items():
+        group = _selector_group_for_name(groups, param_name)
+        if group is None or "net_ema" in param_name:
+            continue
+        if param_name in assigned_names:
+            raise ValueError("parameter was counted more than once")
+        assigned_names.add(param_name)
+        payloads[group][0] += _local_sq_sum(param, detach=True)
+        if param.grad is not None:
+            payloads[group][1] += _local_sq_sum(param.grad, detach=False)
+            payloads[group][2] += 1
+    return payloads
+
+
+def _reduce_group_payloads(
+    payloads: Mapping[str, torch.Tensor],
+    all_reduce: Callable[..., None] = dist.all_reduce,
+) -> None:
+    """Issue the single packed SUM collective required for each Local slow group."""
+    for payload in payloads.values():
+        all_reduce(payload, op=dist.ReduceOp.SUM)
 
 
 class NormMonitor(Callback):
@@ -331,24 +370,16 @@ class NormMonitor(Callback):
                 per_grad_stats[param_name] = self._compute_l2_stats(param.grad, detach=False)
                 local_grad_sq_sum += per_grad_stats[param_name]["sq_sum"]
 
-        group_payloads: dict[str, torch.Tensor] = {}
-        if self.parameter_selector_groups is not None:
-            for group in self.parameter_selector_groups:
-                group_payloads[group] = torch.zeros(3, device="cuda", dtype=torch.float32)
-            for param_name, param in named_parameters.items():
-                group = _selector_group_for_name(self.parameter_selector_groups, param_name)
-                if group is None or "net_ema" in param_name:
-                    continue
-                group_payloads[group][0] += self._compute_l2_stats(param)["sq_sum"]
-                if param.grad is not None:
-                    group_payloads[group][1] += self._compute_l2_stats(param.grad, detach=False)["sq_sum"]
-                    group_payloads[group][2] += 1
+        group_payloads = (
+            _build_group_payloads(self.parameter_selector_groups, named_parameters, device="cuda")
+            if self.parameter_selector_groups is not None
+            else {}
+        )
 
         # All-reduce to aggregate statistics across all FSDP ranks
         dist.all_reduce(local_param_sq_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_grad_sq_sum, op=dist.ReduceOp.SUM)
-        for payload in group_payloads.values():
-            dist.all_reduce(payload, op=dist.ReduceOp.SUM)
+        _reduce_group_payloads(group_payloads)
 
         # All-reduce per-parameter stats
         for param_name, stats_dict in per_param_stats.items():
