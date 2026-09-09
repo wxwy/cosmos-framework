@@ -3,39 +3,121 @@ from __future__ import annotations
 import pytest
 import torch
 
-from cosmos_framework.model.generator.mot.canonical_segment_runtime import CanonicalSegmentRuntimeOwner, RuntimePhase
+from cosmos_framework.model.generator.mot.canonical_segment_runtime import CanonicalSegmentRuntimeOwner
 from cosmos_framework.model.generator.mot.local_evidence import CANONICAL_EVIDENCE_FEATURE_CONFIG, ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
-from cosmos_framework.model.generator.mot.local_memory_segment import GAWindowPlan, RankLocalSegmentScheduler, SegmentIdentity
+from cosmos_framework.model.generator.mot.local_memory_segment import GAWindowPlan, RankLocalSegmentScheduler, SegmentBatch, SegmentIdentity, SegmentProvenance
 from cosmos_framework.model.generator.mot.local_memory_segment_adapter import CanonicalLocalMemorySegmentAdapter, LocalMemorySegmentSidecar
 from cosmos_framework.model.generator.mot.production_segment_wiring import CanonicalSegmentWiring
 
 
-def _owner() -> tuple[CanonicalSegmentRuntimeOwner, SegmentIdentity]:
+def _owner() -> CanonicalSegmentRuntimeOwner:
     scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
     adapter = CanonicalLocalMemorySegmentAdapter(LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(), LocalMemorySegmentSidecar())
-    return CanonicalSegmentRuntimeOwner(scheduler, CanonicalSegmentWiring(adapter, (torch.nn.Parameter(torch.ones(())),))), SegmentIdentity(0, "episode", "suite", 0, 0, "source")
+    return CanonicalSegmentRuntimeOwner(scheduler, CanonicalSegmentWiring(adapter, (torch.nn.Parameter(torch.ones(())),)))
 
 
-def test_skip_resume_reuses_exact_admission_and_plan() -> None:
-    owner, identity = _owner()
+def _identity(slot: int = 0, cursor: int = 0, *, terminal: bool = False) -> SegmentIdentity:
+    return SegmentIdentity(slot, f"episode-{slot}", "suite", cursor, cursor, "source", terminal)
+
+
+def _segment(identity: SegmentIdentity) -> SegmentBatch:
+    return SegmentBatch(
+        torch.zeros(1, 1, 96), ((object(),),), torch.ones(1, 1, dtype=torch.bool), torch.zeros(1, 1, dtype=torch.long),
+        torch.full((1, 1, 96), float("nan")), torch.full((1, 1, 10), float("nan")),
+        torch.zeros(1, 1, dtype=torch.bool), torch.full((1, 1), -1, dtype=torch.long), torch.tensor([identity.slot_id]),
+        (identity.episode_id,), (identity.category,), SegmentProvenance("manifest", "config", identity.source_digest, identity.segment_id),
+    )
+
+
+def _prepare(owner: CanonicalSegmentRuntimeOwner, identity: SegmentIdentity, plan: GAWindowPlan):
     owner.admit((identity,))
-    plan = GAWindowPlan(((0, "episode", 0),), (1,))
     transaction = owner.begin(plan)
-    # The full prepared path is covered by adapter integration fixtures; this
-    # CPU owner fixture proves only retained admission/plan authority.
-    owner.phase = RuntimePhase.SKIP_READY
-    owner._skipped_identity, owner._skipped_plan = identity, plan
+    return transaction, owner.prepare(_segment(identity))
+
+
+def _commit(owner: CanonicalSegmentRuntimeOwner, transaction, forward, identity: SegmentIdentity, index: int = 0) -> None:
+    transaction.successful_backward(index, identity, transaction.plan.planned_n_valid[index])
+    owner.commit(transaction, forward)
+
+
+def test_public_commit_finish_and_snapshot_are_consistent() -> None:
+    owner, identity = _owner(), _identity()
+    plan = GAWindowPlan(((identity.slot_id, identity.episode_id, identity.cursor),), (1,))
+    transaction, forward = _prepare(owner, identity, plan)
+    _commit(owner, transaction, forward, identity)
+    owner.finish_window(transaction)
+    snapshot = owner.snapshot()
+    assert snapshot.scheduler["stable_slots"][identity.slot_id] is identity
+    assert snapshot.committed[0][0] is identity
+
+
+def test_public_two_member_continuation_rejects_wrong_candidate_without_mutation() -> None:
+    owner, first, second = _owner(), _identity(), _identity(cursor=1)
+    plan = GAWindowPlan(((0, first.episode_id, 0), (0, first.episode_id, 1)), (1, 1))
+    transaction, forward = _prepare(owner, first, plan)
+    _commit(owner, transaction, forward, first)
+    before = owner.scheduler.snapshot()
+    with pytest.raises(RuntimeError, match="frozen plan"):
+        owner.admit_next((_identity(slot=1),))
+    assert owner.scheduler.snapshot() == before
+    assert owner.admit_next((second,)) is second
+    forward = owner.prepare(_segment(second))
+    _commit(owner, transaction, forward, second, 1)
+    owner.finish_window(transaction)
+    assert len(owner.snapshot().committed) == 1
+
+
+def test_public_scaler_skip_resume_keeps_exact_admission() -> None:
+    owner, identity = _owner(), _identity()
+    plan = GAWindowPlan(((0, identity.episode_id, 0),), (1,))
+    transaction, forward = _prepare(owner, identity, plan)
+    owner.abort_scaler_skip(transaction, forward)
     resumed = owner.resume_skipped()
-    assert resumed.plan is plan
-    assert owner.identity is identity
-    assert owner.phase is RuntimePhase.MEMBER_READY
+    assert owner.identity is identity and resumed.plan is plan
+    forward = owner.prepare(_segment(identity))
+    _commit(owner, resumed, forward, identity)
+    owner.finish_window(resumed)
 
 
-def test_skip_resume_rejects_replacement_or_committed_identity() -> None:
-    owner, identity = _owner()
-    owner.admit((identity,))
-    owner.phase, owner._skipped_identity = RuntimePhase.SKIP_READY, identity
-    owner._skipped_plan = GAWindowPlan(((0, "episode", 0),), (1,), attempt=1)
-    with pytest.raises(RuntimeError, match="retained exact authority"):
-        owner.resume_skipped()
-    assert owner.phase is RuntimePhase.SKIP_READY
+def test_public_retry_rejects_same_projection_replacement_identity() -> None:
+    owner, identity = _owner(), _identity()
+    plan = GAWindowPlan(((0, identity.episode_id, 0),), (1,))
+    transaction, forward = _prepare(owner, identity, plan)
+    retry = owner.abort_retry(transaction, forward)
+    owner.scheduler.stable_slots[identity.slot_id] = SegmentIdentity(0, identity.episode_id, "suite", 0, 99, "other")
+    with pytest.raises(RuntimeError, match="retained admitted identity"):
+        owner.begin_retry(retry)
+
+
+def test_public_retry_then_terminal_commit_has_no_sidecar_frontier() -> None:
+    owner, identity = _owner(), _identity(terminal=True)
+    plan = GAWindowPlan(((0, identity.episode_id, 0),), (1,))
+    transaction, forward = _prepare(owner, identity, plan)
+    retry = owner.abort_retry(transaction, forward)
+    transaction = owner.begin_retry(retry)
+    forward = owner.prepare(_segment(identity))
+    _commit(owner, transaction, forward, identity)
+    owner.finish_window(transaction)
+    snapshot = owner.snapshot()
+    assert snapshot.committed == ()
+    assert identity.slot_id in snapshot.scheduler["terminal_slots"]
+
+
+def test_public_terminal_abort_discards_pending_without_commit() -> None:
+    owner, identity = _owner(), _identity()
+    plan = GAWindowPlan(((0, identity.episode_id, 0),), (1,))
+    transaction, forward = _prepare(owner, identity, plan)
+    owner.abort_terminal(transaction, forward, "synthetic-terminal")
+    assert owner.adapter.pending() is None
+    assert owner.adapter.committed_snapshot() == ()
+    with pytest.raises(RuntimeError, match="idle committed frontier"):
+        owner.snapshot()
+
+
+def test_snapshot_rejects_admitted_uncommitted_residue_and_second_owner() -> None:
+    owner = _owner()
+    with pytest.raises(RuntimeError, match="exactly one runtime owner"):
+        CanonicalSegmentRuntimeOwner(owner.scheduler, owner.wiring)
+    owner.scheduler.admit((_identity(),))
+    with pytest.raises(RuntimeError, match="admitted-but-uncommitted"):
+        owner.snapshot()
