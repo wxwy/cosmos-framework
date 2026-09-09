@@ -293,3 +293,27 @@ def test_active_model_and_trainer_consume_one_capability_and_complete_window() -
     assert owner.phase.name == "SLOW_RESOLUTION_PENDING"
     assert prepared.transaction.snapshot().completed_members == (identity,)
     assert trainer._psm_active_completed_window.owner is owner
+
+
+def test_active_two_member_window_keeps_one_registry_token_until_completion() -> None:
+    owner, identity, segment, _ = _fixture()
+    next_identity = SegmentIdentity(0, "episode", "suite", 1, 1, "source")
+    plan = GAWindowPlan(((0, "episode", 0), (0, "episode", 1)), (1, 1))
+    registry = ProductionActiveWiringRegistry(owner)
+    model = object.__new__(OmniMoTModel)
+    torch.nn.Module.__init__(model)
+    model._psm_active_wiring_registry = registry
+    trainer = object.__new__(ImaginaireTrainer)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+    first = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    output, _ = model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": first}, 0)
+    trainer._run_active_local_memory_backward(model, output, scaler, grad_accum_iter=0)
+    assert owner.phase.name == "MEMBER_COMMITTED" and not hasattr(trainer, "_psm_active_completed_window")
+
+    second = registry.prepare_continuation(next_identity, segment, first.transaction, trainer_grad_accum_iter=1)
+    assert second.ga_window_token is first.ga_window_token
+    output, _ = model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": second}, 1)
+    trainer._run_active_local_memory_backward(model, output, scaler, grad_accum_iter=1)
+    assert owner.phase.name == "SLOW_RESOLUTION_PENDING"
+    assert trainer._psm_active_completed_window.transaction.snapshot().completed_members == (identity, next_identity)
