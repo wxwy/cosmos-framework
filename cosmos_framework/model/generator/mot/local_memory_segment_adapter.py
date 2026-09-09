@@ -56,6 +56,23 @@ class CanonicalLocalMemorySegmentAdapter:
         """Read-only pending capability for the CPU/static wiring bridge."""
         return self._pending_scan
 
+    def pending(self) -> tuple[SegmentIdentity, LocalMemoryTransaction, SegmentScanResult] | None:
+        """Return the exact graph-bearing pending capability without mutation."""
+        return self._pending_scan
+
+    def committed_snapshot(self) -> tuple[tuple[SegmentIdentity, ContinualTTTFastState], ...]:
+        """Return detached copies of the committed sidecar frontier."""
+        return tuple(
+            (identity, ContinualTTTFastState(*(value.detach().clone() for value in state)) )
+            for _, (identity, state) in sorted(self.sidecar._records.items())
+        )
+
+    def discard_pending(self, identity: SegmentIdentity, transaction: LocalMemoryTransaction, result: SegmentScanResult) -> None:
+        pending = self._pending_scan
+        if pending is None or pending[0] is not identity or pending[1] is not transaction or pending[2] is not result:
+            raise RuntimeError("segment pending discard requires the exact pending capability.")
+        self._pending_scan = None
+
     def scan(
         self, segment: SegmentBatch, *, identity: SegmentIdentity, transaction: LocalMemoryTransaction
     ) -> SegmentScanResult:
