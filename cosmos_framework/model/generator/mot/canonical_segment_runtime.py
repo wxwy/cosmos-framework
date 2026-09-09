@@ -43,7 +43,9 @@ class CanonicalSegmentRuntimeOwner:
         return self.identity
 
     def begin(self, plan: GAWindowPlan) -> LocalMemoryTransaction:
-        if self.phase is not RuntimePhase.ADMITTED or self.identity is None or plan.members[0] != (self.identity.slot_id, self.identity.episode_id, self.identity.cursor): raise RuntimeError("begin requires exact admitted first member")
+        if (self.phase is not RuntimePhase.ADMITTED or self.identity is None or plan.attempt != 0
+                or plan.members[0] != (self.identity.slot_id, self.identity.episode_id, self.identity.cursor)):
+            raise RuntimeError("begin requires an exact attempt-0 admitted first member")
         self.transaction = LocalMemoryTransaction(plan, self.scheduler); self.phase = RuntimePhase.MEMBER_READY
         return self.transaction
 

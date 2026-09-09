@@ -89,6 +89,51 @@ def test_public_retry_rejects_same_projection_replacement_identity() -> None:
         owner.begin_retry(retry)
 
 
+def test_public_begin_rejects_fabricated_attempt_one_without_mutation() -> None:
+    owner, identity = _owner(), _identity()
+    owner.admit((identity,))
+    before = owner.scheduler.snapshot()
+    fabricated = GAWindowPlan(((0, identity.episode_id, 0),), (1,), attempt=1)
+    with pytest.raises(RuntimeError, match="attempt-0"):
+        owner.begin(fabricated)
+    assert owner.scheduler.snapshot() == before
+    assert owner.identity is identity
+
+
+def test_public_scaler_skip_rejects_attempt_one_and_later_member_without_mutation() -> None:
+    owner, identity = _owner(), _identity()
+    plan = GAWindowPlan(((0, identity.episode_id, 0),), (1,))
+    transaction, forward = _prepare(owner, identity, plan)
+    retry = owner.abort_retry(transaction, forward)
+    transaction = owner.begin_retry(retry)
+    forward = owner.prepare(_segment(identity))
+    before_phase, before_identity = owner.phase, owner.identity
+    before_scheduler, before_transaction = owner.scheduler.snapshot(), transaction.snapshot()
+    before_pending, before_committed = owner.adapter.pending(), owner.adapter.committed_snapshot()
+    with pytest.raises(RuntimeError, match="scaler skip"):
+        owner.abort_scaler_skip(transaction, forward)
+    assert owner.phase is before_phase and owner.identity is before_identity
+    assert owner.scheduler.snapshot() == before_scheduler and transaction.snapshot() == before_transaction
+    assert owner.adapter.pending() is before_pending
+    assert tuple(identity for identity, _ in owner.adapter.committed_snapshot()) == tuple(identity for identity, _ in before_committed)
+
+    owner, first, second = _owner(), _identity(), _identity(cursor=1)
+    plan = GAWindowPlan(((0, first.episode_id, 0), (0, first.episode_id, 1)), (1, 1))
+    transaction, forward = _prepare(owner, first, plan)
+    _commit(owner, transaction, forward, first)
+    owner.admit_next((second,))
+    forward = owner.prepare(_segment(second))
+    before_phase, before_identity = owner.phase, owner.identity
+    before_scheduler, before_transaction = owner.scheduler.snapshot(), transaction.snapshot()
+    before_pending, before_committed = owner.adapter.pending(), owner.adapter.committed_snapshot()
+    with pytest.raises(RuntimeError, match="scaler skip"):
+        owner.abort_scaler_skip(transaction, forward)
+    assert owner.phase is before_phase and owner.identity is before_identity
+    assert owner.scheduler.snapshot() == before_scheduler and transaction.snapshot() == before_transaction
+    assert owner.adapter.pending() is before_pending
+    assert tuple(identity for identity, _ in owner.adapter.committed_snapshot()) == tuple(identity for identity, _ in before_committed)
+
+
 def test_public_retry_then_terminal_commit_has_no_sidecar_frontier() -> None:
     owner, identity = _owner(), _identity(terminal=True)
     plan = GAWindowPlan(((0, identity.episode_id, 0),), (1,))
