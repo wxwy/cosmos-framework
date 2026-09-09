@@ -12,9 +12,28 @@ from cosmos_framework.model.generator.mot.local_memory_segment import GAWindowPl
 from cosmos_framework.model.generator.mot.local_memory_segment_adapter import CanonicalLocalMemorySegmentAdapter, LocalMemorySegmentSidecar
 from cosmos_framework.model.generator.mot.production_active_wiring import ActiveSourceTransientError, ProductionActiveWiringRegistry
 from cosmos_framework.model.generator.mot.production_segment_bridge import NativeBatchResult
-from cosmos_framework.model.generator.mot.production_segment_wiring import CanonicalSegmentWiring
+from cosmos_framework.model.generator.mot.production_segment_wiring import CanonicalSegmentWiring, run_native_forward_for_test
 from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
 from cosmos_framework.trainer import ImaginaireTrainer
+
+
+class _ActiveTestOmniMoTModel(OmniMoTModel):
+    """Test-only native seam; the production base class must fail closed."""
+
+    def _run_active_local_memory_native_forward(self, inputs: ActiveNativeBatchInputs, iteration: int) -> NativeBatchResult:
+        del iteration
+        wiring = self._psm_active_wiring_registry.owner.wiring
+        primary, auxiliary = run_native_forward_for_test(
+            inputs.payloads, inputs.locals, wiring.adapter.pending_scan[2].local_tokens, wiring.local_slow_parameters
+        )
+        return NativeBatchResult(primary, auxiliary)
+
+
+def _active_test_model(registry: ProductionActiveWiringRegistry) -> _ActiveTestOmniMoTModel:
+    model = object.__new__(_ActiveTestOmniMoTModel)
+    torch.nn.Module.__init__(model)
+    model._psm_active_wiring_registry = registry
+    return model
 
 
 def _fixture():
@@ -33,6 +52,17 @@ def _fixture():
     return owner, identity, segment, GAWindowPlan(((0, "episode", 0),), (1,))
 
 
+def _two_consumer_fixture():
+    owner, identity, _, _ = _fixture()
+    segment = SegmentBatch(
+        torch.zeros(1, 2, 96), (({"order": 0}, {"order": 1}),), torch.ones(1, 2, dtype=torch.bool),
+        torch.tensor([[0, 1]]), torch.zeros(1, 2, 96), torch.zeros(1, 2, 10), torch.tensor([[False, True]]),
+        torch.tensor([[-1, 0]]), torch.tensor([0]), ("episode",), ("suite",),
+        SegmentProvenance("manifest", "config", "source", 0),
+    )
+    return owner, identity, segment, GAWindowPlan(((0, "episode", 0),), (2,))
+
+
 def test_active_registry_consumes_exact_prepared_and_forward_capabilities_once() -> None:
     owner, identity, segment, plan = _fixture()
     registry = ProductionActiveWiringRegistry(owner)
@@ -43,6 +73,25 @@ def test_active_registry_consumes_exact_prepared_and_forward_capabilities_once()
     assert registry.consume_active_forward(active) is active
     with pytest.raises(RuntimeError, match="stale or foreign"):
         registry.consume_active_forward(active)
+
+
+def test_active_test_spy_receives_ordered_s0_none_and_no_pad_consumers() -> None:
+    class OrderedModel(_ActiveTestOmniMoTModel):
+        def _run_active_local_memory_native_forward(self, inputs: ActiveNativeBatchInputs, iteration: int) -> NativeBatchResult:
+            self.inputs = inputs
+            return super()._run_active_local_memory_native_forward(inputs, iteration)
+
+    owner, identity, segment, plan = _two_consumer_fixture()
+    registry = ProductionActiveWiringRegistry(owner)
+    prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    model = object.__new__(OrderedModel)
+    torch.nn.Module.__init__(model)
+    model._psm_active_wiring_registry = registry
+    model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": prepared}, 0)
+
+    assert tuple(item["order"] for item in model.inputs.payloads) == (0, 1)
+    assert model.inputs.locals[0] is None and model.inputs.locals[1] is not None
+    assert model.inputs.identities == ((0, "episode", 0), (0, "episode", 1))
 
 
 def test_active_registry_rejects_double_prepare_and_foreign_consume_without_new_prepare() -> None:
@@ -86,9 +135,7 @@ def test_active_post_prepare_count_failure_is_terminal_and_clears_pending() -> N
 def test_active_initial_arm_rejects_counter_or_ga_mismatch_before_owner_mutation() -> None:
     owner, identity, segment, plan = _fixture()
     registry = ProductionActiveWiringRegistry(owner)
-    model = object.__new__(OmniMoTModel)
-    torch.nn.Module.__init__(model)
-    model._psm_active_wiring_registry = registry
+    model = _active_test_model(registry)
     trainer = object.__new__(ImaginaireTrainer)
     trainer._psm_active_wiring_registry = registry
     trainer.config = SimpleNamespace(trainer=SimpleNamespace(grad_accum_iter=1))
@@ -124,12 +171,14 @@ def test_active_trainer_retry_arm_consumes_exact_retained_plan_at_counter_zero()
     model._psm_active_wiring_registry = registry
     trainer._psm_active_retry_registry = registry
     trainer._psm_active_retry_plan = registry.abort_source_transient(prepared)
+    trainer._psm_active_retry_segment = segment
 
-    trainer.arm_active_local_memory_retry(model, segment, grad_accum_iter=0)
+    trainer.arm_active_local_memory_retry(model, grad_accum_iter=0)
 
     assert trainer._psm_active_armed_prepared.identity is identity
     assert owner.phase.name == "PREPARED"
     assert trainer._psm_active_retry_plan is None and trainer._psm_active_retry_registry is None
+    assert trainer._psm_active_retry_segment is None
 
 
 def test_active_trainer_tagged_exception_retains_exact_first_member_retry_authority() -> None:
@@ -144,9 +193,41 @@ def test_active_trainer_tagged_exception_retains_exact_first_member_retry_author
     assert owner.phase.name == "RETRY_READY"
     assert trainer._psm_active_retry_registry is registry
     assert trainer._psm_active_retry_plan is not plan
+    assert trainer._psm_active_retry_segment is segment
     assert trainer._psm_active_retry_plan.attempt == 1
     assert trainer._psm_active_retry_plan.members == plan.members
     assert trainer._psm_active_armed_prepared is None
+
+
+def test_active_trainer_retries_tagged_first_member_without_advancing_counter() -> None:
+    class TransientOnceModel(_ActiveTestOmniMoTModel):
+        def _run_active_local_memory_native_forward(self, inputs: ActiveNativeBatchInputs, iteration: int) -> NativeBatchResult:
+            if self.calls == 0:
+                self.calls += 1
+                raise ActiveSourceTransientError("source transient")
+            self.calls += 1
+            return super()._run_active_local_memory_native_forward(inputs, iteration)
+
+    owner, identity, segment, plan = _fixture()
+    registry = ProductionActiveWiringRegistry(owner)
+    prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    model = object.__new__(TransientOnceModel)
+    torch.nn.Module.__init__(model)
+    model._psm_active_wiring_registry = registry
+    model.calls = 0
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer._psm_active_wiring_registry = registry
+    trainer._psm_active_armed_prepared = prepared
+
+    output, _ = trainer._run_active_forward_with_exact_retry(
+        model, model, {"psm_local_memory_active": True, "psm_local_memory_prepared": prepared}, 0, 0, prepared
+    )
+
+    assert model.calls == 2
+    assert owner.phase.name == "PREPARED"
+    assert trainer._psm_active_armed_prepared.transaction.plan.attempt == 1
+    trainer._run_active_local_memory_backward(model, output, torch.amp.GradScaler("cuda", enabled=False), grad_accum_iter=0)
+    assert owner.phase.name == "SLOW_RESOLUTION_PENDING"
 
 
 def test_active_tagged_transient_after_a_member_is_terminal() -> None:
@@ -155,9 +236,7 @@ def test_active_tagged_transient_after_a_member_is_terminal() -> None:
     plan = GAWindowPlan(((0, "episode", 0), (0, "episode", 1)), (1, 1))
     registry = ProductionActiveWiringRegistry(owner)
     prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
-    model = object.__new__(OmniMoTModel)
-    torch.nn.Module.__init__(model)
-    model._psm_active_wiring_registry = registry
+    model = _active_test_model(registry)
     output, _ = model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": prepared}, 0)
     trainer = object.__new__(ImaginaireTrainer)
     trainer._run_active_local_memory_backward(
@@ -254,9 +333,7 @@ def test_active_backward_rejects_wrong_identity_before_scaled_backward_and_clear
     owner, identity, segment, plan = _fixture()
     registry = ProductionActiveWiringRegistry(owner)
     prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
-    model = object.__new__(OmniMoTModel)
-    torch.nn.Module.__init__(model)
-    model._psm_active_wiring_registry = registry
+    model = _active_test_model(registry)
     output, _ = model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": prepared}, 0)
     object.__setattr__(prepared, "identity", SegmentIdentity(0, "other", "suite", 0, 0, "source"))
     trainer = object.__new__(ImaginaireTrainer)
@@ -291,13 +368,23 @@ def test_active_model_marker_schema_rejects_missing_extra_and_bad_capability(dat
         model.training_step(data_batch, 0)
 
 
-def test_active_model_and_trainer_consume_one_capability_and_complete_window() -> None:
+def test_active_production_model_fails_closed_without_the_native_adapter() -> None:
     owner, identity, segment, plan = _fixture()
     registry = ProductionActiveWiringRegistry(owner)
     prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
     model = object.__new__(OmniMoTModel)
     torch.nn.Module.__init__(model)
     model._psm_active_wiring_registry = registry
+
+    with pytest.raises(RuntimeError, match="native MoT adapter is unavailable"):
+        model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": prepared}, 0)
+
+
+def test_active_model_and_trainer_consume_one_capability_and_complete_window() -> None:
+    owner, identity, segment, plan = _fixture()
+    registry = ProductionActiveWiringRegistry(owner)
+    prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    model = _active_test_model(registry)
 
     output, _ = model.training_step(
         {"psm_local_memory_active": True, "psm_local_memory_prepared": prepared}, 0
@@ -317,9 +404,7 @@ def test_active_two_member_window_keeps_one_registry_token_until_completion() ->
     next_identity = SegmentIdentity(0, "episode", "suite", 1, 1, "source")
     plan = GAWindowPlan(((0, "episode", 0), (0, "episode", 1)), (1, 1))
     registry = ProductionActiveWiringRegistry(owner)
-    model = object.__new__(OmniMoTModel)
-    torch.nn.Module.__init__(model)
-    model._psm_active_wiring_registry = registry
+    model = _active_test_model(registry)
     trainer = object.__new__(ImaginaireTrainer)
     scaler = torch.amp.GradScaler("cuda", enabled=False)
 
@@ -334,6 +419,27 @@ def test_active_two_member_window_keeps_one_registry_token_until_completion() ->
     trainer._run_active_local_memory_backward(model, output, scaler, grad_accum_iter=1)
     assert owner.phase.name == "SLOW_RESOLUTION_PENDING"
     assert trainer._psm_active_completed_window.transaction.snapshot().completed_members == (identity, next_identity)
+
+
+def test_active_registry_retires_token_between_resolved_windows() -> None:
+    owner, identity, segment, plan = _fixture()
+    registry = ProductionActiveWiringRegistry(owner)
+    model = _active_test_model(registry)
+    trainer = object.__new__(ImaginaireTrainer)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+    first = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    first_token = first.ga_window_token
+    output, _ = model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": first}, 0)
+    trainer._run_active_local_memory_backward(model, output, scaler, grad_accum_iter=0)
+    sealed = owner.preflight_slow_window(trainer._psm_active_completed_window)
+    owner.resolve_preflighted_slow_window(scaler_skipped=False)
+    registry.retire_resolved_window(sealed.owner)
+
+    next_identity = SegmentIdentity(0, "episode", "suite", 1, 1, "source")
+    next_plan = GAWindowPlan(((0, "episode", 1),), (1,))
+    second = registry.prepare_initial(next_identity, segment, next_plan, trainer_grad_accum_iter=0)
+    assert second.ga_window_token is not first_token
 
 
 def test_active_open_window_rejects_untagged_trainer_interleave_before_forward() -> None:

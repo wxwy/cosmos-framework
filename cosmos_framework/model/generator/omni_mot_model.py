@@ -1305,15 +1305,9 @@ class OmniMoTModel(ImaginaireModel):
     def _run_active_local_memory_native_forward(
         self, inputs: ActiveNativeBatchInputs, iteration: int
     ):
-        """CPU/static batched seam for a registry-owned active Local member."""
-        del iteration
-        wiring = getattr(self, "_psm_active_wiring_registry").owner.wiring
-        primary, auxiliary = run_native_forward_for_test(
-            inputs.payloads, inputs.locals, wiring.adapter.pending_scan[2].local_tokens, wiring.local_slow_parameters
-        )
-        from cosmos_framework.model.generator.mot.production_segment_bridge import NativeBatchResult
-
-        return NativeBatchResult(primary, auxiliary)
+        """Require the future native adapter instead of entering a test-only seam."""
+        del inputs, iteration
+        raise RuntimeError("active Local native MoT adapter is unavailable")
 
     def _active_local_memory_forward(
         self, data_batch: dict[str, Any], iteration: int

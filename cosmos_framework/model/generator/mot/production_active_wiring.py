@@ -36,6 +36,7 @@ class PreparedActiveMemberCapability:
     owner: CanonicalSegmentRuntimeOwner
     transaction: LocalMemoryTransaction
     identity: SegmentIdentity
+    segment: SegmentBatch
     member_index: int
     forward: CanonicalSegmentForward
     inputs: ActiveNativeBatchInputs
@@ -106,7 +107,7 @@ class ProductionActiveWiringRegistry:
         if self._ga_window_token is None:
             self._ga_window_token = object()
         prepared = PreparedActiveMemberCapability(
-            self, self.owner, transaction, identity, member_index, forward, inputs, len(inputs.payloads), self._ga_window_token
+            self, self.owner, transaction, identity, segment, member_index, forward, inputs, len(inputs.payloads), self._ga_window_token
         )
         self._prepared = prepared
         return prepared
@@ -130,6 +131,12 @@ class ProductionActiveWiringRegistry:
             raise RuntimeError("active forward capability is stale or foreign")
         self._prepared = self._model_consumed = self._published = None
         return active
+
+    def retire_resolved_window(self, owner: CanonicalSegmentRuntimeOwner) -> None:
+        """Retire the exact token only after its owner has resolved to idle."""
+        if owner is not self.owner or owner.phase is not RuntimePhase.IDLE or self._ga_window_token is None:
+            raise RuntimeError("active Local window token cannot retire before exact resolution")
+        self._ga_window_token = None
 
     def abort_source_transient(self, prepared: PreparedActiveMemberCapability) -> GAWindowPlan:
         """Return the owner-retained retry plan only for the exact first active member."""

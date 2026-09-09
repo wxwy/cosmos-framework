@@ -524,16 +524,13 @@ class ImaginaireTrainer:
                 with self.straggler_detector.profile_section(
                     "fwd", self.config.trainer.straggler_detection.analyze_forward
                 ):
-                    try:
-                        output_batch, loss = model_ddp.training_step(active_data, iteration)
-                    except Exception as error:
-                        if armed_prepared is not None:
-                            self._handle_active_forward_exception(armed_prepared, error)
-                        raise
+                    model = model_ddp.module if self.config.trainer.distributed_parallelism == "ddp" else model_ddp
+                    output_batch, loss = self._run_active_forward_with_exact_retry(
+                        model_ddp, model, active_data, iteration, grad_accum_iter, armed_prepared
+                    )
             if armed_prepared is not None:
                 self._psm_active_armed_prepared = None
             self.callbacks.on_after_forward(iteration=iteration)
-            model = model_ddp.module if self.config.trainer.distributed_parallelism == "ddp" else model_ddp
             if capture_only:
                 return output_batch, loss, 0
             is_active_step = "psm_local_memory_active_forward" in output_batch
@@ -622,9 +619,38 @@ class ImaginaireTrainer:
         if isinstance(error, ActiveSourceTransientError):
             self._psm_active_retry_plan = armed_prepared.registry.abort_source_transient(armed_prepared)
             self._psm_active_retry_registry = armed_prepared.registry
+            self._psm_active_retry_segment = armed_prepared.segment
         else:
             armed_prepared.owner.abort_terminal(armed_prepared.transaction, armed_prepared.forward, "LOCAL_MEM_OUTER_FAILURE")
         self._psm_active_armed_prepared = None
+
+    def _run_active_forward_with_exact_retry(
+        self, model_ddp: torch.nn.Module, model: torch.nn.Module, data: dict[str, torch.Tensor], iteration: int,
+        grad_accum_iter: int, armed_prepared: object | None,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Retry one tagged first member in-process without fetching or advancing GA."""
+        try:
+            return model_ddp.training_step(data, iteration)
+        except Exception as error:
+            if armed_prepared is None:
+                raise
+            from cosmos_framework.model.generator.mot.production_active_wiring import ActiveSourceTransientError
+
+            self._handle_active_forward_exception(armed_prepared, error)
+            if not isinstance(error, ActiveSourceTransientError):
+                raise
+        self.arm_active_local_memory_retry(model, grad_accum_iter=grad_accum_iter)
+        retry_prepared = self._psm_active_armed_prepared
+        if retry_prepared is None:
+            raise RuntimeError("active Local retry arm did not produce an exact capability")
+        retry_data = dict(data)
+        retry_data["psm_local_memory_active"] = True
+        retry_data["psm_local_memory_prepared"] = retry_prepared
+        try:
+            return model_ddp.training_step(retry_data, iteration)
+        except Exception as error:
+            self._handle_active_forward_exception(retry_prepared, error)
+            raise
 
     def arm_active_local_memory_initial(
         self, model: torch.nn.Module, identity: object, segment: object, plan: object, *, grad_accum_iter: int
@@ -660,24 +686,26 @@ class ImaginaireTrainer:
             identity, segment, transaction, trainer_grad_accum_iter=grad_accum_iter
         )
 
-    def arm_active_local_memory_retry(self, model: torch.nn.Module, segment: object, *, grad_accum_iter: int) -> None:
+    def arm_active_local_memory_retry(self, model: torch.nn.Module, *, grad_accum_iter: int) -> None:
         """Consume the exact retained first-member retry plan without advancing GA."""
         from cosmos_framework.model.generator.mot.production_active_wiring import ProductionActiveWiringRegistry
 
         registry = getattr(self, "_psm_active_wiring_registry", None)
         retry_registry = getattr(self, "_psm_active_retry_registry", None)
         plan = getattr(self, "_psm_active_retry_plan", None)
+        segment = getattr(self, "_psm_active_retry_segment", None)
         if (
             not isinstance(registry, ProductionActiveWiringRegistry)
             or retry_registry is not registry
             or getattr(model, "_psm_active_wiring_registry", None) is not registry
             or plan is None
+            or segment is None
             or grad_accum_iter != 0
             or getattr(self, "_psm_active_armed_prepared", None) is not None
         ):
             raise RuntimeError("active Local retry requires the exact retained trainer authority")
         self._psm_active_armed_prepared = registry.prepare_retry(segment, plan, trainer_grad_accum_iter=grad_accum_iter)
-        self._psm_active_retry_plan = self._psm_active_retry_registry = None
+        self._psm_active_retry_plan = self._psm_active_retry_registry = self._psm_active_retry_segment = None
 
     def bind_active_local_memory_registry(self, model: torch.nn.Module, registry: object) -> None:
         """Bind the exact process-local registry to trainer and model once."""
@@ -720,6 +748,11 @@ class ImaginaireTrainer:
         grad_scaler.step(optimizer)
         if active_seal is not None:
             active_seal.owner.resolve_preflighted_slow_window(scaler_skipped=found_inf)
+            from cosmos_framework.model.generator.mot.production_active_wiring import ProductionActiveWiringRegistry
+
+            active_registry = getattr(self, "_psm_active_registry", None)
+            if isinstance(active_registry, ProductionActiveWiringRegistry):
+                active_registry.retire_resolved_window(active_seal.owner)
             if not found_inf:
                 scheduler.step()
             grad_scaler.update()
