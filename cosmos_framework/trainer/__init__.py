@@ -76,6 +76,14 @@ class ContextParallelDataWindow:
             )
 
 
+@dataclass(frozen=True)
+class LocalMemoryBridgeBackwardResult:
+    """Pure member-backward outcome; owner disposition stays outside this seam."""
+
+    loss: torch.Tensor | None = None
+    terminal_code: str | None = None
+
+
 @dataclass
 class OptimizerStepTiming:
     """Aggregate host wall-clock timings for one optimizer step.
@@ -599,6 +607,37 @@ class ImaginaireTrainer:
             raise RuntimeError("LOCAL_MEM_OUTER_FAILURE") from error
         return loss
 
+    def _run_local_memory_bridge_backward(
+        self,
+        member_index: int,
+        primary_consumer_mean: torch.Tensor,
+        auxiliary_loss: torch.Tensor,
+        actual_n_valid: int,
+        *,
+        transaction: object,
+        identity: object,
+    ) -> LocalMemoryBridgeBackwardResult:
+        """Run exactly one pure Local-Memory backward with transaction-owned scaling."""
+        from cosmos_framework.model.generator.mot.c6_runtime_adapter import CanonicalSegmentRuntimeAdapter
+
+        try:
+            transaction.validate_success(member_index, identity, actual_n_valid)
+        except ValueError:
+            return LocalMemoryBridgeBackwardResult(terminal_code="LOCAL_MEM_IDENTITY_CONTRACT_FAILURE")
+        try:
+            loss = CanonicalSegmentRuntimeAdapter.objective(
+                transaction.plan, member_index, primary_consumer_mean, auxiliary_loss, actual_n_valid
+            )
+        except RuntimeError as error:
+            if str(error) == "LOCAL_MEM_NUMERICAL_FAILURE":
+                return LocalMemoryBridgeBackwardResult(terminal_code="LOCAL_MEM_NUMERICAL_FAILURE")
+            return LocalMemoryBridgeBackwardResult(terminal_code="LOCAL_MEM_OUTER_FAILURE")
+        try:
+            loss.backward()
+        except Exception:
+            return LocalMemoryBridgeBackwardResult(terminal_code="LOCAL_MEM_OUTER_FAILURE")
+        return LocalMemoryBridgeBackwardResult(loss=loss)
+
     def _run_canonical_segment_backward(self, output_batch: dict[str, object]) -> torch.Tensor:
         """Delegate canonical wiring exactly once to the existing transaction seam."""
         required = (
@@ -624,11 +663,15 @@ class ImaginaireTrainer:
         if (forward.wiring is not wiring or pending is None or pending[0] != identity
                 or pending[1] is not transaction or pending[2] is not forward.result):
             raise RuntimeError("canonical segment capability identity is invalid.")
-        loss = self._run_local_memory_segment_backward(
-            transaction.plan, output_batch["canonical_member_index"], output_batch["primary_consumer_mean"],
-            output_batch["auxiliary_loss"], output_batch["actual_n_valid"], transaction=transaction,
-            identity=identity, clear_slow_grads=wiring.clear_local_slow_grads,
+        result = self._run_local_memory_bridge_backward(
+            output_batch["canonical_member_index"], output_batch["primary_consumer_mean"],
+            output_batch["auxiliary_loss"], output_batch["actual_n_valid"], transaction=transaction, identity=identity,
         )
+        if result.terminal_code is not None:
+            raise RuntimeError(result.terminal_code)
+        assert result.loss is not None
+        loss = result.loss
+        transaction.successful_backward(output_batch["canonical_member_index"], identity, output_batch["actual_n_valid"])
         wiring.adapter.commit(identity, forward.result, transaction=transaction)
         return loss
 

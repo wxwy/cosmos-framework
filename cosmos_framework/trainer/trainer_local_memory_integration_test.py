@@ -29,6 +29,36 @@ def test_local_memory_segment_backward_owns_single_primary_aux_scaling() -> None
     assert transaction.snapshot().completed_members == (identity,)
 
 
+def test_bridge_backward_uses_only_transaction_plan_and_stays_pure() -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    identity = SegmentIdentity(0, "episode", "suite", 0, 0, "digest")
+    plan = GAWindowPlan(((0, "episode", 0),), (2,), plan_chain_id="authoritative")
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit([identity])
+    transaction = LocalMemoryTransaction(plan, scheduler)
+    primary, auxiliary = torch.tensor(6.0, requires_grad=True), torch.tensor(4.0, requires_grad=True)
+    result = trainer._run_local_memory_bridge_backward(
+        0, primary, auxiliary, 2, transaction=transaction, identity=identity,
+    )
+    assert result.terminal_code is None and result.loss is not None and result.loss.item() == 10.0
+    assert primary.grad.item() == auxiliary.grad.item() == 1.0
+    assert transaction.snapshot().completed_members == ()
+
+
+def test_bridge_backward_rejects_mismatched_member_before_backward_without_mutation() -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    identity = SegmentIdentity(0, "episode", "suite", 0, 0, "digest")
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0})
+    scheduler.admit([identity])
+    transaction = LocalMemoryTransaction(GAWindowPlan(((0, "episode", 0),), (2,)), scheduler)
+    primary = torch.tensor(1.0, requires_grad=True)
+    result = trainer._run_local_memory_bridge_backward(
+        0, primary, torch.zeros(()), 1, transaction=transaction, identity=identity,
+    )
+    assert result.terminal_code == "LOCAL_MEM_IDENTITY_CONTRACT_FAILURE"
+    assert primary.grad is None and transaction.snapshot().completed_members == ()
+
+
 def test_local_memory_segment_terminal_failures_clear_without_fast_commit() -> None:
     trainer = object.__new__(ImaginaireTrainer)
     identity = SegmentIdentity(0, "episode", "suite", 0, 0, "digest")

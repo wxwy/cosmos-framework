@@ -40,12 +40,16 @@ def _commit(owner: CanonicalSegmentRuntimeOwner, transaction, forward, identity:
     owner.commit(transaction, forward)
 
 
+def _finish(owner: CanonicalSegmentRuntimeOwner, transaction, *, scaler_skipped: bool = False) -> None:
+    owner.resolve_local_memory_slow_window(owner.finish_window(transaction), scaler_skipped=scaler_skipped)
+
+
 def test_public_commit_finish_and_snapshot_are_consistent() -> None:
     owner, identity = _owner(), _identity()
     plan = GAWindowPlan(((identity.slot_id, identity.episode_id, identity.cursor),), (1,))
     transaction, forward = _prepare(owner, identity, plan)
     _commit(owner, transaction, forward, identity)
-    owner.finish_window(transaction)
+    _finish(owner, transaction)
     snapshot = owner.snapshot()
     assert snapshot.scheduler["stable_slots"][identity.slot_id] is identity
     assert snapshot.committed[0][0] is identity
@@ -63,7 +67,7 @@ def test_public_two_member_continuation_rejects_wrong_candidate_without_mutation
     assert owner.admit_next((second,)) is second
     forward = owner.prepare(_segment(second))
     _commit(owner, transaction, forward, second, 1)
-    owner.finish_window(transaction)
+    _finish(owner, transaction)
     assert len(owner.snapshot().committed) == 1
 
 
@@ -76,7 +80,7 @@ def test_public_scaler_skip_resume_keeps_exact_admission() -> None:
     assert owner.identity is identity and resumed.plan is plan
     forward = owner.prepare(_segment(identity))
     _commit(owner, resumed, forward, identity)
-    owner.finish_window(resumed)
+    _finish(owner, resumed)
 
 
 def test_public_retry_rejects_same_projection_replacement_identity() -> None:
@@ -142,7 +146,7 @@ def test_public_retry_then_terminal_commit_has_no_sidecar_frontier() -> None:
     transaction = owner.begin_retry(retry)
     forward = owner.prepare(_segment(identity))
     _commit(owner, transaction, forward, identity)
-    owner.finish_window(transaction)
+    _finish(owner, transaction)
     snapshot = owner.snapshot()
     assert snapshot.committed == ()
     assert identity.slot_id in snapshot.scheduler["terminal_slots"]
@@ -166,3 +170,39 @@ def test_snapshot_rejects_admitted_uncommitted_residue_and_second_owner() -> Non
     owner.scheduler.admit((_identity(),))
     with pytest.raises(RuntimeError, match="admitted-but-uncommitted"):
         owner.snapshot()
+
+
+def test_final_member_requires_exact_one_shot_slow_resolution() -> None:
+    owner, identity = _owner(), _identity()
+    transaction, forward = _prepare(owner, identity, GAWindowPlan(((0, identity.episode_id, 0),), (1,)))
+    _commit(owner, transaction, forward, identity)
+    capability = owner.finish_window(transaction)
+    assert owner.phase.name == "SLOW_RESOLUTION_PENDING"
+    for operation in (
+        owner.snapshot,
+        lambda: owner.admit((identity,)),
+        lambda: owner.begin(transaction.plan),
+        lambda: owner.prepare(_segment(identity)),
+    ):
+        with pytest.raises(RuntimeError):
+            operation()
+    with pytest.raises(RuntimeError, match="exact unconsumed"):
+        owner.resolve_local_memory_slow_window(type(capability)(owner, transaction), scaler_skipped=False)
+    owner.resolve_local_memory_slow_window(capability, scaler_skipped=False)
+    assert transaction.snapshot().slow_optimizer_steps == transaction.snapshot().slow_lr_scheduler_steps == 1
+    with pytest.raises(RuntimeError, match="exact unconsumed"):
+        owner.resolve_local_memory_slow_window(capability, scaler_skipped=False)
+    assert owner.snapshot().committed[0][0] is identity
+
+
+def test_final_member_scaler_skip_clears_real_grads_and_preserves_fast_frontier() -> None:
+    owner, identity = _owner(), _identity()
+    transaction, forward = _prepare(owner, identity, GAWindowPlan(((0, identity.episode_id, 0),), (1,)))
+    _commit(owner, transaction, forward, identity)
+    parameter = owner.wiring.local_slow_parameters[0]
+    parameter.grad = torch.ones_like(parameter)
+    owner.resolve_local_memory_slow_window(owner.finish_window(transaction), scaler_skipped=True)
+    assert parameter.grad is None
+    snapshot = transaction.snapshot()
+    assert snapshot.slow_grads_cleared and snapshot.slow_optimizer_steps == snapshot.slow_lr_scheduler_steps == 0
+    assert owner.snapshot().committed[0][0] is identity

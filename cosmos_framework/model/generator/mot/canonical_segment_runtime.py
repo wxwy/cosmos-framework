@@ -10,13 +10,21 @@ from .production_segment_wiring import CanonicalSegmentForward, CanonicalSegment
 
 
 class RuntimePhase(Enum):
-    IDLE = auto(); ADMITTED = auto(); MEMBER_READY = auto(); PREPARED = auto(); MEMBER_COMMITTED = auto(); RETRY_READY = auto(); SKIP_READY = auto(); ABORTED = auto()
+    IDLE = auto(); ADMITTED = auto(); MEMBER_READY = auto(); PREPARED = auto(); MEMBER_COMMITTED = auto(); SLOW_RESOLUTION_PENDING = auto(); RETRY_READY = auto(); SKIP_READY = auto(); ABORTED = auto()
 
 @dataclass(frozen=True)
 class CanonicalRuntimeSnapshot:
     generation: int
     scheduler: dict[str, object]
     committed: tuple
+
+
+@dataclass(frozen=True)
+class CompletedWindowCapability:
+    """Owner-created, one-shot authority to resolve one completed slow window."""
+
+    owner: "CanonicalSegmentRuntimeOwner"
+    transaction: LocalMemoryTransaction
 
 
 class CanonicalSegmentRuntimeOwner:
@@ -35,6 +43,8 @@ class CanonicalSegmentRuntimeOwner:
         self._skipped_identity: SegmentIdentity | None = None
         self._retry_plan: GAWindowPlan | None = None
         self._retry_identity: SegmentIdentity | None = None
+        self._completed_transaction: LocalMemoryTransaction | None = None
+        self._completed_capability: CompletedWindowCapability | None = None
         self.generation = 0
 
     def admit(self, candidates: tuple[SegmentIdentity, ...]) -> SegmentIdentity:
@@ -91,18 +101,43 @@ class CanonicalSegmentRuntimeOwner:
         self.phase = RuntimePhase.MEMBER_READY
         return identity
 
-    def finish_window(self, transaction: LocalMemoryTransaction) -> None:
+    def finish_window(self, transaction: LocalMemoryTransaction) -> CompletedWindowCapability:
         if self.phase is not RuntimePhase.MEMBER_COMMITTED or transaction is not self.transaction or self.adapter.pending() is not None:
             raise RuntimeError("finish requires committed transaction without pending scan")
         if len(transaction.completed_members) != transaction.plan.ga_effective:
             raise RuntimeError("finish requires all plan members")
-        self.identity = self.transaction = self.forward = None
+        self.identity = self.forward = None
+        self._completed_transaction = transaction
+        self._completed_capability = CompletedWindowCapability(self, transaction)
+        self.phase = RuntimePhase.SLOW_RESOLUTION_PENDING
+        return self._completed_capability
+
+    def resolve_local_memory_slow_window(
+        self, completed: CompletedWindowCapability, *, scaler_skipped: bool
+    ) -> None:
+        if (
+            self.phase is not RuntimePhase.SLOW_RESOLUTION_PENDING
+            or completed is not self._completed_capability
+            or completed.owner is not self
+            or completed.transaction is not self._completed_transaction
+            or self.transaction is not self._completed_transaction
+        ):
+            raise RuntimeError("slow-window resolution requires exact unconsumed capability")
+        transaction = completed.transaction
+        if scaler_skipped:
+            self.wiring.clear_local_slow_grads()
+            transaction.grad_scaler_skip()
+        else:
+            transaction.slow_optimizer_step_succeeded()
+        self._completed_capability = self._completed_transaction = None
+        self.transaction = None
         self.phase = RuntimePhase.IDLE
 
     def snapshot(self) -> CanonicalRuntimeSnapshot:
         if (self.phase is not RuntimePhase.IDLE or self.adapter.pending() is not None or self.identity is not None
                 or self.transaction is not None or self.forward is not None or self._skipped_plan is not None
-                or self._skipped_identity is not None or self._retry_plan is not None or self._retry_identity is not None):
+                or self._skipped_identity is not None or self._retry_plan is not None or self._retry_identity is not None
+                or self._completed_transaction is not None or self._completed_capability is not None):
             raise RuntimeError("snapshot requires idle committed frontier")
         committed = self.adapter.committed_snapshot()
         committed_by_slot = {identity.slot_id: identity for identity in self.scheduler.committed_identities}
@@ -122,6 +157,7 @@ class CanonicalSegmentRuntimeOwner:
         pending = self.adapter.pending()
         if pending is None or pending[0] is not self.identity or pending[1] is not transaction or pending[2] is not forward.result:
             raise RuntimeError("terminal abort requires exact pending capability")
+        self.wiring.clear_local_slow_grads()
         transaction.terminal_failure(code)
         self.adapter.discard_pending(self.identity, transaction, forward.result)
         self.forward = None
@@ -133,6 +169,7 @@ class CanonicalSegmentRuntimeOwner:
         pending = self.adapter.pending()
         if pending is None or pending[0] is not self.identity or pending[1] is not transaction or pending[2] is not forward.result:
             raise RuntimeError("retry abort requires exact pending capability")
+        self.wiring.clear_local_slow_grads()
         plan = transaction.recover_transient(len(transaction.completed_members))
         self.adapter.discard_pending(self.identity, transaction, forward.result)
         self._retry_identity = self.identity
