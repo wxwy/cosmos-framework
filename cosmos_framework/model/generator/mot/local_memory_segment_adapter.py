@@ -63,7 +63,7 @@ class CanonicalLocalMemorySegmentAdapter:
     def committed_snapshot(self) -> tuple[tuple[SegmentIdentity, ContinualTTTFastState], ...]:
         """Return detached copies of the committed sidecar frontier."""
         return tuple(
-            (identity, ContinualTTTFastState(*(value.detach().clone() for value in state)) )
+            (identity, ContinualTTTFastState(*(value.detach().to(dtype=torch.float32).clone() for value in state)) )
             for _, (identity, state) in sorted(self.sidecar._records.items())
         )
 

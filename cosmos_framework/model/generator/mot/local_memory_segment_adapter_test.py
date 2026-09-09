@@ -45,6 +45,19 @@ def test_sidecar_uses_canonical_cursor_and_terminal_reset() -> None:
     assert sidecar.read(SegmentIdentity(2, "replacement", "suite", 0, 2, "source")) is None
 
 
+def test_committed_snapshot_is_detached_fp32_and_isolated() -> None:
+    sidecar = LocalMemorySegmentSidecar()
+    identity = SegmentIdentity(2, "episode", "suite", 0, 0, "source")
+    adapter = CanonicalLocalMemorySegmentAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(), sidecar,
+    )
+    sidecar.commit(identity, ContinualTTTFastState(*(torch.ones(1, 1, dtype=torch.float16) for _ in range(4))))
+    _, snapshot = adapter.committed_snapshot()[0]
+    assert snapshot[0].dtype is torch.float32
+    snapshot[0].zero_()
+    assert sidecar.read(SegmentIdentity(2, "episode", "suite", 1, 1, "source"))[0].item() == 1
+
+
 def test_adapter_scans_masked_segment_and_preserves_gather_identity() -> None:
     payload0, payload1, payload2 = object(), object(), object()
     segment = SegmentBatch(
