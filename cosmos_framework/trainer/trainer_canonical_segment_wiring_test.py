@@ -112,6 +112,28 @@ def test_canonical_trainer_rejects_stale_result_before_backward() -> None:
     assert transaction.snapshot().completed_members == ()
 
 
+@pytest.mark.parametrize(
+    ("primary", "auxiliary", "code"),
+    (
+        (torch.tensor(float("nan"), requires_grad=True), torch.zeros((), requires_grad=True), "LOCAL_MEM_NUMERICAL_FAILURE"),
+        (torch.ones(()), torch.zeros(()), "LOCAL_MEM_OUTER_FAILURE"),
+    ),
+)
+def test_canonical_trainer_failure_regression_clears_grad_without_commit(primary, auxiliary, code: str) -> None:
+    wiring, segment, identity, transaction = _fixture()
+    output, _ = _model_marker_output(wiring, segment, identity, transaction)
+    parameter = wiring.local_slow_parameters[0]
+    parameter.grad = torch.ones_like(parameter)
+    output["primary_consumer_mean"] = primary
+    output["auxiliary_loss"] = auxiliary
+    with pytest.raises(RuntimeError, match=code):
+        object.__new__(ImaginaireTrainer)._run_canonical_segment_backward(output)
+    snapshot = transaction.snapshot()
+    assert snapshot.completed_members == () and snapshot.terminal_failure_code == code
+    assert snapshot.slow_grads_cleared and parameter.grad is None
+    assert wiring.adapter.committed_snapshot() == ()
+
+
 def test_two_step_marker_to_trainer_keeps_visible_local_primary_exactly_once() -> None:
     wiring, segment, identity, transaction = _fixture(two_steps=True)
     output, _ = _model_marker_output(wiring, segment, identity, transaction)

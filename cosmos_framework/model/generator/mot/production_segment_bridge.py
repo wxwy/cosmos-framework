@@ -30,12 +30,14 @@ class NativeBatchOutcome:
 class OpenMemberCapability:
     owner: CanonicalSegmentRuntimeOwner
     transaction: LocalMemoryTransaction
+    member_index: int
 
 
 @dataclass(frozen=True)
 class RetryMemberCapability:
     owner: CanonicalSegmentRuntimeOwner
     transaction: LocalMemoryTransaction
+    member_index: int
 
 
 @dataclass(frozen=True)
@@ -76,13 +78,17 @@ def run_member(
         owner.admit((identity,))
         transaction = owner.begin(initial_plan)
     elif prior is not None:
-        if prior.owner is not owner or prior.transaction is not owner.transaction or owner.phase is not RuntimePhase.MEMBER_COMMITTED:
+        if (prior.owner is not owner or prior.transaction is not owner.transaction
+                or prior.member_index != len(prior.transaction.completed_members)
+                or owner.phase is not RuntimePhase.MEMBER_COMMITTED):
             raise RuntimeError("continuation requires exact open capability")
         transaction = prior.transaction
         owner.admit_next((identity,))
     else:
         assert retry is not None
-        if retry.owner is not owner or retry.transaction is not owner.transaction or owner.phase is not RuntimePhase.MEMBER_READY:
+        if (retry.owner is not owner or retry.transaction is not owner.transaction
+                or retry.member_index != len(retry.transaction.completed_members)
+                or owner.phase is not RuntimePhase.MEMBER_READY):
             raise RuntimeError("retry requires exact retained capability")
         transaction = retry.transaction
     member_index = len(transaction.completed_members)
@@ -91,7 +97,8 @@ def run_member(
     forward = owner.prepare(segment)
     actual_n_valid = len(forward.payloads)
     if actual_n_valid != transaction.plan.planned_n_valid[member_index]:
-        raise RuntimeError("gathered consumer count does not match frozen plan")
+        owner.abort_terminal(transaction, forward, "LOCAL_MEM_IDENTITY_CONTRACT_FAILURE")
+        return TerminalMemberResult("LOCAL_MEM_IDENTITY_CONTRACT_FAILURE")
     try:
         outcome = native_batch(forward.payloads, forward.locals)
     except Exception:
@@ -108,7 +115,8 @@ def run_member(
             owner.abort_terminal(transaction, forward, "LOCAL_MEM_RETRY_EXHAUSTED")
             return TerminalMemberResult("LOCAL_MEM_RETRY_EXHAUSTED")
         suffix = owner.abort_retry(transaction, forward)
-        return RetryMemberCapability(owner, owner.begin_retry(suffix))
+        retry_transaction = owner.begin_retry(suffix)
+        return RetryMemberCapability(owner, retry_transaction, len(retry_transaction.completed_members))
     assert outcome.result is not None
     backward = _pure_backward(member_index, outcome.result, actual_n_valid, transaction, identity)
     if backward.terminal_code is not None:
@@ -118,7 +126,7 @@ def run_member(
     owner.commit(transaction, forward)
     if len(transaction.completed_members) == transaction.plan.ga_effective:
         return owner.finish_window(transaction)
-    return OpenMemberCapability(owner, transaction)
+    return OpenMemberCapability(owner, transaction, len(transaction.completed_members))
 
 
 def run_disabled(payloads: tuple[Any, ...], native_batch: Callable[[tuple[Any, ...]], torch.Tensor]) -> torch.Tensor:
