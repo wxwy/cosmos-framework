@@ -14,7 +14,6 @@ from .local_memory_segment import GAWindowPlan, LocalMemoryTransaction, SegmentB
 class NativeBatchResult:
     primary_consumer_mean: torch.Tensor
     auxiliary_loss: torch.Tensor
-    actual_n_valid: int
 
 
 @dataclass(frozen=True)
@@ -48,13 +47,13 @@ MemberBridgeResult = OpenMemberCapability | CompletedWindowCapability | RetryMem
 
 
 def _pure_backward(
-    member_index: int, result: NativeBatchResult, transaction: LocalMemoryTransaction, identity: SegmentIdentity
+    member_index: int, result: NativeBatchResult, actual_n_valid: int, transaction: LocalMemoryTransaction, identity: SegmentIdentity
 ):
     from cosmos_framework.trainer import ImaginaireTrainer
 
     return ImaginaireTrainer._run_local_memory_bridge_backward(
         object.__new__(ImaginaireTrainer), member_index, result.primary_consumer_mean, result.auxiliary_loss,
-        result.actual_n_valid, transaction=transaction, identity=identity,
+        actual_n_valid, transaction=transaction, identity=identity,
     )
 
 
@@ -90,6 +89,9 @@ def run_member(
     if owner.identity is not identity or transaction.plan.members[member_index] != (identity.slot_id, identity.episode_id, identity.cursor):
         raise RuntimeError("member identity does not match exact transaction plan")
     forward = owner.prepare(segment)
+    actual_n_valid = len(forward.payloads)
+    if actual_n_valid != transaction.plan.planned_n_valid[member_index]:
+        raise RuntimeError("gathered consumer count does not match frozen plan")
     try:
         outcome = native_batch(forward.payloads, forward.locals)
     except Exception:
@@ -108,12 +110,17 @@ def run_member(
         suffix = owner.abort_retry(transaction, forward)
         return RetryMemberCapability(owner, owner.begin_retry(suffix))
     assert outcome.result is not None
-    backward = _pure_backward(member_index, outcome.result, transaction, identity)
+    backward = _pure_backward(member_index, outcome.result, actual_n_valid, transaction, identity)
     if backward.terminal_code is not None:
         owner.abort_terminal(transaction, forward, backward.terminal_code)
         return TerminalMemberResult(backward.terminal_code)
-    transaction.successful_backward(member_index, identity, outcome.result.actual_n_valid)
+    transaction.successful_backward(member_index, identity, actual_n_valid)
     owner.commit(transaction, forward)
     if len(transaction.completed_members) == transaction.plan.ga_effective:
         return owner.finish_window(transaction)
     return OpenMemberCapability(owner, transaction)
+
+
+def run_disabled(payloads: tuple[Any, ...], native_batch: Callable[[tuple[Any, ...]], torch.Tensor]) -> torch.Tensor:
+    """No-Local parity path: no owner, plan, scan, or Local mutation."""
+    return native_batch(payloads)

@@ -663,15 +663,11 @@ class ImaginaireTrainer:
         if (forward.wiring is not wiring or pending is None or pending[0] != identity
                 or pending[1] is not transaction or pending[2] is not forward.result):
             raise RuntimeError("canonical segment capability identity is invalid.")
-        result = self._run_local_memory_bridge_backward(
-            output_batch["canonical_member_index"], output_batch["primary_consumer_mean"],
-            output_batch["auxiliary_loss"], output_batch["actual_n_valid"], transaction=transaction, identity=identity,
+        loss = self._run_local_memory_segment_backward(
+            transaction.plan, output_batch["canonical_member_index"], output_batch["primary_consumer_mean"],
+            output_batch["auxiliary_loss"], output_batch["actual_n_valid"], transaction=transaction,
+            identity=identity, clear_slow_grads=wiring.clear_local_slow_grads,
         )
-        if result.terminal_code is not None:
-            raise RuntimeError(result.terminal_code)
-        assert result.loss is not None
-        loss = result.loss
-        transaction.successful_backward(output_batch["canonical_member_index"], identity, output_batch["actual_n_valid"])
         wiring.adapter.commit(identity, forward.result, transaction=transaction)
         return loss
 
