@@ -206,3 +206,20 @@ def test_final_member_scaler_skip_clears_real_grads_and_preserves_fast_frontier(
     snapshot = transaction.snapshot()
     assert snapshot.slow_grads_cleared and snapshot.slow_optimizer_steps == snapshot.slow_lr_scheduler_steps == 0
     assert owner.snapshot().committed[0][0] is identity
+
+
+def test_preflighted_slow_window_consumes_exact_owner_seal_once() -> None:
+    owner, identity = _owner(), _identity()
+    transaction, forward = _prepare(owner, identity, GAWindowPlan(((0, identity.episode_id, 0),), (1,)))
+    _commit(owner, transaction, forward, identity)
+    completed = owner.finish_window(transaction)
+    sealed = owner.preflight_slow_window(completed)
+    with pytest.raises(RuntimeError, match="idle committed frontier"):
+        owner.snapshot()
+    with pytest.raises(RuntimeError, match="exact owner seal"):
+        owner.resolve_preflighted_slow_window(type(sealed)(owner, completed), scaler_skipped=False)
+    assert owner.phase.name == "SLOW_RESOLUTION_PENDING"
+    owner.resolve_preflighted_slow_window(sealed, scaler_skipped=False)
+    assert transaction.snapshot().slow_optimizer_steps == 1
+    with pytest.raises(RuntimeError, match="exact owner seal"):
+        owner.resolve_preflighted_slow_window(sealed, scaler_skipped=False)

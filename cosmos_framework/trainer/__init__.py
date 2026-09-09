@@ -84,6 +84,26 @@ class LocalMemoryBridgeBackwardResult:
     terminal_code: str | None = None
 
 
+def _dispatch_active_callbacks_excluding_ttt(callback_group: callback.CallBackGroup, hook_name: str, **kwargs: Any) -> None:
+    """Dispatch one active hook while preserving the frozen callback-list identity."""
+    from cosmos_framework.model.generator.mot.ttt_lifecycle import TTTLifecycleCallback
+
+    callbacks = callback_group._callbacks
+    before = (id(callbacks), len(callbacks), tuple(id(item) for item in callbacks))
+    for current_callback in callbacks:
+        if type(current_callback) is TTTLifecycleCallback:
+            continue
+        if not hasattr(current_callback, hook_name):
+            raise AttributeError(f"callback lacks required hook {hook_name}")
+        method = getattr(current_callback, hook_name)
+        if not callable(method):
+            raise TypeError(f"callback hook {hook_name} is not callable")
+        method(**kwargs)
+    after = (id(callbacks), len(callbacks), tuple(id(item) for item in callbacks))
+    if after != before:
+        raise RuntimeError("active callback dispatch mutated callback registration")
+
+
 @dataclass
 class OptimizerStepTiming:
     """Aggregate host wall-clock timings for one optimizer step.
@@ -482,6 +502,21 @@ class ImaginaireTrainer:
             loss (torch.Tensor): The total loss of the training data batch.
         """
         capture_only = os.environ.get("PSM_R08_GATE_B_CAPTURE_ONLY", "0") == "1"
+        armed_prepared = getattr(self, "_psm_active_armed_prepared", None)
+        active_registry = getattr(self, "_psm_active_wiring_registry", None)
+        if armed_prepared is None and active_registry is not None:
+            from cosmos_framework.model.generator.mot.canonical_segment_runtime import RuntimePhase
+            from cosmos_framework.model.generator.mot.production_active_wiring import ProductionActiveWiringRegistry
+
+            if isinstance(active_registry, ProductionActiveWiringRegistry) and active_registry.owner.phase is not RuntimePhase.IDLE:
+                raise RuntimeError("open active Local window forbids no-marker interleaving")
+        active_data = data
+        if armed_prepared is not None:
+            if grad_accum_iter != armed_prepared.member_index:
+                raise RuntimeError("armed active Local member counter mismatch")
+            active_data = dict(data)
+            active_data["psm_local_memory_active"] = True
+            active_data["psm_local_memory_prepared"] = armed_prepared
         # Only let DDP sync gradient at the last iteration of the gradient accumulation window
         with distributed.ddp_sync_grad(model_ddp, grad_accum_iter == self.config.trainer.grad_accum_iter - 1):
             self.callbacks.on_before_forward(iteration=iteration)
@@ -489,21 +524,39 @@ class ImaginaireTrainer:
                 with self.straggler_detector.profile_section(
                     "fwd", self.config.trainer.straggler_detection.analyze_forward
                 ):
-                    output_batch, loss = model_ddp.training_step(data, iteration)
+                    try:
+                        output_batch, loss = model_ddp.training_step(active_data, iteration)
+                    except Exception:
+                        if armed_prepared is not None:
+                            armed_prepared.owner.abort_terminal(
+                                armed_prepared.transaction, armed_prepared.forward, "LOCAL_MEM_OUTER_FAILURE"
+                            )
+                            self._psm_active_armed_prepared = None
+                        raise
+            if armed_prepared is not None:
+                self._psm_active_armed_prepared = None
             self.callbacks.on_after_forward(iteration=iteration)
             model = model_ddp.module if self.config.trainer.distributed_parallelism == "ddp" else model_ddp
             if capture_only:
                 return output_batch, loss, 0
-            self.callbacks.on_before_backward(model, loss, iteration=iteration)
+            is_active_step = "psm_local_memory_active_forward" in output_batch
+            if is_active_step:
+                _dispatch_active_callbacks_excluding_ttt(
+                    self.callbacks, "on_before_backward", model=model, loss=loss, iteration=iteration
+                )
+            else:
+                self.callbacks.on_before_backward(model, loss, iteration=iteration)
             with self.training_timer("backward"):
                 with self.straggler_detector.profile_section(
                     "bwd", self.config.trainer.straggler_detection.analyze_backward
                 ):
-                    if "canonical_segment_forward" in output_batch:
+                    if is_active_step:
+                        self._run_active_local_memory_backward(model, output_batch, grad_scaler, grad_accum_iter)
+                    elif "canonical_segment_forward" in output_batch:
                         self._run_canonical_segment_backward(output_batch)
                     else:
                         loss_scaled = grad_scaler.scale(loss / self.config.trainer.grad_accum_iter)
-                        ttt_lifecycle = getattr(model, "_ttt_lifecycle", None)
+                        ttt_lifecycle = None if is_active_step else getattr(model, "_ttt_lifecycle", None)
                         try:
                             loss_scaled.backward()
                         except Exception:
@@ -515,9 +568,21 @@ class ImaginaireTrainer:
                                 ttt_lifecycle.abort_open_segments()
                             raise
                     model.on_after_backward()
-            self.callbacks.on_after_backward(model, iteration=iteration)
+            if is_active_step:
+                _dispatch_active_callbacks_excluding_ttt(
+                    self.callbacks, "on_after_backward", model=model, iteration=iteration
+                )
+            else:
+                self.callbacks.on_after_backward(model, iteration=iteration)
         grad_accum_iter += 1
         if grad_accum_iter == self.config.trainer.grad_accum_iter:
+            active_seal = None
+            active_completed = getattr(self, "_psm_active_completed_window", None)
+            active_registry = getattr(self, "_psm_active_registry", None)
+            if active_completed is not None:
+                if active_registry is None or grad_accum_iter != active_completed.transaction.plan.ga_effective:
+                    raise RuntimeError("active Local completed window does not match optimizer boundary")
+                active_seal = active_completed.owner.preflight_slow_window(active_completed)
             with self.training_timer("optimizer_step"):
                 with self.straggler_detector.profile_section(
                     "opt", self.config.trainer.straggler_detection.analyze_optimizer
@@ -526,12 +591,55 @@ class ImaginaireTrainer:
                         model, optimizer, scheduler, grad_scaler, iteration=iteration
                     )
                     model.on_before_optimizer_step(optimizer, scheduler, iteration=iteration)
-                    self._optimizer_step(model, optimizer, scheduler, grad_scaler, iteration=iteration)
+                    self._optimizer_step(
+                        model, optimizer, scheduler, grad_scaler, iteration=iteration, active_seal=active_seal
+                    )
                     self.callbacks.on_before_zero_grad(model, optimizer, scheduler, iteration=iteration)
                     model.on_before_zero_grad(optimizer, scheduler, iteration=iteration)
                     self._zero_grad(model, optimizer, iteration)
             grad_accum_iter = 0
         return output_batch, loss, grad_accum_iter
+
+    def arm_active_local_memory_initial(self, model: torch.nn.Module, identity: object, segment: object, plan: object) -> None:
+        """Main-process-only arm surface; producer data remains capability-free."""
+        from cosmos_framework.model.generator.mot.production_active_wiring import ProductionActiveWiringRegistry
+
+        registry = getattr(self, "_psm_active_wiring_registry", None)
+        if not isinstance(registry, ProductionActiveWiringRegistry):
+            raise RuntimeError("active Local registry is not bound to trainer")
+        if getattr(model, "_psm_active_wiring_registry", None) is not registry:
+            raise RuntimeError("active Local registry is not bound to model")
+        if getattr(self, "_psm_active_armed_prepared", None) is not None:
+            raise RuntimeError("active Local member is already armed")
+        self._psm_active_armed_prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+
+    def arm_active_local_memory_continuation(
+        self, model: torch.nn.Module, identity: object, segment: object, transaction: object, *, grad_accum_iter: int
+    ) -> None:
+        """Arm the exact next member of an already-open active window."""
+        from cosmos_framework.model.generator.mot.production_active_wiring import ProductionActiveWiringRegistry
+
+        registry = getattr(self, "_psm_active_wiring_registry", None)
+        if not isinstance(registry, ProductionActiveWiringRegistry) or getattr(model, "_psm_active_wiring_registry", None) is not registry:
+            raise RuntimeError("active Local registry is not object-identically bound")
+        if getattr(self, "_psm_active_armed_prepared", None) is not None:
+            raise RuntimeError("active Local member is already armed")
+        self._psm_active_armed_prepared = registry.prepare_continuation(
+            identity, segment, transaction, trainer_grad_accum_iter=grad_accum_iter
+        )
+
+    def bind_active_local_memory_registry(self, model: torch.nn.Module, registry: object) -> None:
+        """Bind the exact process-local registry to trainer and model once."""
+        from cosmos_framework.model.generator.mot.production_active_wiring import ProductionActiveWiringRegistry
+
+        if not isinstance(registry, ProductionActiveWiringRegistry):
+            raise TypeError("active Local registry has invalid type")
+        if getattr(self, "_psm_active_wiring_registry", None) not in (None, registry):
+            raise RuntimeError("trainer already has another active Local registry")
+        if getattr(model, "_psm_active_wiring_registry", None) not in (None, registry):
+            raise RuntimeError("model already has another active Local registry")
+        self._psm_active_wiring_registry = registry
+        model._psm_active_wiring_registry = registry
 
     def _optimizer_step(
         self,
@@ -540,9 +648,23 @@ class ImaginaireTrainer:
         scheduler: torch.optim.lr_scheduler.LRScheduler,
         grad_scaler: torch.amp.GradScaler,
         iteration: int,
+        active_seal: object | None = None,
     ) -> None:
         """Execute the optimizer step. Override to customise (e.g. PhaseOptimizer)."""
         grad_scaler.step(optimizer)
+        if active_seal is not None:
+            found_inf = False
+            if grad_scaler.is_enabled():
+                states = getattr(grad_scaler, "_per_optimizer_states", {})
+                state = states.get(id(optimizer), {})
+                found_inf = any(bool(value.item()) for value in state.get("found_inf_per_device", {}).values())
+            active_seal.owner.resolve_preflighted_slow_window(active_seal, scaler_skipped=found_inf)
+            if not found_inf:
+                scheduler.step()
+            grad_scaler.update()
+            self._psm_active_completed_window = None
+            self._psm_active_registry = None
+            return
         grad_scaler.update()
         ttt_lifecycle = getattr(model, "_ttt_lifecycle", None)
         if ttt_lifecycle is not None:
@@ -637,6 +759,39 @@ class ImaginaireTrainer:
         except Exception:
             return LocalMemoryBridgeBackwardResult(terminal_code="LOCAL_MEM_OUTER_FAILURE")
         return LocalMemoryBridgeBackwardResult(loss=loss)
+
+    def _run_active_local_memory_backward(
+        self, model: torch.nn.Module, output_batch: dict[str, object], grad_scaler: object, grad_accum_iter: int
+    ) -> None:
+        """Execute the active registry's one weighted/scaled backward and commit."""
+        from cosmos_framework.model.generator.mot.production_active_wiring import ActiveForwardCapability, ProductionActiveWiringRegistry
+
+        registry = getattr(model, "_psm_active_wiring_registry", None)
+        active = output_batch.get("psm_local_memory_active_forward")
+        if not isinstance(registry, ProductionActiveWiringRegistry) or not isinstance(active, ActiveForwardCapability):
+            raise RuntimeError("active Local forward capability is invalid")
+        active = registry.consume_active_forward(active)
+        prepared, transaction = active.prepared, active.prepared.transaction
+        if prepared.registry is not registry or prepared.member_index != len(transaction.completed_members):
+            raise RuntimeError("active Local member capability is stale")
+        if grad_accum_iter != prepared.member_index:
+            raise RuntimeError("active Local trainer counter does not match member index")
+        objective = transaction.plan.objective(
+            prepared.member_index, active.result.primary_consumer_mean, active.result.auxiliary_loss, prepared.actual_n_valid
+        )
+        if not torch.isfinite(objective):
+            prepared.owner.abort_terminal(transaction, prepared.forward, "LOCAL_MEM_NUMERICAL_FAILURE")
+            raise RuntimeError("LOCAL_MEM_NUMERICAL_FAILURE")
+        try:
+            grad_scaler.scale(objective).backward()
+        except Exception:
+            prepared.owner.abort_terminal(transaction, prepared.forward, "LOCAL_MEM_OUTER_FAILURE")
+            raise
+        transaction.successful_backward(prepared.member_index, prepared.identity, prepared.actual_n_valid)
+        prepared.owner.commit(transaction, prepared.forward)
+        if len(transaction.completed_members) == transaction.plan.ga_effective:
+            self._psm_active_completed_window = prepared.owner.finish_window(transaction)
+            self._psm_active_registry = registry
 
     def _run_canonical_segment_backward(self, output_batch: dict[str, object]) -> torch.Tensor:
         """Delegate canonical wiring exactly once to the existing transaction seam."""

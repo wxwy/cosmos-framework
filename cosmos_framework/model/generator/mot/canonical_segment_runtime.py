@@ -27,6 +27,14 @@ class CompletedWindowCapability:
     transaction: LocalMemoryTransaction
 
 
+@dataclass(frozen=True)
+class OwnerSealedSlowWindowCapability:
+    """One-shot owner seal created before any optimizer-side mutation."""
+
+    owner: "CanonicalSegmentRuntimeOwner"
+    completed: CompletedWindowCapability
+
+
 class CanonicalSegmentRuntimeOwner:
     def __init__(self, scheduler: RankLocalSegmentScheduler, wiring: CanonicalSegmentWiring) -> None:
         if getattr(scheduler, "_canonical_runtime_owner", None) is not None or getattr(wiring, "_canonical_runtime_owner", None) is not None:
@@ -45,6 +53,7 @@ class CanonicalSegmentRuntimeOwner:
         self._retry_identity: SegmentIdentity | None = None
         self._completed_transaction: LocalMemoryTransaction | None = None
         self._completed_capability: CompletedWindowCapability | None = None
+        self._sealed_slow_window: OwnerSealedSlowWindowCapability | None = None
         self.generation = 0
 
     def admit(self, candidates: tuple[SegmentIdentity, ...]) -> SegmentIdentity:
@@ -133,11 +142,41 @@ class CanonicalSegmentRuntimeOwner:
         self.transaction = None
         self.phase = RuntimePhase.IDLE
 
+    def preflight_slow_window(self, completed: CompletedWindowCapability) -> OwnerSealedSlowWindowCapability:
+        if (
+            self.phase is not RuntimePhase.SLOW_RESOLUTION_PENDING
+            or completed is not self._completed_capability
+            or completed.owner is not self
+            or completed.transaction is not self._completed_transaction
+            or self._sealed_slow_window is not None
+        ):
+            raise RuntimeError("slow-window preflight requires exact unconsumed capability")
+        self._sealed_slow_window = OwnerSealedSlowWindowCapability(self, completed)
+        return self._sealed_slow_window
+
+    def resolve_preflighted_slow_window(
+        self, sealed: OwnerSealedSlowWindowCapability, *, scaler_skipped: bool
+    ) -> None:
+        if sealed is not self._sealed_slow_window:
+            raise RuntimeError("slow-window resolution requires exact owner seal")
+        # All fallible owner/capability validation occurred in preflight.
+        transaction = sealed.completed.transaction
+        if scaler_skipped:
+            self.wiring.clear_local_slow_grads()
+            transaction.grad_scaler_skip()
+        else:
+            transaction.slow_optimizer_step_succeeded()
+        self._sealed_slow_window = None
+        self._completed_capability = self._completed_transaction = None
+        self.transaction = None
+        self.phase = RuntimePhase.IDLE
+
     def snapshot(self) -> CanonicalRuntimeSnapshot:
         if (self.phase is not RuntimePhase.IDLE or self.adapter.pending() is not None or self.identity is not None
                 or self.transaction is not None or self.forward is not None or self._skipped_plan is not None
                 or self._skipped_identity is not None or self._retry_plan is not None or self._retry_identity is not None
-                or self._completed_transaction is not None or self._completed_capability is not None):
+                or self._completed_transaction is not None or self._completed_capability is not None
+                or self._sealed_slow_window is not None):
             raise RuntimeError("snapshot requires idle committed frontier")
         committed = self.adapter.committed_snapshot()
         committed_by_slot = {identity.slot_id: identity for identity in self.scheduler.committed_identities}

@@ -75,6 +75,11 @@ from cosmos_framework.model.generator.mot.production_segment_wiring import (
     CanonicalSegmentWiring,
     run_native_forward_for_test,
 )
+from cosmos_framework.model.generator.mot.production_active_wiring import (
+    ActiveNativeBatchInputs,
+    PreparedActiveMemberCapability,
+    ProductionActiveWiringRegistry,
+)
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
@@ -1297,6 +1302,41 @@ class OmniMoTModel(ImaginaireModel):
         }
         return output, primary + auxiliary
 
+    def _run_active_local_memory_native_forward(
+        self, inputs: ActiveNativeBatchInputs, iteration: int
+    ):
+        """CPU/static batched seam for a registry-owned active Local member."""
+        del iteration
+        wiring = getattr(self, "_psm_active_wiring_registry").owner.wiring
+        primary, auxiliary = run_native_forward_for_test(
+            inputs.payloads, inputs.locals, wiring.adapter.pending_scan[2].local_tokens, wiring.local_slow_parameters
+        )
+        from cosmos_framework.model.generator.mot.production_segment_bridge import NativeBatchResult
+
+        return NativeBatchResult(primary, auxiliary)
+
+    def _active_local_memory_forward(
+        self, data_batch: dict[str, Any], iteration: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        if set(key for key in data_batch if key.startswith("psm_local_memory_")) != {
+            "psm_local_memory_active", "psm_local_memory_prepared"
+        }:
+            raise ValueError("active Local marker keys are incomplete or unexpected.")
+        if data_batch["psm_local_memory_active"] is not True:
+            raise ValueError("active Local marker must be exactly True.")
+        prepared = data_batch["psm_local_memory_prepared"]
+        if not isinstance(prepared, PreparedActiveMemberCapability):
+            raise TypeError("active Local prepared capability has invalid type.")
+        registry = getattr(self, "_psm_active_wiring_registry", None)
+        if not isinstance(registry, ProductionActiveWiringRegistry):
+            raise RuntimeError("active Local registry is unavailable.")
+        registry.assert_trainer_bound_model(self)
+        active = registry.consume_prepared_for_model(prepared)
+        result = self._run_active_local_memory_native_forward(active.inputs, iteration)
+        published = registry.publish_active_forward(active, result)
+        output = {"psm_local_memory_active_forward": published}
+        return output, result.primary_consumer_mean + result.auxiliary_loss
+
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -1321,6 +1361,9 @@ class OmniMoTModel(ImaginaireModel):
                 - Tensor: The computed loss for the training step as a PyTorch Tensor.
 
         """
+        if data_batch.get("psm_local_memory_active") is True:
+            return self._active_local_memory_forward(data_batch, iteration)
+
         if self.config.local_ttt_enabled and data_batch.get("canonical_local_memory_segment") is True:
             return self._canonical_local_memory_segment_forward(data_batch, iteration)
 
