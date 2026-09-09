@@ -317,3 +317,16 @@ def test_active_two_member_window_keeps_one_registry_token_until_completion() ->
     trainer._run_active_local_memory_backward(model, output, scaler, grad_accum_iter=1)
     assert owner.phase.name == "SLOW_RESOLUTION_PENDING"
     assert trainer._psm_active_completed_window.transaction.snapshot().completed_members == (identity, next_identity)
+
+
+def test_active_open_window_rejects_untagged_trainer_interleave_before_forward() -> None:
+    owner, identity, segment, plan = _fixture()
+    registry = ProductionActiveWiringRegistry(owner)
+    registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer._psm_active_wiring_registry = registry
+
+    with pytest.raises(RuntimeError, match="open active Local window forbids no-marker interleaving"):
+        trainer.training_step(object(), object(), object(), object(), {}, grad_accum_iter=0)
+
+    assert owner.phase.name == "PREPARED" and owner.adapter.pending() is not None
