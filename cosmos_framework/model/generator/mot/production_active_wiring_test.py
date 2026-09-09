@@ -7,12 +7,32 @@ import pytest
 import torch
 
 from cosmos_framework.model.generator.mot.canonical_segment_runtime import CanonicalSegmentRuntimeOwner
-from cosmos_framework.model.generator.mot.local_evidence import CANONICAL_EVIDENCE_FEATURE_CONFIG, ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
-from cosmos_framework.model.generator.mot.local_memory_segment import GAWindowPlan, RankLocalSegmentScheduler, SegmentBatch, SegmentIdentity, SegmentProvenance
-from cosmos_framework.model.generator.mot.local_memory_segment_adapter import CanonicalLocalMemorySegmentAdapter, LocalMemorySegmentSidecar
-from cosmos_framework.model.generator.mot.production_active_wiring import ActiveSourceTransientError, ProductionActiveWiringRegistry
+from cosmos_framework.model.generator.mot.local_evidence import (
+    CANONICAL_EVIDENCE_FEATURE_CONFIG,
+    ContinualTTTLocalMemoryCore,
+    LocalEvidenceEncoder,
+)
+from cosmos_framework.model.generator.mot.local_memory_segment import (
+    GAWindowPlan,
+    RankLocalSegmentScheduler,
+    SegmentBatch,
+    SegmentIdentity,
+    SegmentProvenance,
+)
+from cosmos_framework.model.generator.mot.local_memory_segment_adapter import (
+    CanonicalLocalMemorySegmentAdapter,
+    LocalMemorySegmentSidecar,
+)
+from cosmos_framework.model.generator.mot.production_active_wiring import (
+    ActiveNativeBatchInputs,
+    ActiveSourceTransientError,
+    ProductionActiveWiringRegistry,
+)
 from cosmos_framework.model.generator.mot.production_segment_bridge import NativeBatchResult
-from cosmos_framework.model.generator.mot.production_segment_wiring import CanonicalSegmentWiring, run_native_forward_for_test
+from cosmos_framework.model.generator.mot.production_segment_wiring import (
+    CanonicalSegmentWiring,
+    run_native_forward_for_test,
+)
 from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
 from cosmos_framework.trainer import ImaginaireTrainer
 
@@ -258,6 +278,30 @@ def test_active_tagged_transient_after_a_member_is_terminal() -> None:
     )
     with pytest.raises(RuntimeError, match="LOCAL_MEM_RETRY_AFTER_MEMBER"):
         registry.abort_source_transient(continuation)
+    assert owner.phase.name == "ABORTED" and owner.adapter.pending() is None
+
+
+def test_active_attempt_one_later_member_transient_keeps_later_member_terminal_code() -> None:
+    owner, identity, segment, _ = _fixture()
+    next_identity = SegmentIdentity(0, "episode", "suite", 1, 1, "source")
+    plan = GAWindowPlan(((0, "episode", 0), (0, "episode", 1)), (1, 1))
+    registry = ProductionActiveWiringRegistry(owner)
+    initial = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    retry = registry.abort_source_transient(initial)
+    retried = registry.prepare_retry(segment, retry, trainer_grad_accum_iter=0)
+    model = _active_test_model(registry)
+    output, _ = model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": retried}, 0)
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer._run_active_local_memory_backward(
+        model, output, torch.amp.GradScaler("cuda", enabled=False), grad_accum_iter=0
+    )
+    continuation = registry.prepare_continuation(
+        next_identity, segment, retried.transaction, trainer_grad_accum_iter=1
+    )
+
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_RETRY_AFTER_MEMBER"):
+        registry.abort_source_transient(continuation)
+
     assert owner.phase.name == "ABORTED" and owner.adapter.pending() is None
 
 

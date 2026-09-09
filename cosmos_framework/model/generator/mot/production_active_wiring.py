@@ -142,14 +142,14 @@ class ProductionActiveWiringRegistry:
         """Return the owner-retained retry plan only for the exact first active member."""
         if prepared.registry is not self or prepared is not self._prepared:
             raise RuntimeError("active transient capability is stale or foreign")
-        if prepared.transaction.plan.attempt != 0:
-            self.owner.abort_terminal(prepared.transaction, prepared.forward, "LOCAL_MEM_RETRY_EXHAUSTED")
-            self._prepared = self._model_consumed = self._published = None
-            raise RuntimeError("LOCAL_MEM_RETRY_EXHAUSTED")
         if prepared.member_index != 0 or prepared.transaction.completed_members:
             self.owner.abort_terminal(prepared.transaction, prepared.forward, "LOCAL_MEM_RETRY_AFTER_MEMBER")
             self._prepared = self._model_consumed = self._published = None
             raise RuntimeError("LOCAL_MEM_RETRY_AFTER_MEMBER")
+        if prepared.transaction.plan.attempt != 0:
+            self.owner.abort_terminal(prepared.transaction, prepared.forward, "LOCAL_MEM_RETRY_EXHAUSTED")
+            self._prepared = self._model_consumed = self._published = None
+            raise RuntimeError("LOCAL_MEM_RETRY_EXHAUSTED")
         plan = self.owner.abort_retry(prepared.transaction, prepared.forward)
         self._prepared = self._model_consumed = self._published = None
         return plan
