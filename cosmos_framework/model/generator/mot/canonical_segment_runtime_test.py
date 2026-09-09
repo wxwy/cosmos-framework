@@ -216,10 +216,8 @@ def test_preflighted_slow_window_consumes_exact_owner_seal_once() -> None:
     sealed = owner.preflight_slow_window(completed)
     with pytest.raises(RuntimeError, match="idle committed frontier"):
         owner.snapshot()
-    with pytest.raises(RuntimeError, match="exact owner seal"):
-        owner.resolve_preflighted_slow_window(type(sealed)(owner, completed), scaler_skipped=False)
     assert owner.phase.name == "SLOW_RESOLUTION_PENDING"
-    owner.resolve_preflighted_slow_window(sealed, scaler_skipped=False)
+    owner.resolve_preflighted_slow_window(scaler_skipped=False)
     assert transaction.snapshot().slow_optimizer_steps == 1
-    with pytest.raises(RuntimeError, match="exact owner seal"):
-        owner.resolve_preflighted_slow_window(sealed, scaler_skipped=False)
+    with pytest.raises(RuntimeError, match="preflighted owner seal"):
+        owner.resolve_preflighted_slow_window(scaler_skipped=False)

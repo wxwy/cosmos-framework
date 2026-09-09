@@ -526,11 +526,18 @@ class ImaginaireTrainer:
                 ):
                     try:
                         output_batch, loss = model_ddp.training_step(active_data, iteration)
-                    except Exception:
+                    except Exception as error:
                         if armed_prepared is not None:
-                            armed_prepared.owner.abort_terminal(
-                                armed_prepared.transaction, armed_prepared.forward, "LOCAL_MEM_OUTER_FAILURE"
+                            from cosmos_framework.model.generator.mot.production_active_wiring import (
+                                ActiveSourceTransientError,
                             )
+
+                            if isinstance(error, ActiveSourceTransientError):
+                                armed_prepared.registry.abort_source_transient(armed_prepared)
+                            else:
+                                armed_prepared.owner.abort_terminal(
+                                    armed_prepared.transaction, armed_prepared.forward, "LOCAL_MEM_OUTER_FAILURE"
+                                )
                             self._psm_active_armed_prepared = None
                         raise
             if armed_prepared is not None:
@@ -579,6 +586,14 @@ class ImaginaireTrainer:
             active_seal = None
             active_completed = getattr(self, "_psm_active_completed_window", None)
             active_registry = getattr(self, "_psm_active_registry", None)
+            open_registry = getattr(self, "_psm_active_wiring_registry", None)
+            if (
+                open_registry is not None
+                and getattr(open_registry, "owner", None) is not None
+                and open_registry.owner.phase.name != "IDLE"
+                and active_completed is None
+            ):
+                raise RuntimeError("active Local window reached optimizer boundary without exact completion")
             if active_completed is not None:
                 if active_registry is None or grad_accum_iter != active_completed.transaction.plan.ga_effective:
                     raise RuntimeError("active Local completed window does not match optimizer boundary")
@@ -600,7 +615,9 @@ class ImaginaireTrainer:
             grad_accum_iter = 0
         return output_batch, loss, grad_accum_iter
 
-    def arm_active_local_memory_initial(self, model: torch.nn.Module, identity: object, segment: object, plan: object) -> None:
+    def arm_active_local_memory_initial(
+        self, model: torch.nn.Module, identity: object, segment: object, plan: object, *, grad_accum_iter: int
+    ) -> None:
         """Main-process-only arm surface; producer data remains capability-free."""
         from cosmos_framework.model.generator.mot.production_active_wiring import ProductionActiveWiringRegistry
 
@@ -611,7 +628,11 @@ class ImaginaireTrainer:
             raise RuntimeError("active Local registry is not bound to model")
         if getattr(self, "_psm_active_armed_prepared", None) is not None:
             raise RuntimeError("active Local member is already armed")
-        self._psm_active_armed_prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+        if grad_accum_iter != 0 or plan.ga_effective != self.config.trainer.grad_accum_iter:
+            raise RuntimeError("active initial plan must exactly match the native accumulation boundary")
+        self._psm_active_armed_prepared = registry.prepare_initial(
+            identity, segment, plan, trainer_grad_accum_iter=grad_accum_iter
+        )
 
     def arm_active_local_memory_continuation(
         self, model: torch.nn.Module, identity: object, segment: object, transaction: object, *, grad_accum_iter: int
@@ -651,14 +672,24 @@ class ImaginaireTrainer:
         active_seal: object | None = None,
     ) -> None:
         """Execute the optimizer step. Override to customise (e.g. PhaseOptimizer)."""
+        found_inf = False
+        if active_seal is not None and grad_scaler.is_enabled():
+            # Resolve the scaler disposition before the irreversible optimizer
+            # step. GradScaler.step() accepts a prior unscale_ call and then
+            # consumes exactly this recorded per-optimizer result.
+            grad_scaler.unscale_(optimizer)
+            states = getattr(grad_scaler, "_per_optimizer_states", None)
+            state = None if states is None else states.get(id(optimizer))
+            found_inf_per_device = None if state is None else state.get("found_inf_per_device")
+            if not found_inf_per_device:
+                raise RuntimeError("active Local scaler outcome is unavailable")
+            try:
+                found_inf = any(bool(value.item()) for value in found_inf_per_device.values())
+            except (AttributeError, TypeError, ValueError) as error:
+                raise RuntimeError("active Local scaler outcome is invalid") from error
         grad_scaler.step(optimizer)
         if active_seal is not None:
-            found_inf = False
-            if grad_scaler.is_enabled():
-                states = getattr(grad_scaler, "_per_optimizer_states", {})
-                state = states.get(id(optimizer), {})
-                found_inf = any(bool(value.item()) for value in state.get("found_inf_per_device", {}).values())
-            active_seal.owner.resolve_preflighted_slow_window(active_seal, scaler_skipped=found_inf)
+            active_seal.owner.resolve_preflighted_slow_window(scaler_skipped=found_inf)
             if not found_inf:
                 scheduler.step()
             grad_scaler.update()

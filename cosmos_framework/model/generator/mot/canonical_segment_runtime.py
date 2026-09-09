@@ -154,11 +154,10 @@ class CanonicalSegmentRuntimeOwner:
         self._sealed_slow_window = OwnerSealedSlowWindowCapability(self, completed)
         return self._sealed_slow_window
 
-    def resolve_preflighted_slow_window(
-        self, sealed: OwnerSealedSlowWindowCapability, *, scaler_skipped: bool
-    ) -> None:
-        if sealed is not self._sealed_slow_window:
-            raise RuntimeError("slow-window resolution requires exact owner seal")
+    def resolve_preflighted_slow_window(self, *, scaler_skipped: bool) -> None:
+        sealed = self._sealed_slow_window
+        if sealed is None:
+            raise RuntimeError("slow-window resolution requires a preflighted owner seal")
         # All fallible owner/capability validation occurred in preflight.
         transaction = sealed.completed.transaction
         if scaler_skipped:

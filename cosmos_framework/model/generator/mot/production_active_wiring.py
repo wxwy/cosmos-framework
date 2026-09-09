@@ -50,6 +50,10 @@ class ActiveForwardCapability:
     result: NativeBatchResult
 
 
+class ActiveSourceTransientError(RuntimeError):
+    """Explicit producer-tagged transient; arbitrary forward errors are not retryable."""
+
+
 class ProductionActiveWiringRegistry:
     """One trainer/model-bound, identity-only active-window registry."""
 
@@ -65,6 +69,8 @@ class ProductionActiveWiringRegistry:
     ) -> PreparedActiveMemberCapability:
         if trainer_grad_accum_iter != 0 or plan.ga_effective <= 0:
             raise RuntimeError("active initial member requires trainer counter zero")
+        if plan.attempt != 0 or plan.members[0] != (identity.slot_id, identity.episode_id, identity.cursor):
+            raise RuntimeError("active initial plan must match the exact first member")
         if self.owner.phase is not RuntimePhase.IDLE or self._prepared is not None or self._published is not None:
             raise RuntimeError("active registry is not idle")
         self.owner.admit((identity,))
@@ -87,11 +93,16 @@ class ProductionActiveWiringRegistry:
         if member_index >= transaction.plan.ga_effective:
             raise RuntimeError("active member is outside frozen plan")
         forward = self.owner.prepare(segment)
-        inputs = ActiveNativeBatchInputs(
-            tuple(forward.payloads), tuple(forward.locals), tuple(forward.identities)
-        )
-        if len(inputs.payloads) != transaction.plan.planned_n_valid[member_index]:
-            raise RuntimeError("active gathered count does not match frozen plan")
+        try:
+            inputs = ActiveNativeBatchInputs(
+                tuple(forward.payloads), tuple(forward.locals), tuple(forward.identities)
+            )
+            if len(inputs.payloads) != transaction.plan.planned_n_valid[member_index]:
+                raise RuntimeError("active gathered count does not match frozen plan")
+        except (TypeError, ValueError, RuntimeError):
+            self.owner.abort_terminal(transaction, forward, "LOCAL_MEM_IDENTITY_CONTRACT_FAILURE")
+            self._prepared = self._model_consumed = self._published = None
+            raise
         if self._ga_window_token is None:
             self._ga_window_token = object()
         prepared = PreparedActiveMemberCapability(
@@ -119,6 +130,26 @@ class ProductionActiveWiringRegistry:
             raise RuntimeError("active forward capability is stale or foreign")
         self._prepared = self._model_consumed = self._published = None
         return active
+
+    def abort_source_transient(self, prepared: PreparedActiveMemberCapability) -> GAWindowPlan:
+        """Return the owner-retained retry plan only for the exact first active member."""
+        if prepared.registry is not self or prepared is not self._prepared:
+            raise RuntimeError("active transient capability is stale or foreign")
+        if prepared.member_index != 0 or prepared.transaction.completed_members:
+            self.owner.abort_terminal(prepared.transaction, prepared.forward, "LOCAL_MEM_RETRY_AFTER_MEMBER")
+            self._prepared = self._model_consumed = self._published = None
+            raise RuntimeError("LOCAL_MEM_RETRY_AFTER_MEMBER")
+        plan = self.owner.abort_retry(prepared.transaction, prepared.forward)
+        self._prepared = self._model_consumed = self._published = None
+        return plan
+
+    def prepare_retry(
+        self, identity: SegmentIdentity, segment: SegmentBatch, plan: GAWindowPlan, *, trainer_grad_accum_iter: int
+    ) -> PreparedActiveMemberCapability:
+        if trainer_grad_accum_iter != 0:
+            raise RuntimeError("active retry requires trainer counter zero")
+        transaction = self.owner.begin_retry(plan)
+        return self._prepare(identity, segment, transaction, 0)
 
     def assert_trainer_bound_model(self, model: object) -> None:
         if getattr(model, "_psm_active_wiring_registry", None) is not self:
