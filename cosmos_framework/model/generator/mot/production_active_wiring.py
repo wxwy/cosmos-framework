@@ -144,11 +144,14 @@ class ProductionActiveWiringRegistry:
         return plan
 
     def prepare_retry(
-        self, identity: SegmentIdentity, segment: SegmentBatch, plan: GAWindowPlan, *, trainer_grad_accum_iter: int
+        self, segment: SegmentBatch, plan: GAWindowPlan, *, trainer_grad_accum_iter: int
     ) -> PreparedActiveMemberCapability:
         if trainer_grad_accum_iter != 0:
             raise RuntimeError("active retry requires trainer counter zero")
         transaction = self.owner.begin_retry(plan)
+        identity = self.owner.identity
+        if identity is None:
+            raise RuntimeError("active retry requires retained owner identity")
         return self._prepare(identity, segment, transaction, 0)
 
     def assert_trainer_bound_model(self, model: object) -> None:

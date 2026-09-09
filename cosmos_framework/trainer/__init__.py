@@ -533,7 +533,8 @@ class ImaginaireTrainer:
                             )
 
                             if isinstance(error, ActiveSourceTransientError):
-                                armed_prepared.registry.abort_source_transient(armed_prepared)
+                                self._psm_active_retry_plan = armed_prepared.registry.abort_source_transient(armed_prepared)
+                                self._psm_active_retry_registry = armed_prepared.registry
                             else:
                                 armed_prepared.owner.abort_terminal(
                                     armed_prepared.transaction, armed_prepared.forward, "LOCAL_MEM_OUTER_FAILURE"
@@ -595,7 +596,13 @@ class ImaginaireTrainer:
             ):
                 raise RuntimeError("active Local window reached optimizer boundary without exact completion")
             if active_completed is not None:
-                if active_registry is None or grad_accum_iter != active_completed.transaction.plan.ga_effective:
+                if (
+                    active_registry is not open_registry
+                    or active_registry is None
+                    or active_completed.owner is not active_registry.owner
+                    or active_completed.transaction is not active_registry.owner.transaction
+                    or grad_accum_iter != active_completed.transaction.plan.ga_effective
+                ):
                     raise RuntimeError("active Local completed window does not match optimizer boundary")
                 active_seal = active_completed.owner.preflight_slow_window(active_completed)
             with self.training_timer("optimizer_step"):
@@ -648,6 +655,25 @@ class ImaginaireTrainer:
         self._psm_active_armed_prepared = registry.prepare_continuation(
             identity, segment, transaction, trainer_grad_accum_iter=grad_accum_iter
         )
+
+    def arm_active_local_memory_retry(self, model: torch.nn.Module, segment: object, *, grad_accum_iter: int) -> None:
+        """Consume the exact retained first-member retry plan without advancing GA."""
+        from cosmos_framework.model.generator.mot.production_active_wiring import ProductionActiveWiringRegistry
+
+        registry = getattr(self, "_psm_active_wiring_registry", None)
+        retry_registry = getattr(self, "_psm_active_retry_registry", None)
+        plan = getattr(self, "_psm_active_retry_plan", None)
+        if (
+            not isinstance(registry, ProductionActiveWiringRegistry)
+            or retry_registry is not registry
+            or getattr(model, "_psm_active_wiring_registry", None) is not registry
+            or plan is None
+            or grad_accum_iter != 0
+            or getattr(self, "_psm_active_armed_prepared", None) is not None
+        ):
+            raise RuntimeError("active Local retry requires the exact retained trainer authority")
+        self._psm_active_armed_prepared = registry.prepare_retry(segment, plan, trainer_grad_accum_iter=grad_accum_iter)
+        self._psm_active_retry_plan = self._psm_active_retry_registry = None
 
     def bind_active_local_memory_registry(self, model: torch.nn.Module, registry: object) -> None:
         """Bind the exact process-local registry to trainer and model once."""
@@ -807,16 +833,22 @@ class ImaginaireTrainer:
             raise RuntimeError("active Local member capability is stale")
         if grad_accum_iter != prepared.member_index:
             raise RuntimeError("active Local trainer counter does not match member index")
-        objective = transaction.plan.objective(
-            prepared.member_index, active.result.primary_consumer_mean, active.result.auxiliary_loss, prepared.actual_n_valid
-        )
-        if not torch.isfinite(objective):
-            prepared.owner.abort_terminal(transaction, prepared.forward, "LOCAL_MEM_NUMERICAL_FAILURE")
-            raise RuntimeError("LOCAL_MEM_NUMERICAL_FAILURE")
         try:
+            transaction.validate_success(prepared.member_index, prepared.identity, prepared.actual_n_valid)
+            objective = transaction.plan.objective(
+                prepared.member_index, active.result.primary_consumer_mean, active.result.auxiliary_loss, prepared.actual_n_valid
+            )
+            if not torch.isfinite(objective):
+                raise RuntimeError("LOCAL_MEM_NUMERICAL_FAILURE")
             grad_scaler.scale(objective).backward()
-        except Exception:
-            prepared.owner.abort_terminal(transaction, prepared.forward, "LOCAL_MEM_OUTER_FAILURE")
+        except ValueError as error:
+            prepared.owner.abort_terminal(transaction, prepared.forward, "LOCAL_MEM_IDENTITY_CONTRACT_FAILURE")
+            raise RuntimeError("LOCAL_MEM_IDENTITY_CONTRACT_FAILURE") from error
+        except Exception as error:
+            code = "LOCAL_MEM_NUMERICAL_FAILURE" if str(error) == "LOCAL_MEM_NUMERICAL_FAILURE" else "LOCAL_MEM_OUTER_FAILURE"
+            prepared.owner.abort_terminal(transaction, prepared.forward, code)
+            if code == "LOCAL_MEM_NUMERICAL_FAILURE":
+                raise RuntimeError(code) from error
             raise
         transaction.successful_backward(prepared.member_index, prepared.identity, prepared.actual_n_valid)
         prepared.owner.commit(transaction, prepared.forward)

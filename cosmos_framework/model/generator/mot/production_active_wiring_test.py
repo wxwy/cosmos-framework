@@ -109,8 +109,27 @@ def test_active_tagged_transient_retries_only_the_first_member() -> None:
     prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
     retry_plan = registry.abort_source_transient(prepared)
     assert owner.phase.name == "RETRY_READY" and owner.adapter.pending() is None
-    retried = registry.prepare_retry(identity, segment, retry_plan, trainer_grad_accum_iter=0)
+    retried = registry.prepare_retry(segment, retry_plan, trainer_grad_accum_iter=0)
     assert retried.transaction.plan is retry_plan and owner.phase.name == "PREPARED"
+
+
+def test_active_trainer_retry_arm_consumes_exact_retained_plan_at_counter_zero() -> None:
+    owner, identity, segment, plan = _fixture()
+    registry = ProductionActiveWiringRegistry(owner)
+    prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    trainer = object.__new__(ImaginaireTrainer)
+    model = object.__new__(OmniMoTModel)
+    torch.nn.Module.__init__(model)
+    trainer._psm_active_wiring_registry = registry
+    model._psm_active_wiring_registry = registry
+    trainer._psm_active_retry_registry = registry
+    trainer._psm_active_retry_plan = registry.abort_source_transient(prepared)
+
+    trainer.arm_active_local_memory_retry(model, segment, grad_accum_iter=0)
+
+    assert trainer._psm_active_armed_prepared.identity is identity
+    assert owner.phase.name == "PREPARED"
+    assert trainer._psm_active_retry_plan is None and trainer._psm_active_retry_registry is None
 
 
 def test_active_tagged_transient_after_a_member_is_terminal() -> None:
@@ -165,6 +184,94 @@ def test_active_optimizer_refuses_unknown_enabled_scaler_outcome_before_step() -
             torch.nn.Identity(), object(), object(), scaler, iteration=0, active_seal=SimpleNamespace(owner=Owner())
         )
     assert scaler.unscaled and not scaler.stepped
+
+
+@pytest.mark.parametrize(("found_inf", "scheduler_steps"), ((False, 1), (True, 0)))
+def test_active_optimizer_resolves_enabled_scaler_success_and_skip(found_inf: bool, scheduler_steps: int) -> None:
+    class Scaler:
+        def __init__(self) -> None:
+            self._per_optimizer_states: dict[int, object] = {}
+            self.unscaled = self.stepped = self.updated = False
+
+        def is_enabled(self) -> bool:
+            return True
+
+        def unscale_(self, optimizer: object) -> None:
+            self.unscaled = True
+            self._per_optimizer_states[id(optimizer)] = {
+                "found_inf_per_device": {"cpu": torch.tensor(float(found_inf))}
+            }
+
+        def step(self, optimizer: object) -> None:
+            self.stepped = True
+
+        def update(self) -> None:
+            self.updated = True
+
+    class Owner:
+        def __init__(self) -> None:
+            self.resolutions: list[bool] = []
+
+        def resolve_preflighted_slow_window(self, *, scaler_skipped: bool) -> None:
+            self.resolutions.append(scaler_skipped)
+
+    class Scheduler:
+        def __init__(self) -> None:
+            self.steps = 0
+
+        def step(self) -> None:
+            self.steps += 1
+
+    optimizer, scaler, owner, scheduler = object(), Scaler(), Owner(), Scheduler()
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer._psm_active_completed_window = object()
+    trainer._psm_active_registry = object()
+    trainer._optimizer_step(torch.nn.Identity(), optimizer, scheduler, scaler, iteration=0, active_seal=SimpleNamespace(owner=owner))
+
+    assert scaler.unscaled and scaler.stepped and scaler.updated
+    assert owner.resolutions == [found_inf] and scheduler.steps == scheduler_steps
+    assert trainer._psm_active_completed_window is None and trainer._psm_active_registry is None
+
+
+def test_active_backward_rejects_wrong_identity_before_scaled_backward_and_clears_pending() -> None:
+    owner, identity, segment, plan = _fixture()
+    registry = ProductionActiveWiringRegistry(owner)
+    prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    model = object.__new__(OmniMoTModel)
+    torch.nn.Module.__init__(model)
+    model._psm_active_wiring_registry = registry
+    output, _ = model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": prepared}, 0)
+    object.__setattr__(prepared, "identity", SegmentIdentity(0, "other", "suite", 0, 0, "source"))
+    trainer = object.__new__(ImaginaireTrainer)
+
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_IDENTITY_CONTRACT_FAILURE"):
+        trainer._run_active_local_memory_backward(
+            model, output, torch.amp.GradScaler("cuda", enabled=False), grad_accum_iter=0
+        )
+    assert owner.phase.name == "ABORTED" and owner.adapter.pending() is None
+    assert owner.wiring.local_slow_parameters[0].grad is None
+
+
+@pytest.mark.parametrize(
+    "data_batch, error",
+    (
+        ({"psm_local_memory_active": True}, "keys are incomplete"),
+        (
+            {
+                "psm_local_memory_active": True,
+                "psm_local_memory_prepared": object(),
+                "psm_local_memory_unexpected": True,
+            },
+            "keys are incomplete",
+        ),
+        ({"psm_local_memory_active": True, "psm_local_memory_prepared": object()}, "invalid type"),
+    ),
+)
+def test_active_model_marker_schema_rejects_missing_extra_and_bad_capability(data_batch, error: str) -> None:
+    model = object.__new__(OmniMoTModel)
+    torch.nn.Module.__init__(model)
+    with pytest.raises((TypeError, ValueError), match=error):
+        model.training_step(data_batch, 0)
 
 
 def test_active_model_and_trainer_consume_one_capability_and_complete_window() -> None:
