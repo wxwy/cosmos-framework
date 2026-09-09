@@ -330,3 +330,20 @@ def test_active_open_window_rejects_untagged_trainer_interleave_before_forward()
         trainer.training_step(object(), object(), object(), object(), {}, grad_accum_iter=0)
 
     assert owner.phase.name == "PREPARED" and owner.adapter.pending() is not None
+
+
+def test_active_optimizer_boundary_rejects_open_or_foreign_window_before_callbacks() -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    open_owner = SimpleNamespace(phase=SimpleNamespace(name="PREPARED"), transaction=object())
+    trainer._psm_active_wiring_registry = SimpleNamespace(owner=open_owner)
+    with pytest.raises(RuntimeError, match="without exact completion"):
+        trainer._preflight_active_optimizer_boundary(1)
+
+    expected_transaction = SimpleNamespace(plan=SimpleNamespace(ga_effective=1))
+    bound_owner = SimpleNamespace(phase=SimpleNamespace(name="SLOW_RESOLUTION_PENDING"), transaction=expected_transaction)
+    bound_registry = SimpleNamespace(owner=bound_owner)
+    trainer._psm_active_wiring_registry = bound_registry
+    trainer._psm_active_registry = bound_registry
+    trainer._psm_active_completed_window = SimpleNamespace(owner=bound_owner, transaction=object())
+    with pytest.raises(RuntimeError, match="does not match optimizer boundary"):
+        trainer._preflight_active_optimizer_boundary(1)

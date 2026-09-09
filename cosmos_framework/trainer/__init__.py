@@ -584,27 +584,7 @@ class ImaginaireTrainer:
                 self.callbacks.on_after_backward(model, iteration=iteration)
         grad_accum_iter += 1
         if grad_accum_iter == self.config.trainer.grad_accum_iter:
-            active_seal = None
-            active_completed = getattr(self, "_psm_active_completed_window", None)
-            active_registry = getattr(self, "_psm_active_registry", None)
-            open_registry = getattr(self, "_psm_active_wiring_registry", None)
-            if (
-                open_registry is not None
-                and getattr(open_registry, "owner", None) is not None
-                and open_registry.owner.phase.name != "IDLE"
-                and active_completed is None
-            ):
-                raise RuntimeError("active Local window reached optimizer boundary without exact completion")
-            if active_completed is not None:
-                if (
-                    active_registry is not open_registry
-                    or active_registry is None
-                    or active_completed.owner is not active_registry.owner
-                    or active_completed.transaction is not active_registry.owner.transaction
-                    or grad_accum_iter != active_completed.transaction.plan.ga_effective
-                ):
-                    raise RuntimeError("active Local completed window does not match optimizer boundary")
-                active_seal = active_completed.owner.preflight_slow_window(active_completed)
+            active_seal = self._preflight_active_optimizer_boundary(grad_accum_iter)
             with self.training_timer("optimizer_step"):
                 with self.straggler_detector.profile_section(
                     "opt", self.config.trainer.straggler_detection.analyze_optimizer
@@ -621,6 +601,30 @@ class ImaginaireTrainer:
                     self._zero_grad(model, optimizer, iteration)
             grad_accum_iter = 0
         return output_batch, loss, grad_accum_iter
+
+    def _preflight_active_optimizer_boundary(self, grad_accum_iter: int) -> object | None:
+        """Return an exact active-window seal or fail before optimizer callbacks."""
+        active_completed = getattr(self, "_psm_active_completed_window", None)
+        active_registry = getattr(self, "_psm_active_registry", None)
+        open_registry = getattr(self, "_psm_active_wiring_registry", None)
+        if (
+            open_registry is not None
+            and getattr(open_registry, "owner", None) is not None
+            and open_registry.owner.phase.name != "IDLE"
+            and active_completed is None
+        ):
+            raise RuntimeError("active Local window reached optimizer boundary without exact completion")
+        if active_completed is None:
+            return None
+        if (
+            active_registry is not open_registry
+            or active_registry is None
+            or active_completed.owner is not active_registry.owner
+            or active_completed.transaction is not active_registry.owner.transaction
+            or grad_accum_iter != active_completed.transaction.plan.ga_effective
+        ):
+            raise RuntimeError("active Local completed window does not match optimizer boundary")
+        return active_completed.owner.preflight_slow_window(active_completed)
 
     def arm_active_local_memory_initial(
         self, model: torch.nn.Module, identity: object, segment: object, plan: object, *, grad_accum_iter: int
