@@ -65,3 +65,16 @@ def test_active_callback_filter_never_touches_existing_ttt_lifecycle() -> None:
     _dispatch_active_callbacks_excluding_ttt(group, "on_after_backward", model=model, iteration=0)
 
     assert lifecycle.calls == []
+
+
+def test_no_marker_dispatch_keeps_exact_ttt_callback_in_original_order() -> None:
+    calls: list[tuple[str, object]] = []
+    group = object.__new__(CallBackGroup)
+    exact = TTTLifecycleCallback()
+    exact.on_before_backward = lambda **kwargs: calls.append(("exact", kwargs["loss"]))
+    first, second = _Spy("first", calls), _Spy("second", calls)
+    group._callbacks = [first, exact, second]
+
+    group.on_before_backward(model=object(), loss="legacy", iteration=4)
+
+    assert calls == [("first", "legacy"), ("exact", "legacy"), ("second", "legacy")]

@@ -160,6 +160,17 @@ def test_active_tagged_transient_retries_only_the_first_member() -> None:
     assert retried.transaction.plan is retry_plan and owner.phase.name == "PREPARED"
 
 
+def test_active_retry_exhaustion_terminalizes_and_discards_pending() -> None:
+    owner, identity, segment, plan = _fixture()
+    registry = ProductionActiveWiringRegistry(owner)
+    first = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    retry = registry.abort_source_transient(first)
+    second = registry.prepare_retry(segment, retry, trainer_grad_accum_iter=0)
+    with pytest.raises(RuntimeError, match="LOCAL_MEM_RETRY_EXHAUSTED"):
+        registry.abort_source_transient(second)
+    assert owner.phase.name == "ABORTED" and owner.adapter.pending() is None
+
+
 def test_active_trainer_retry_arm_consumes_exact_retained_plan_at_counter_zero() -> None:
     owner, identity, segment, plan = _fixture()
     registry = ProductionActiveWiringRegistry(owner)
