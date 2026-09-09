@@ -10,7 +10,7 @@ from cosmos_framework.model.generator.mot.canonical_segment_runtime import Canon
 from cosmos_framework.model.generator.mot.local_evidence import CANONICAL_EVIDENCE_FEATURE_CONFIG, ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
 from cosmos_framework.model.generator.mot.local_memory_segment import GAWindowPlan, RankLocalSegmentScheduler, SegmentBatch, SegmentIdentity, SegmentProvenance
 from cosmos_framework.model.generator.mot.local_memory_segment_adapter import CanonicalLocalMemorySegmentAdapter, LocalMemorySegmentSidecar
-from cosmos_framework.model.generator.mot.production_active_wiring import ProductionActiveWiringRegistry
+from cosmos_framework.model.generator.mot.production_active_wiring import ActiveSourceTransientError, ProductionActiveWiringRegistry
 from cosmos_framework.model.generator.mot.production_segment_bridge import NativeBatchResult
 from cosmos_framework.model.generator.mot.production_segment_wiring import CanonicalSegmentWiring
 from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
@@ -130,6 +130,23 @@ def test_active_trainer_retry_arm_consumes_exact_retained_plan_at_counter_zero()
     assert trainer._psm_active_armed_prepared.identity is identity
     assert owner.phase.name == "PREPARED"
     assert trainer._psm_active_retry_plan is None and trainer._psm_active_retry_registry is None
+
+
+def test_active_trainer_tagged_exception_retains_exact_first_member_retry_authority() -> None:
+    owner, identity, segment, plan = _fixture()
+    registry = ProductionActiveWiringRegistry(owner)
+    prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer._psm_active_armed_prepared = prepared
+
+    trainer._handle_active_forward_exception(prepared, ActiveSourceTransientError("source transient"))
+
+    assert owner.phase.name == "RETRY_READY"
+    assert trainer._psm_active_retry_registry is registry
+    assert trainer._psm_active_retry_plan is not plan
+    assert trainer._psm_active_retry_plan.attempt == 1
+    assert trainer._psm_active_retry_plan.members == plan.members
+    assert trainer._psm_active_armed_prepared is None
 
 
 def test_active_tagged_transient_after_a_member_is_terminal() -> None:

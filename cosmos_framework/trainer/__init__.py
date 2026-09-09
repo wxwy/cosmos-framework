@@ -528,18 +528,7 @@ class ImaginaireTrainer:
                         output_batch, loss = model_ddp.training_step(active_data, iteration)
                     except Exception as error:
                         if armed_prepared is not None:
-                            from cosmos_framework.model.generator.mot.production_active_wiring import (
-                                ActiveSourceTransientError,
-                            )
-
-                            if isinstance(error, ActiveSourceTransientError):
-                                self._psm_active_retry_plan = armed_prepared.registry.abort_source_transient(armed_prepared)
-                                self._psm_active_retry_registry = armed_prepared.registry
-                            else:
-                                armed_prepared.owner.abort_terminal(
-                                    armed_prepared.transaction, armed_prepared.forward, "LOCAL_MEM_OUTER_FAILURE"
-                                )
-                            self._psm_active_armed_prepared = None
+                            self._handle_active_forward_exception(armed_prepared, error)
                         raise
             if armed_prepared is not None:
                 self._psm_active_armed_prepared = None
@@ -625,6 +614,17 @@ class ImaginaireTrainer:
         ):
             raise RuntimeError("active Local completed window does not match optimizer boundary")
         return active_completed.owner.preflight_slow_window(active_completed)
+
+    def _handle_active_forward_exception(self, armed_prepared: object, error: Exception) -> None:
+        """Retain retry authority only for the tagged exact first member."""
+        from cosmos_framework.model.generator.mot.production_active_wiring import ActiveSourceTransientError
+
+        if isinstance(error, ActiveSourceTransientError):
+            self._psm_active_retry_plan = armed_prepared.registry.abort_source_transient(armed_prepared)
+            self._psm_active_retry_registry = armed_prepared.registry
+        else:
+            armed_prepared.owner.abort_terminal(armed_prepared.transaction, armed_prepared.forward, "LOCAL_MEM_OUTER_FAILURE")
+        self._psm_active_armed_prepared = None
 
     def arm_active_local_memory_initial(
         self, model: torch.nn.Module, identity: object, segment: object, plan: object, *, grad_accum_iter: int
