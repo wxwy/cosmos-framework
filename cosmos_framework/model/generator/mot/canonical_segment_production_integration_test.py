@@ -63,10 +63,9 @@ def test_adapter_binds_only_the_exact_registered_canonical_modules() -> None:
 
 def test_canonical_branch_rejects_context_parallelism_before_adapter_lookup() -> None:
     request = _request()
-    object.__setattr__(request, "carrier", object())
     model = SimpleNamespace(parallel_dims=SimpleNamespace(cp_enabled=True))
     with pytest.raises(RuntimeError, match="rejects context parallelism before scan"):
-        OmniMoTModel._canonical_production_segment_forward(model, request, 1)
+        OmniMoTModel._canonical_production_segment_forward(model, request, object(), 1)
 
 
 def test_canonical_safe_preparation_adapts_only_gathered_prefixes() -> None:
@@ -81,14 +80,14 @@ def test_canonical_safe_preparation_adapts_only_gathered_prefixes() -> None:
         memory_init_training=lambda value, batch, indexes: (calls.append("memory") or value, {}),
         _get_vae_pixel_shapes=lambda raw: [],
     )
-    request = SimpleNamespace(carrier=SimpleNamespace(model_data_batch={"text_token_ids": []}))
+    carrier = SimpleNamespace(model_data_batch={"text_token_ids": []})
     result = SimpleNamespace(gathered=SimpleNamespace(item_count=2, local_prefixes=(None, "prefix")))
     import cosmos_framework.model.generator.omni_mot_model as module
 
     original = module.build_sequence_plans_from_data_batch
     module.build_sequence_plans_from_data_batch = lambda **kwargs: calls.append("plan") or plans
     try:
-        OmniMoTModel._prepare_canonical_production_inputs(model, request, result, 1)
+        OmniMoTModel._prepare_canonical_production_inputs(model, carrier, result, 1)
     finally:
         module.build_sequence_plans_from_data_batch = original
     assert calls == ["text", "plan", "clean", "memory"]

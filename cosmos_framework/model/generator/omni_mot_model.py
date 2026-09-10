@@ -54,6 +54,7 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
     CanonicalProductionAdapter,
+    CanonicalRawRowCarrier,
     CanonicalProductionSegmentRequest,
 )
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
@@ -126,6 +127,7 @@ from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_line
 
 _CANONICAL_PRODUCTION_MODE_KEY = "canonical_production_segment_mode"
 _CANONICAL_PRODUCTION_REQUEST_KEY = "canonical_production_segment_input"
+_CANONICAL_PRODUCTION_CARRIER_KEY = "canonical_production_segment_carrier"
 _LEGACY_LOCAL_MARKER_KEYS = frozenset(
     {"psm_local_memory_active", "psm_local_memory_prepared", "canonical_local_memory_segment"}
 )
@@ -1392,33 +1394,31 @@ class OmniMoTModel(ImaginaireModel):
         return output, result.primary_consumer_mean + result.auxiliary_loss
 
     def _canonical_production_segment_forward(
-        self, request: CanonicalProductionSegmentRequest, iteration: int
+        self, request: CanonicalProductionSegmentRequest, carrier: CanonicalRawRowCarrier, iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Reserve the canonical ABI branch; its native pack/forward seam is P2-owned."""
-        if request.carrier is None:
-            raise RuntimeError("canonical-production requires an immutable raw-row carrier")
         if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
             raise RuntimeError("canonical-production rejects context parallelism before scan")
         adapter = _canonical_production_adapter_from_model(self)
-        expected = request.carrier.expected_for(request)
-        if "local_memory" in request.carrier.model_data_batch:
+        expected = carrier.expected_for(request)
+        carrier.validate_model_data_batch(expected)
+        if "local_memory" in carrier.model_data_batch:
             raise RuntimeError("canonical-production model batch must remain Local-neutral")
         result = adapter.scan(request)
         try:
             if result.gathered.identities != expected.identities or result.gathered.item_count != len(expected.identities):
                 raise RuntimeError("canonical-production gathered result differs from pre-scan expected traversal")
-            self._prepare_canonical_production_inputs(request, result, iteration)
+            self._prepare_canonical_production_inputs(carrier, result, iteration)
             raise RuntimeError("canonical-production native forward seam is unavailable")
         except Exception:
             adapter.abort_scan(request, result)
             raise
 
     def _prepare_canonical_production_inputs(
-        self, request: CanonicalProductionSegmentRequest, result: Any, iteration: int
+        self, carrier: CanonicalRawRowCarrier, result: Any, iteration: int
     ) -> tuple[list[list[int]], list[SequencePlan], GenerationDataClean, dict, list[str] | None, list[tuple[int, int, int]]]:
         """Run only the canonical-safe preparation prefix, then stop before packing."""
-        assert request.carrier is not None
-        data_batch = dict(request.carrier.model_data_batch)
+        data_batch = dict(carrier.model_data_batch)
         if "local_memory" in data_batch:
             raise RuntimeError("canonical-production model batch must remain Local-neutral")
         input_text_indexes = self._load_and_tokenize_text_data(data_batch, iteration)
@@ -1428,7 +1428,7 @@ class OmniMoTModel(ImaginaireModel):
         if any(plan.has_local_memory for plan in sequence_plans):
             raise RuntimeError("canonical-production plans must be Local-neutral before clean materialization")
         gen_data_clean = self.get_data_and_condition(data_batch, iteration=iteration)
-        if any(plan.has_local_memory for plan in sequence_plans) or gen_data_clean.x0_tokens_local_memory is not None:
+        if "local_memory" in data_batch or any(plan.has_local_memory for plan in sequence_plans) or gen_data_clean.x0_tokens_local_memory is not None:
             raise RuntimeError("canonical-production clean materialization introduced an ordinary Local payload")
         if len(sequence_plans) != result.gathered.item_count:
             raise RuntimeError("canonical-production plan count differs from gathered result")
@@ -1470,7 +1470,10 @@ class OmniMoTModel(ImaginaireModel):
             local_ttt_enabled=self.config.local_ttt_enabled, data_batch=data_batch
         )
         if canonical_request is not None:
-            return self._canonical_production_segment_forward(canonical_request, iteration)
+            carrier = data_batch.get(_CANONICAL_PRODUCTION_CARRIER_KEY)
+            if not isinstance(carrier, CanonicalRawRowCarrier):
+                raise TypeError("canonical-production mode requires CanonicalRawRowCarrier marker")
+            return self._canonical_production_segment_forward(canonical_request, carrier, iteration)
 
         if data_batch.get("psm_local_memory_active") is True:
             return self._active_local_memory_forward(data_batch, iteration)

@@ -32,7 +32,6 @@ class CanonicalProductionSegmentRequest:
     member: MicrobatchPlanMember
     member_index: int
     segment_batch: SegmentBatch
-    carrier: "CanonicalRawRowCarrier | None" = None
 
 
 @dataclass(frozen=True)
@@ -45,11 +44,33 @@ class CanonicalExpectedTraversal:
 class CanonicalRawRowCarrier:
     """Immutable nested raw source; flat views are derived, never stored."""
 
+    request: CanonicalProductionSegmentRequest
+    member: MicrobatchPlanMember
+    segment_batch: SegmentBatch
+    row_identities: tuple[Any, ...]
+    row_chronology: tuple[Any, ...]
     raw_rows: tuple[tuple[Mapping[str, Any] | None, ...], ...]
     row_model_samples: tuple[tuple[Mapping[str, Any] | None, ...], ...]
     model_data_batch: Mapping[str, Any]
 
+    _MODEL_BATCH_KEYS = frozenset(
+        {
+            "text_token_ids", "video", "image", "video_latent", "verify_cached_latent", "image_size",
+            "enable_per_camera_vae_encoding", "sample_n_views", "num_video_frames_per_view", "action",
+            "domain_id", "raw_action_dim", "sound", "conditioning_fps", "conditioning_fps_action",
+            "control_weights", "num_vision_items_per_sample", "is_preprocessed", "sequence_plan",
+        }
+    )
+
     def expected_for(self, request: CanonicalProductionSegmentRequest) -> CanonicalExpectedTraversal:
+        if (
+            self.request is not request
+            or self.member is not request.member
+            or self.segment_batch is not request.segment_batch
+            or self.row_identities is not request.member.row_identities
+            or self.row_chronology is not request.member.row_chronology
+        ):
+            raise CanonicalSegmentContractError("canonical carrier authority is foreign")
         valid = request.segment_batch.consumer_valid
         batch, steps = valid.shape
         if len(self.raw_rows) != batch or len(self.row_model_samples) != batch:
@@ -81,6 +102,18 @@ class CanonicalRawRowCarrier:
         if len(expected.identities) != request.member.planned_n_valid:
             raise CanonicalSegmentContractError("canonical carrier expected count differs from frozen member")
         return expected
+
+    def validate_model_data_batch(self, expected: CanonicalExpectedTraversal) -> None:
+        unexpected = set(self.model_data_batch) - self._MODEL_BATCH_KEYS
+        if unexpected:
+            raise CanonicalSegmentContractError("canonical carrier model batch has an unexpected key")
+        for key, value in self.model_data_batch.items():
+            if not isinstance(value, (list, tuple)) or len(value) != len(expected.logical_indexes):
+                raise CanonicalSegmentContractError("canonical carrier model batch cardinality is foreign")
+            for value_item, (row, index) in zip(value, expected.logical_indexes, strict=True):
+                source = self.row_model_samples[row][index]
+                if source is None or source.get(key) is not value_item:
+                    raise CanonicalSegmentContractError("canonical carrier model batch source is foreign")
 
 
 @dataclass(frozen=True)

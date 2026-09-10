@@ -81,11 +81,31 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
     scheduler = CanonicalBatchScheduler(ProjectedSchedulerState(QueueEpochSnapshot(1, 0, "catalog", ()), ()))
     request = CanonicalProductionSegmentRequest(scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, batch)
     samples = tuple(tuple({"canonical_identity": (row, f"episode-{row}", step)} if step >= 0 else None for step in steps) for row, steps in enumerate(((0, 1, -1), (0, 1, 2))))
-    carrier = CanonicalRawRowCarrier(samples, samples, {"sequence_plan": ()})
+    carrier = CanonicalRawRowCarrier(
+        request, member, batch, member.row_identities, member.row_chronology, samples, samples, {"sequence_plan": ()}
+    )
     assert carrier.expected_for(request).logical_indexes == ((0, 0), (0, 1), (1, 0), (1, 1), (1, 2))
-    foreign = CanonicalRawRowCarrier((({"canonical_identity": (1, "episode-0", 0)}, samples[0][1], None), samples[1]), samples, {})
+    foreign = CanonicalRawRowCarrier(
+        request, member, batch, member.row_identities, member.row_chronology,
+        (({"canonical_identity": (1, "episode-0", 0)}, samples[0][1], None), samples[1]), samples, {},
+    )
     with pytest.raises(CanonicalSegmentContractError, match="raw identity is foreign"):
         foreign.expected_for(request)
+    model_samples = tuple(
+        tuple(None if sample is None else {"canonical_identity": sample["canonical_identity"], "text_token_ids": sample} for sample in row) for row in samples
+    )
+    bound = CanonicalRawRowCarrier(
+        request, member, batch, member.row_identities, member.row_chronology, samples, model_samples,
+        {"text_token_ids": [model_samples[row][index]["text_token_ids"] for row, index in carrier.expected_for(request).logical_indexes]},
+    )
+    expected = bound.expected_for(request)
+    bound.validate_model_data_batch(expected)
+    foreign_batch = CanonicalRawRowCarrier(
+        request, member, batch, member.row_identities, member.row_chronology, samples, model_samples,
+        {"text_token_ids": [dict(value) for value in bound.model_data_batch["text_token_ids"]]},
+    )
+    with pytest.raises(CanonicalSegmentContractError, match="model batch source is foreign"):
+        foreign_batch.validate_model_data_batch(expected)
 
 
 def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() -> None:
