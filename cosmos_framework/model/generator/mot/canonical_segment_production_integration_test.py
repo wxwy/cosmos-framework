@@ -157,6 +157,9 @@ def test_native_preparation_owns_working_carrier_fields_and_aborts_on_mismatch()
     prepared = adapter.prepare_native_inputs(
         request, result, carrier, input_image_key="images", input_video_key="video"
     )
+    assert prepared.owner_maps.vision_owner_indexes == (0, 1)
+    assert prepared.owner_maps.action_owner_indexes == ()
+    assert prepared.owner_maps.sound_owner_indexes == ()
     prepared.working_data_batch["images"][0]["rewritten"] = True
     prepared.working_data_batch["sequence_plan"][0].has_local_memory = True
     assert "rewritten" not in carrier.model_data_batch["images"][0]

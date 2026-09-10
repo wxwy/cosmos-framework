@@ -41,6 +41,15 @@ class CanonicalExpectedTraversal:
 
 
 @dataclass(frozen=True)
+class CanonicalNativeOwnerMaps:
+    """Exact logical-consumer owners for native vision/action/sound populations."""
+
+    vision_owner_indexes: tuple[int, ...]
+    action_owner_indexes: tuple[int, ...]
+    sound_owner_indexes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class CanonicalRawRowCarrier:
     """Immutable nested raw source; flat views are derived, never stored."""
 
@@ -188,6 +197,39 @@ class CanonicalRawRowCarrier:
         )
         return expected
 
+    def native_owner_maps(
+        self, expected: CanonicalExpectedTraversal, *, input_image_key: str, input_video_key: str
+    ) -> CanonicalNativeOwnerMaps:
+        """Derive source-identified native populations without a fallback identity."""
+        samples = tuple(self.row_model_samples[row][index] for row, index in expected.logical_indexes)
+        vision_counts = self.model_data_batch.get("num_vision_items_per_sample")
+        if vision_counts is None:
+            counts = (1,) * len(samples)
+        elif isinstance(vision_counts, torch.Tensor):
+            if vision_counts.ndim != 1:
+                raise CanonicalSegmentContractError("canonical vision item counts are invalid")
+            counts = tuple(int(value) for value in vision_counts.tolist())
+        elif isinstance(vision_counts, (list, tuple)):
+            counts = tuple(int(value) for value in vision_counts)
+        else:
+            raise CanonicalSegmentContractError("canonical vision item counts are invalid")
+        if len(counts) != len(samples) or any(value <= 0 for value in counts):
+            raise CanonicalSegmentContractError("canonical vision item counts are invalid")
+        vision_owners: list[int] = []
+        action_owners: list[int] = []
+        sound_owners: list[int] = []
+        for owner, sample in enumerate(samples):
+            if sample is None:
+                raise CanonicalSegmentContractError("canonical native source sample is missing")
+            if input_image_key not in sample and input_video_key not in sample:
+                raise CanonicalSegmentContractError("canonical native vision source is missing")
+            vision_owners.extend((owner,) * counts[owner])
+            if "action" in sample:
+                action_owners.append(owner)
+            if "sound" in sample:
+                sound_owners.append(owner)
+        return CanonicalNativeOwnerMaps(tuple(vision_owners), tuple(action_owners), tuple(sound_owners))
+
 
 @dataclass(frozen=True)
 class CanonicalProductionScanResult:
@@ -205,6 +247,7 @@ class CanonicalNativePreparedInputs:
     request: CanonicalProductionSegmentRequest
     result: CanonicalProductionScanResult
     traversal: CanonicalExpectedTraversal
+    owner_maps: CanonicalNativeOwnerMaps
     working_data_batch: Mapping[str, Any]
 
 
@@ -484,7 +527,13 @@ class CanonicalProductionAdapter:
             if result.gathered.identities != traversal.identities or result.gathered.item_count != len(traversal.identities):
                 raise CanonicalSegmentContractError("native preparation traversal differs from adapter gather")
             return CanonicalNativePreparedInputs(
-                request, result, traversal, _clone_canonical_working_value(carrier.model_data_batch)
+                request,
+                result,
+                traversal,
+                carrier.native_owner_maps(
+                    traversal, input_image_key=input_image_key, input_video_key=input_video_key
+                ),
+                _clone_canonical_working_value(carrier.model_data_batch),
             )
         except Exception:
             if self._scan_results.get(id(result)) is request:
