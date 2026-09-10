@@ -16,6 +16,7 @@ from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler im
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
     CanonicalProductionAdapter,
+    CanonicalProductionFastStateFrontier,
     CanonicalProductionSegmentRequest,
 )
 from cosmos_framework.model.generator.mot.local_evidence import (
@@ -103,3 +104,53 @@ def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() 
     assert transaction.snapshot().completed_members == (0,)
     with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
         adapter.commit_success(capability)
+
+
+def test_fast_state_frontier_preserves_w0_gradients_and_slot_isolation() -> None:
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    identities = (
+        SegmentIdentity(0, "episode-0", "category", 0, 0, "source-0"),
+        SegmentIdentity(1, "episode-1", "category", 0, 0, "source-1"),
+    )
+    member = MicrobatchPlanMember(
+        0,
+        identities,
+        (provenance, provenance),
+        (
+            ChronologyCountRecord(0, "episode-0", "category", "source-0", 0, 1, False, "manifest"),
+            ChronologyCountRecord(1, "episode-1", "category", "source-1", 0, 1, False, "manifest"),
+        ),
+        (1, 1),
+        2,
+        QueueEpochSnapshot(1, 0, "catalog", (("category", 0),)),
+        (),
+    )
+    core = ContinualTTTLocalMemoryCore(evidence_dim=256)
+    frontier = CanonicalProductionFastStateFrontier(core)
+    fresh = frontier.state_for(member)
+    assert all(value.dtype is torch.float32 for value in fresh)
+    sum(value.sum() for value in fresh).backward()
+    assert all(parameter.grad is not None for parameter in core._w0)
+    # Give each slot a distinct numeric state without introducing a shared storage alias.
+    committed = type(fresh)(*(value + torch.arange(2, dtype=torch.float32).reshape(2, *([1] * (value.ndim - 1))) for value in fresh))
+    frontier.commit(member, committed)
+    continued = MicrobatchPlanMember(
+        0,
+        (
+            SegmentIdentity(0, "episode-0", "category", 1, 1, "source-0"),
+            SegmentIdentity(1, "episode-1", "category", 1, 1, "source-1"),
+        ),
+        (provenance, provenance),
+        (
+            ChronologyCountRecord(0, "episode-0", "category", "source-0", 1, 2, False, "manifest"),
+            ChronologyCountRecord(1, "episode-1", "category", "source-1", 1, 2, False, "manifest"),
+        ),
+        (1, 1),
+        2,
+        member.queue_snapshot,
+        (),
+    )
+    state = frontier.state_for(continued)
+    for value, expected in zip(state, committed, strict=True):
+        torch.testing.assert_close(value, expected)
+        assert value[0].data_ptr() != value[1].data_ptr()
