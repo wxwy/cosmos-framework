@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from cosmos_framework.data.generator.sequence_packing import SequencePlan
+from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler import (
+    CanonicalBatchScheduler,
+    CanonicalBatchWindowTransaction,
+    CatalogRow,
+    ProjectedSchedulerState,
+    QueueEpochSnapshot,
+)
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
     CanonicalProductionAdapter,
+    CanonicalProductionCommitCapability,
+    CanonicalProductionSegmentRequest,
     build_canonical_native_loss_split,
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_integration_test import (
@@ -227,27 +237,57 @@ def test_canonical_native_rejects_batch_slow_parameter_authority_before_backward
 
 def test_canonical_native_post_mutation_failure_preserves_trainer_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
     request, carrier = _bound_request_and_carrier()
+    identity = request.member.row_identities[0]
+    chronology = request.member.row_chronology[0]
+    provenance = request.member.row_provenances[0]
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            QueueEpochSnapshot(1, 0, "catalog", (("category", 0),), (("category", (0,)),)),
+            (("category", 0),),
+            target_distribution=(("category", 1.0),),
+            catalog=(CatalogRow(identity, chronology, provenance),),
+        )
+    )
+    plan = scheduler.freeze_plan(slot_groups=((0,),), plan_chain_id="post-mutation")
+    member = plan.members[0]
+    request = CanonicalProductionSegmentRequest(
+        scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, request.segment_batch
+    )
+    carrier = replace(
+        carrier,
+        request=request,
+        member=member,
+        row_identities=member.row_identities,
+        row_chronology=member.row_chronology,
+    )
     adapter = CanonicalProductionAdapter(LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256))
     result = adapter.scan(request)
     prepared = adapter.attach_native_preparation(adapter.prepare_native_inputs(request, result, carrier, input_image_key="images", input_video_key="video"), input_text_indexes=[[], []], sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)], gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[])
     anchor = torch.ones((), requires_grad=True)
     capability = adapter.bind_native_forward(prepared, build_canonical_native_loss_split(consumer_identities=prepared.traversal.identities, modalities={}, sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 0.0, graph_anchor=anchor))
-    post_mutation_capability = SimpleNamespace(request=request, result=result)
+    prepared_capabilities: list[CanonicalProductionCommitCapability] = []
+    production_prepare_commit = adapter.prepare_commit
+    production_frontier_commit = adapter.frontier.commit
 
-    def fail_after_frontier_mutation(commit_capability):
-        adapter._commit_capabilities.add(id(commit_capability))
-        adapter._post_mutation_commits.add(id(commit_capability))
-        adapter.frontier.commit(commit_capability.request.member, commit_capability.result.candidate_state_out)
+    def capture_production_prepare_commit(request, result):
+        commit_capability = production_prepare_commit(request, result)
+        prepared_capabilities.append(commit_capability)
+        return commit_capability
+
+    def fail_after_real_frontier_mutation(member, state):
+        production_frontier_commit(member, state)
         raise RuntimeError("injected post-mutation failure")
 
-    monkeypatch.setattr(adapter, "commit_success", fail_after_frontier_mutation)
-    monkeypatch.setattr(adapter, "prepare_commit", lambda request, result: post_mutation_capability)
+    monkeypatch.setattr(adapter, "prepare_commit", capture_production_prepare_commit)
+    monkeypatch.setattr(adapter.frontier, "commit", fail_after_real_frontier_mutation)
     for parameter in capability.slow_parameters:
         parameter.grad = torch.ones_like(parameter)
     with pytest.raises(RuntimeError, match="CANONICAL_NATIVE_POST_MUTATION_FAILURE"):
         object.__new__(ImaginaireTrainer)._run_canonical_native_backward(
             {"psm_canonical_native_forward": capability}, SimpleNamespace(is_enabled=lambda: False, scale=lambda value: value)
-        )
+    )
+    assert len(prepared_capabilities) == 1
+    assert id(prepared_capabilities[0]) in adapter._commit_capabilities
     assert all(parameter.grad is not None for parameter in capability.slow_parameters)
     assert adapter._commit_capabilities and adapter._scan_requests and adapter.frontier._states
     assert request.transaction.snapshot().terminal_failure_code is None
