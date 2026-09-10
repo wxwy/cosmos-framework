@@ -201,6 +201,37 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
             expected, input_image_key="images", input_video_key="video"
         )
 
+    flat_samples = tuple(model_samples[row][index] for row, index in expected.logical_indexes)
+    vision_counts = (2, 1, 1, 1, 3)
+    for sample, count in zip(flat_samples, vision_counts, strict=True):
+        sample["num_vision_items_per_sample"] = count
+    flat_samples[1]["action"] = torch.tensor([1.0])
+    flat_samples[4]["action"] = torch.tensor([2.0])
+    flat_samples[3]["sound"] = torch.tensor([3.0])
+    dense_batch = CanonicalRawRowCarrier(
+        request,
+        member,
+        batch,
+        member.row_identities,
+        member.row_chronology,
+        samples,
+        model_samples,
+        {
+            "text_token_ids": [sample["text_token_ids"] for sample in flat_samples],
+            "images": [sample["images"] for sample in flat_samples],
+            "num_vision_items_per_sample": list(vision_counts),
+            "action": [flat_samples[1]["action"], flat_samples[4]["action"]],
+            "sound": [flat_samples[3]["sound"]],
+        },
+        raw_row_source_identities=source_identities,
+        row_model_source_rows=samples,
+    )
+    dense_batch.validate_model_data_batch(expected, input_image_key="images", input_video_key="video")
+    dense_maps = dense_batch.native_owner_maps(expected, input_image_key="images", input_video_key="video")
+    assert dense_maps.vision_owner_indexes == (0, 0, 1, 2, 3, 4, 4, 4)
+    assert dense_maps.action_owner_indexes == (1, 4)
+    assert dense_maps.sound_owner_indexes == (3,)
+
 
 def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)

@@ -162,19 +162,24 @@ class CanonicalRawRowCarrier:
                     or source_identity != expected_identity
                 ):
                     raise CanonicalSegmentContractError("canonical carrier model sample source is foreign")
+            native_sources = (
+                tuple(source for source in sources if source is not None and key in source)
+                if key in {"action", "sound"}
+                else sources
+            )
             if isinstance(value, (list, tuple)):
-                if len(value) != len(sources):
+                if len(value) != len(native_sources):
                     raise CanonicalSegmentContractError("canonical carrier model batch cardinality is foreign")
-                for value_item, source in zip(value, sources, strict=True):
+                for value_item, source in zip(value, native_sources, strict=True):
                     if source is None or source.get(key) is not value_item:
                         raise CanonicalSegmentContractError("canonical carrier model batch source is foreign")
                 continue
             if not isinstance(value, torch.Tensor):
                 raise CanonicalSegmentContractError("canonical carrier model batch has an unsupported source form")
             source_items = self.stacked_model_batch_sources.get(key)
-            if source_items is None or len(source_items) != len(sources):
+            if source_items is None or len(source_items) != len(native_sources):
                 raise CanonicalSegmentContractError("canonical carrier stacked source cardinality is foreign")
-            for source_item, source in zip(source_items, sources, strict=True):
+            for source_item, source in zip(source_items, native_sources, strict=True):
                 if source is None or source.get(key) is not source_item or not isinstance(source_item, torch.Tensor):
                     raise CanonicalSegmentContractError("canonical carrier stacked source is foreign")
             expected_tensor = torch.stack(source_items)
@@ -183,7 +188,7 @@ class CanonicalRawRowCarrier:
                 or value.shape != expected_tensor.shape
                 or value.dtype != expected_tensor.dtype
                 or value.device != expected_tensor.device
-                or value.shape[0] != len(expected.logical_indexes)
+                or value.shape[0] != len(native_sources)
                 or not torch.equal(value, expected_tensor)
             ):
                 raise CanonicalSegmentContractError("canonical carrier stacked model batch is foreign")
