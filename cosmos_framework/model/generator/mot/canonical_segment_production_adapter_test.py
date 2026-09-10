@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -247,6 +249,69 @@ def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() 
     assert transaction.snapshot().completed_members == (0,)
     with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
         adapter.commit_success(capability)
+
+
+def test_adapter_retry_preserves_original_frozen_transition_exactly_once() -> None:
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    identity = SegmentIdentity(0, "episode", "category", 0, 0, "source")
+    record = ChronologyCountRecord(0, "episode", "category", "source", 0, 2, False, "manifest")
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            QueueEpochSnapshot(1, 0, "catalog", (("category", 0),), (("category", (0,)),)),
+            (("category", 0),),
+            target_distribution=(("category", 1.0),),
+            catalog=(CatalogRow(identity, record, provenance),),
+        )
+    )
+    plan = scheduler.freeze_plan(slot_groups=((0,),), plan_chain_id="retry")
+    member = plan.members[0]
+    batch = SegmentBatch(
+        torch.zeros(1, 2, 96),
+        (("s0", "s1"),),
+        torch.tensor([[True, True]]),
+        torch.tensor([[0, 1]]),
+        torch.zeros(1, 2, 96),
+        torch.zeros(1, 2, 10),
+        torch.tensor([[False, True]]),
+        torch.tensor([[-1, 0]]),
+        torch.tensor([0]),
+        ("episode",),
+        ("category",),
+        provenance,
+    )
+    request = CanonicalProductionSegmentRequest(
+        scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, batch
+    )
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+
+    with pytest.raises(CanonicalSegmentContractError, match="exact unscanned"):
+        adapter.retry_first_member_pre_backward(replace(request, member_index=1))
+    capability = adapter.retry_first_member_pre_backward(request)
+    assert capability.original_plan is plan
+    assert capability.retry_plan.attempt == 1
+    assert capability.retry_plan.members == plan.members
+    assert capability.retry_plan.members[0] is member
+    assert capability.retry_plan.original_n_valid_window == plan.original_n_valid_window
+    assert capability.retry_plan.original_ga_effective == plan.original_ga_effective
+    assert capability.retry_plan.plan_chain_id == plan.plan_chain_id
+    assert len(scheduler._frozen_transitions) == 1
+    with pytest.raises(CanonicalSegmentContractError, match="unstarted batch window"):
+        adapter.retry_first_member_pre_backward(request)
+    with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
+        adapter.consume_retry(replace(capability, retry_request=request))
+
+    retry_request = adapter.consume_retry(capability)
+    with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
+        adapter.consume_retry(capability)
+    result = adapter.scan(retry_request)
+    prepared = adapter.prepare_commit(retry_request, result)
+    retry_request.transaction.mark_backward_started(0)
+    adapter.commit_success(prepared)
+    assert scheduler._frozen_transitions == []
+    assert retry_request.transaction.snapshot().completed_members == (0,)
 
 
 def test_fast_state_frontier_preserves_w0_gradients_and_slot_isolation() -> None:

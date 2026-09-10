@@ -1,7 +1,7 @@
 """CPU/static production-ABI contracts for canonical Local-Memory segments."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 import torch
@@ -205,6 +205,18 @@ class CanonicalProductionCommitCapability:
     prepared_reconcile: PreparedCanonicalReconcile
 
 
+@dataclass(frozen=True)
+class CanonicalProductionRetryCapability:
+    """One-shot typed lineage from the exact attempt-0 request to attempt-1."""
+
+    original_request: CanonicalProductionSegmentRequest
+    original_plan: CanonicalGAWindowPlan
+    original_transaction: CanonicalBatchWindowTransaction
+    retry_request: CanonicalProductionSegmentRequest
+    retry_plan: CanonicalGAWindowPlan
+    retry_transaction: CanonicalBatchWindowTransaction
+
+
 def _fp32_clone(state: ContinualTTTFastState, *, detach: bool) -> ContinualTTTFastState:
     values = (value.detach() if detach else value for value in state)
     return ContinualTTTFastState(*(value.to(dtype=torch.float32).clone() for value in values))
@@ -264,6 +276,63 @@ class CanonicalProductionAdapter:
         self._scan_requests: set[int] = set()
         self._scan_results: dict[int, CanonicalProductionSegmentRequest] = {}
         self._commit_capabilities: set[int] = set()
+        self._retry_capabilities: set[int] = set()
+
+    def retry_first_member_pre_backward(
+        self, request: CanonicalProductionSegmentRequest
+    ) -> CanonicalProductionRetryCapability:
+        """Mint the only permitted attempt-1 request without admitting again."""
+        if (
+            request.plan.attempt != 0
+            or request.member_index != 0
+            or request.member is not request.plan.members[0]
+            or request.transaction.plan is not request.plan
+            or id(request) in self._scan_requests
+        ):
+            raise CanonicalSegmentContractError("retry requires the exact unscanned attempt-0 first member")
+        request.scheduler.prepare_reconcile_after_backward(request.member, request.member.planned_n_valid)
+        retry_plan = request.transaction.retry_first_member_pre_backward()
+        retry_transaction = CanonicalBatchWindowTransaction(retry_plan)
+        retry_request = replace(request, plan=retry_plan, transaction=retry_transaction)
+        capability = CanonicalProductionRetryCapability(
+            request,
+            request.plan,
+            request.transaction,
+            retry_request,
+            retry_plan,
+            retry_transaction,
+        )
+        self._retry_capabilities.add(id(capability))
+        return capability
+
+    def consume_retry(self, capability: CanonicalProductionRetryCapability) -> CanonicalProductionSegmentRequest:
+        """Return the exact attempt-1 request once, preserving original admission."""
+        if id(capability) not in self._retry_capabilities:
+            raise CanonicalSegmentContractError("retry capability is foreign or already consumed")
+        original = capability.original_request
+        retry = capability.retry_request
+        if (
+            original.plan is not capability.original_plan
+            or original.transaction is not capability.original_transaction
+            or original.plan.attempt != 0
+            or original.member_index != 0
+            or original.member is not original.plan.members[0]
+            or retry.plan is not capability.retry_plan
+            or retry.transaction is not capability.retry_transaction
+            or retry.plan.attempt != 1
+            or retry.plan.members != original.plan.members
+            or retry.plan.members[0] is not original.member
+            or retry.plan.original_n_valid_window != original.plan.original_n_valid_window
+            or retry.plan.original_ga_effective != original.plan.original_ga_effective
+            or retry.plan.plan_chain_id != original.plan.plan_chain_id
+            or retry.scheduler is not original.scheduler
+            or retry.member is not original.member
+            or retry.member_index != 0
+            or retry.transaction.plan is not retry.plan
+        ):
+            raise CanonicalSegmentContractError("retry capability lineage is foreign or stale")
+        self._retry_capabilities.remove(id(capability))
+        return retry
 
     def scan(self, request: CanonicalProductionSegmentRequest) -> CanonicalProductionScanResult:
         if (
