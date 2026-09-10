@@ -10,9 +10,20 @@ passed explicitly instead of being read from ``self``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from cosmos_framework.model.generator.diffusion.rectified_flow import RectifiedFlow
+
+
+@dataclass(frozen=True)
+class FlowMatchingLossTerms:
+    """Weighted and diagnostic per-instance terms from one native modality."""
+
+    weighted_mean: torch.Tensor
+    weighted_per_instance: torch.Tensor
+    unweighted_per_instance: torch.Tensor
 
 
 def compute_flow_matching_loss(
@@ -53,10 +64,37 @@ def compute_flow_matching_loss(
             - Flow matching loss (or dummy loss for gradient consistency).
             - Per-instance loss (or dummy loss for gradient consistency).
     """
+    terms = compute_flow_matching_loss_terms(
+        pred=pred,
+        target=target,
+        condition_mask=condition_mask,
+        timesteps=timesteps,
+        has_valid_tokens=has_valid_tokens,
+        rectified_flow=rectified_flow,
+        tensor_kwargs_fp32=tensor_kwargs_fp32,
+        raw_action_dim=raw_action_dim,
+        normalize_by_active=normalize_by_active,
+    )
+    return terms.weighted_mean, terms.unweighted_per_instance
+
+
+def compute_flow_matching_loss_terms(
+    pred: list[torch.Tensor],
+    target: list[torch.Tensor],
+    condition_mask: list[torch.Tensor],
+    timesteps: torch.Tensor,
+    has_valid_tokens: bool,
+    rectified_flow: RectifiedFlow,
+    tensor_kwargs_fp32: dict,
+    raw_action_dim: list[torch.Tensor] | None = None,
+    normalize_by_active: bool = False,
+) -> FlowMatchingLossTerms:
+    """Compute the native loss while retaining its weighted per-instance terms."""
     if not has_valid_tokens:
         # Dummy loss to maintain backward graph consistency across ranks
         dummy_loss = 0.0 * sum(p.sum() for p in pred)
-        return dummy_loss, dummy_loss.unsqueeze(0)  # make per-instance loss 1-D
+        dummy_per_instance = dummy_loss.unsqueeze(0)
+        return FlowMatchingLossTerms(dummy_loss, dummy_per_instance, dummy_per_instance)
 
     # condition_mask[i] is T-first with trailing singletons: [T,1,1] vision, [T,1] action.
     # tw_i gets the same shape so w(σ_t) broadcasts element-wise over non-T dims.
@@ -85,7 +123,4 @@ def compute_flow_matching_loss(
 
     per_instance_loss = torch.stack(per_instance_losses)  # [B]
     per_instance_weighted_loss = torch.stack(per_instance_weighted_losses)  # [B]
-    return (
-        per_instance_weighted_loss.mean(),  # []
-        per_instance_loss,  # [B]
-    )
+    return FlowMatchingLossTerms(per_instance_weighted_loss.mean(), per_instance_weighted_loss, per_instance_loss)

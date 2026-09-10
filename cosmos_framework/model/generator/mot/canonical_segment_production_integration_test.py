@@ -7,6 +7,10 @@ import pytest
 import torch
 
 from cosmos_framework.data.generator.sequence_packing import SequencePlan
+from cosmos_framework.model.generator.algorithm.loss.flow_matching import (
+    compute_flow_matching_loss,
+    compute_flow_matching_loss_terms,
+)
 from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler import (
     CanonicalBatchScheduler,
     CanonicalBatchWindowTransaction,
@@ -36,6 +40,27 @@ from cosmos_framework.model.generator.omni_mot_model import (
 
 def _request() -> CanonicalProductionSegmentRequest:
     return CanonicalProductionSegmentRequest.__new__(CanonicalProductionSegmentRequest)
+
+
+class _UnitTimeWeight:
+    def train_time_weight(self, timesteps: torch.Tensor, tensor_kwargs_fp32: dict) -> torch.Tensor:
+        return torch.ones_like(timesteps, **tensor_kwargs_fp32)
+
+
+def test_flow_matching_terms_preserve_legacy_wrapper_and_weighted_population() -> None:
+    prediction = [torch.tensor([[1.0], [3.0]], requires_grad=True), torch.tensor([[2.0], [4.0]], requires_grad=True)]
+    target = [torch.zeros_like(value) for value in prediction]
+    masks = [torch.zeros(2, 1), torch.zeros(2, 1)]
+    kwargs = {"dtype": torch.float32, "device": torch.device("cpu")}
+    terms = compute_flow_matching_loss_terms(
+        prediction, target, masks, torch.ones(2, 2), True, _UnitTimeWeight(), kwargs
+    )
+    legacy_mean, legacy_unweighted = compute_flow_matching_loss(
+        prediction, target, masks, torch.ones(2, 2), True, _UnitTimeWeight(), kwargs
+    )
+    torch.testing.assert_close(terms.weighted_mean, terms.weighted_per_instance.mean())
+    torch.testing.assert_close(legacy_mean, terms.weighted_mean)
+    torch.testing.assert_close(legacy_unweighted, terms.unweighted_per_instance)
 
 
 def _bound_request_and_carrier() -> tuple[CanonicalProductionSegmentRequest, CanonicalRawRowCarrier]:
