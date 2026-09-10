@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 import torch
 
+from cosmos_framework.model.generator.algorithm.loss.flow_matching import FlowMatchingLossTerms
+
 from .canonical_segment_adapter_scheduler import (
     CanonicalBatchScheduler,
     CanonicalBatchWindowTransaction,
@@ -296,6 +298,7 @@ class CanonicalNativeForwardCapability:
     adapter: "CanonicalProductionAdapter"
     prepared: CanonicalNativePreparedInputs
     loss_split: CanonicalNativeLossSplit
+    slow_parameters: tuple[torch.nn.Parameter, ...]
 
 
 def build_canonical_native_loss_split(
@@ -341,9 +344,9 @@ def build_canonical_native_loss_split(
 def build_prepared_canonical_native_loss_split(
     *,
     prepared: CanonicalNativePreparedInputs,
-    vision_weighted_terms: torch.Tensor | None,
-    action_weighted_terms: torch.Tensor | None,
-    sound_weighted_terms: torch.Tensor | None,
+    vision_weighted_terms: torch.Tensor | FlowMatchingLossTerms | None,
+    action_weighted_terms: torch.Tensor | FlowMatchingLossTerms | None,
+    sound_weighted_terms: torch.Tensor | FlowMatchingLossTerms | None,
     vision_weight: float,
     action_weight: float,
     sound_weight: float,
@@ -359,10 +362,18 @@ def build_prepared_canonical_native_loss_split(
     )
     modalities: dict[str, CanonicalNativeModalityTerms] = {}
     for name, terms, owner_indexes, weight in populations:
+        if isinstance(terms, FlowMatchingLossTerms):
+            terms = terms.canonical_weighted_per_instance
         if terms is None:
             if owner_indexes:
-                raise CanonicalSegmentContractError("canonical native modality terms are missing")
+                # A certified no-valid native population contributes only the
+                # graph-connected zero supplied by ``graph_anchor`` below.
+                continue
             continue
+        if not isinstance(terms, torch.Tensor):
+            raise CanonicalSegmentContractError("canonical native modality terms are invalid")
+        if not len(terms) and owner_indexes:
+            raise CanonicalSegmentContractError("canonical native modality terms are missing")
         modalities[name] = CanonicalNativeModalityTerms(terms, owner_indexes, weight)
     return build_canonical_native_loss_split(
         consumer_identities=prepared.traversal.identities,
@@ -605,7 +616,10 @@ class CanonicalProductionAdapter:
             or loss_split.actual_n_valid != prepared.request.member.planned_n_valid
         ):
             raise CanonicalSegmentContractError("canonical native forward capability is foreign or incomplete")
-        capability = CanonicalNativeForwardCapability(self, prepared, loss_split)
+        slow_parameters = self._native_slow_parameters()
+        if not slow_parameters or len({id(parameter) for parameter in slow_parameters}) != len(slow_parameters):
+            raise CanonicalSegmentContractError("canonical native slow parameter authority is invalid")
+        capability = CanonicalNativeForwardCapability(self, prepared, loss_split, slow_parameters)
         self._native_forward_capabilities[id(capability)] = capability
         return capability
 
@@ -653,12 +667,22 @@ class CanonicalProductionAdapter:
 
     def validate_native_forward(self, capability: CanonicalNativeForwardCapability) -> None:
         """Prove that a forward capability still owns its exact pending scan."""
+        expected_slow_parameters = self._native_slow_parameters()
         if (
             self._native_forward_capabilities.get(id(capability)) is not capability
             or capability.adapter is not self
             or self._scan_results.get(id(capability.prepared.result)) is not capability.prepared.request
+            or len(capability.slow_parameters) != len(expected_slow_parameters)
+            or any(actual is not expected for actual, expected in zip(capability.slow_parameters, expected_slow_parameters, strict=True))
         ):
             raise CanonicalSegmentContractError("canonical native forward capability is foreign or already consumed")
+
+    def _native_slow_parameters(self) -> tuple[torch.nn.Parameter, ...]:
+        """Return the one registered slow-gradient authority for this adapter."""
+        parameters = tuple(self.encoder.parameters()) + tuple(self.core.parameters())
+        if not parameters or len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise CanonicalSegmentContractError("canonical native slow parameter authority is invalid")
+        return parameters
 
     def abort_native_forward(self, capability: CanonicalNativeForwardCapability) -> None:
         """Dispose one exact pending forward capability without reconciling its scan."""

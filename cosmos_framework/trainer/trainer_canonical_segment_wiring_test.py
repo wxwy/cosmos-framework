@@ -188,13 +188,53 @@ def test_canonical_native_scaler_rejection_disposes_before_backward() -> None:
     capability = adapter.bind_native_forward(prepared, split)
     with pytest.raises(RuntimeError, match="CANONICAL_NATIVE_SCALER_UNSUPPORTED"):
         object.__new__(ImaginaireTrainer)._run_canonical_native_backward(
-            {
-                "psm_canonical_native_forward": capability,
-                "psm_canonical_native_slow_parameters": (anchor,),
-            },
+            {"psm_canonical_native_forward": capability},
             SimpleNamespace(is_enabled=lambda: True),
         )
-    assert anchor.grad is None
+    assert all(parameter.grad is None for parameter in capability.slow_parameters)
     assert adapter._native_forward_capabilities == {}
     assert adapter._scan_requests == set() and adapter._scan_results == {}
     assert request.transaction.snapshot().terminal_failure_code == "CANONICAL_NATIVE_SCALER_UNSUPPORTED"
+
+
+def test_canonical_native_rejects_batch_slow_parameter_authority_before_backward() -> None:
+    request, carrier = _bound_request_and_carrier()
+    adapter = CanonicalProductionAdapter(LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256))
+    result = adapter.scan(request)
+    prepared = adapter.attach_native_preparation(adapter.prepare_native_inputs(request, result, carrier, input_image_key="images", input_video_key="video"), input_text_indexes=[[], []], sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)], gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[])
+    anchor = torch.ones((), requires_grad=True)
+    capability = adapter.bind_native_forward(prepared, build_canonical_native_loss_split(consumer_identities=prepared.traversal.identities, modalities={}, sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 0.0, graph_anchor=anchor))
+    foreign = torch.nn.Parameter(torch.ones(()))
+    foreign.grad = torch.ones(())
+    with pytest.raises(RuntimeError, match="CANONICAL_NATIVE_SLOW_PARAMETER_AUTHORITY"):
+        object.__new__(ImaginaireTrainer)._run_canonical_native_backward({"psm_canonical_native_forward": capability, "psm_canonical_native_slow_parameters": (foreign,)}, SimpleNamespace(is_enabled=lambda: False, scale=lambda value: value))
+    torch.testing.assert_close(foreign.grad, torch.ones(()))
+    assert all(parameter.grad is None for parameter in capability.slow_parameters)
+    assert request.transaction.snapshot().terminal_failure_code == "CANONICAL_NATIVE_SLOW_PARAMETER_AUTHORITY"
+
+
+@pytest.mark.parametrize("phase", ("backward", "prepare", "commit"))
+def test_canonical_native_dispatcher_failure_disposes_exact_authority(monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
+    request, carrier = _bound_request_and_carrier()
+    adapter = CanonicalProductionAdapter(LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256))
+    result = adapter.scan(request)
+    prepared = adapter.attach_native_preparation(adapter.prepare_native_inputs(request, result, carrier, input_image_key="images", input_video_key="video"), input_text_indexes=[[], []], sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)], gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[])
+    anchor = torch.ones((), requires_grad=True)
+    capability = adapter.bind_native_forward(prepared, build_canonical_native_loss_split(consumer_identities=prepared.traversal.identities, modalities={}, sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 0.0, graph_anchor=anchor))
+    for parameter in capability.slow_parameters:
+        parameter.grad = torch.ones_like(parameter)
+    scheduler_before = request.scheduler.snapshot
+    if phase == "backward":
+        scaler = SimpleNamespace(is_enabled=lambda: False, scale=lambda value: SimpleNamespace(backward=lambda: (_ for _ in ()).throw(RuntimeError("injected backward failure"))))
+    else:
+        scaler = SimpleNamespace(is_enabled=lambda: False, scale=lambda value: value)
+        target = adapter.prepare_commit if phase == "prepare" else adapter.commit_success
+        monkeypatch.setattr(adapter, target.__name__, lambda *args: (_ for _ in ()).throw(RuntimeError(f"injected {phase} failure")))
+    with pytest.raises(RuntimeError, match="CANONICAL_NATIVE_(BACKWARD|COMMIT)_FAILURE"):
+        object.__new__(ImaginaireTrainer)._run_canonical_native_backward({"psm_canonical_native_forward": capability}, scaler)
+    assert all(parameter.grad is None for parameter in capability.slow_parameters)
+    assert adapter._native_forward_capabilities == {}
+    assert adapter._scan_requests == set() and adapter._scan_results == {}
+    assert request.scheduler.snapshot == scheduler_before
+    assert request.transaction.snapshot().completed_members == ()
+    assert request.transaction.snapshot().terminal_failure_code in {"CANONICAL_NATIVE_BACKWARD_FAILURE", "CANONICAL_NATIVE_COMMIT_FAILURE"}

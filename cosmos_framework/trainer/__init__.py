@@ -939,22 +939,23 @@ class ImaginaireTrainer:
         )
 
         capability = output_batch.get("psm_canonical_native_forward")
-        slow_parameters = output_batch.get("psm_canonical_native_slow_parameters")
-        if not isinstance(capability, CanonicalNativeForwardCapability) or not isinstance(slow_parameters, tuple):
+        if not isinstance(capability, CanonicalNativeForwardCapability):
             raise RuntimeError("canonical native forward capability is incomplete")
         adapter = capability.adapter
         request = capability.prepared.request
         transaction = request.transaction
+        adapter.validate_native_forward(capability)
+        slow_parameters = capability.slow_parameters
 
         def abort_before_commit(code: str) -> None:
             for parameter in slow_parameters:
-                if not isinstance(parameter, torch.nn.Parameter):
-                    raise RuntimeError("canonical native slow parameter is invalid")
                 parameter.grad = None
             adapter.abort_native_forward(capability)
             transaction.terminalize(request.member_index, code)
 
-        adapter.validate_native_forward(capability)
+        if "psm_canonical_native_slow_parameters" in output_batch:
+            abort_before_commit("CANONICAL_NATIVE_SLOW_PARAMETER_AUTHORITY")
+            raise RuntimeError("CANONICAL_NATIVE_SLOW_PARAMETER_AUTHORITY")
         if grad_scaler.is_enabled():
             abort_before_commit("CANONICAL_NATIVE_SCALER_UNSUPPORTED")
             raise RuntimeError("CANONICAL_NATIVE_SCALER_UNSUPPORTED")

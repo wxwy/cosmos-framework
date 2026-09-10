@@ -26,6 +26,7 @@ from cosmos_framework.model.generator.mot.canonical_segment_production_adapter i
     CanonicalProductionSegmentRequest,
     CanonicalRawRowCarrier,
     build_canonical_native_loss_split,
+    build_prepared_canonical_native_loss_split,
 )
 from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
@@ -85,6 +86,33 @@ def test_canonical_loss_split_preserves_weighted_native_modality_means() -> None
     assert split.actual_n_valid == 3
     (split.consumer_loss + split.auxiliary_loss).backward()
     assert anchor.grad is not None
+
+
+def test_prepared_loss_split_no_valid_population_has_no_fake_native_owner() -> None:
+    request, carrier = _bound_request_and_carrier()
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+    result = adapter.scan(request)
+    prepared = adapter.prepare_native_inputs(request, result, carrier, input_image_key="images", input_video_key="video")
+    prediction = [torch.ones(1, 1, requires_grad=True), torch.ones(1, 1, requires_grad=True)]
+    terms = compute_flow_matching_loss_terms(
+        prediction, [torch.zeros_like(value) for value in prediction], [torch.ones(1, 1), torch.ones(1, 1)],
+        torch.ones(2, 1), False, _UnitTimeWeight(), {"dtype": torch.float32, "device": torch.device("cpu")},
+    )
+    assert terms.weighted_per_instance.numel() == 1
+    assert terms.canonical_weighted_per_instance is None
+    anchor = sum(value.sum() for value in prediction)
+    split = build_prepared_canonical_native_loss_split(
+        prepared=prepared, vision_weighted_terms=terms, action_weighted_terms=None, sound_weighted_terms=None,
+        vision_weight=1.0, action_weight=1.0, sound_weight=1.0, sample_level_scale=torch.ones(()),
+        auxiliary_loss=anchor * 0.0, graph_anchor=anchor,
+    )
+    torch.testing.assert_close(split.consumer_loss, torch.zeros(()))
+    (split.consumer_loss + split.auxiliary_loss).backward()
+    assert all(value.grad is not None for value in prediction)
+    adapter.abort_scan(request, result)
 
 
 def _bound_request_and_carrier() -> tuple[CanonicalProductionSegmentRequest, CanonicalRawRowCarrier]:

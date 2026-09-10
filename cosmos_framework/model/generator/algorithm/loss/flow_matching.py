@@ -24,6 +24,7 @@ class FlowMatchingLossTerms:
     weighted_mean: torch.Tensor
     weighted_per_instance: torch.Tensor
     unweighted_per_instance: torch.Tensor
+    canonical_weighted_per_instance: torch.Tensor | None = None
 
 
 def compute_flow_matching_loss(
@@ -94,7 +95,9 @@ def compute_flow_matching_loss_terms(
         # Dummy loss to maintain backward graph consistency across ranks
         dummy_loss = 0.0 * sum(p.sum() for p in pred)
         dummy_per_instance = dummy_loss.unsqueeze(0)
-        return FlowMatchingLossTerms(dummy_loss, dummy_per_instance, dummy_per_instance)
+        # The singleton remains a legacy diagnostic only.  Canonical ownership
+        # must not turn it into a synthetic native item.
+        return FlowMatchingLossTerms(dummy_loss, dummy_per_instance, dummy_per_instance, None)
 
     # condition_mask[i] is T-first with trailing singletons: [T,1,1] vision, [T,1] action.
     # tw_i gets the same shape so w(σ_t) broadcasts element-wise over non-T dims.
@@ -123,4 +126,6 @@ def compute_flow_matching_loss_terms(
 
     per_instance_loss = torch.stack(per_instance_losses)  # [B]
     per_instance_weighted_loss = torch.stack(per_instance_weighted_losses)  # [B]
-    return FlowMatchingLossTerms(per_instance_weighted_loss.mean(), per_instance_weighted_loss, per_instance_loss)
+    return FlowMatchingLossTerms(
+        per_instance_weighted_loss.mean(), per_instance_weighted_loss, per_instance_loss, per_instance_weighted_loss
+    )
