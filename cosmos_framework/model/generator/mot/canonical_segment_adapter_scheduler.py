@@ -213,6 +213,7 @@ class CanonicalBatchWindowTransaction:
     def __init__(self, plan: CanonicalGAWindowPlan) -> None:
         self.plan = plan
         self.backward_started = False
+        self._active_backward_member: int | None = None
         self.completed_members: list[int] = []
         self.slow_grads_cleared = False
         self.terminal_failure_code: str | None = None
@@ -234,20 +235,23 @@ class CanonicalBatchWindowTransaction:
             or member_index < 0
             or member_index >= len(self.plan.members)
             or member_index != len(self.completed_members)
+            or self._active_backward_member is not None
         ):
             raise CanonicalSegmentContractError("backward must follow the frozen batch window order")
         self.backward_started = True
+        self._active_backward_member = member_index
 
     def mark_reconciled(self, member_index: int) -> None:
         if (
             self._closed
-            or not self.backward_started
             or member_index < 0
             or member_index >= len(self.plan.members)
             or member_index != len(self.completed_members)
+            or self._active_backward_member != member_index
         ):
             raise CanonicalSegmentContractError("reconcile requires the current backward member")
         self.completed_members.append(member_index)
+        self._active_backward_member = None
         if len(self.completed_members) == len(self.plan.members):
             self._closed = True
 

@@ -193,6 +193,48 @@ def test_batch_window_retry_lifecycle_rejects_post_backward_and_terminalizes_lat
     assert snapshot.slow_grads_cleared and snapshot.remaining_members_suppressed
 
 
+def test_batch_window_binds_reconcile_to_the_exact_member_backward() -> None:
+    first, second = _member(), _member(index=1, exposure=(("a", 2), ("b", 1)))
+    transaction = CanonicalBatchWindowTransaction(CanonicalGAWindowPlan((first, second), 6, 2, "exact"))
+    transaction.mark_backward_started(0)
+    with pytest.raises(CanonicalSegmentContractError, match="frozen batch window order"):
+        transaction.mark_backward_started(0)
+    transaction.mark_reconciled(0)
+    before = transaction.snapshot()
+    with pytest.raises(CanonicalSegmentContractError, match="current backward member"):
+        transaction.mark_reconciled(1)
+    assert transaction.snapshot() == before
+    transaction.mark_backward_started(1)
+    transaction.mark_reconciled(1)
+
+
+def test_slot_neutral_continuation_rebinds_runtime_slot_and_rejects_bad_successors() -> None:
+    def row(cursor: int, terminal: bool) -> CatalogRow:
+        return CatalogRow(
+            SegmentIdentity(0, "episode-a", "a", cursor, cursor, "source", terminal),
+            ChronologyCountRecord(0, "episode-a", "a", "source", cursor, cursor + 1, terminal, "manifest"),
+            _provenance(),
+        )
+
+    catalog = (row(0, False), row(1, True))
+    permutation = queue_permutation(queue_seed=7, epoch=2, category="a", catalog_size=1)
+    state = ProjectedSchedulerState(
+        QueueEpochSnapshot(7, 2, "catalog", (("a", 0),), (("a", permutation),)),
+        (("a", 0),), target_distribution=(("a", 1.0),), catalog=catalog,
+    )
+    plan = CanonicalBatchScheduler(state).freeze_plan(slot_groups=((1,), (1,)), plan_chain_id="continuation")
+    first, second = plan.members
+    assert first.row_identities[0].slot_id == second.row_identities[0].slot_id == 1
+    assert first.row_identities[0].cursor == 0 and second.row_identities[0].cursor == 1
+    assert first.row_chronology[0].slot_id == second.row_chronology[0].slot_id == 1
+    missing = replace(state, catalog=(catalog[0],))
+    with pytest.raises(CanonicalSegmentContractError, match="lacks exact continuation"):
+        missing.project_commit(first).derive_member(member_index=1, slot_ids=(1,))
+    ambiguous = replace(state, catalog=(catalog[0], catalog[1], row(1, True)))
+    with pytest.raises(CanonicalSegmentContractError, match="lacks exact continuation"):
+        ambiguous.project_commit(first).derive_member(member_index=1, slot_ids=(1,))
+
+
 def test_projected_planning_is_pure_and_all_row_commit_is_atomic() -> None:
     initial = _state()
     scheduler = CanonicalBatchScheduler(initial)
