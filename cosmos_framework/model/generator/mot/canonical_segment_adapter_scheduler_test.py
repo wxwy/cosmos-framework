@@ -60,9 +60,13 @@ def _member(*, index: int = 0, exposure: tuple[tuple[str, int], ...] = (("a", 0)
 
 def _state() -> ProjectedSchedulerState:
     member = _member()
-    catalog = tuple(
-        CatalogRow(identity, chronology, provenance)
-        for identity, chronology, provenance in zip(member.row_identities, member.row_chronology, member.row_provenances, strict=True)
+    catalog = (
+        CatalogRow(member.row_identities[0], member.row_chronology[0], member.row_provenances[0]),
+        CatalogRow(
+            member.row_identities[1],
+            ChronologyCountRecord(1, "episode-b", "b", "source", 0, 1, False, "manifest"),
+            member.row_provenances[1],
+        ),
     )
     snapshot = QueueEpochSnapshot(
         7,
@@ -116,10 +120,9 @@ def test_unequal_count_ga_objective_and_first_member_only_retry() -> None:
     plan = CanonicalGAWindowPlan((first, second), 4, 2, "chain")
     actual = plan.objective(0, torch.tensor(4.0), torch.tensor(2.0), 3) + plan.objective(1, torch.tensor(8.0), torch.tensor(2.0), 1)
     torch.testing.assert_close(actual, torch.tensor(7.0))
-    retry = plan.retry_first_member_pre_backward(0)
+    retry = CanonicalBatchWindowTransaction(plan).retry_first_member_pre_backward()
     assert retry.attempt == 1 and retry.members == plan.members and retry.original_n_valid_window == plan.original_n_valid_window
-    with pytest.raises(CanonicalSegmentContractError, match="only attempt-0 first"):
-        plan.retry_first_member_pre_backward(1)
+    assert not hasattr(plan, "retry_first_member_pre_backward")
 
 
 def test_full_valid_ga_consumer_term_degenerates_to_one_over_ga() -> None:
@@ -162,8 +165,9 @@ def test_later_member_retry_is_fail_closed() -> None:
     first = _member()
     second = _member(index=1, exposure=(("a", 2), ("b", 1)))
     plan = CanonicalGAWindowPlan((first, second), 6, 2, "later")
-    with pytest.raises(CanonicalSegmentContractError, match="only attempt-0 first"):
-        plan.retry_first_member_pre_backward(1)
+    transaction = CanonicalBatchWindowTransaction(plan)
+    transaction.terminalize(1, "LOCAL_MEM_RETRY_AFTER_MEMBER")
+    assert transaction.snapshot().remaining_members_suppressed
 
 
 def test_batch_window_retry_lifecycle_rejects_post_backward_and_terminalizes_later_failure() -> None:
@@ -174,6 +178,8 @@ def test_batch_window_retry_lifecycle_rejects_post_backward_and_terminalizes_lat
     transaction.mark_reconciled(0)
     with pytest.raises(CanonicalSegmentContractError, match="unstarted"):
         transaction.retry_first_member_pre_backward()
+    with pytest.raises(CanonicalSegmentContractError, match="frozen batch window order"):
+        transaction.mark_backward_started(2)
     transaction.terminalize(1, "LOCAL_MEM_RETRY_AFTER_MEMBER")
     snapshot = transaction.snapshot()
     assert snapshot.slow_grads_cleared and snapshot.remaining_members_suppressed
@@ -221,7 +227,10 @@ def test_terminal_projection_reconcile_and_rollover_release_are_atomic() -> None
     initial = _state()
     member = _member()
     terminal_identities = tuple(replace(identity, training_stream_end=True) for identity in member.row_identities)
-    terminal_records = tuple(replace(record, training_stream_end=True) for record in member.row_chronology)
+    terminal_records = (
+        replace(member.row_chronology[0], training_stream_end=True),
+        ChronologyCountRecord(1, "episode-b", "b", "source", 0, 1, True, "manifest"),
+    )
     terminal = replace(member, row_identities=terminal_identities, row_chronology=terminal_records)
     initial = replace(initial, catalog=tuple(CatalogRow(identity, record, _provenance()) for identity, record in zip(terminal_identities, terminal_records, strict=True)))
     scheduler = CanonicalBatchScheduler(initial)
@@ -229,8 +238,7 @@ def test_terminal_projection_reconcile_and_rollover_release_are_atomic() -> None
     frozen = plan.members[0]
     assert initial.terminal_slots == ()
     scheduler.reconcile_after_backward(frozen, 3)
-    assert tuple(slot for slot, _ in scheduler.snapshot.terminal_slots) == (0, 1)
-    scheduler.rollover_if_exhausted({"a": 1, "b": 1})
+    assert scheduler.snapshot.queue_snapshot.epoch == 3
     assert scheduler.snapshot.terminal_slots == () and scheduler.snapshot.exposure == (("a", 2), ("b", 1))
 
 
@@ -256,33 +264,30 @@ def test_shared_backward_precedes_exact_atomic_reconcile() -> None:
     assert scheduler.snapshot.exposure == (("a", 2), ("b", 1))
 
 
-def test_terminal_rebind_advances_frozen_queue_and_fresh_states_match() -> None:
+def test_multimember_projection_reserves_episode_queue_and_rolls_over_purely() -> None:
+    def row(episode_id: str, cursor: int, terminal: bool) -> CatalogRow:
+        return CatalogRow(
+            SegmentIdentity(0, episode_id, "a", cursor, cursor, "source", terminal),
+            ChronologyCountRecord(0, episode_id, "a", "source", cursor, cursor + 1, terminal, "manifest"),
+            _provenance(),
+        )
+
+    catalog = (row("episode-a", 0, True), row("episode-a", 1, True), row("episode-b", 0, True))
     permutation = queue_permutation(queue_seed=7, epoch=2, category="a", catalog_size=2)
-    old = CatalogRow(
-        SegmentIdentity(0, "episode-old", "a", 0, 0, "source", True),
-        ChronologyCountRecord(0, "episode-old", "a", "source", 0, 1, True, "manifest"),
-        _provenance(),
-    )
-    fresh = CatalogRow(
-        SegmentIdentity(0, "episode-fresh", "a", 0, 0, "source"),
-        ChronologyCountRecord(0, "episode-fresh", "a", "source", 0, 1, False, "manifest"),
-        _provenance(),
-    )
-    ordered: list[CatalogRow | None] = [None, None]
-    ordered[permutation[0]], ordered[permutation[1]] = old, fresh
     state = ProjectedSchedulerState(
         QueueEpochSnapshot(7, 2, "catalog", (("a", 0),), (("a", permutation),)),
-        (("a", 0),), target_distribution=(("a", 1.0),), catalog=tuple(ordered),  # type: ignore[arg-type]
+        (("a", 0),), target_distribution=(("a", 1.0),), catalog=catalog,
     )
     first, second = CanonicalBatchScheduler(state), CanonicalBatchScheduler(state)
-    first_plan, second_plan = (
-        first.freeze_plan(slot_groups=((0,),), plan_chain_id="rebind"),
-        second.freeze_plan(slot_groups=((0,),), plan_chain_id="rebind"),
-    )
-    assert first_plan.members == second_plan.members
-    first.reconcile_after_backward(first_plan.members[0], 1)
-    rebound = first.freeze_plan(slot_groups=((0,),), plan_chain_id="rebind-next")
-    assert rebound.members[0].row_identities[0].episode_id == "episode-fresh"
-    assert first.snapshot.queue_snapshot.positions == (("a", 1),)
-    first.reconcile_after_backward(rebound.members[0], 1)
-    assert first.snapshot.queue_snapshot.positions == (("a", 2),)
+    first_plan = first.freeze_plan(slot_groups=((0, 1), (0, 1)), plan_chain_id="multi")
+    second_plan = second.freeze_plan(slot_groups=((0, 1), (0, 1)), plan_chain_id="multi")
+    assert first.snapshot == state and first_plan == second_plan
+    assert {row.episode_id for row in first_plan.members[0].row_identities} == {"episode-a", "episode-b"}
+    assert first_plan.members[1].queue_snapshot.epoch == 3
+    assert first_plan.members[1].projected_exposure_before == (("a", 2),)
+    with pytest.raises(CanonicalSegmentContractError, match="foreign, stale"):
+        first.reconcile_after_backward(first_plan.members[1], 2)
+    assert first.snapshot == state
+    first.reconcile_after_backward(first_plan.members[0], 2)
+    first.reconcile_after_backward(first_plan.members[1], 2)
+    assert first.snapshot.exposure == (("a", 4),)

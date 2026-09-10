@@ -192,12 +192,6 @@ class CanonicalGAWindowPlan:
             + auxiliary_loss / self.original_ga_effective
         )
 
-    def retry_first_member_pre_backward(self, member_index: int) -> "CanonicalGAWindowPlan":
-        if self.attempt != 0 or member_index != 0:
-            raise CanonicalSegmentContractError("only attempt-0 first member may retry before backward")
-        return replace(self, attempt=1)
-
-
 @dataclass(frozen=True)
 class BatchWindowSnapshot:
     backward_started: bool
@@ -222,19 +216,34 @@ class CanonicalBatchWindowTransaction:
     def retry_first_member_pre_backward(self) -> CanonicalGAWindowPlan:
         if self._closed or self.backward_started or self.completed_members:
             raise CanonicalSegmentContractError("retry requires an unstarted batch window")
-        retry = self.plan.retry_first_member_pre_backward(0)
+        if self.plan.attempt != 0:
+            raise CanonicalSegmentContractError("attempt-1 may not retry")
+        retry = replace(self.plan, attempt=1)
         self._closed = True
         return retry
 
     def mark_backward_started(self, member_index: int) -> None:
-        if self._closed or member_index != len(self.completed_members):
+        if (
+            self._closed
+            or member_index < 0
+            or member_index >= len(self.plan.members)
+            or member_index != len(self.completed_members)
+        ):
             raise CanonicalSegmentContractError("backward must follow the frozen batch window order")
         self.backward_started = True
 
     def mark_reconciled(self, member_index: int) -> None:
-        if self._closed or not self.backward_started or member_index != len(self.completed_members):
+        if (
+            self._closed
+            or not self.backward_started
+            or member_index < 0
+            or member_index >= len(self.plan.members)
+            or member_index != len(self.completed_members)
+        ):
             raise CanonicalSegmentContractError("reconcile requires the current backward member")
         self.completed_members.append(member_index)
+        if len(self.completed_members) == len(self.plan.members):
+            self._closed = True
 
     def terminalize(self, member_index: int, code: str) -> None:
         if self._closed or member_index < len(self.completed_members) or not code:
@@ -315,7 +324,7 @@ class ProjectedSchedulerState:
                 queue_seed=self.queue_snapshot.queue_seed,
                 epoch=self.queue_snapshot.epoch,
                 category=category,
-                catalog_size=len(self._catalog_for(category)),
+                catalog_size=len(self._queue_for(category)),
             )
             if permutations[category] != expected:
                 raise ValueError("catalog epoch permutation differs from deterministic authority")
@@ -326,9 +335,20 @@ class ProjectedSchedulerState:
     def _catalog_for(self, category: str) -> tuple["CatalogRow", ...]:
         return tuple(item for item in self.catalog if item.identity.category == category)
 
+    def _queue_for(self, category: str) -> tuple["CatalogRow", ...]:
+        """Return canonical fresh episodes only; continuation rows never enter a queue."""
+        fresh = tuple(
+            row for row in self._catalog_for(category)
+            if row.identity.cursor == 0 and row.chronology.consumer_step_start == 0
+        )
+        ordered = tuple(sorted(fresh, key=lambda row: (row.identity.source_digest, row.identity.episode_id)))
+        if len({(row.identity.source_digest, row.identity.episode_id) for row in ordered}) != len(ordered):
+            raise CanonicalSegmentContractError("fresh episode queue has duplicate provenance")
+        return ordered
+
     def _permutation(self, category: str) -> tuple[int, ...]:
         frozen = dict(self.queue_snapshot.permutations).get(category)
-        catalog = self._catalog_for(category)
+        catalog = self._queue_for(category)
         expected = queue_permutation(
             queue_seed=self.queue_snapshot.queue_seed,
             epoch=self.queue_snapshot.epoch,
@@ -357,22 +377,25 @@ class ProjectedSchedulerState:
         choices: list[tuple[float, str, CatalogRow]] = []
         total = sum(exposure.values())
         for category in sorted(target):
-            catalog, permutation = self._catalog_for(category), self._permutation(category)
+            catalog, permutation = self._queue_for(category), self._permutation(category)
             position = positions.get(category, 0)
             if position >= len(permutation):
                 continue
             candidate = catalog[permutation[position]]
-            if candidate.identity.slot_id != slot_id or candidate.identity.cursor != 0:
-                continue
             choices.append((target[category] - exposure.get(category, 0) / max(total, 1), category, candidate))
         if not choices:
             raise CanonicalSegmentContractError("no legal free-slot queue admission")
-        return max(choices, key=lambda item: (item[0], item[1]))[2]
+        return max(choices, key=lambda item: (item[0], item[1]))[2].bind_slot(slot_id)
 
     def derive_member(self, *, member_index: int, slot_ids: tuple[int, ...]) -> MicrobatchPlanMember:
         if tuple(sorted(slot_ids)) != slot_ids or len(set(slot_ids)) != len(slot_ids):
             raise CanonicalSegmentContractError("member slot ids must be unique and sorted")
-        rows = tuple(self._admit(slot_id) for slot_id in slot_ids)
+        state = self
+        rows: list[CatalogRow] = []
+        for slot_id in slot_ids:
+            row = state._admit(slot_id)
+            rows.append(row)
+            state = state._commit_admission(row, row.chronology.planned_n_valid)
         return MicrobatchPlanMember(
             member_index,
             tuple(row.identity for row in rows),
@@ -382,6 +405,35 @@ class ProjectedSchedulerState:
             sum(row.chronology.planned_n_valid for row in rows),
             self.queue_snapshot,
             self.exposure,
+        )
+
+    def rollover_projected_if_safe(self) -> "ProjectedSchedulerState":
+        """Perform the frozen post-member epoch boundary without mutating live state."""
+        catalog_sizes = {category: len(self._queue_for(category)) for category, _ in self.target_distribution}
+        positions = dict(self.queue_snapshot.positions)
+        if not catalog_sizes or any(positions.get(category, 0) < size for category, size in catalog_sizes.items()):
+            return self
+        if any(slot not in dict(self.terminal_slots) for slot, _ in self.stable_slots):
+            return self
+        snapshot = self.queue_snapshot
+        next_epoch = snapshot.epoch + 1
+        permutations = tuple(
+            (
+                category,
+                queue_permutation(
+                    queue_seed=snapshot.queue_seed,
+                    epoch=next_epoch,
+                    category=category,
+                    catalog_size=size,
+                ),
+            )
+            for category, size in sorted(catalog_sizes.items())
+        )
+        return ProjectedSchedulerState(
+            QueueEpochSnapshot(snapshot.queue_seed, next_epoch, snapshot.catalog_digest, tuple(), permutations),
+            self.exposure,
+            target_distribution=self.target_distribution,
+            catalog=self.catalog,
         )
 
     def project_commit(self, member: MicrobatchPlanMember) -> "ProjectedSchedulerState":
@@ -431,6 +483,14 @@ class CatalogRow:
     chronology: ChronologyCountRecord
     provenance: SegmentProvenance
 
+    def bind_slot(self, slot_id: int) -> "CatalogRow":
+        """Bind an immutable episode/chronology row to a newly admitted slot."""
+        return CatalogRow(
+            replace(self.identity, slot_id=slot_id),
+            replace(self.chronology, slot_id=slot_id),
+            self.provenance,
+        )
+
 
 class CanonicalBatchScheduler:
     """Metadata-only live/projected frontier with all-row atomic commits."""
@@ -455,6 +515,7 @@ class CanonicalBatchScheduler:
             member = state.derive_member(member_index=member_index, slot_ids=slot_ids)
             state = state.project_commit(member)
             members.append(member)
+            state = state.rollover_projected_if_safe()
             transitions.append((member, before, state))
         plan = CanonicalGAWindowPlan(
             tuple(members),
@@ -477,24 +538,29 @@ class CanonicalBatchScheduler:
         self._frozen_transitions.pop(0)
 
     def rollover_if_exhausted(self, catalog_sizes: Mapping[str, int]) -> None:
-        positions = dict(self._state.queue_snapshot.positions)
-        if any(positions.get(category, 0) < size for category, size in catalog_sizes.items()):
-            raise CanonicalSegmentContractError("queue epoch is not exhausted")
-        if any(slot not in dict(self._state.terminal_slots) for slot, _ in self._state.stable_slots):
-            raise CanonicalSegmentContractError("bound continuation takes precedence over epoch rollover")
-        snapshot = self._state.queue_snapshot
-        permutations = tuple(
-            (category, queue_permutation(
-                queue_seed=snapshot.queue_seed,
-                epoch=snapshot.epoch + 1,
-                category=category,
-                catalog_size=size,
-            ))
-            for category, size in sorted(catalog_sizes.items())
-        )
-        self._state = ProjectedSchedulerState(
-            QueueEpochSnapshot(snapshot.queue_seed, snapshot.epoch + 1, snapshot.catalog_digest, tuple(), permutations),
-            self._state.exposure,
-            target_distribution=self._state.target_distribution,
-            catalog=self._state.catalog,
-        )
+        if not self._state.catalog and not self._state.target_distribution:
+            positions = dict(self._state.queue_snapshot.positions)
+            if any(positions.get(category, 0) < size for category, size in catalog_sizes.items()):
+                raise CanonicalSegmentContractError("queue epoch is not exhausted")
+            if any(slot not in dict(self._state.terminal_slots) for slot, _ in self._state.stable_slots):
+                raise CanonicalSegmentContractError("bound continuation takes precedence over epoch rollover")
+            snapshot = self._state.queue_snapshot
+            permutations = tuple(
+                (category, queue_permutation(queue_seed=snapshot.queue_seed, epoch=snapshot.epoch + 1, category=category, catalog_size=size))
+                for category, size in sorted(catalog_sizes.items())
+            )
+            self._state = ProjectedSchedulerState(
+                QueueEpochSnapshot(snapshot.queue_seed, snapshot.epoch + 1, snapshot.catalog_digest, tuple(), permutations),
+                self._state.exposure,
+            )
+            return
+        authoritative = {
+            category: len(self._state._queue_for(category))
+            for category, _ in self._state.target_distribution
+        }
+        if dict(catalog_sizes) != authoritative:
+            raise CanonicalSegmentContractError("rollover catalog sizes differ from authoritative queue")
+        next_state = self._state.rollover_projected_if_safe()
+        if next_state is self._state:
+            raise CanonicalSegmentContractError("queue epoch is not exhausted or continuation remains bound")
+        self._state = next_state
