@@ -52,8 +52,11 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
     broadcast_context_parallel_object,
     context_parallel_broadcast_tensor_list,
 )
+from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import CanonicalProductionSegmentRequest
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
 from cosmos_framework.model.generator.mot.local_evidence import (
+    CANONICAL_EVIDENCE_FEATURE_CONFIG,
+    LEGACY_EVIDENCE_FEATURE_CONFIG,
     ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
     LocalHistoryRuntime,
@@ -116,6 +119,34 @@ from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelU
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
 from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_linears_on_meta
+
+
+_CANONICAL_PRODUCTION_MODE_KEY = "canonical_production_segment_mode"
+_CANONICAL_PRODUCTION_REQUEST_KEY = "canonical_production_segment_input"
+_LEGACY_LOCAL_MARKER_KEYS = frozenset(
+    {"psm_local_memory_active", "psm_local_memory_prepared", "canonical_local_memory_segment"}
+)
+
+
+def _canonical_production_request_from_batch(
+    *, local_ttt_enabled: bool, data_batch: Mapping[str, Any]
+) -> CanonicalProductionSegmentRequest | None:
+    """Apply the P2 activation matrix before any legacy training preparation."""
+    mode_present = _CANONICAL_PRODUCTION_MODE_KEY in data_batch
+    request_present = _CANONICAL_PRODUCTION_REQUEST_KEY in data_batch
+    legacy_present = any(key in data_batch for key in _LEGACY_LOCAL_MARKER_KEYS)
+    if not local_ttt_enabled:
+        if mode_present or request_present or legacy_present:
+            raise ValueError("canonical or legacy Local-Memory markers require local_ttt_enabled=True")
+        return None
+    if data_batch.get(_CANONICAL_PRODUCTION_MODE_KEY) is not True:
+        raise ValueError("local_ttt_enabled requires the exact canonical-production mode declaration")
+    request = data_batch.get(_CANONICAL_PRODUCTION_REQUEST_KEY)
+    if not isinstance(request, CanonicalProductionSegmentRequest):
+        raise TypeError("canonical-production mode requires CanonicalProductionSegmentRequest")
+    if legacy_present:
+        raise ValueError("canonical-production request conflicts with a legacy Local-Memory marker")
+    return request
 
 
 def _flatten_batch_scalars(value: Any) -> list[Any]:
@@ -354,7 +385,15 @@ class OmniMoTModel(ImaginaireModel):
                 else:
                     raise ValueError(f"unsupported local_history_backend: {self.config.local_history_backend}")
                 net.local_history_runtime = LocalHistoryRuntime(
-                    LocalEvidenceEncoder(evidence_dim=self.config.local_history_evidence_dim, visual_dim=96),
+                    LocalEvidenceEncoder(
+                        evidence_dim=self.config.local_history_evidence_dim,
+                        visual_dim=96,
+                        feature_config=(
+                            CANONICAL_EVIDENCE_FEATURE_CONFIG
+                            if self.config.local_ttt_enabled
+                            else LEGACY_EVIDENCE_FEATURE_CONFIG
+                        ),
+                    ),
                     StatelessLocalReplayReadout(
                         evidence_dim=self.config.local_history_evidence_dim,
                         local_dim=self.config.local_memory_dim,
@@ -1331,6 +1370,13 @@ class OmniMoTModel(ImaginaireModel):
         output = {"psm_local_memory_active_forward": published}
         return output, result.primary_consumer_mean + result.auxiliary_loss
 
+    def _canonical_production_segment_forward(
+        self, request: CanonicalProductionSegmentRequest, iteration: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Reserve the canonical ABI branch; its native pack/forward seam is P2-owned."""
+        del request, iteration
+        raise RuntimeError("canonical-production native forward seam is unavailable")
+
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -1355,6 +1401,12 @@ class OmniMoTModel(ImaginaireModel):
                 - Tensor: The computed loss for the training step as a PyTorch Tensor.
 
         """
+        canonical_request = _canonical_production_request_from_batch(
+            local_ttt_enabled=self.config.local_ttt_enabled, data_batch=data_batch
+        )
+        if canonical_request is not None:
+            return self._canonical_production_segment_forward(canonical_request, iteration)
+
         if data_batch.get("psm_local_memory_active") is True:
             return self._active_local_memory_forward(data_batch, iteration)
 
