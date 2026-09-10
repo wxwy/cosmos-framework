@@ -21,9 +21,11 @@ from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler im
     QueueEpochSnapshot,
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
+    CanonicalNativeModalityTerms,
     CanonicalProductionAdapter,
     CanonicalProductionSegmentRequest,
     CanonicalRawRowCarrier,
+    build_canonical_native_loss_split,
 )
 from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
@@ -61,6 +63,28 @@ def test_flow_matching_terms_preserve_legacy_wrapper_and_weighted_population() -
     torch.testing.assert_close(terms.weighted_mean, terms.weighted_per_instance.mean())
     torch.testing.assert_close(legacy_mean, terms.weighted_mean)
     torch.testing.assert_close(legacy_unweighted, terms.unweighted_per_instance)
+
+
+def test_canonical_loss_split_preserves_weighted_native_modality_means() -> None:
+    anchor = torch.tensor(1.0, requires_grad=True)
+    auxiliary = anchor * 7.0
+    split = build_canonical_native_loss_split(
+        consumer_identities=((0, "episode", 0), (0, "episode", 1), (1, "episode", 0)),
+        modalities={
+            "vision": CanonicalNativeModalityTerms(torch.tensor([1.0, 3.0]), (0, 1), 2.0),
+            "action": CanonicalNativeModalityTerms(torch.tensor([2.0, 4.0, 6.0]), (0, 1, 2), 0.5),
+            "sound": CanonicalNativeModalityTerms(torch.empty(0), (), 9.0),
+        },
+        sample_level_scale=torch.tensor(0.25),
+        auxiliary_loss=auxiliary,
+        graph_anchor=anchor,
+    )
+    torch.testing.assert_close(split.consumer_loss, torch.tensor(1.5))
+    torch.testing.assert_close(split.weighted_consumer_terms, torch.tensor([1.0, 2.75, 0.75]))
+    torch.testing.assert_close(split.auxiliary_loss, auxiliary)
+    assert split.actual_n_valid == 3
+    (split.consumer_loss + split.auxiliary_loss).backward()
+    assert anchor.grad is not None
 
 
 def _bound_request_and_carrier() -> tuple[CanonicalProductionSegmentRequest, CanonicalRawRowCarrier]:

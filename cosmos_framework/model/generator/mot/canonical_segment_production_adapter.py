@@ -208,6 +208,66 @@ class CanonicalNativePreparedInputs:
     working_data_batch: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class CanonicalNativeModalityTerms:
+    """One native weighted item population and its exact consumer ownership."""
+
+    weighted_per_instance: torch.Tensor
+    owner_indexes: tuple[int, ...]
+    weight: float
+
+
+@dataclass(frozen=True)
+class CanonicalNativeLossSplit:
+    """Canonical consumer mean and independent native auxiliary loss."""
+
+    consumer_loss: torch.Tensor
+    auxiliary_loss: torch.Tensor
+    actual_n_valid: int
+    consumer_identities: tuple[tuple[int, str, int], ...]
+    weighted_consumer_terms: torch.Tensor
+
+
+def build_canonical_native_loss_split(
+    *,
+    consumer_identities: tuple[tuple[int, str, int], ...],
+    modalities: Mapping[str, CanonicalNativeModalityTerms],
+    sample_level_scale: torch.Tensor,
+    auxiliary_loss: torch.Tensor,
+    graph_anchor: torch.Tensor,
+) -> CanonicalNativeLossSplit:
+    """Preserve native weighted modality means under a consumer-axis reduction."""
+    actual_n_valid = len(consumer_identities)
+    if actual_n_valid == 0 or len(set(consumer_identities)) != actual_n_valid:
+        raise CanonicalSegmentContractError("canonical consumer identities are invalid")
+    if sample_level_scale.ndim != 0 or auxiliary_loss.ndim != 0:
+        raise CanonicalSegmentContractError("canonical native loss scalars are invalid")
+    consumer_terms = graph_anchor.sum() * 0.0 + torch.zeros(
+        actual_n_valid, dtype=graph_anchor.dtype, device=graph_anchor.device
+    )
+    for modality in modalities.values():
+        terms = modality.weighted_per_instance
+        if terms.ndim != 1 or len(terms) != len(modality.owner_indexes):
+            raise CanonicalSegmentContractError("canonical native modality ownership is invalid")
+        if not len(terms):
+            continue
+        if any(index < 0 or index >= actual_n_valid for index in modality.owner_indexes):
+            raise CanonicalSegmentContractError("canonical native modality owner is foreign")
+        if terms.dtype != consumer_terms.dtype or terms.device != consumer_terms.device:
+            raise CanonicalSegmentContractError("canonical native modality tensor is foreign")
+        contribution = terms * (actual_n_valid / len(terms)) * modality.weight
+        indexes = torch.tensor(modality.owner_indexes, dtype=torch.long, device=terms.device)
+        consumer_terms = consumer_terms.scatter_add(0, indexes, contribution)
+    weighted_consumer_terms = consumer_terms * sample_level_scale
+    return CanonicalNativeLossSplit(
+        weighted_consumer_terms.mean() + graph_anchor.sum() * 0.0,
+        auxiliary_loss,
+        actual_n_valid,
+        consumer_identities,
+        weighted_consumer_terms,
+    )
+
+
 def _clone_canonical_working_value(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.clone()
