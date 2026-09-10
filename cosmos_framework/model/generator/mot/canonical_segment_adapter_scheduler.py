@@ -311,6 +311,17 @@ class NativeConsumerBatch:
 
 
 @dataclass(frozen=True)
+class PreparedCanonicalReconcile:
+    """One-shot, prevalidated scheduler reconcile capability."""
+
+    scheduler: "CanonicalBatchScheduler"
+    member: MicrobatchPlanMember
+    actual_n_valid: int
+    before: ProjectedSchedulerState
+    after: ProjectedSchedulerState
+
+
+@dataclass(frozen=True)
 class ProjectedSchedulerState:
     queue_snapshot: QueueEpochSnapshot
     exposure: tuple[tuple[str, int], ...]
@@ -549,6 +560,34 @@ class CanonicalBatchScheduler:
         frozen, before, after = self._frozen_transitions[0]
         if member is not frozen or self._state != before:
             raise CanonicalSegmentContractError("reconcile member is foreign, stale, or out of frozen order")
+        self._state = after
+        self._frozen_transitions.pop(0)
+
+    def prepare_reconcile_after_backward(
+        self, member: MicrobatchPlanMember, actual_n_valid: int
+    ) -> PreparedCanonicalReconcile:
+        """Validate the exact next frozen transition without mutating state."""
+        if actual_n_valid != member.planned_n_valid or not self._frozen_transitions:
+            raise CanonicalSegmentContractError("reconcile preflight count/transition is invalid")
+        frozen, before, after = self._frozen_transitions[0]
+        if member is not frozen or self._state != before:
+            raise CanonicalSegmentContractError("reconcile preflight member is foreign, stale, or out of order")
+        return PreparedCanonicalReconcile(self, member, actual_n_valid, before, after)
+
+    def consume_prepared_reconcile(self, prepared: PreparedCanonicalReconcile) -> None:
+        """Consume only the exact capability returned by this scheduler preflight."""
+        if prepared.scheduler is not self:
+            raise CanonicalSegmentContractError("prepared reconcile belongs to a foreign scheduler")
+        if self._state != prepared.before or not self._frozen_transitions:
+            raise CanonicalSegmentContractError("prepared reconcile is stale")
+        frozen, before, after = self._frozen_transitions[0]
+        if (
+            prepared.member is not frozen
+            or prepared.actual_n_valid != frozen.planned_n_valid
+            or before != prepared.before
+            or after != prepared.after
+        ):
+            raise CanonicalSegmentContractError("prepared reconcile no longer matches frozen transition")
         self._state = after
         self._frozen_transitions.pop(0)
 

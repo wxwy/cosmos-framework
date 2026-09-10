@@ -249,6 +249,21 @@ def test_projected_planning_is_pure_and_all_row_commit_is_atomic() -> None:
     assert tuple(slot for slot, _ in scheduler.snapshot.stable_slots) == (0, 1)
 
 
+def test_prepared_reconcile_is_pure_one_shot_and_rejects_foreign_scheduler() -> None:
+    initial = _state()
+    scheduler = CanonicalBatchScheduler(initial)
+    member = scheduler.freeze_plan(slot_groups=((0, 1),), plan_chain_id="prepared").members[0]
+    prepared = scheduler.prepare_reconcile_after_backward(member, 3)
+    assert scheduler.snapshot == initial
+    foreign = CanonicalBatchScheduler(initial)
+    with pytest.raises(CanonicalSegmentContractError, match="foreign scheduler"):
+        foreign.consume_prepared_reconcile(prepared)
+    scheduler.consume_prepared_reconcile(prepared)
+    assert scheduler.snapshot != initial
+    with pytest.raises(CanonicalSegmentContractError, match="stale"):
+        scheduler.consume_prepared_reconcile(prepared)
+
+
 def test_queue_preimage_permutation_and_rollover_preserve_exposure() -> None:
     preimage = queue_digest_preimage(queue_seed=7, epoch=2, category="a", canonical_index=0)
     assert preimage == b"PSM-WMA/queue/v1\0" + b"7\0" + b"2\0a\0" + b"0"
