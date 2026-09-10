@@ -17,6 +17,7 @@ from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler im
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
     CanonicalProductionAdapter,
     CanonicalProductionFastStateFrontier,
+    CanonicalRawRowCarrier,
     CanonicalProductionSegmentRequest,
 )
 from cosmos_framework.model.generator.mot.local_evidence import (
@@ -51,6 +52,35 @@ def test_adapter_scan_derives_stream_major_gather_and_fp32_state() -> None:
     assert result.slot_chain == ((0, "episode", "source", 0),)
     with pytest.raises(Exception, match="already has a scan capability"):
         adapter.scan(request)
+    frontier_before = dict(adapter.frontier._states)
+    adapter.abort_scan(request, result)
+    assert adapter.frontier._states == frontier_before
+    with pytest.raises(CanonicalSegmentContractError, match="exact pending"):
+        adapter.abort_scan(request, result)
+    adapter.abort_scan(request, adapter.scan(request))
+
+
+def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity() -> None:
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    batch = SegmentBatch(
+        torch.zeros(1, 2, 96), (("s0", None),), torch.tensor([[True, False]]), torch.tensor([[0, -1]]),
+        torch.zeros(1, 2, 96), torch.zeros(1, 2, 10), torch.tensor([[False, False]]), torch.tensor([[-1, -1]]),
+        torch.tensor([0]), ("episode",), ("category",), provenance,
+    )
+    member = MicrobatchPlanMember(
+        0, (SegmentIdentity(0, "episode", "category", 0, 0, "source"),), (provenance,),
+        (ChronologyCountRecord(0, "episode", "category", "source", 0, 1, False, "manifest"),), (1,), 1,
+        QueueEpochSnapshot(1, 0, "catalog", (("category", 0),)), (),
+    )
+    plan = CanonicalGAWindowPlan((member,), 1, 1, "carrier")
+    scheduler = CanonicalBatchScheduler(ProjectedSchedulerState(QueueEpochSnapshot(1, 0, "catalog", ()), ()))
+    request = CanonicalProductionSegmentRequest(scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, batch)
+    sample = {"canonical_identity": (0, "episode", 0)}
+    carrier = CanonicalRawRowCarrier(((sample, None),), ((sample, None),), {"sequence_plan": ()})
+    assert carrier.expected_for(request).logical_indexes == ((0, 0),)
+    foreign = CanonicalRawRowCarrier((({"canonical_identity": (1, "episode", 0)}, None),), ((sample, None),), {})
+    with pytest.raises(CanonicalSegmentContractError, match="raw identity is foreign"):
+        foreign.expected_for(request)
 
 
 def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() -> None:

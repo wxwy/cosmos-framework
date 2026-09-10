@@ -1395,8 +1395,21 @@ class OmniMoTModel(ImaginaireModel):
         self, request: CanonicalProductionSegmentRequest, iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Reserve the canonical ABI branch; its native pack/forward seam is P2-owned."""
-        del request, iteration
-        raise RuntimeError("canonical-production native forward seam is unavailable")
+        del iteration
+        if request.carrier is None:
+            raise RuntimeError("canonical-production requires an immutable raw-row carrier")
+        adapter = _canonical_production_adapter_from_model(self)
+        expected = request.carrier.expected_for(request)
+        if "local_memory" in request.carrier.model_data_batch:
+            raise RuntimeError("canonical-production model batch must remain Local-neutral")
+        result = adapter.scan(request)
+        try:
+            if result.gathered.identities != expected.identities or result.gathered.item_count != len(expected.identities):
+                raise RuntimeError("canonical-production gathered result differs from pre-scan expected traversal")
+            raise RuntimeError("canonical-production native forward seam is unavailable")
+        except Exception:
+            adapter.abort_scan(request, result)
+            raise
 
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int

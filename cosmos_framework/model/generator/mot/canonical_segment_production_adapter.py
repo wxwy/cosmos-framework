@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 import torch
 
@@ -31,6 +32,55 @@ class CanonicalProductionSegmentRequest:
     member: MicrobatchPlanMember
     member_index: int
     segment_batch: SegmentBatch
+    carrier: "CanonicalRawRowCarrier | None" = None
+
+
+@dataclass(frozen=True)
+class CanonicalExpectedTraversal:
+    identities: tuple[tuple[int, str, int], ...]
+    logical_indexes: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class CanonicalRawRowCarrier:
+    """Immutable nested raw source; flat views are derived, never stored."""
+
+    raw_rows: tuple[tuple[Mapping[str, Any] | None, ...], ...]
+    row_model_samples: tuple[tuple[Mapping[str, Any] | None, ...], ...]
+    model_data_batch: Mapping[str, Any]
+
+    def expected_for(self, request: CanonicalProductionSegmentRequest) -> CanonicalExpectedTraversal:
+        valid = request.segment_batch.consumer_valid
+        batch, steps = valid.shape
+        if len(self.raw_rows) != batch or len(self.row_model_samples) != batch:
+            raise CanonicalSegmentContractError("canonical carrier outer batch differs from segment")
+        identities: list[tuple[int, str, int]] = []
+        indexes: list[tuple[int, int]] = []
+        for row in range(batch):
+            if len(self.raw_rows[row]) != steps or len(self.row_model_samples[row]) != steps:
+                raise CanonicalSegmentContractError("canonical carrier inner width differs from segment")
+            for index in range(steps):
+                raw, sample = self.raw_rows[row][index], self.row_model_samples[row][index]
+                if not bool(valid[row, index]):
+                    if raw is not None or sample is not None:
+                        raise CanonicalSegmentContractError("canonical carrier PAD entries must be absent")
+                    continue
+                if raw is None or sample is None:
+                    raise CanonicalSegmentContractError("canonical carrier valid entries must be present")
+                if raw.get("canonical_identity") != (
+                    int(request.segment_batch.slot_id[row]),
+                    request.segment_batch.episode_id[row],
+                    int(request.segment_batch.consumer_step[row, index]),
+                ):
+                    raise CanonicalSegmentContractError("canonical carrier raw identity is foreign")
+                if sample.get("canonical_identity") != raw.get("canonical_identity"):
+                    raise CanonicalSegmentContractError("canonical carrier model sample identity is foreign")
+                identities.append(raw["canonical_identity"])
+                indexes.append((row, index))
+        expected = CanonicalExpectedTraversal(tuple(identities), tuple(indexes))
+        if len(expected.identities) != request.member.planned_n_valid:
+            raise CanonicalSegmentContractError("canonical carrier expected count differs from frozen member")
+        return expected
 
 
 @dataclass(frozen=True)
@@ -157,6 +207,13 @@ class CanonicalProductionAdapter:
         capability = CanonicalProductionCommitCapability(request, result, prepared)
         self._commit_capabilities.add(id(capability))
         return capability
+
+    def abort_scan(self, request: CanonicalProductionSegmentRequest, result: CanonicalProductionScanResult) -> None:
+        """Dispose one uncommitted scan capability without mutating the frontier."""
+        if id(request) not in self._scan_requests or self._scan_results.get(id(result)) is not request:
+            raise CanonicalSegmentContractError("scan abort requires this exact pending request/result pair")
+        self._scan_requests.remove(id(request))
+        self._scan_results.pop(id(result))
 
     def commit_success(self, capability: CanonicalProductionCommitCapability) -> None:
         request, result = capability.request, capability.result
