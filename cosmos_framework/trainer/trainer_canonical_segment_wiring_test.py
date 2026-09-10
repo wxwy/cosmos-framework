@@ -1,12 +1,26 @@
 from __future__ import annotations
 
-import pytest
-import torch
 from types import SimpleNamespace
 
-from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
+import pytest
+import torch
+
+from cosmos_framework.data.generator.sequence_packing import SequencePlan
+from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
+    CanonicalProductionAdapter,
+    build_canonical_native_loss_split,
+)
+from cosmos_framework.model.generator.mot.canonical_segment_production_integration_test import (
+    _bound_request_and_carrier,
+)
+from cosmos_framework.model.generator.mot.local_evidence import (
+    CANONICAL_EVIDENCE_FEATURE_CONFIG,
+    ContinualTTTLocalMemoryCore,
+    LocalEvidenceEncoder,
+)
 from cosmos_framework.model.generator.mot.production_segment_wiring import run_native_forward_for_test
 from cosmos_framework.model.generator.mot.production_segment_wiring_test import _fixture
+from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
 from cosmos_framework.trainer import ImaginaireTrainer
 
 
@@ -142,3 +156,45 @@ def test_two_step_marker_to_trainer_keeps_visible_local_primary_exactly_once() -
     torch.testing.assert_close(output["primary_consumer_mean"], expected)
     object.__new__(ImaginaireTrainer)._run_canonical_segment_backward(output)
     assert transaction.snapshot().completed_members == (identity,)
+
+
+def test_canonical_native_scaler_rejection_disposes_before_backward() -> None:
+    request, carrier = _bound_request_and_carrier()
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+    result = adapter.scan(request)
+    prepared = adapter.prepare_native_inputs(
+        request, result, carrier, input_image_key="images", input_video_key="video"
+    )
+    prepared = adapter.attach_native_preparation(
+        prepared,
+        input_text_indexes=[[], []],
+        sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)],
+        gen_data_clean=object(),
+        memory_info={},
+        data_resolutions=None,
+        vae_pixel_shapes=[],
+    )
+    anchor = torch.nn.Parameter(torch.ones(()))
+    split = build_canonical_native_loss_split(
+        consumer_identities=prepared.traversal.identities,
+        modalities={},
+        sample_level_scale=torch.ones(()),
+        auxiliary_loss=anchor * 0.0,
+        graph_anchor=anchor,
+    )
+    capability = adapter.bind_native_forward(prepared, split)
+    with pytest.raises(RuntimeError, match="CANONICAL_NATIVE_SCALER_UNSUPPORTED"):
+        object.__new__(ImaginaireTrainer)._run_canonical_native_backward(
+            {
+                "psm_canonical_native_forward": capability,
+                "psm_canonical_native_slow_parameters": (anchor,),
+            },
+            SimpleNamespace(is_enabled=lambda: True),
+        )
+    assert anchor.grad is None
+    assert adapter._native_forward_capabilities == {}
+    assert adapter._scan_requests == set() and adapter._scan_results == {}
+    assert request.transaction.snapshot().terminal_failure_code == "CANONICAL_NATIVE_SCALER_UNSUPPORTED"
