@@ -517,6 +517,17 @@ class CanonicalProductionAdapter:
         self._native_forward_capabilities.remove(id(capability))
         return capability
 
+    def abort_native_forward(self, capability: CanonicalNativeForwardCapability) -> None:
+        """Dispose one exact pending forward capability without reconciling its scan."""
+        if (
+            id(capability) not in self._native_forward_capabilities
+            or capability.adapter is not self
+            or self._scan_results.get(id(capability.prepared.result)) is not capability.prepared.request
+        ):
+            raise CanonicalSegmentContractError("canonical native forward abort is foreign or already consumed")
+        self._native_forward_capabilities.remove(id(capability))
+        self.abort_scan(capability.prepared.request, capability.prepared.result)
+
     def prepare_commit(
         self, request: CanonicalProductionSegmentRequest, result: CanonicalProductionScanResult
     ) -> CanonicalProductionCommitCapability:

@@ -201,6 +201,18 @@ def test_native_forward_capability_binds_one_exact_pending_scan() -> None:
         adapter.consume_native_forward(capability)
     adapter.abort_scan(request, result)
 
+    result = adapter.scan(request)
+    prepared = adapter.prepare_native_inputs(
+        request, result, carrier, input_image_key="images", input_video_key="video"
+    )
+    capability = adapter.bind_native_forward(prepared, split)
+    adapter.abort_native_forward(capability)
+    assert adapter._native_forward_capabilities == set()
+    assert adapter._scan_requests == set()
+    assert adapter._scan_results == {}
+    with pytest.raises(Exception, match="already consumed"):
+        adapter.abort_native_forward(capability)
+
 
 def test_activation_matrix_fails_before_legacy_routes() -> None:
     assert _canonical_production_request_from_batch(local_ttt_enabled=False, data_batch={}) is None
