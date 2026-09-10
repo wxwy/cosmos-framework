@@ -201,7 +201,7 @@ def test_canonical_native_scaler_rejection_disposes_before_backward() -> None:
 def test_canonical_training_step_rejects_before_model_forward(scaler_enabled: bool) -> None:
     trainer = object.__new__(ImaginaireTrainer)
     parameter = torch.nn.Parameter(torch.ones(()))
-    optimizer = torch.optim.SGD((parameter,), lr=0.1)
+    optimizer = object() if scaler_enabled else torch.optim.SGD((parameter,), lr=0.1)
     scaler = SimpleNamespace(is_enabled=lambda: scaler_enabled)
     with pytest.raises(RuntimeError, match="rejects scaler or optimizer before scan"):
         trainer.training_step(
@@ -223,6 +223,34 @@ def test_canonical_native_rejects_batch_slow_parameter_authority_before_backward
     torch.testing.assert_close(foreign.grad, torch.ones(()))
     assert all(parameter.grad is None for parameter in capability.slow_parameters)
     assert request.transaction.snapshot().terminal_failure_code == "CANONICAL_NATIVE_SLOW_PARAMETER_AUTHORITY"
+
+
+def test_canonical_native_post_mutation_failure_preserves_trainer_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    request, carrier = _bound_request_and_carrier()
+    adapter = CanonicalProductionAdapter(LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256))
+    result = adapter.scan(request)
+    prepared = adapter.attach_native_preparation(adapter.prepare_native_inputs(request, result, carrier, input_image_key="images", input_video_key="video"), input_text_indexes=[[], []], sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)], gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[])
+    anchor = torch.ones((), requires_grad=True)
+    capability = adapter.bind_native_forward(prepared, build_canonical_native_loss_split(consumer_identities=prepared.traversal.identities, modalities={}, sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 0.0, graph_anchor=anchor))
+    post_mutation_capability = SimpleNamespace(request=request, result=result)
+
+    def fail_after_frontier_mutation(commit_capability):
+        adapter._commit_capabilities.add(id(commit_capability))
+        adapter._post_mutation_commits.add(id(commit_capability))
+        adapter.frontier.commit(commit_capability.request.member, commit_capability.result.candidate_state_out)
+        raise RuntimeError("injected post-mutation failure")
+
+    monkeypatch.setattr(adapter, "commit_success", fail_after_frontier_mutation)
+    monkeypatch.setattr(adapter, "prepare_commit", lambda request, result: post_mutation_capability)
+    for parameter in capability.slow_parameters:
+        parameter.grad = torch.ones_like(parameter)
+    with pytest.raises(RuntimeError, match="CANONICAL_NATIVE_POST_MUTATION_FAILURE"):
+        object.__new__(ImaginaireTrainer)._run_canonical_native_backward(
+            {"psm_canonical_native_forward": capability}, SimpleNamespace(is_enabled=lambda: False, scale=lambda value: value)
+        )
+    assert all(parameter.grad is not None for parameter in capability.slow_parameters)
+    assert adapter._commit_capabilities and adapter._scan_requests and adapter.frontier._states
+    assert request.transaction.snapshot().terminal_failure_code is None
 
 
 @pytest.mark.parametrize("phase", ("backward", "prepare", "commit"))

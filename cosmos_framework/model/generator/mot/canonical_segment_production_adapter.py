@@ -361,16 +361,20 @@ def build_prepared_canonical_native_loss_split(
         ("sound", sound_weighted_terms, prepared.owner_maps.sound_owner_indexes, sound_weight),
     )
     modalities: dict[str, CanonicalNativeModalityTerms] = {}
+    modality_graph_anchor = graph_anchor
     for name, terms, owner_indexes, weight in populations:
         typed_no_valid = isinstance(terms, FlowMatchingLossTerms)
         if typed_no_valid:
+            if terms.canonical_weighted_per_instance is None:
+                modality_graph_anchor = modality_graph_anchor + terms.weighted_mean * 0.0
             terms = terms.canonical_weighted_per_instance
         if terms is None:
             if owner_indexes and not typed_no_valid:
                 raise CanonicalSegmentContractError("canonical native modality terms are missing")
             if owner_indexes:
                 # A certified no-valid native population contributes only the
-                # graph-connected zero supplied by ``graph_anchor`` below.
+                # graph-connected zero supplied by this modality's own dummy
+                # term through ``modality_graph_anchor`` below.
                 continue
             continue
         if not isinstance(terms, torch.Tensor):
@@ -383,7 +387,7 @@ def build_prepared_canonical_native_loss_split(
         modalities=modalities,
         sample_level_scale=sample_level_scale,
         auxiliary_loss=auxiliary_loss,
-        graph_anchor=graph_anchor,
+        graph_anchor=modality_graph_anchor,
     )
 
 
@@ -753,8 +757,8 @@ class CanonicalProductionAdapter:
             raise CanonicalSegmentContractError("commit candidate fast state is not fp32")
         request.scheduler.validate_prepared_reconcile(capability.prepared_reconcile)
         request.transaction.validate_reconcile(request.member_index)
-        self.frontier.commit(request.member, result.candidate_state_out)
         self._post_mutation_commits.add(id(capability))
+        self.frontier.commit(request.member, result.candidate_state_out)
         request.scheduler.consume_prepared_reconcile(capability.prepared_reconcile)
         request.transaction.mark_reconciled(request.member_index)
         self._commit_capabilities.remove(id(capability))

@@ -103,7 +103,7 @@ def test_prepared_loss_split_no_valid_population_has_no_fake_native_owner() -> N
     )
     assert terms.weighted_per_instance.numel() == 1
     assert terms.canonical_weighted_per_instance is None
-    anchor = sum(value.sum() for value in prediction)
+    anchor = torch.ones((), requires_grad=True)
     split = build_prepared_canonical_native_loss_split(
         prepared=prepared, vision_weighted_terms=terms, action_weighted_terms=None, sound_weighted_terms=None,
         vision_weight=1.0, action_weight=1.0, sound_weight=1.0, sample_level_scale=torch.ones(()),
@@ -112,6 +112,7 @@ def test_prepared_loss_split_no_valid_population_has_no_fake_native_owner() -> N
     torch.testing.assert_close(split.consumer_loss, torch.zeros(()))
     (split.consumer_loss + split.auxiliary_loss).backward()
     assert all(value.grad is not None for value in prediction)
+    assert anchor.grad is not None
     adapter.abort_scan(request, result)
 
 

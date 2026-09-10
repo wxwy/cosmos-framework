@@ -358,16 +358,17 @@ def test_adapter_abort_commit_consumes_exact_capability_without_reconcile(monkey
         adapter.abort_commit(replace(capability))
     assert adapter._commit_capabilities == {id(capability)}
     assert adapter._scan_requests == {id(request)}
-    frontier_commit = adapter.frontier.commit
+    validate_prepared_reconcile = request.scheduler.validate_prepared_reconcile
     monkeypatch.setattr(
-        adapter.frontier,
-        "commit",
-        lambda member, state: (_ for _ in ()).throw(RuntimeError("injected pre-mutation commit failure")),
+        request.scheduler,
+        "validate_prepared_reconcile",
+        lambda prepared: (_ for _ in ()).throw(RuntimeError("injected pre-mutation validation failure")),
     )
-    with pytest.raises(RuntimeError, match="injected pre-mutation commit failure"):
+    with pytest.raises(RuntimeError, match="injected pre-mutation validation failure"):
         adapter.commit_success(capability)
     assert adapter._commit_capabilities == {id(capability)}
     assert adapter._scan_requests == {id(request)}
+    monkeypatch.setattr(request.scheduler, "validate_prepared_reconcile", validate_prepared_reconcile)
     adapter.abort_commit(capability)
     assert adapter._commit_capabilities == set()
     assert adapter._scan_requests == set()
@@ -380,7 +381,6 @@ def test_adapter_abort_commit_consumes_exact_capability_without_reconcile(monkey
     with pytest.raises(CanonicalSegmentContractError, match="exact pending capability"):
         adapter.abort_commit(capability)
 
-    monkeypatch.setattr(adapter.frontier, "commit", frontier_commit)
     post_transaction = CanonicalBatchWindowTransaction(plan)
     post_request = CanonicalProductionSegmentRequest(
         scheduler, plan, post_transaction, member, 0, batch

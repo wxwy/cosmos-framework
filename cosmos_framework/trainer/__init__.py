@@ -981,14 +981,16 @@ class ImaginaireTrainer:
             commit_capability = adapter.prepare_commit(request, capability.prepared.result)
             adapter.commit_success(commit_capability)
         except Exception as error:
-            for parameter in slow_parameters:
-                parameter.grad = None
             if commit_capability is None:
+                for parameter in slow_parameters:
+                    parameter.grad = None
                 adapter.abort_scan(request, capability.prepared.result)
             else:
                 if adapter.commit_has_crossed_mutation_boundary(commit_capability):
                     raise RuntimeError("CANONICAL_NATIVE_POST_MUTATION_FAILURE") from error
                 try:
+                    for parameter in slow_parameters:
+                        parameter.grad = None
                     adapter.abort_commit(commit_capability)
                 except Exception:
                     raise RuntimeError("CANONICAL_NATIVE_POST_MUTATION_FAILURE") from error
