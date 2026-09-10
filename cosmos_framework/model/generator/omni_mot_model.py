@@ -52,7 +52,10 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
     broadcast_context_parallel_object,
     context_parallel_broadcast_tensor_list,
 )
-from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import CanonicalProductionSegmentRequest
+from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
+    CanonicalProductionAdapter,
+    CanonicalProductionSegmentRequest,
+)
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
 from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
@@ -147,6 +150,24 @@ def _canonical_production_request_from_batch(
     if legacy_present:
         raise ValueError("canonical-production request conflicts with a legacy Local-Memory marker")
     return request
+
+
+def _canonical_production_adapter_from_model(model: Any) -> CanonicalProductionAdapter:
+    """Return only an adapter bound to the model's already-registered modules."""
+    runtime = getattr(getattr(model, "net", None), "local_history_runtime", None)
+    encoder = getattr(runtime, "encoder", None)
+    core = getattr(runtime, "recurrent_backend", None)
+    if not isinstance(encoder, LocalEvidenceEncoder) or not isinstance(core, ContinualTTTLocalMemoryCore):
+        raise RuntimeError("canonical-production requires registered canonical encoder and TTT core")
+    if encoder.feature_config is not CANONICAL_EVIDENCE_FEATURE_CONFIG:
+        raise RuntimeError("canonical-production encoder has a non-canonical feature config")
+    adapter = getattr(model, "_canonical_production_adapter", None)
+    if adapter is None:
+        adapter = CanonicalProductionAdapter(encoder, core)
+        model._canonical_production_adapter = adapter
+    if not isinstance(adapter, CanonicalProductionAdapter) or adapter.encoder is not encoder or adapter.core is not core:
+        raise RuntimeError("canonical-production adapter is not bound to registered modules")
+    return adapter
 
 
 def _flatten_batch_scalars(value: Any) -> list[Any]:
