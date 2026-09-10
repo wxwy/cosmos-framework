@@ -508,14 +508,18 @@ class CanonicalProductionAdapter:
 
     def consume_native_forward(self, capability: CanonicalNativeForwardCapability) -> CanonicalNativeForwardCapability:
         """Consume one exact forward capability before entering its trainer boundary."""
+        self.validate_native_forward(capability)
+        self._native_forward_capabilities.pop(id(capability))
+        return capability
+
+    def validate_native_forward(self, capability: CanonicalNativeForwardCapability) -> None:
+        """Prove that a forward capability still owns its exact pending scan."""
         if (
             self._native_forward_capabilities.get(id(capability)) is not capability
             or capability.adapter is not self
             or self._scan_results.get(id(capability.prepared.result)) is not capability.prepared.request
         ):
             raise CanonicalSegmentContractError("canonical native forward capability is foreign or already consumed")
-        self._native_forward_capabilities.pop(id(capability))
-        return capability
 
     def abort_native_forward(self, capability: CanonicalNativeForwardCapability) -> None:
         """Dispose one exact pending forward capability without reconciling its scan."""

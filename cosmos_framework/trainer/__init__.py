@@ -546,6 +546,8 @@ class ImaginaireTrainer:
                 ):
                     if is_active_step:
                         self._run_active_local_memory_backward(model, output_batch, grad_scaler, grad_accum_iter)
+                    elif "psm_canonical_native_forward" in output_batch:
+                        self._run_canonical_native_backward(output_batch, grad_scaler)
                     elif "canonical_segment_forward" in output_batch:
                         self._run_canonical_segment_backward(output_batch)
                     else:
@@ -925,6 +927,67 @@ class ImaginaireTrainer:
         )
         wiring.adapter.commit(identity, forward.result, transaction=transaction)
         return loss
+
+    def _run_canonical_native_backward(self, output_batch: dict[str, object], grad_scaler: object) -> torch.Tensor:
+        """Run one exact canonical-native member lifecycle without ordinary GA scaling."""
+        from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
+            CanonicalNativeForwardCapability,
+        )
+
+        capability = output_batch.get("psm_canonical_native_forward")
+        slow_parameters = output_batch.get("psm_canonical_native_slow_parameters")
+        if not isinstance(capability, CanonicalNativeForwardCapability) or not isinstance(slow_parameters, tuple):
+            raise RuntimeError("canonical native forward capability is incomplete")
+        adapter = capability.adapter
+        request = capability.prepared.request
+        transaction = request.transaction
+
+        def abort_before_commit(code: str) -> None:
+            for parameter in slow_parameters:
+                if not isinstance(parameter, torch.nn.Parameter):
+                    raise RuntimeError("canonical native slow parameter is invalid")
+                parameter.grad = None
+            adapter.abort_native_forward(capability)
+            transaction.terminalize(request.member_index, code)
+
+        adapter.validate_native_forward(capability)
+        if grad_scaler.is_enabled():
+            abort_before_commit("CANONICAL_NATIVE_SCALER_UNSUPPORTED")
+            raise RuntimeError("CANONICAL_NATIVE_SCALER_UNSUPPORTED")
+        try:
+            transaction.mark_backward_started(request.member_index)
+            objective = request.plan.objective(
+                request.member_index,
+                capability.loss_split.consumer_loss,
+                capability.loss_split.auxiliary_loss,
+                capability.loss_split.actual_n_valid,
+            )
+            if not torch.isfinite(objective):
+                raise RuntimeError("CANONICAL_NATIVE_NUMERICAL_FAILURE")
+            grad_scaler.scale(objective).backward()
+        except Exception as error:
+            code = "CANONICAL_NATIVE_NUMERICAL_FAILURE" if str(error) == "CANONICAL_NATIVE_NUMERICAL_FAILURE" else "CANONICAL_NATIVE_BACKWARD_FAILURE"
+            abort_before_commit(code)
+            raise RuntimeError(code) from error
+
+        commit_capability = None
+        try:
+            adapter.consume_native_forward(capability)
+            commit_capability = adapter.prepare_commit(request, capability.prepared.result)
+            adapter.commit_success(commit_capability)
+        except Exception as error:
+            for parameter in slow_parameters:
+                parameter.grad = None
+            if commit_capability is None:
+                adapter.abort_scan(request, capability.prepared.result)
+            else:
+                try:
+                    adapter.abort_commit(commit_capability)
+                except Exception:
+                    raise RuntimeError("CANONICAL_NATIVE_POST_MUTATION_FAILURE") from error
+            transaction.terminalize(request.member_index, "CANONICAL_NATIVE_COMMIT_FAILURE")
+            raise RuntimeError("CANONICAL_NATIVE_COMMIT_FAILURE") from error
+        return objective
 
     def _zero_grad(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, iteration: int) -> None:
         """Zero gradients. Override to customise (e.g. PhaseOptimizer)."""
