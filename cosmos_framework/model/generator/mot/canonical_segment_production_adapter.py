@@ -325,6 +325,41 @@ def build_canonical_native_loss_split(
     )
 
 
+def build_prepared_canonical_native_loss_split(
+    *,
+    prepared: CanonicalNativePreparedInputs,
+    vision_weighted_terms: torch.Tensor | None,
+    action_weighted_terms: torch.Tensor | None,
+    sound_weighted_terms: torch.Tensor | None,
+    vision_weight: float,
+    action_weight: float,
+    sound_weight: float,
+    sample_level_scale: torch.Tensor,
+    auxiliary_loss: torch.Tensor,
+    graph_anchor: torch.Tensor,
+) -> CanonicalNativeLossSplit:
+    """Build a loss split only from the exact native populations in prepared inputs."""
+    populations = (
+        ("vision", vision_weighted_terms, prepared.owner_maps.vision_owner_indexes, vision_weight),
+        ("action", action_weighted_terms, prepared.owner_maps.action_owner_indexes, action_weight),
+        ("sound", sound_weighted_terms, prepared.owner_maps.sound_owner_indexes, sound_weight),
+    )
+    modalities: dict[str, CanonicalNativeModalityTerms] = {}
+    for name, terms, owner_indexes, weight in populations:
+        if terms is None:
+            if owner_indexes:
+                raise CanonicalSegmentContractError("canonical native modality terms are missing")
+            continue
+        modalities[name] = CanonicalNativeModalityTerms(terms, owner_indexes, weight)
+    return build_canonical_native_loss_split(
+        consumer_identities=prepared.traversal.identities,
+        modalities=modalities,
+        sample_level_scale=sample_level_scale,
+        auxiliary_loss=auxiliary_loss,
+        graph_anchor=graph_anchor,
+    )
+
+
 def _clone_canonical_working_value(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.clone()

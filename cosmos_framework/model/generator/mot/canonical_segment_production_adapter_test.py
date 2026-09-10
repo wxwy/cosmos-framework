@@ -21,6 +21,7 @@ from cosmos_framework.model.generator.mot.canonical_segment_production_adapter i
     CanonicalProductionFastStateFrontier,
     CanonicalProductionSegmentRequest,
     CanonicalRawRowCarrier,
+    build_prepared_canonical_native_loss_split,
 )
 from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
@@ -231,6 +232,30 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
     assert dense_maps.vision_owner_indexes == (0, 0, 1, 2, 3, 4, 4, 4)
     assert dense_maps.action_owner_indexes == (1, 4)
     assert dense_maps.sound_owner_indexes == (3,)
+    dense_adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+    dense_result = dense_adapter.scan(request)
+    dense_prepared = dense_adapter.prepare_native_inputs(
+        request, dense_result, dense_batch, input_image_key="images", input_video_key="video"
+    )
+    anchor = torch.tensor(1.0, requires_grad=True)
+    split = build_prepared_canonical_native_loss_split(
+        prepared=dense_prepared,
+        vision_weighted_terms=torch.arange(1.0, 9.0),
+        action_weighted_terms=torch.tensor([2.0, 4.0]),
+        sound_weighted_terms=torch.tensor([6.0]),
+        vision_weight=1.0,
+        action_weight=0.5,
+        sound_weight=0.25,
+        sample_level_scale=torch.tensor(0.5),
+        auxiliary_loss=anchor * 7.0,
+        graph_anchor=anchor,
+    )
+    torch.testing.assert_close(split.consumer_loss, torch.tensor(3.75))
+    torch.testing.assert_close(split.auxiliary_loss, anchor * 7.0)
+    dense_adapter.abort_scan(request, dense_result)
 
 
 def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() -> None:
