@@ -123,6 +123,36 @@ def _bound_request_and_carrier() -> tuple[CanonicalProductionSegmentRequest, Can
     return request, carrier
 
 
+def test_native_preparation_owns_working_carrier_fields_and_aborts_on_mismatch() -> None:
+    request, carrier = _bound_request_and_carrier()
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+    result = adapter.scan(request)
+    prepared = adapter.prepare_native_inputs(
+        request, result, carrier, input_image_key="images", input_video_key="video"
+    )
+    prepared.working_data_batch["images"][0]["rewritten"] = True
+    prepared.working_data_batch["sequence_plan"][0].has_local_memory = True
+    assert "rewritten" not in carrier.model_data_batch["images"][0]
+    assert carrier.model_data_batch["sequence_plan"][0].has_local_memory is False
+    adapter.abort_scan(request, result)
+
+    result = adapter.scan(request)
+    foreign = dataclasses.replace(
+        result.gathered,
+        identities=((0, "foreign", 0), *result.gathered.identities[1:]),
+    )
+    mismatch = dataclasses.replace(result, gathered=foreign)
+    adapter._scan_results.pop(id(result))
+    adapter._scan_results[id(mismatch)] = request
+    with pytest.raises(Exception, match="traversal differs"):
+        adapter.prepare_native_inputs(request, mismatch, carrier, input_image_key="images", input_video_key="video")
+    assert adapter._scan_requests == set()
+    assert adapter._scan_results == {}
+
+
 def test_activation_matrix_fails_before_legacy_routes() -> None:
     assert _canonical_production_request_from_batch(local_ttt_enabled=False, data_batch={}) is None
     with pytest.raises(ValueError, match="require local_ttt_enabled"):

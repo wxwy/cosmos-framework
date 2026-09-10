@@ -1,7 +1,7 @@
 """CPU/static production-ABI contracts for canonical Local-Memory segments."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any, Mapping
 
 import torch
@@ -199,6 +199,32 @@ class CanonicalProductionScanResult:
 
 
 @dataclass(frozen=True)
+class CanonicalNativePreparedInputs:
+    """Exact scan-bound, independently owned pre-pack native inputs."""
+
+    request: CanonicalProductionSegmentRequest
+    result: CanonicalProductionScanResult
+    traversal: CanonicalExpectedTraversal
+    working_data_batch: Mapping[str, Any]
+
+
+def _clone_canonical_working_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, list):
+        return [_clone_canonical_working_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_canonical_working_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return {key: _clone_canonical_working_value(item) for key, item in value.items()}
+    if is_dataclass(value) and not isinstance(value, type):
+        return replace(value, **{item.name: _clone_canonical_working_value(getattr(value, item.name)) for item in fields(value)})
+    if value is None or isinstance(value, (bool, float, int, str)):
+        return value
+    raise CanonicalSegmentContractError("canonical working input has an unsupported mutable value")
+
+
+@dataclass(frozen=True)
 class CanonicalProductionCommitCapability:
     request: CanonicalProductionSegmentRequest
     result: CanonicalProductionScanResult
@@ -368,6 +394,32 @@ class CanonicalProductionAdapter:
         self._scan_requests.add(id(request))
         self._scan_results[id(result)] = request
         return result
+
+    def prepare_native_inputs(
+        self,
+        request: CanonicalProductionSegmentRequest,
+        result: CanonicalProductionScanResult,
+        carrier: CanonicalRawRowCarrier,
+        *,
+        input_image_key: str,
+        input_video_key: str,
+    ) -> CanonicalNativePreparedInputs:
+        """Validate and clone the admitted carrier before any native pack/noise work."""
+        try:
+            if self._scan_results.get(id(result)) is not request:
+                raise CanonicalSegmentContractError("native preparation requires this exact pending scan result")
+            traversal = carrier.preflight(
+                request, input_image_key=input_image_key, input_video_key=input_video_key
+            )
+            if result.gathered.identities != traversal.identities or result.gathered.item_count != len(traversal.identities):
+                raise CanonicalSegmentContractError("native preparation traversal differs from adapter gather")
+            return CanonicalNativePreparedInputs(
+                request, result, traversal, _clone_canonical_working_value(carrier.model_data_batch)
+            )
+        except Exception:
+            if self._scan_results.get(id(result)) is request:
+                self.abort_scan(request, result)
+            raise
 
     def prepare_commit(
         self, request: CanonicalProductionSegmentRequest, result: CanonicalProductionScanResult
