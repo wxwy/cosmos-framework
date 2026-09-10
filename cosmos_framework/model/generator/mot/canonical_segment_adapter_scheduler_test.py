@@ -122,6 +122,10 @@ def test_unequal_count_ga_objective_and_first_member_only_retry() -> None:
     torch.testing.assert_close(actual, torch.tensor(7.0))
     retry = CanonicalBatchWindowTransaction(plan).retry_first_member_pre_backward()
     assert retry.attempt == 1 and retry.members == plan.members and retry.original_n_valid_window == plan.original_n_valid_window
+    with pytest.raises(CanonicalSegmentContractError, match="attempt-1 may not retry"):
+        CanonicalBatchWindowTransaction(retry).retry_first_member_pre_backward()
+    with pytest.raises(ValueError, match="metadata is invalid"):
+        replace(plan, attempt=1)
     assert not hasattr(plan, "retry_first_member_pre_backward")
 
 
@@ -166,8 +170,12 @@ def test_later_member_retry_is_fail_closed() -> None:
     second = _member(index=1, exposure=(("a", 2), ("b", 1)))
     plan = CanonicalGAWindowPlan((first, second), 6, 2, "later")
     transaction = CanonicalBatchWindowTransaction(plan)
+    transaction.mark_backward_started(0)
+    transaction.mark_reconciled(0)
     transaction.terminalize(1, "LOCAL_MEM_RETRY_AFTER_MEMBER")
     assert transaction.snapshot().remaining_members_suppressed
+    with pytest.raises(CanonicalSegmentContractError, match="terminal failure"):
+        CanonicalBatchWindowTransaction(plan).terminalize(2, "PHANTOM")
 
 
 def test_batch_window_retry_lifecycle_rejects_post_backward_and_terminalizes_later_failure() -> None:

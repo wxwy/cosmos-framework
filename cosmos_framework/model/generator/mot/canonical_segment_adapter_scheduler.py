@@ -18,6 +18,9 @@ class CanonicalSegmentContractError(RuntimeError):
     """Fail-closed error for the canonical batch-level contract double."""
 
 
+_ATTEMPT_ONE_AUTHORITY = object()
+
+
 @dataclass(frozen=True)
 class ChronologyCountRecord:
     slot_id: int
@@ -169,6 +172,7 @@ class CanonicalGAWindowPlan:
     original_ga_effective: int
     plan_chain_id: str
     attempt: int = 0
+    _attempt_authority: object | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -178,6 +182,8 @@ class CanonicalGAWindowPlan:
             or tuple(member.member_index for member in self.members) != tuple(range(len(self.members)))
             or not self.plan_chain_id
             or self.attempt not in (0, 1)
+            or (self.attempt == 0 and self._attempt_authority is not None)
+            or (self.attempt == 1 and self._attempt_authority is not _ATTEMPT_ONE_AUTHORITY)
         ):
             raise ValueError("CanonicalGAWindowPlan metadata is invalid")
 
@@ -218,7 +224,7 @@ class CanonicalBatchWindowTransaction:
             raise CanonicalSegmentContractError("retry requires an unstarted batch window")
         if self.plan.attempt != 0:
             raise CanonicalSegmentContractError("attempt-1 may not retry")
-        retry = replace(self.plan, attempt=1)
+        retry = replace(self.plan, attempt=1, _attempt_authority=_ATTEMPT_ONE_AUTHORITY)
         self._closed = True
         return retry
 
@@ -246,7 +252,13 @@ class CanonicalBatchWindowTransaction:
             self._closed = True
 
     def terminalize(self, member_index: int, code: str) -> None:
-        if self._closed or member_index < len(self.completed_members) or not code:
+        if (
+            self._closed
+            or member_index < 0
+            or member_index >= len(self.plan.members)
+            or member_index != len(self.completed_members)
+            or not code
+        ):
             raise CanonicalSegmentContractError("terminal failure does not match the batch window")
         self.slow_grads_cleared = True
         self.terminal_failure_code = code
@@ -364,15 +376,14 @@ class ProjectedSchedulerState:
         if stable is not None and slot_id not in dict(self.terminal_slots):
             matches = tuple(
                 item for item in self.catalog
-                if item.identity.slot_id == slot_id
-                and item.identity.category == stable.category
+                if item.identity.category == stable.category
                 and item.identity.episode_id == stable.episode_id
                 and item.identity.source_digest == stable.source_digest
                 and item.identity.cursor == stable.cursor + 1
             )
             if len(matches) != 1:
                 raise CanonicalSegmentContractError("bound stable slot lacks exact continuation")
-            return matches[0]
+            return matches[0].bind_slot(slot_id)
         exposure, target, positions = self.exposure_map(), dict(self.target_distribution), dict(self.queue_snapshot.positions)
         choices: list[tuple[float, str, CatalogRow]] = []
         total = sum(exposure.values())
