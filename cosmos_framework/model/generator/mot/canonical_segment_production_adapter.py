@@ -14,7 +14,12 @@ from .canonical_segment_adapter_scheduler import (
     NativeConsumerBatch,
     PreparedCanonicalReconcile,
 )
-from .local_evidence import ContinualTTTFastState, ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
+from .local_evidence import (
+    CANONICAL_EVIDENCE_FEATURE_CONFIG,
+    ContinualTTTFastState,
+    ContinualTTTLocalMemoryCore,
+    LocalEvidenceEncoder,
+)
 from .local_memory_segment import SegmentBatch
 
 
@@ -34,6 +39,7 @@ class CanonicalProductionScanResult:
     local_present: torch.Tensor
     candidate_state_out: ContinualTTTFastState
     gathered: NativeConsumerBatch
+    slot_chain: tuple[tuple[int, str, str, int], ...]
 
 
 @dataclass(frozen=True)
@@ -83,7 +89,9 @@ class CanonicalProductionFastStateFrontier:
         for row, identity in enumerate(member.row_identities):
             key = (identity.slot_id, identity.episode_id, identity.source_digest, identity.cursor)
             if identity.training_stream_end:
-                self._states.pop(key, None)
+                for prior_key in tuple(self._states):
+                    if prior_key[:3] == key[:3]:
+                        self._states.pop(prior_key)
             else:
                 self._states[key] = ContinualTTTFastState(*(value[row : row + 1].detach().clone() for value in state))
 
@@ -92,9 +100,14 @@ class CanonicalProductionAdapter:
     """Own the canonical encoded scan and derive gather/count from its result."""
 
     def __init__(self, encoder: LocalEvidenceEncoder, core: ContinualTTTLocalMemoryCore) -> None:
+        if encoder.feature_config is not CANONICAL_EVIDENCE_FEATURE_CONFIG:
+            raise CanonicalSegmentContractError("canonical adapter requires the canonical evidence feature config")
         self.encoder = encoder
         self.core = core
         self.frontier = CanonicalProductionFastStateFrontier(core)
+        self._scan_requests: set[int] = set()
+        self._scan_results: dict[int, CanonicalProductionSegmentRequest] = {}
+        self._commit_capabilities: set[int] = set()
 
     def scan(self, request: CanonicalProductionSegmentRequest) -> CanonicalProductionScanResult:
         if (
@@ -104,6 +117,8 @@ class CanonicalProductionAdapter:
             or request.plan.members[request.member_index] is not request.member
         ):
             raise CanonicalSegmentContractError("canonical request identity is invalid")
+        if id(request) in self._scan_requests:
+            raise CanonicalSegmentContractError("canonical request already has a scan capability")
         request.member.validate_batch(request.segment_batch)
         state_in = self.frontier.state_for(request.member)
         tokens, state_out, present = self.core.scan_segment_masked_encoded_many(
@@ -115,22 +130,47 @@ class CanonicalProductionAdapter:
             create_graph=True,
         )
         gathered = NativeConsumerBatch.from_segment(request.segment_batch, request.member, tokens, present)
-        return CanonicalProductionScanResult(tokens, present, state_out, gathered)
+        result = CanonicalProductionScanResult(
+            tokens,
+            present,
+            state_out,
+            gathered,
+            tuple(
+                (identity.slot_id, identity.episode_id, identity.source_digest, identity.cursor)
+                for identity in request.member.row_identities
+            ),
+        )
+        self._scan_requests.add(id(request))
+        self._scan_results[id(result)] = request
+        return result
 
     def prepare_commit(
         self, request: CanonicalProductionSegmentRequest, result: CanonicalProductionScanResult
     ) -> CanonicalProductionCommitCapability:
+        if self._scan_results.get(id(result)) is not request:
+            raise CanonicalSegmentContractError("commit preparation requires this adapter scan result")
         if result.gathered.item_count != request.member.planned_n_valid:
             raise CanonicalSegmentContractError("adapter gathered count differs from frozen member")
+        if any(value.dtype is not torch.float32 for value in result.candidate_state_out):
+            raise CanonicalSegmentContractError("commit candidate fast state is not fp32")
         prepared = request.scheduler.prepare_reconcile_after_backward(request.member, result.gathered.item_count)
-        return CanonicalProductionCommitCapability(request, result, prepared)
+        capability = CanonicalProductionCommitCapability(request, result, prepared)
+        self._commit_capabilities.add(id(capability))
+        return capability
 
     def commit_success(self, capability: CanonicalProductionCommitCapability) -> None:
         request, result = capability.request, capability.result
+        if id(capability) not in self._commit_capabilities:
+            raise CanonicalSegmentContractError("commit capability is foreign or already consumed")
+        if self._scan_results.get(id(result)) is not request:
+            raise CanonicalSegmentContractError("commit capability scan result is foreign")
         if capability.prepared_reconcile.scheduler is not request.scheduler:
             raise CanonicalSegmentContractError("commit capability scheduler is foreign")
         if any(value.dtype is not torch.float32 for value in result.candidate_state_out):
             raise CanonicalSegmentContractError("commit candidate fast state is not fp32")
+        request.scheduler.validate_prepared_reconcile(capability.prepared_reconcile)
+        request.transaction.validate_reconcile(request.member_index)
         self.frontier.commit(request.member, result.candidate_state_out)
         request.scheduler.consume_prepared_reconcile(capability.prepared_reconcile)
         request.transaction.mark_reconciled(request.member_index)
+        self._commit_capabilities.remove(id(capability))

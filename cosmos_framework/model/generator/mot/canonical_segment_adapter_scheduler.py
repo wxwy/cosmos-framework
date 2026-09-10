@@ -255,6 +255,17 @@ class CanonicalBatchWindowTransaction:
         if len(self.completed_members) == len(self.plan.members):
             self._closed = True
 
+    def validate_reconcile(self, member_index: int) -> None:
+        """Prove that the current member may cross its post-backward boundary."""
+        if (
+            self._closed
+            or member_index < 0
+            or member_index >= len(self.plan.members)
+            or member_index != len(self.completed_members)
+            or self._active_backward_member != member_index
+        ):
+            raise CanonicalSegmentContractError("reconcile requires the current backward member")
+
     def terminalize(self, member_index: int, code: str) -> None:
         if (
             self._closed
@@ -590,6 +601,21 @@ class CanonicalBatchScheduler:
             raise CanonicalSegmentContractError("prepared reconcile no longer matches frozen transition")
         self._state = after
         self._frozen_transitions.pop(0)
+
+    def validate_prepared_reconcile(self, prepared: PreparedCanonicalReconcile) -> None:
+        """Check a prepared capability without consuming scheduler state."""
+        if prepared.scheduler is not self:
+            raise CanonicalSegmentContractError("prepared reconcile belongs to a foreign scheduler")
+        if self._state != prepared.before or not self._frozen_transitions:
+            raise CanonicalSegmentContractError("prepared reconcile is stale")
+        frozen, before, after = self._frozen_transitions[0]
+        if (
+            prepared.member is not frozen
+            or prepared.actual_n_valid != frozen.planned_n_valid
+            or before != prepared.before
+            or after != prepared.after
+        ):
+            raise CanonicalSegmentContractError("prepared reconcile no longer matches frozen transition")
 
     def rollover_if_exhausted(self, catalog_sizes: Mapping[str, int]) -> None:
         if not self._state.catalog and not self._state.target_distribution:
