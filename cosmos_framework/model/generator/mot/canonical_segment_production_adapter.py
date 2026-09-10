@@ -1,7 +1,7 @@
 """CPU/static production-ABI contracts for canonical Local-Memory segments."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import torch
@@ -52,10 +52,11 @@ class CanonicalRawRowCarrier:
     raw_rows: tuple[tuple[Mapping[str, Any] | None, ...], ...]
     row_model_samples: tuple[tuple[Mapping[str, Any] | None, ...], ...]
     model_data_batch: Mapping[str, Any]
+    stacked_model_batch_sources: Mapping[str, tuple[Any, ...]] = field(default_factory=dict)
 
     _MODEL_BATCH_KEYS = frozenset(
         {
-            "text_token_ids", "video", "image", "video_latent", "verify_cached_latent", "image_size",
+            "text_token_ids", "video_latent", "verify_cached_latent", "image_size",
             "enable_per_camera_vae_encoding", "sample_n_views", "num_video_frames_per_view", "action",
             "domain_id", "raw_action_dim", "sound", "conditioning_fps", "conditioning_fps_action",
             "control_weights", "num_vision_items_per_sample", "is_preprocessed", "sequence_plan",
@@ -71,6 +72,14 @@ class CanonicalRawRowCarrier:
             or self.row_chronology is not request.member.row_chronology
         ):
             raise CanonicalSegmentContractError("canonical carrier authority is foreign")
+        if (
+            request.transaction.plan is not request.plan
+            or request.member_index < 0
+            or request.member_index >= len(request.plan.members)
+            or request.plan.members[request.member_index] is not request.member
+        ):
+            raise CanonicalSegmentContractError("canonical request identity is invalid")
+        request.member.validate_batch(request.segment_batch)
         valid = request.segment_batch.consumer_valid
         batch, steps = valid.shape
         if len(self.raw_rows) != batch or len(self.row_model_samples) != batch:
@@ -103,17 +112,61 @@ class CanonicalRawRowCarrier:
             raise CanonicalSegmentContractError("canonical carrier expected count differs from frozen member")
         return expected
 
-    def validate_model_data_batch(self, expected: CanonicalExpectedTraversal) -> None:
-        unexpected = set(self.model_data_batch) - self._MODEL_BATCH_KEYS
+    def validate_model_data_batch(
+        self, expected: CanonicalExpectedTraversal, *, input_image_key: str, input_video_key: str
+    ) -> None:
+        allowed = self._MODEL_BATCH_KEYS | {input_image_key, input_video_key}
+        unexpected = set(self.model_data_batch) - allowed
         if unexpected:
             raise CanonicalSegmentContractError("canonical carrier model batch has an unexpected key")
+        image_present = input_image_key in self.model_data_batch
+        video_present = input_video_key in self.model_data_batch
+        if image_present == video_present:
+            raise CanonicalSegmentContractError("canonical carrier model batch requires exactly one vision input key")
+        if set(self.stacked_model_batch_sources) - set(self.model_data_batch):
+            raise CanonicalSegmentContractError("canonical carrier stacked source key is foreign")
         for key, value in self.model_data_batch.items():
-            if not isinstance(value, (list, tuple)) or len(value) != len(expected.logical_indexes):
-                raise CanonicalSegmentContractError("canonical carrier model batch cardinality is foreign")
-            for value_item, (row, index) in zip(value, expected.logical_indexes, strict=True):
-                source = self.row_model_samples[row][index]
-                if source is None or source.get(key) is not value_item:
-                    raise CanonicalSegmentContractError("canonical carrier model batch source is foreign")
+            sources = tuple(
+                self.row_model_samples[row][index] for row, index in expected.logical_indexes
+            )
+            for source, (row, index) in zip(sources, expected.logical_indexes, strict=True):
+                raw = self.raw_rows[row][index]
+                if raw is None or source is None or raw.get("canonical_model_sample") is not source:
+                    raise CanonicalSegmentContractError("canonical carrier model sample source is foreign")
+            if isinstance(value, (list, tuple)):
+                if len(value) != len(sources):
+                    raise CanonicalSegmentContractError("canonical carrier model batch cardinality is foreign")
+                for value_item, source in zip(value, sources, strict=True):
+                    if source is None or source.get(key) is not value_item:
+                        raise CanonicalSegmentContractError("canonical carrier model batch source is foreign")
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise CanonicalSegmentContractError("canonical carrier model batch has an unsupported source form")
+            source_items = self.stacked_model_batch_sources.get(key)
+            if source_items is None or len(source_items) != len(sources):
+                raise CanonicalSegmentContractError("canonical carrier stacked source cardinality is foreign")
+            for source_item, source in zip(source_items, sources, strict=True):
+                if source is None or source.get(key) is not source_item or not isinstance(source_item, torch.Tensor):
+                    raise CanonicalSegmentContractError("canonical carrier stacked source is foreign")
+            expected_tensor = torch.stack(source_items)
+            if (
+                value.ndim == 0
+                or value.shape != expected_tensor.shape
+                or value.dtype != expected_tensor.dtype
+                or value.device != expected_tensor.device
+                or value.shape[0] != len(expected.logical_indexes)
+                or not torch.equal(value, expected_tensor)
+            ):
+                raise CanonicalSegmentContractError("canonical carrier stacked model batch is foreign")
+
+    def preflight(
+        self, request: CanonicalProductionSegmentRequest, *, input_image_key: str, input_video_key: str
+    ) -> CanonicalExpectedTraversal:
+        expected = self.expected_for(request)
+        self.validate_model_data_batch(
+            expected, input_image_key=input_image_key, input_video_key=input_video_key
+        )
+        return expected
 
 
 @dataclass(frozen=True)

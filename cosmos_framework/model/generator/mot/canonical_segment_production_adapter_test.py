@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 
 from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler import (
     CanonicalBatchScheduler,
@@ -17,8 +17,8 @@ from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler im
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
     CanonicalProductionAdapter,
     CanonicalProductionFastStateFrontier,
-    CanonicalRawRowCarrier,
     CanonicalProductionSegmentRequest,
+    CanonicalRawRowCarrier,
 )
 from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
@@ -80,7 +80,10 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
     plan = CanonicalGAWindowPlan((member,), 5, 1, "carrier")
     scheduler = CanonicalBatchScheduler(ProjectedSchedulerState(QueueEpochSnapshot(1, 0, "catalog", ()), ()))
     request = CanonicalProductionSegmentRequest(scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, batch)
-    samples = tuple(tuple({"canonical_identity": (row, f"episode-{row}", step)} if step >= 0 else None for step in steps) for row, steps in enumerate(((0, 1, -1), (0, 1, 2))))
+    samples = tuple(
+        tuple({"canonical_identity": (row, f"episode-{row}", step)} if step >= 0 else None for step in steps)
+        for row, steps in enumerate(((0, 1, -1), (0, 1, 2)))
+    )
     carrier = CanonicalRawRowCarrier(
         request, member, batch, member.row_identities, member.row_chronology, samples, samples, {"sequence_plan": ()}
     )
@@ -92,20 +95,92 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
     with pytest.raises(CanonicalSegmentContractError, match="raw identity is foreign"):
         foreign.expected_for(request)
     model_samples = tuple(
-        tuple(None if sample is None else {"canonical_identity": sample["canonical_identity"], "text_token_ids": sample} for sample in row) for row in samples
+        tuple(
+            None
+            if sample is None
+            else {
+                "canonical_identity": sample["canonical_identity"],
+                "text_token_ids": sample,
+                "images": sample,
+            }
+            for sample in row
+        )
+        for row in samples
     )
+    for raw_row, model_row in zip(samples, model_samples, strict=True):
+        for raw, model_sample in zip(raw_row, model_row, strict=True):
+            if raw is not None:
+                raw["canonical_model_sample"] = model_sample
     bound = CanonicalRawRowCarrier(
         request, member, batch, member.row_identities, member.row_chronology, samples, model_samples,
-        {"text_token_ids": [model_samples[row][index]["text_token_ids"] for row, index in carrier.expected_for(request).logical_indexes]},
+        {
+            "text_token_ids": [model_samples[row][index]["text_token_ids"] for row, index in carrier.expected_for(request).logical_indexes],
+            "images": [model_samples[row][index]["images"] for row, index in carrier.expected_for(request).logical_indexes],
+        },
     )
     expected = bound.expected_for(request)
-    bound.validate_model_data_batch(expected)
+    bound.validate_model_data_batch(expected, input_image_key="images", input_video_key="video")
     foreign_batch = CanonicalRawRowCarrier(
         request, member, batch, member.row_identities, member.row_chronology, samples, model_samples,
-        {"text_token_ids": [dict(value) for value in bound.model_data_batch["text_token_ids"]]},
+        {
+            "text_token_ids": [dict(value) for value in bound.model_data_batch["text_token_ids"]],
+            "images": bound.model_data_batch["images"],
+        },
     )
     with pytest.raises(CanonicalSegmentContractError, match="model batch source is foreign"):
-        foreign_batch.validate_model_data_batch(expected)
+        foreign_batch.validate_model_data_batch(expected, input_image_key="images", input_video_key="video")
+    stacked_sources = tuple(
+        torch.tensor([position], dtype=torch.int64) for position in range(len(expected.logical_indexes))
+    )
+    for source, (row, index) in zip(stacked_sources, expected.logical_indexes, strict=True):
+        model_samples[row][index]["image_size"] = source
+    stacked_batch = CanonicalRawRowCarrier(
+        request,
+        member,
+        batch,
+        member.row_identities,
+        member.row_chronology,
+        samples,
+        model_samples,
+        {
+            "images": bound.model_data_batch["images"],
+            "image_size": torch.stack(stacked_sources),
+        },
+        {"image_size": stacked_sources},
+    )
+    stacked_batch.validate_model_data_batch(expected, input_image_key="images", input_video_key="video")
+    foreign_stacked_batch = CanonicalRawRowCarrier(
+        request,
+        member,
+        batch,
+        member.row_identities,
+        member.row_chronology,
+        samples,
+        model_samples,
+        {
+            "images": bound.model_data_batch["images"],
+            "image_size": torch.stack(tuple(reversed(stacked_sources))),
+        },
+        {"image_size": stacked_sources},
+    )
+    with pytest.raises(CanonicalSegmentContractError, match="stacked model batch is foreign"):
+        foreign_stacked_batch.validate_model_data_batch(
+            expected, input_image_key="images", input_video_key="video"
+        )
+    conflicting_vision_batch = CanonicalRawRowCarrier(
+        request,
+        member,
+        batch,
+        member.row_identities,
+        member.row_chronology,
+        samples,
+        model_samples,
+        {"images": bound.model_data_batch["images"], "video": bound.model_data_batch["images"]},
+    )
+    with pytest.raises(CanonicalSegmentContractError, match="exactly one vision input key"):
+        conflicting_vision_batch.validate_model_data_batch(
+            expected, input_image_key="images", input_video_key="video"
+        )
 
 
 def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() -> None:

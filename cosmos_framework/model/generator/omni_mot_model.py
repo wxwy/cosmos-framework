@@ -139,9 +139,10 @@ def _canonical_production_request_from_batch(
     """Apply the P2 activation matrix before any legacy training preparation."""
     mode_present = _CANONICAL_PRODUCTION_MODE_KEY in data_batch
     request_present = _CANONICAL_PRODUCTION_REQUEST_KEY in data_batch
+    carrier_present = _CANONICAL_PRODUCTION_CARRIER_KEY in data_batch
     legacy_present = any(key in data_batch for key in _LEGACY_LOCAL_MARKER_KEYS)
     if not local_ttt_enabled:
-        if mode_present or request_present or legacy_present:
+        if mode_present or request_present or carrier_present or legacy_present:
             raise ValueError("canonical or legacy Local-Memory markers require local_ttt_enabled=True")
         return None
     if data_batch.get(_CANONICAL_PRODUCTION_MODE_KEY) is not True:
@@ -149,6 +150,8 @@ def _canonical_production_request_from_batch(
     request = data_batch.get(_CANONICAL_PRODUCTION_REQUEST_KEY)
     if not isinstance(request, CanonicalProductionSegmentRequest):
         raise TypeError("canonical-production mode requires CanonicalProductionSegmentRequest")
+    if not isinstance(data_batch.get(_CANONICAL_PRODUCTION_CARRIER_KEY), CanonicalRawRowCarrier):
+        raise TypeError("canonical-production mode requires CanonicalRawRowCarrier marker")
     if legacy_present:
         raise ValueError("canonical-production request conflicts with a legacy Local-Memory marker")
     return request
@@ -1399,11 +1402,12 @@ class OmniMoTModel(ImaginaireModel):
         """Reserve the canonical ABI branch; its native pack/forward seam is P2-owned."""
         if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
             raise RuntimeError("canonical-production rejects context parallelism before scan")
-        adapter = _canonical_production_adapter_from_model(self)
-        expected = carrier.expected_for(request)
-        carrier.validate_model_data_batch(expected)
+        expected = carrier.preflight(
+            request, input_image_key=self.input_image_key, input_video_key=self.input_video_key
+        )
         if "local_memory" in carrier.model_data_batch:
             raise RuntimeError("canonical-production model batch must remain Local-neutral")
+        adapter = _canonical_production_adapter_from_model(self)
         result = adapter.scan(request)
         try:
             if result.gathered.identities != expected.identities or result.gathered.item_count != len(expected.identities):
