@@ -228,6 +228,15 @@ class CanonicalNativeLossSplit:
     weighted_consumer_terms: torch.Tensor
 
 
+@dataclass(frozen=True)
+class CanonicalNativeForwardCapability:
+    """One-shot binding of one pending scan to its canonical native loss split."""
+
+    adapter: "CanonicalProductionAdapter"
+    prepared: CanonicalNativePreparedInputs
+    loss_split: CanonicalNativeLossSplit
+
+
 def build_canonical_native_loss_split(
     *,
     consumer_identities: tuple[tuple[int, str, int], ...],
@@ -362,6 +371,7 @@ class CanonicalProductionAdapter:
         self._scan_requests: set[int] = set()
         self._scan_results: dict[int, CanonicalProductionSegmentRequest] = {}
         self._commit_capabilities: set[int] = set()
+        self._native_forward_capabilities: set[int] = set()
         self._retry_capabilities: set[int] = set()
 
     def retry_first_member_pre_backward(
@@ -480,6 +490,32 @@ class CanonicalProductionAdapter:
             if self._scan_results.get(id(result)) is request:
                 self.abort_scan(request, result)
             raise
+
+    def bind_native_forward(
+        self, prepared: CanonicalNativePreparedInputs, loss_split: CanonicalNativeLossSplit
+    ) -> CanonicalNativeForwardCapability:
+        """Bind only the exact pending prepared scan to its consumer-axis loss."""
+        if (
+            self._scan_results.get(id(prepared.result)) is not prepared.request
+            or loss_split.actual_n_valid != prepared.result.gathered.item_count
+            or loss_split.consumer_identities != prepared.traversal.identities
+            or loss_split.actual_n_valid != prepared.request.member.planned_n_valid
+        ):
+            raise CanonicalSegmentContractError("canonical native forward capability is foreign or incomplete")
+        capability = CanonicalNativeForwardCapability(self, prepared, loss_split)
+        self._native_forward_capabilities.add(id(capability))
+        return capability
+
+    def consume_native_forward(self, capability: CanonicalNativeForwardCapability) -> CanonicalNativeForwardCapability:
+        """Consume one exact forward capability before entering its trainer boundary."""
+        if (
+            id(capability) not in self._native_forward_capabilities
+            or capability.adapter is not self
+            or self._scan_results.get(id(capability.prepared.result)) is not capability.prepared.request
+        ):
+            raise CanonicalSegmentContractError("canonical native forward capability is foreign or already consumed")
+        self._native_forward_capabilities.remove(id(capability))
+        return capability
 
     def prepare_commit(
         self, request: CanonicalProductionSegmentRequest, result: CanonicalProductionScanResult

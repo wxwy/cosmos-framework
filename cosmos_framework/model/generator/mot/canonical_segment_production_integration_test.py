@@ -177,6 +177,31 @@ def test_native_preparation_owns_working_carrier_fields_and_aborts_on_mismatch()
     assert adapter._scan_results == {}
 
 
+def test_native_forward_capability_binds_one_exact_pending_scan() -> None:
+    request, carrier = _bound_request_and_carrier()
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+    result = adapter.scan(request)
+    prepared = adapter.prepare_native_inputs(
+        request, result, carrier, input_image_key="images", input_video_key="video"
+    )
+    anchor = torch.tensor(1.0, requires_grad=True)
+    split = build_canonical_native_loss_split(
+        consumer_identities=prepared.traversal.identities,
+        modalities={},
+        sample_level_scale=torch.ones(()),
+        auxiliary_loss=anchor * 0.0,
+        graph_anchor=anchor,
+    )
+    capability = adapter.bind_native_forward(prepared, split)
+    assert adapter.consume_native_forward(capability) is capability
+    with pytest.raises(Exception, match="already consumed"):
+        adapter.consume_native_forward(capability)
+    adapter.abort_scan(request, result)
+
+
 def test_activation_matrix_fails_before_legacy_routes() -> None:
     assert _canonical_production_request_from_batch(local_ttt_enabled=False, data_batch={}) is None
     with pytest.raises(ValueError, match="require local_ttt_enabled"):
