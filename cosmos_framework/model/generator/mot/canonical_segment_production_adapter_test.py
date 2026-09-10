@@ -127,6 +127,10 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
     )
     expected = bound.expected_for(request)
     bound.validate_model_data_batch(expected, input_image_key="images", input_video_key="video")
+    owner_maps = bound.native_owner_maps(expected, input_image_key="images", input_video_key="video")
+    assert owner_maps.vision_owner_indexes == (0, 1, 2, 3, 4)
+    assert owner_maps.action_owner_indexes == ()
+    assert owner_maps.sound_owner_indexes == ()
     foreign_batch = CanonicalRawRowCarrier(
         request, member, batch, member.row_identities, member.row_chronology, samples, model_samples,
         {
