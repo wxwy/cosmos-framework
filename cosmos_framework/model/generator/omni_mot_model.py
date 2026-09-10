@@ -1456,7 +1456,12 @@ class OmniMoTModel(ImaginaireModel):
         sequence_plans = [dataclasses.replace(plan) for plan in sequence_plans]
         if any(plan.has_local_memory for plan in sequence_plans):
             raise RuntimeError("canonical-production plans must be Local-neutral before clean materialization")
-        gen_data_clean = self.get_data_and_condition(data_batch, iteration=iteration)
+        per_camera_vae_encoding = "enable_per_camera_vae_encoding" in data_batch
+        gen_data_clean = self.get_data_and_condition(
+            data_batch,
+            iteration=iteration,
+            retain_raw_state_vision=not per_camera_vae_encoding,
+        )
         if "local_memory" in data_batch or any(plan.has_local_memory for plan in sequence_plans) or gen_data_clean.x0_tokens_local_memory is not None:
             raise RuntimeError("canonical-production clean materialization introduced an ordinary Local payload")
         if len(sequence_plans) != result.gathered.item_count:
@@ -1467,8 +1472,20 @@ class OmniMoTModel(ImaginaireModel):
             prefix for prefix in result.gathered.local_prefixes if prefix is not None
         ] or None
         gen_data_clean, memory_info = self.memory_init_training(gen_data_clean, data_batch, input_text_indexes)
-        data_resolutions = None
+        if "image_size" in data_batch:
+            data_resolutions: list[str] | None = []
+            for index in range(gen_data_clean.batch_size):
+                image_size = data_batch["image_size"][index]
+                if image_size.dim() == 2:
+                    image_size = image_size[0]
+                target_h = int(image_size[0].item())
+                target_w = int(image_size[1].item())
+                data_resolutions.append(get_vision_data_resolution((target_h, target_w)))
+        else:
+            data_resolutions = None
         vae_pixel_shapes = self._get_vae_pixel_shapes(gen_data_clean.raw_state_vision)
+        if per_camera_vae_encoding:
+            gen_data_clean.raw_state_vision = None
         return input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes
 
     def training_step(

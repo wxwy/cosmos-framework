@@ -310,7 +310,7 @@ def test_canonical_safe_preparation_adapts_only_gathered_prefixes() -> None:
         _load_and_tokenize_text_data=lambda batch, iteration: calls.append("text") or [[1], [2]],
         input_video_key="video",
         input_image_key="image",
-        get_data_and_condition=lambda batch, iteration: calls.append("clean") or clean,
+        get_data_and_condition=lambda batch, iteration, **kwargs: calls.append("clean") or clean,
         memory_init_training=lambda value, batch, indexes: (calls.append("memory") or value, {}),
         _get_vae_pixel_shapes=lambda raw: [],
     )
@@ -328,6 +328,42 @@ def test_canonical_safe_preparation_adapts_only_gathered_prefixes() -> None:
     assert [plan.has_local_memory for plan in plans] == [False, False]
     assert [plan.has_local_memory for plan in prepared[1]] == [False, True]
     assert clean.x0_tokens_local_memory == ["prefix"]
+
+
+def test_canonical_safe_preparation_preserves_per_camera_and_resolution_parity() -> None:
+    plans = [SequencePlan(has_text=False), SequencePlan(has_text=False)]
+    clean = SimpleNamespace(batch_size=2, x0_tokens_local_memory=None, raw_state_vision=[torch.zeros(1)])
+    retain_raw_state: list[bool] = []
+    model = SimpleNamespace(
+        _load_and_tokenize_text_data=lambda batch, iteration: [[1], [2]],
+        input_video_key="video",
+        input_image_key="image",
+        get_data_and_condition=lambda batch, iteration, **kwargs: retain_raw_state.append(
+            kwargs["retain_raw_state_vision"]
+        ) or clean,
+        memory_init_training=lambda value, batch, indexes: (value, {}),
+        _get_vae_pixel_shapes=lambda raw: [(1, 2, 3)] if raw is clean.raw_state_vision else pytest.fail("raw state mismatch"),
+    )
+    carrier = SimpleNamespace(
+        model_data_batch={
+            "text_token_ids": [],
+            "enable_per_camera_vae_encoding": torch.tensor([True, True]),
+            "image_size": torch.tensor([[256, 512, 0, 0], [512, 256, 0, 0]]),
+        }
+    )
+    result = SimpleNamespace(gathered=SimpleNamespace(item_count=2, local_prefixes=(None, None)))
+    import cosmos_framework.model.generator.omni_mot_model as module
+
+    original = module.build_sequence_plans_from_data_batch
+    module.build_sequence_plans_from_data_batch = lambda **kwargs: plans
+    try:
+        prepared = OmniMoTModel._prepare_canonical_production_inputs(model, carrier, result, 1)
+    finally:
+        module.build_sequence_plans_from_data_batch = original
+    assert retain_raw_state == [False]
+    assert prepared[4] == ["256", "256"]
+    assert prepared[5] == [(1, 2, 3)]
+    assert clean.raw_state_vision is None
 
 
 def test_canonical_forward_preflights_foreign_batch_before_adapter_creation() -> None:
@@ -383,7 +419,7 @@ def test_canonical_forward_aborts_real_pending_scan_before_hard_stop() -> None:
         input_video_key="video",
         net=SimpleNamespace(local_history_runtime=SimpleNamespace(encoder=encoder, recurrent_backend=core)),
         _load_and_tokenize_text_data=lambda batch, iteration: calls.append("text") or [[1], [2]],
-        get_data_and_condition=lambda batch, iteration: calls.append("clean") or clean,
+        get_data_and_condition=lambda batch, iteration, **kwargs: calls.append("clean") or clean,
         memory_init_training=lambda value, batch, indexes: (calls.append("memory") or value, {}),
         _get_vae_pixel_shapes=lambda raw: [],
     )
@@ -418,7 +454,7 @@ def _production_model(*, memory_init_training) -> tuple[SimpleNamespace, list[st
         input_video_key="video",
         net=SimpleNamespace(local_history_runtime=SimpleNamespace(encoder=encoder, recurrent_backend=core)),
         _load_and_tokenize_text_data=lambda batch, iteration: calls.append("text") or [[1], [2]],
-        get_data_and_condition=lambda batch, iteration: calls.append("clean") or clean,
+        get_data_and_condition=lambda batch, iteration, **kwargs: calls.append("clean") or clean,
         memory_init_training=memory_init_training,
         _get_vae_pixel_shapes=lambda raw: [],
     )
@@ -518,7 +554,7 @@ def test_canonical_safe_preparation_rejects_post_clean_ordinary_local_memory() -
     plans = [SequencePlan(has_text=False), SequencePlan(has_text=False)]
     clean = SimpleNamespace(x0_tokens_local_memory=None, raw_state_vision=[])
 
-    def materialize(batch, iteration):
+    def materialize(batch, iteration, **kwargs):
         calls.append("clean")
         batch["local_memory"] = [object()]
         return clean
