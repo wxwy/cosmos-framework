@@ -254,6 +254,19 @@ class CanonicalNativePreparedInputs:
     traversal: CanonicalExpectedTraversal
     owner_maps: CanonicalNativeOwnerMaps
     working_data_batch: Mapping[str, Any]
+    native_preparation: CanonicalNativeModelPreparation | None = None
+
+
+@dataclass(frozen=True)
+class CanonicalNativeModelPreparation:
+    """Exact model-side preparation bound to one pending canonical scan."""
+
+    input_text_indexes: tuple[tuple[int, ...], ...]
+    sequence_plans: tuple[Any, ...]
+    gen_data_clean: Any
+    memory_info: Mapping[str, Any]
+    data_resolutions: Any
+    vae_pixel_shapes: tuple[tuple[int, int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -586,6 +599,7 @@ class CanonicalProductionAdapter:
         """Bind only the exact pending prepared scan to its consumer-axis loss."""
         if (
             self._scan_results.get(id(prepared.result)) is not prepared.request
+            or prepared.native_preparation is None
             or loss_split.actual_n_valid != prepared.result.gathered.item_count
             or loss_split.consumer_identities != prepared.traversal.identities
             or loss_split.actual_n_valid != prepared.request.member.planned_n_valid
@@ -594,6 +608,42 @@ class CanonicalProductionAdapter:
         capability = CanonicalNativeForwardCapability(self, prepared, loss_split)
         self._native_forward_capabilities[id(capability)] = capability
         return capability
+
+    def attach_native_preparation(
+        self,
+        prepared: CanonicalNativePreparedInputs,
+        *,
+        input_text_indexes: list[list[int]],
+        sequence_plans: list[Any],
+        gen_data_clean: Any,
+        memory_info: Mapping[str, Any],
+        data_resolutions: Any,
+        vae_pixel_shapes: list[tuple[int, int, int]],
+    ) -> CanonicalNativePreparedInputs:
+        """Bind model-safe preparation to its exact pre-pack scan without executing native work."""
+        if self._scan_results.get(id(prepared.result)) is not prepared.request:
+            raise CanonicalSegmentContractError("canonical native preparation is foreign or stale")
+        expected_count = prepared.result.gathered.item_count
+        if (
+            len(input_text_indexes) != expected_count
+            or len(sequence_plans) != expected_count
+            or not isinstance(memory_info, Mapping)
+        ):
+            raise CanonicalSegmentContractError("canonical native preparation cardinality is invalid")
+        for plan, prefix in zip(sequence_plans, prepared.result.gathered.local_prefixes, strict=True):
+            if bool(getattr(plan, "has_local_memory", False)) is not (prefix is not None):
+                raise CanonicalSegmentContractError("canonical native preparation Local prefix is invalid")
+        return replace(
+            prepared,
+            native_preparation=CanonicalNativeModelPreparation(
+                tuple(tuple(indexes) for indexes in input_text_indexes),
+                tuple(sequence_plans),
+                gen_data_clean,
+                dict(memory_info),
+                data_resolutions,
+                tuple(vae_pixel_shapes),
+            ),
+        )
 
     def consume_native_forward(self, capability: CanonicalNativeForwardCapability) -> CanonicalNativeForwardCapability:
         """Consume one exact forward capability before entering its trainer boundary."""

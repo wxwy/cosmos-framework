@@ -198,6 +198,17 @@ def test_native_forward_capability_binds_one_exact_pending_scan() -> None:
         auxiliary_loss=anchor * 0.0,
         graph_anchor=anchor,
     )
+    with pytest.raises(Exception, match="foreign or incomplete"):
+        adapter.bind_native_forward(prepared, split)
+    prepared = adapter.attach_native_preparation(
+        prepared,
+        input_text_indexes=[[], []],
+        sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)],
+        gen_data_clean=object(),
+        memory_info={},
+        data_resolutions=None,
+        vae_pixel_shapes=[],
+    )
     capability = adapter.bind_native_forward(prepared, split)
     assert adapter.consume_native_forward(capability) is capability
     with pytest.raises(Exception, match="already consumed"):
@@ -207,6 +218,15 @@ def test_native_forward_capability_binds_one_exact_pending_scan() -> None:
     result = adapter.scan(request)
     prepared = adapter.prepare_native_inputs(
         request, result, carrier, input_image_key="images", input_video_key="video"
+    )
+    prepared = adapter.attach_native_preparation(
+        prepared,
+        input_text_indexes=[[], []],
+        sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)],
+        gen_data_clean=object(),
+        memory_info={},
+        data_resolutions=None,
+        vae_pixel_shapes=[],
     )
     capability = adapter.bind_native_forward(prepared, split)
     with pytest.raises(Exception, match="native forward capability"):

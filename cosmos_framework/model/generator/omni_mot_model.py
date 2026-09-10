@@ -1419,8 +1419,17 @@ class OmniMoTModel(ImaginaireModel):
             )
             if result.gathered.identities != expected.identities or result.gathered.item_count != len(expected.identities):
                 raise RuntimeError("canonical-production gathered result differs from pre-scan expected traversal")
-            self._prepare_canonical_production_inputs(
+            native_inputs = self._prepare_canonical_production_inputs(
                 carrier, result, iteration, working_data_batch=prepared.working_data_batch
+            )
+            prepared = adapter.attach_native_preparation(
+                prepared,
+                input_text_indexes=native_inputs[0],
+                sequence_plans=native_inputs[1],
+                gen_data_clean=native_inputs[2],
+                memory_info=native_inputs[3],
+                data_resolutions=native_inputs[4],
+                vae_pixel_shapes=native_inputs[5],
             )
             raise RuntimeError("canonical-production native forward seam is unavailable")
         except Exception:
