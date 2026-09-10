@@ -352,6 +352,8 @@ def test_adapter_abort_commit_consumes_exact_capability_without_reconcile() -> N
     assert adapter.frontier._states == {}
     assert scheduler.snapshot == scheduler_before
     assert request.transaction.snapshot().completed_members == ()
+    request.transaction.terminalize(0, "CANONICAL_NATIVE_COMMIT_FAILURE")
+    assert request.transaction.snapshot().terminal_failure_code == "CANONICAL_NATIVE_COMMIT_FAILURE"
     with pytest.raises(CanonicalSegmentContractError, match="exact pending capability"):
         adapter.abort_commit(capability)
 

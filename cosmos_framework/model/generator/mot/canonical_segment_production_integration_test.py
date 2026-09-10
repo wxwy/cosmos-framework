@@ -502,7 +502,7 @@ def test_canonical_forward_aborts_gather_mismatch_without_commit() -> None:
 
     adapter.scan = scan_with_mismatched_gather
     scheduler_before = request.scheduler.snapshot
-    with pytest.raises(RuntimeError, match="gathered result differs"):
+    with pytest.raises(Exception, match="native preparation traversal differs from adapter gather"):
         OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
     _assert_aborted_without_commit(request, adapter, scheduler_before)
 
