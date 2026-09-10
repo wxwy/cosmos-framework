@@ -1410,19 +1410,34 @@ class OmniMoTModel(ImaginaireModel):
         adapter = _canonical_production_adapter_from_model(self)
         result = adapter.scan(request)
         try:
+            prepared = adapter.prepare_native_inputs(
+                request,
+                result,
+                carrier,
+                input_image_key=self.input_image_key,
+                input_video_key=self.input_video_key,
+            )
             if result.gathered.identities != expected.identities or result.gathered.item_count != len(expected.identities):
                 raise RuntimeError("canonical-production gathered result differs from pre-scan expected traversal")
-            self._prepare_canonical_production_inputs(carrier, result, iteration)
+            self._prepare_canonical_production_inputs(
+                carrier, result, iteration, working_data_batch=prepared.working_data_batch
+            )
             raise RuntimeError("canonical-production native forward seam is unavailable")
         except Exception:
-            adapter.abort_scan(request, result)
+            if adapter._scan_results.get(id(result)) is request:
+                adapter.abort_scan(request, result)
             raise
 
     def _prepare_canonical_production_inputs(
-        self, carrier: CanonicalRawRowCarrier, result: Any, iteration: int
+        self,
+        carrier: CanonicalRawRowCarrier,
+        result: Any,
+        iteration: int,
+        *,
+        working_data_batch: Mapping[str, Any] | None = None,
     ) -> tuple[list[list[int]], list[SequencePlan], GenerationDataClean, dict, list[str] | None, list[tuple[int, int, int]]]:
         """Run only the canonical-safe preparation prefix, then stop before packing."""
-        data_batch = dict(carrier.model_data_batch)
+        data_batch = dict(carrier.model_data_batch) if working_data_batch is None else dict(working_data_batch)
         if "local_memory" in data_batch:
             raise RuntimeError("canonical-production model batch must remain Local-neutral")
         input_text_indexes = self._load_and_tokenize_text_data(data_batch, iteration)

@@ -365,8 +365,8 @@ def test_canonical_forward_aborts_real_pending_scan_before_hard_stop() -> None:
         _get_vae_pixel_shapes=lambda raw: [],
     )
     model._prepare_canonical_production_inputs = (
-        lambda prepared_carrier, result, iteration: OmniMoTModel._prepare_canonical_production_inputs(
-            model, prepared_carrier, result, iteration
+        lambda prepared_carrier, result, iteration, **kwargs: OmniMoTModel._prepare_canonical_production_inputs(
+            model, prepared_carrier, result, iteration, **kwargs
         )
     )
     import cosmos_framework.model.generator.omni_mot_model as module
@@ -400,8 +400,8 @@ def _production_model(*, memory_init_training) -> tuple[SimpleNamespace, list[st
         _get_vae_pixel_shapes=lambda raw: [],
     )
     model._prepare_canonical_production_inputs = (
-        lambda prepared_carrier, result, iteration: OmniMoTModel._prepare_canonical_production_inputs(
-            model, prepared_carrier, result, iteration
+        lambda prepared_carrier, result, iteration, **kwargs: OmniMoTModel._prepare_canonical_production_inputs(
+            model, prepared_carrier, result, iteration, **kwargs
         )
     )
     return model, calls
