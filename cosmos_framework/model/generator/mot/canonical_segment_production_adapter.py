@@ -362,9 +362,12 @@ def build_prepared_canonical_native_loss_split(
     )
     modalities: dict[str, CanonicalNativeModalityTerms] = {}
     for name, terms, owner_indexes, weight in populations:
-        if isinstance(terms, FlowMatchingLossTerms):
+        typed_no_valid = isinstance(terms, FlowMatchingLossTerms)
+        if typed_no_valid:
             terms = terms.canonical_weighted_per_instance
         if terms is None:
+            if owner_indexes and not typed_no_valid:
+                raise CanonicalSegmentContractError("canonical native modality terms are missing")
             if owner_indexes:
                 # A certified no-valid native population contributes only the
                 # graph-connected zero supplied by ``graph_anchor`` below.
@@ -478,6 +481,7 @@ class CanonicalProductionAdapter:
         self._scan_requests: set[int] = set()
         self._scan_results: dict[int, CanonicalProductionSegmentRequest] = {}
         self._commit_capabilities: set[int] = set()
+        self._post_mutation_commits: set[int] = set()
         self._native_forward_capabilities: dict[int, CanonicalNativeForwardCapability] = {}
         self._retry_capabilities: set[int] = set()
 
@@ -724,6 +728,8 @@ class CanonicalProductionAdapter:
     def abort_commit(self, capability: CanonicalProductionCommitCapability) -> None:
         """Consume one pre-mutation commit capability and its exact pending scan."""
         request, result = capability.request, capability.result
+        if id(capability) in self._post_mutation_commits:
+            raise CanonicalSegmentContractError("commit abort is forbidden after irreversible mutation")
         if id(capability) not in self._commit_capabilities:
             raise CanonicalSegmentContractError("commit abort requires an exact pending capability")
         if self._scan_results.get(id(result)) is not request or id(request) not in self._scan_requests:
@@ -748,6 +754,11 @@ class CanonicalProductionAdapter:
         request.scheduler.validate_prepared_reconcile(capability.prepared_reconcile)
         request.transaction.validate_reconcile(request.member_index)
         self.frontier.commit(request.member, result.candidate_state_out)
+        self._post_mutation_commits.add(id(capability))
         request.scheduler.consume_prepared_reconcile(capability.prepared_reconcile)
         request.transaction.mark_reconciled(request.member_index)
         self._commit_capabilities.remove(id(capability))
+        self._post_mutation_commits.remove(id(capability))
+
+    def commit_has_crossed_mutation_boundary(self, capability: CanonicalProductionCommitCapability) -> bool:
+        return id(capability) in self._post_mutation_commits

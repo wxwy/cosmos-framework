@@ -255,6 +255,19 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
     )
     torch.testing.assert_close(split.consumer_loss, torch.tensor(3.75))
     torch.testing.assert_close(split.auxiliary_loss, anchor * 7.0)
+    with pytest.raises(CanonicalSegmentContractError, match="modality terms are missing"):
+        build_prepared_canonical_native_loss_split(
+            prepared=dense_prepared,
+            vision_weighted_terms=None,
+            action_weighted_terms=torch.tensor([2.0, 4.0]),
+            sound_weighted_terms=torch.tensor([6.0]),
+            vision_weight=1.0,
+            action_weight=0.5,
+            sound_weight=0.25,
+            sample_level_scale=torch.tensor(0.5),
+            auxiliary_loss=anchor * 7.0,
+            graph_anchor=anchor,
+        )
     dense_adapter.abort_scan(request, dense_result)
 
 
@@ -345,6 +358,7 @@ def test_adapter_abort_commit_consumes_exact_capability_without_reconcile(monkey
         adapter.abort_commit(replace(capability))
     assert adapter._commit_capabilities == {id(capability)}
     assert adapter._scan_requests == {id(request)}
+    frontier_commit = adapter.frontier.commit
     monkeypatch.setattr(
         adapter.frontier,
         "commit",
@@ -364,6 +378,29 @@ def test_adapter_abort_commit_consumes_exact_capability_without_reconcile(monkey
     request.transaction.terminalize(0, "CANONICAL_NATIVE_COMMIT_FAILURE")
     assert request.transaction.snapshot().terminal_failure_code == "CANONICAL_NATIVE_COMMIT_FAILURE"
     with pytest.raises(CanonicalSegmentContractError, match="exact pending capability"):
+        adapter.abort_commit(capability)
+
+    monkeypatch.setattr(adapter.frontier, "commit", frontier_commit)
+    post_transaction = CanonicalBatchWindowTransaction(plan)
+    post_request = CanonicalProductionSegmentRequest(
+        scheduler, plan, post_transaction, member, 0, batch
+    )
+    result = adapter.scan(post_request)
+    post_request.transaction.mark_backward_started(0)
+    capability = adapter.prepare_commit(post_request, result)
+    monkeypatch.setattr(
+        post_request.scheduler,
+        "consume_prepared_reconcile",
+        lambda prepared: (_ for _ in ()).throw(RuntimeError("injected post-mutation reconcile failure")),
+    )
+    with pytest.raises(RuntimeError, match="post-mutation reconcile failure"):
+        adapter.commit_success(capability)
+    assert adapter.commit_has_crossed_mutation_boundary(capability)
+    assert id(capability) in adapter._commit_capabilities
+    assert id(post_request) in adapter._scan_requests
+    assert adapter.frontier._states
+    assert post_request.transaction.snapshot().terminal_failure_code is None
+    with pytest.raises(CanonicalSegmentContractError, match="forbidden after irreversible mutation"):
         adapter.abort_commit(capability)
 
 

@@ -197,6 +197,18 @@ def test_canonical_native_scaler_rejection_disposes_before_backward() -> None:
     assert request.transaction.snapshot().terminal_failure_code == "CANONICAL_NATIVE_SCALER_UNSUPPORTED"
 
 
+@pytest.mark.parametrize("scaler_enabled", (True, False))
+def test_canonical_training_step_rejects_before_model_forward(scaler_enabled: bool) -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.SGD((parameter,), lr=0.1)
+    scaler = SimpleNamespace(is_enabled=lambda: scaler_enabled)
+    with pytest.raises(RuntimeError, match="rejects scaler or optimizer before scan"):
+        trainer.training_step(
+            object(), optimizer, None, scaler, {"canonical_production_segment_mode": True}
+        )
+
+
 def test_canonical_native_rejects_batch_slow_parameter_authority_before_backward() -> None:
     request, carrier = _bound_request_and_carrier()
     adapter = CanonicalProductionAdapter(LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256))

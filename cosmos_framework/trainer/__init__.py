@@ -986,6 +986,8 @@ class ImaginaireTrainer:
             if commit_capability is None:
                 adapter.abort_scan(request, capability.prepared.result)
             else:
+                if adapter.commit_has_crossed_mutation_boundary(commit_capability):
+                    raise RuntimeError("CANONICAL_NATIVE_POST_MUTATION_FAILURE") from error
                 try:
                     adapter.abort_commit(commit_capability)
                 except Exception:
