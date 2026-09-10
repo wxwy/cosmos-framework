@@ -206,8 +206,10 @@ def test_native_forward_capability_binds_one_exact_pending_scan() -> None:
         request, result, carrier, input_image_key="images", input_video_key="video"
     )
     capability = adapter.bind_native_forward(prepared, split)
+    with pytest.raises(Exception, match="native forward capability"):
+        adapter.abort_scan(request, result)
     adapter.abort_native_forward(capability)
-    assert adapter._native_forward_capabilities == set()
+    assert adapter._native_forward_capabilities == {}
     assert adapter._scan_requests == set()
     assert adapter._scan_results == {}
     with pytest.raises(Exception, match="already consumed"):
