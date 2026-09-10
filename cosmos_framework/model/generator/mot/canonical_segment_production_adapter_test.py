@@ -311,7 +311,7 @@ def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() 
         adapter.commit_success(capability)
 
 
-def test_adapter_abort_commit_consumes_exact_capability_without_reconcile() -> None:
+def test_adapter_abort_commit_consumes_exact_capability_without_reconcile(monkeypatch: pytest.MonkeyPatch) -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
     identity = SegmentIdentity(0, "episode", "category", 0, 0, "source")
     record = ChronologyCountRecord(0, "episode", "category", "source", 0, 2, False, "manifest")
@@ -343,6 +343,15 @@ def test_adapter_abort_commit_consumes_exact_capability_without_reconcile() -> N
     scheduler_before = scheduler.snapshot
     with pytest.raises(CanonicalSegmentContractError, match="exact pending capability"):
         adapter.abort_commit(replace(capability))
+    assert adapter._commit_capabilities == {id(capability)}
+    assert adapter._scan_requests == {id(request)}
+    monkeypatch.setattr(
+        adapter.frontier,
+        "commit",
+        lambda member, state: (_ for _ in ()).throw(RuntimeError("injected pre-mutation commit failure")),
+    )
+    with pytest.raises(RuntimeError, match="injected pre-mutation commit failure"):
+        adapter.commit_success(capability)
     assert adapter._commit_capabilities == {id(capability)}
     assert adapter._scan_requests == {id(request)}
     adapter.abort_commit(capability)
