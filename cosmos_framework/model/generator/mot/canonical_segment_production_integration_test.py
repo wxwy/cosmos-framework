@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from cosmos_framework.data.generator.sequence_packing import SequencePlan
 from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler import (
     CanonicalBatchScheduler,
     CanonicalBatchWindowTransaction,
@@ -15,6 +17,7 @@ from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler im
     QueueEpochSnapshot,
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
+    CanonicalProductionAdapter,
     CanonicalProductionSegmentRequest,
     CanonicalRawRowCarrier,
 )
@@ -74,7 +77,7 @@ def _bound_request_and_carrier() -> tuple[CanonicalProductionSegmentRequest, Can
         {"canonical_identity": (0, "episode", 0), "images": raw_rows[0][0]},
         {"canonical_identity": (0, "episode", 1), "images": raw_rows[0][1]},
     ),)
-    raw_plans = [SimpleNamespace(has_local_memory=False), SimpleNamespace(has_local_memory=False)]
+    raw_plans = [SequencePlan(has_text=False), SequencePlan(has_text=False)]
     for sample, plan_item in zip(samples[0], raw_plans, strict=True):
         sample["sequence_plan"] = plan_item
     carrier = CanonicalRawRowCarrier(
@@ -160,7 +163,7 @@ def test_canonical_branch_rejects_context_parallelism_before_adapter_lookup() ->
 
 def test_canonical_safe_preparation_adapts_only_gathered_prefixes() -> None:
     calls: list[str] = []
-    plans = [SimpleNamespace(has_local_memory=False), SimpleNamespace(has_local_memory=False)]
+    plans = [SequencePlan(has_text=False), SequencePlan(has_text=False)]
     clean = SimpleNamespace(x0_tokens_local_memory=None, raw_state_vision=[])
     model = SimpleNamespace(
         _load_and_tokenize_text_data=lambda batch, iteration: calls.append("text") or [[1], [2]],
@@ -261,3 +264,156 @@ def test_canonical_forward_aborts_real_pending_scan_before_hard_stop() -> None:
     assert [plan.has_local_memory for plan in carrier.model_data_batch["sequence_plan"]] == [False, False]
     assert model._canonical_production_adapter._scan_requests == set()
     assert model._canonical_production_adapter._scan_results == {}
+
+
+def _production_model(*, memory_init_training) -> tuple[SimpleNamespace, list[str]]:
+    encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
+    core = ContinualTTTLocalMemoryCore(evidence_dim=256)
+    calls: list[str] = []
+    clean = SimpleNamespace(x0_tokens_local_memory=None, raw_state_vision=[])
+    model = SimpleNamespace(
+        parallel_dims=None,
+        input_image_key="images",
+        input_video_key="video",
+        net=SimpleNamespace(local_history_runtime=SimpleNamespace(encoder=encoder, recurrent_backend=core)),
+        _load_and_tokenize_text_data=lambda batch, iteration: calls.append("text") or [[1], [2]],
+        get_data_and_condition=lambda batch, iteration: calls.append("clean") or clean,
+        memory_init_training=memory_init_training,
+        _get_vae_pixel_shapes=lambda raw: [],
+    )
+    model._prepare_canonical_production_inputs = (
+        lambda prepared_carrier, result, iteration: OmniMoTModel._prepare_canonical_production_inputs(
+            model, prepared_carrier, result, iteration
+        )
+    )
+    return model, calls
+
+
+def _assert_aborted_without_commit(
+    request: CanonicalProductionSegmentRequest, adapter: CanonicalProductionAdapter, scheduler_before: object
+) -> None:
+    assert adapter._scan_requests == set()
+    assert adapter._scan_results == {}
+    assert adapter._commit_capabilities == set()
+    assert adapter.frontier._states == {}
+    assert request.scheduler.snapshot == scheduler_before
+    assert request.transaction.completed_members == []
+    assert request.transaction.backward_started is False
+
+
+def test_canonical_forward_aborts_gather_mismatch_without_commit() -> None:
+    request, carrier = _bound_request_and_carrier()
+    model, _ = _production_model(memory_init_training=lambda value, batch, indexes: (value, {}))
+    adapter = CanonicalProductionAdapter(
+        model.net.local_history_runtime.encoder, model.net.local_history_runtime.recurrent_backend
+    )
+    model._canonical_production_adapter = adapter
+    scan = adapter.scan
+
+    def scan_with_mismatched_gather(current_request):
+        result = scan(current_request)
+        gathered = dataclasses.replace(
+            result.gathered,
+            payloads=result.gathered.payloads[:-1],
+            local_prefixes=result.gathered.local_prefixes[:-1],
+            identities=result.gathered.identities[:-1],
+        )
+        mismatch = dataclasses.replace(result, gathered=gathered)
+        adapter._scan_results.pop(id(result))
+        adapter._scan_results[id(mismatch)] = current_request
+        return mismatch
+
+    adapter.scan = scan_with_mismatched_gather
+    scheduler_before = request.scheduler.snapshot
+    with pytest.raises(RuntimeError, match="gathered result differs"):
+        OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
+    _assert_aborted_without_commit(request, adapter, scheduler_before)
+
+
+def test_canonical_forward_aborts_memory_initialization_exception_without_commit() -> None:
+    request, carrier = _bound_request_and_carrier()
+    calls: list[str] = []
+    model, _ = _production_model(
+        memory_init_training=lambda value, batch, indexes: calls.append("memory")
+        or (_ for _ in ()).throw(RuntimeError("injected memory initialization failure"))
+    )
+    import cosmos_framework.model.generator.omni_mot_model as module
+
+    original = module.build_sequence_plans_from_data_batch
+    module.build_sequence_plans_from_data_batch = lambda **kwargs: kwargs["data_batch"]["sequence_plan"]
+    scheduler_before = request.scheduler.snapshot
+    try:
+        with pytest.raises(RuntimeError, match="injected memory initialization failure"):
+            OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
+    finally:
+        module.build_sequence_plans_from_data_batch = original
+    _assert_aborted_without_commit(request, model._canonical_production_adapter, scheduler_before)
+    assert calls == ["memory"]
+
+
+def test_canonical_forward_never_calls_ordinary_or_legacy_preparation() -> None:
+    request, carrier = _bound_request_and_carrier()
+    model, _ = _production_model(memory_init_training=lambda value, batch, indexes: (value, {}))
+    for name in (
+        "_prepare_training_data",
+        "_get_training_inputs",
+        "_inject_local_history",
+        "_ttt_local_memory_tokens",
+    ):
+        setattr(model, name, lambda *args, _name=name, **kwargs: pytest.fail(f"unexpected {_name} call"))
+    import cosmos_framework.model.generator.omni_mot_model as module
+
+    original = module.build_sequence_plans_from_data_batch
+    module.build_sequence_plans_from_data_batch = lambda **kwargs: kwargs["data_batch"]["sequence_plan"]
+    try:
+        with pytest.raises(RuntimeError, match="native forward seam is unavailable"):
+            OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
+    finally:
+        module.build_sequence_plans_from_data_batch = original
+
+
+def test_canonical_safe_preparation_rejects_post_clean_ordinary_local_memory() -> None:
+    calls: list[str] = []
+    plans = [SequencePlan(has_text=False), SequencePlan(has_text=False)]
+    clean = SimpleNamespace(x0_tokens_local_memory=None, raw_state_vision=[])
+
+    def materialize(batch, iteration):
+        calls.append("clean")
+        batch["local_memory"] = [object()]
+        return clean
+
+    model = SimpleNamespace(
+        _load_and_tokenize_text_data=lambda batch, iteration: calls.append("text") or [[1], [2]],
+        input_video_key="video",
+        input_image_key="image",
+        get_data_and_condition=materialize,
+        memory_init_training=lambda *args: pytest.fail("memory init must not run"),
+        _get_vae_pixel_shapes=lambda raw: [],
+    )
+    carrier = SimpleNamespace(model_data_batch={"text_token_ids": []})
+    result = SimpleNamespace(gathered=SimpleNamespace(item_count=2, local_prefixes=(None, "prefix")))
+    import cosmos_framework.model.generator.omni_mot_model as module
+
+    original = module.build_sequence_plans_from_data_batch
+    module.build_sequence_plans_from_data_batch = lambda **kwargs: calls.append("plan") or plans
+    try:
+        with pytest.raises(RuntimeError, match="introduced an ordinary Local payload"):
+            OmniMoTModel._prepare_canonical_production_inputs(model, carrier, result, 1)
+    finally:
+        module.build_sequence_plans_from_data_batch = original
+    assert calls == ["text", "plan", "clean"]
+    assert [plan.has_local_memory for plan in plans] == [False, False]
+
+
+def test_training_step_no_local_falls_through_without_canonical_construction() -> None:
+    calls: list[str] = []
+    model = SimpleNamespace(
+        config=SimpleNamespace(local_ttt_enabled=False),
+        _get_training_inputs=lambda batch, iteration: calls.append("ordinary")
+        or (_ for _ in ()).throw(RuntimeError("ordinary no-local path reached")),
+        _canonical_production_segment_forward=lambda *args: pytest.fail("canonical branch must not run"),
+    )
+    with pytest.raises(RuntimeError, match="ordinary no-local path reached"):
+        OmniMoTModel.training_step(model, {}, 1)
+    assert calls == ["ordinary"]
+    assert not hasattr(model, "_canonical_production_adapter")
