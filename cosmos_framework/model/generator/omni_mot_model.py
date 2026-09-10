@@ -54,8 +54,8 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
     CanonicalProductionAdapter,
-    CanonicalRawRowCarrier,
     CanonicalProductionSegmentRequest,
+    CanonicalRawRowCarrier,
 )
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
 from cosmos_framework.model.generator.mot.local_evidence import (
@@ -1429,6 +1429,7 @@ class OmniMoTModel(ImaginaireModel):
         sequence_plans = build_sequence_plans_from_data_batch(
             data_batch=data_batch, input_video_key=self.input_video_key, input_image_key=self.input_image_key
         )
+        sequence_plans = [dataclasses.replace(plan) for plan in sequence_plans]
         if any(plan.has_local_memory for plan in sequence_plans):
             raise RuntimeError("canonical-production plans must be Local-neutral before clean materialization")
         gen_data_clean = self.get_data_and_condition(data_batch, iteration=iteration)

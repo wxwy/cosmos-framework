@@ -107,16 +107,21 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
         )
         for row in samples
     )
-    for raw_row, model_row in zip(samples, model_samples, strict=True):
-        for raw, model_sample in zip(raw_row, model_row, strict=True):
-            if raw is not None:
-                raw["canonical_model_sample"] = model_sample
+    source_identities = tuple(
+        tuple(
+            None if raw is None else (row, f"episode-{row}", "source", raw["canonical_identity"][2])
+            for raw in raw_row
+        )
+        for row, raw_row in enumerate(samples)
+    )
     bound = CanonicalRawRowCarrier(
         request, member, batch, member.row_identities, member.row_chronology, samples, model_samples,
         {
             "text_token_ids": [model_samples[row][index]["text_token_ids"] for row, index in carrier.expected_for(request).logical_indexes],
             "images": [model_samples[row][index]["images"] for row, index in carrier.expected_for(request).logical_indexes],
         },
+        raw_row_source_identities=source_identities,
+        row_model_source_rows=samples,
     )
     expected = bound.expected_for(request)
     bound.validate_model_data_batch(expected, input_image_key="images", input_video_key="video")
@@ -126,6 +131,8 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
             "text_token_ids": [dict(value) for value in bound.model_data_batch["text_token_ids"]],
             "images": bound.model_data_batch["images"],
         },
+        raw_row_source_identities=source_identities,
+        row_model_source_rows=samples,
     )
     with pytest.raises(CanonicalSegmentContractError, match="model batch source is foreign"):
         foreign_batch.validate_model_data_batch(expected, input_image_key="images", input_video_key="video")
@@ -147,6 +154,8 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
             "image_size": torch.stack(stacked_sources),
         },
         {"image_size": stacked_sources},
+        raw_row_source_identities=source_identities,
+        row_model_source_rows=samples,
     )
     stacked_batch.validate_model_data_batch(expected, input_image_key="images", input_video_key="video")
     foreign_stacked_batch = CanonicalRawRowCarrier(
@@ -162,6 +171,8 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
             "image_size": torch.stack(tuple(reversed(stacked_sources))),
         },
         {"image_size": stacked_sources},
+        raw_row_source_identities=source_identities,
+        row_model_source_rows=samples,
     )
     with pytest.raises(CanonicalSegmentContractError, match="stacked model batch is foreign"):
         foreign_stacked_batch.validate_model_data_batch(
@@ -176,6 +187,8 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
         samples,
         model_samples,
         {"images": bound.model_data_batch["images"], "video": bound.model_data_batch["images"]},
+        raw_row_source_identities=source_identities,
+        row_model_source_rows=samples,
     )
     with pytest.raises(CanonicalSegmentContractError, match="exactly one vision input key"):
         conflicting_vision_batch.validate_model_data_batch(

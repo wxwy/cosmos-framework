@@ -74,8 +74,9 @@ def _bound_request_and_carrier() -> tuple[CanonicalProductionSegmentRequest, Can
         {"canonical_identity": (0, "episode", 0), "images": raw_rows[0][0]},
         {"canonical_identity": (0, "episode", 1), "images": raw_rows[0][1]},
     ),)
-    for raw, sample in zip(raw_rows[0], samples[0], strict=True):
-        raw["canonical_model_sample"] = sample
+    raw_plans = [SimpleNamespace(has_local_memory=False), SimpleNamespace(has_local_memory=False)]
+    for sample, plan_item in zip(samples[0], raw_plans, strict=True):
+        sample["sequence_plan"] = plan_item
     carrier = CanonicalRawRowCarrier(
         request,
         member,
@@ -84,7 +85,12 @@ def _bound_request_and_carrier() -> tuple[CanonicalProductionSegmentRequest, Can
         member.row_chronology,
         raw_rows,
         samples,
-        {"images": [sample["images"] for sample in samples[0]]},
+        {
+            "images": [sample["images"] for sample in samples[0]],
+            "sequence_plan": raw_plans,
+        },
+        raw_row_source_identities=(((0, "episode", "source", 0), (0, "episode", "source", 1)),),
+        row_model_source_rows=raw_rows,
     )
     return request, carrier
 
@@ -171,11 +177,12 @@ def test_canonical_safe_preparation_adapts_only_gathered_prefixes() -> None:
     original = module.build_sequence_plans_from_data_batch
     module.build_sequence_plans_from_data_batch = lambda **kwargs: calls.append("plan") or plans
     try:
-        OmniMoTModel._prepare_canonical_production_inputs(model, carrier, result, 1)
+        prepared = OmniMoTModel._prepare_canonical_production_inputs(model, carrier, result, 1)
     finally:
         module.build_sequence_plans_from_data_batch = original
     assert calls == ["text", "plan", "clean", "memory"]
-    assert [plan.has_local_memory for plan in plans] == [False, True]
+    assert [plan.has_local_memory for plan in plans] == [False, False]
+    assert [plan.has_local_memory for plan in prepared[1]] == [False, True]
     assert clean.x0_tokens_local_memory == ["prefix"]
 
 
@@ -190,10 +197,32 @@ def test_canonical_forward_preflights_foreign_batch_before_adapter_creation() ->
         carrier.raw_rows,
         carrier.row_model_samples,
         {"images": [dict(value) for value in carrier.model_data_batch["images"]]},
+        raw_row_source_identities=carrier.raw_row_source_identities,
+        row_model_source_rows=carrier.row_model_source_rows,
     )
     model = SimpleNamespace(parallel_dims=None, input_image_key="images", input_video_key="video")
     with pytest.raises(Exception, match="model batch source is foreign"):
         OmniMoTModel._canonical_production_segment_forward(model, request, foreign, 1)
+    assert not hasattr(model, "_canonical_production_adapter")
+
+
+def test_canonical_forward_rejects_foreign_raw_source_before_adapter_creation() -> None:
+    request, carrier = _bound_request_and_carrier()
+    foreign_source = CanonicalRawRowCarrier(
+        carrier.request,
+        carrier.member,
+        carrier.segment_batch,
+        carrier.row_identities,
+        carrier.row_chronology,
+        carrier.raw_rows,
+        carrier.row_model_samples,
+        carrier.model_data_batch,
+        raw_row_source_identities=(((0, "episode", "foreign-source", 0), (0, "episode", "source", 1)),),
+        row_model_source_rows=carrier.row_model_source_rows,
+    )
+    model = SimpleNamespace(parallel_dims=None, input_image_key="images", input_video_key="video")
+    with pytest.raises(Exception, match="model sample source is foreign"):
+        OmniMoTModel._canonical_production_segment_forward(model, request, foreign_source, 1)
     assert not hasattr(model, "_canonical_production_adapter")
 
 
@@ -202,20 +231,33 @@ def test_canonical_forward_aborts_real_pending_scan_before_hard_stop() -> None:
     encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
     core = ContinualTTTLocalMemoryCore(evidence_dim=256)
     calls: list[str] = []
-
-    def hard_stop(*_args) -> None:
-        calls.append("helper")
-        raise RuntimeError("controlled pre-packer stop")
+    clean = SimpleNamespace(x0_tokens_local_memory=None, raw_state_vision=[])
 
     model = SimpleNamespace(
         parallel_dims=None,
         input_image_key="images",
         input_video_key="video",
         net=SimpleNamespace(local_history_runtime=SimpleNamespace(encoder=encoder, recurrent_backend=core)),
-        _prepare_canonical_production_inputs=hard_stop,
+        _load_and_tokenize_text_data=lambda batch, iteration: calls.append("text") or [[1], [2]],
+        get_data_and_condition=lambda batch, iteration: calls.append("clean") or clean,
+        memory_init_training=lambda value, batch, indexes: (calls.append("memory") or value, {}),
+        _get_vae_pixel_shapes=lambda raw: [],
     )
-    with pytest.raises(RuntimeError, match="controlled pre-packer stop"):
-        OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
-    assert calls == ["helper"]
+    model._prepare_canonical_production_inputs = (
+        lambda prepared_carrier, result, iteration: OmniMoTModel._prepare_canonical_production_inputs(
+            model, prepared_carrier, result, iteration
+        )
+    )
+    import cosmos_framework.model.generator.omni_mot_model as module
+
+    original = module.build_sequence_plans_from_data_batch
+    module.build_sequence_plans_from_data_batch = lambda **kwargs: calls.append("plan") or kwargs["data_batch"]["sequence_plan"]
+    try:
+        with pytest.raises(RuntimeError, match="native forward seam is unavailable"):
+            OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
+    finally:
+        module.build_sequence_plans_from_data_batch = original
+    assert calls == ["text", "plan", "clean", "memory"]
+    assert [plan.has_local_memory for plan in carrier.model_data_batch["sequence_plan"]] == [False, False]
     assert model._canonical_production_adapter._scan_requests == set()
     assert model._canonical_production_adapter._scan_results == {}

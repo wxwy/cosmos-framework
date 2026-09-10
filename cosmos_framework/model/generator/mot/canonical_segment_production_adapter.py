@@ -53,6 +53,8 @@ class CanonicalRawRowCarrier:
     row_model_samples: tuple[tuple[Mapping[str, Any] | None, ...], ...]
     model_data_batch: Mapping[str, Any]
     stacked_model_batch_sources: Mapping[str, tuple[Any, ...]] = field(default_factory=dict)
+    raw_row_source_identities: tuple[tuple[tuple[int, str, str, int] | None, ...], ...] = ()
+    row_model_source_rows: tuple[tuple[Mapping[str, Any] | None, ...], ...] = ()
 
     _MODEL_BATCH_KEYS = frozenset(
         {
@@ -125,13 +127,31 @@ class CanonicalRawRowCarrier:
             raise CanonicalSegmentContractError("canonical carrier model batch requires exactly one vision input key")
         if set(self.stacked_model_batch_sources) - set(self.model_data_batch):
             raise CanonicalSegmentContractError("canonical carrier stacked source key is foreign")
+        if (
+            len(self.raw_row_source_identities) != len(self.raw_rows)
+            or len(self.row_model_source_rows) != len(self.raw_rows)
+        ):
+            raise CanonicalSegmentContractError("canonical carrier raw source metadata is foreign")
         for key, value in self.model_data_batch.items():
             sources = tuple(
                 self.row_model_samples[row][index] for row, index in expected.logical_indexes
             )
             for source, (row, index) in zip(sources, expected.logical_indexes, strict=True):
                 raw = self.raw_rows[row][index]
-                if raw is None or source is None or raw.get("canonical_model_sample") is not source:
+                source_identity = self.raw_row_source_identities[row][index]
+                source_raw = self.row_model_source_rows[row][index]
+                expected_identity = (
+                    int(self.segment_batch.slot_id[row]),
+                    self.segment_batch.episode_id[row],
+                    self.member.row_identities[row].source_digest,
+                    int(self.segment_batch.consumer_step[row, index]),
+                )
+                if (
+                    raw is None
+                    or source is None
+                    or source_raw is not raw
+                    or source_identity != expected_identity
+                ):
                     raise CanonicalSegmentContractError("canonical carrier model sample source is foreign")
             if isinstance(value, (list, tuple)):
                 if len(value) != len(sources):
