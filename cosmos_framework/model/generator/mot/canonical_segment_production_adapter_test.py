@@ -251,6 +251,51 @@ def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() 
         adapter.commit_success(capability)
 
 
+def test_adapter_abort_commit_consumes_exact_capability_without_reconcile() -> None:
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    identity = SegmentIdentity(0, "episode", "category", 0, 0, "source")
+    record = ChronologyCountRecord(0, "episode", "category", "source", 0, 2, False, "manifest")
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            QueueEpochSnapshot(1, 0, "catalog", (("category", 0),), (("category", (0,)),)),
+            (("category", 0),),
+            target_distribution=(("category", 1.0),),
+            catalog=(CatalogRow(identity, record, provenance),),
+        )
+    )
+    plan = scheduler.freeze_plan(slot_groups=((0,),), plan_chain_id="abort-commit")
+    member = plan.members[0]
+    batch = SegmentBatch(
+        torch.zeros(1, 2, 96), (("s0", "s1"),), torch.tensor([[True, True]]), torch.tensor([[0, 1]]),
+        torch.zeros(1, 2, 96), torch.zeros(1, 2, 10), torch.tensor([[False, True]]), torch.tensor([[-1, 0]]),
+        torch.tensor([0]), ("episode",), ("category",), provenance,
+    )
+    request = CanonicalProductionSegmentRequest(
+        scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, batch
+    )
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+    result = adapter.scan(request)
+    request.transaction.mark_backward_started(0)
+    capability = adapter.prepare_commit(request, result)
+    scheduler_before = scheduler.snapshot
+    with pytest.raises(CanonicalSegmentContractError, match="exact pending capability"):
+        adapter.abort_commit(replace(capability))
+    assert adapter._commit_capabilities == {id(capability)}
+    assert adapter._scan_requests == {id(request)}
+    adapter.abort_commit(capability)
+    assert adapter._commit_capabilities == set()
+    assert adapter._scan_requests == set()
+    assert adapter._scan_results == {}
+    assert adapter.frontier._states == {}
+    assert scheduler.snapshot == scheduler_before
+    assert request.transaction.snapshot().completed_members == ()
+    with pytest.raises(CanonicalSegmentContractError, match="exact pending capability"):
+        adapter.abort_commit(capability)
+
+
 def test_adapter_retry_preserves_original_frozen_transition_exactly_once() -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
     identity = SegmentIdentity(0, "episode", "category", 0, 0, "source")

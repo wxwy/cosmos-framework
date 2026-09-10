@@ -390,6 +390,20 @@ class CanonicalProductionAdapter:
         self._scan_requests.remove(id(request))
         self._scan_results.pop(id(result))
 
+    def abort_commit(self, capability: CanonicalProductionCommitCapability) -> None:
+        """Consume one pre-mutation commit capability and its exact pending scan."""
+        request, result = capability.request, capability.result
+        if id(capability) not in self._commit_capabilities:
+            raise CanonicalSegmentContractError("commit abort requires an exact pending capability")
+        if self._scan_results.get(id(result)) is not request or id(request) not in self._scan_requests:
+            raise CanonicalSegmentContractError("commit abort requires this exact pending request/result pair")
+        if capability.prepared_reconcile.scheduler is not request.scheduler:
+            raise CanonicalSegmentContractError("commit abort capability scheduler is foreign")
+        request.scheduler.validate_prepared_reconcile(capability.prepared_reconcile)
+        request.transaction.validate_reconcile(request.member_index)
+        self._commit_capabilities.remove(id(capability))
+        self.abort_scan(request, result)
+
     def commit_success(self, capability: CanonicalProductionCommitCapability) -> None:
         request, result = capability.request, capability.result
         if id(capability) not in self._commit_capabilities:
