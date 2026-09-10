@@ -1395,9 +1395,10 @@ class OmniMoTModel(ImaginaireModel):
         self, request: CanonicalProductionSegmentRequest, iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Reserve the canonical ABI branch; its native pack/forward seam is P2-owned."""
-        del iteration
         if request.carrier is None:
             raise RuntimeError("canonical-production requires an immutable raw-row carrier")
+        if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
+            raise RuntimeError("canonical-production rejects context parallelism before scan")
         adapter = _canonical_production_adapter_from_model(self)
         expected = request.carrier.expected_for(request)
         if "local_memory" in request.carrier.model_data_batch:
@@ -1406,10 +1407,40 @@ class OmniMoTModel(ImaginaireModel):
         try:
             if result.gathered.identities != expected.identities or result.gathered.item_count != len(expected.identities):
                 raise RuntimeError("canonical-production gathered result differs from pre-scan expected traversal")
+            self._prepare_canonical_production_inputs(request, result, iteration)
             raise RuntimeError("canonical-production native forward seam is unavailable")
         except Exception:
             adapter.abort_scan(request, result)
             raise
+
+    def _prepare_canonical_production_inputs(
+        self, request: CanonicalProductionSegmentRequest, result: Any, iteration: int
+    ) -> tuple[list[list[int]], list[SequencePlan], GenerationDataClean, dict, list[str] | None, list[tuple[int, int, int]]]:
+        """Run only the canonical-safe preparation prefix, then stop before packing."""
+        assert request.carrier is not None
+        data_batch = dict(request.carrier.model_data_batch)
+        if "local_memory" in data_batch:
+            raise RuntimeError("canonical-production model batch must remain Local-neutral")
+        input_text_indexes = self._load_and_tokenize_text_data(data_batch, iteration)
+        sequence_plans = build_sequence_plans_from_data_batch(
+            data_batch=data_batch, input_video_key=self.input_video_key, input_image_key=self.input_image_key
+        )
+        if any(plan.has_local_memory for plan in sequence_plans):
+            raise RuntimeError("canonical-production plans must be Local-neutral before clean materialization")
+        gen_data_clean = self.get_data_and_condition(data_batch, iteration=iteration)
+        if any(plan.has_local_memory for plan in sequence_plans) or gen_data_clean.x0_tokens_local_memory is not None:
+            raise RuntimeError("canonical-production clean materialization introduced an ordinary Local payload")
+        if len(sequence_plans) != result.gathered.item_count:
+            raise RuntimeError("canonical-production plan count differs from gathered result")
+        for plan, prefix in zip(sequence_plans, result.gathered.local_prefixes, strict=True):
+            plan.has_local_memory = prefix is not None
+        gen_data_clean.x0_tokens_local_memory = [
+            prefix for prefix in result.gathered.local_prefixes if prefix is not None
+        ] or None
+        gen_data_clean, memory_info = self.memory_init_training(gen_data_clean, data_batch, input_text_indexes)
+        data_resolutions = None
+        vae_pixel_shapes = self._get_vae_pixel_shapes(gen_data_clean.raw_state_vision)
+        return input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes
 
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int

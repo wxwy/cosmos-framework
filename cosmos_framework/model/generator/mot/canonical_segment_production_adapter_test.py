@@ -63,22 +63,27 @@ def test_adapter_scan_derives_stream_major_gather_and_fp32_state() -> None:
 def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity() -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
     batch = SegmentBatch(
-        torch.zeros(1, 2, 96), (("s0", None),), torch.tensor([[True, False]]), torch.tensor([[0, -1]]),
-        torch.zeros(1, 2, 96), torch.zeros(1, 2, 10), torch.tensor([[False, False]]), torch.tensor([[-1, -1]]),
-        torch.tensor([0]), ("episode",), ("category",), provenance,
+        torch.zeros(2, 3, 96), (("s00", "s01", None), ("s10", "s11", "s12")),
+        torch.tensor([[True, True, False], [True, True, True]]), torch.tensor([[0, 1, -1], [0, 1, 2]]),
+        torch.zeros(2, 3, 96), torch.zeros(2, 3, 10), torch.tensor([[False, True, False], [False, True, True]]),
+        torch.tensor([[-1, 0, -1], [-1, 0, 1]]), torch.tensor([0, 1]), ("episode-0", "episode-1"),
+        ("category", "category"), provenance,
     )
     member = MicrobatchPlanMember(
-        0, (SegmentIdentity(0, "episode", "category", 0, 0, "source"),), (provenance,),
-        (ChronologyCountRecord(0, "episode", "category", "source", 0, 1, False, "manifest"),), (1,), 1,
+        0,
+        (SegmentIdentity(0, "episode-0", "category", 0, 0, "source"), SegmentIdentity(1, "episode-1", "category", 0, 0, "source")),
+        (provenance, provenance),
+        (ChronologyCountRecord(0, "episode-0", "category", "source", 0, 2, False, "manifest"), ChronologyCountRecord(1, "episode-1", "category", "source", 0, 3, False, "manifest")),
+        (2, 3), 5,
         QueueEpochSnapshot(1, 0, "catalog", (("category", 0),)), (),
     )
-    plan = CanonicalGAWindowPlan((member,), 1, 1, "carrier")
+    plan = CanonicalGAWindowPlan((member,), 5, 1, "carrier")
     scheduler = CanonicalBatchScheduler(ProjectedSchedulerState(QueueEpochSnapshot(1, 0, "catalog", ()), ()))
     request = CanonicalProductionSegmentRequest(scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, batch)
-    sample = {"canonical_identity": (0, "episode", 0)}
-    carrier = CanonicalRawRowCarrier(((sample, None),), ((sample, None),), {"sequence_plan": ()})
-    assert carrier.expected_for(request).logical_indexes == ((0, 0),)
-    foreign = CanonicalRawRowCarrier((({"canonical_identity": (1, "episode", 0)}, None),), ((sample, None),), {})
+    samples = tuple(tuple({"canonical_identity": (row, f"episode-{row}", step)} if step >= 0 else None for step in steps) for row, steps in enumerate(((0, 1, -1), (0, 1, 2))))
+    carrier = CanonicalRawRowCarrier(samples, samples, {"sequence_plan": ()})
+    assert carrier.expected_for(request).logical_indexes == ((0, 0), (0, 1), (1, 0), (1, 1), (1, 2))
+    foreign = CanonicalRawRowCarrier((({"canonical_identity": (1, "episode-0", 0)}, samples[0][1], None), samples[1]), samples, {})
     with pytest.raises(CanonicalSegmentContractError, match="raw identity is foreign"):
         foreign.expected_for(request)
 
