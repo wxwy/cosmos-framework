@@ -517,6 +517,10 @@ class ImaginaireTrainer:
             active_data = dict(data)
             active_data["psm_local_memory_active"] = True
             active_data["psm_local_memory_prepared"] = armed_prepared
+        if active_data.get("canonical_production_segment_mode") is True and (
+            grad_scaler.is_enabled() or isinstance(optimizer, torch.optim.Optimizer)
+        ):
+            raise RuntimeError("canonical native CPU/static route rejects scaler or optimizer before scan")
         # Only let DDP sync gradient at the last iteration of the gradient accumulation window
         with distributed.ddp_sync_grad(model_ddp, grad_accum_iter == self.config.trainer.grad_accum_iter - 1):
             self.callbacks.on_before_forward(iteration=iteration)
