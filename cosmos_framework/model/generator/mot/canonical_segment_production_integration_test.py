@@ -38,6 +38,7 @@ from cosmos_framework.model.generator.omni_mot_model import (
     _canonical_production_adapter_from_model,
     _canonical_production_request_from_batch,
 )
+from cosmos_framework.trainer import ImaginaireTrainer
 
 
 def _request() -> CanonicalProductionSegmentRequest:
@@ -523,7 +524,20 @@ def test_canonical_forward_rejects_foreign_raw_source_before_adapter_creation() 
     assert not hasattr(model, "_canonical_production_adapter")
 
 
-def test_canonical_forward_aborts_real_pending_scan_before_hard_stop() -> None:
+def test_canonical_forward_rejects_initialized_process_group_before_adapter_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, carrier = _bound_request_and_carrier()
+    model = SimpleNamespace(parallel_dims=None, input_image_key="images", input_video_key="video")
+    import cosmos_framework.model.generator.omni_mot_model as module
+
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    with pytest.raises(RuntimeError, match="initialized distributed process groups"):
+        OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
+    assert not hasattr(model, "_canonical_production_adapter")
+
+
+def test_canonical_forward_aborts_pending_scan_without_cpu_static_loss_seam() -> None:
     request, carrier = _bound_request_and_carrier()
     encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
     core = ContinualTTTLocalMemoryCore(evidence_dim=256)
@@ -550,7 +564,7 @@ def test_canonical_forward_aborts_real_pending_scan_before_hard_stop() -> None:
     original = module.build_sequence_plans_from_data_batch
     module.build_sequence_plans_from_data_batch = lambda **kwargs: calls.append("plan") or kwargs["data_batch"]["sequence_plan"]
     try:
-        with pytest.raises(RuntimeError, match="native forward seam is unavailable"):
+        with pytest.raises(RuntimeError, match="requires an injected CPU/static native loss seam"):
             OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
     finally:
         module.build_sequence_plans_from_data_batch = original
@@ -558,6 +572,52 @@ def test_canonical_forward_aborts_real_pending_scan_before_hard_stop() -> None:
     assert [plan.has_local_memory for plan in carrier.model_data_batch["sequence_plan"]] == [False, False]
     assert model._canonical_production_adapter._scan_requests == set()
     assert model._canonical_production_adapter._scan_results == {}
+
+
+def test_canonical_forward_binds_injected_cpu_static_loss_once() -> None:
+    request, carrier = _bound_request_and_carrier()
+    model, calls = _production_model(memory_init_training=lambda value, batch, indexes: (value, {}))
+    anchor = torch.ones((), requires_grad=True)
+
+    def cpu_static_loss_split(prepared):
+        return build_canonical_native_loss_split(
+            consumer_identities=prepared.traversal.identities,
+            modalities={
+                "vision": CanonicalNativeModalityTerms(
+                    torch.ones(prepared.result.gathered.item_count, requires_grad=True),
+                    tuple(range(prepared.result.gathered.item_count)),
+                    1.0,
+                )
+            },
+            sample_level_scale=torch.ones(()),
+            auxiliary_loss=anchor * 0.0,
+            graph_anchor=anchor,
+        )
+
+    model._psm_canonical_native_cpu_static_loss_split = cpu_static_loss_split
+    import cosmos_framework.model.generator.omni_mot_model as module
+
+    original = module.build_sequence_plans_from_data_batch
+    module.build_sequence_plans_from_data_batch = lambda **kwargs: kwargs["data_batch"]["sequence_plan"]
+    try:
+        output, loss = OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
+    finally:
+        module.build_sequence_plans_from_data_batch = original
+    capability = output["psm_canonical_native_forward"]
+    assert capability.loss_split.actual_n_valid == request.member.planned_n_valid
+    torch.testing.assert_close(loss, capability.loss_split.consumer_loss + capability.loss_split.auxiliary_loss)
+    assert calls == ["text", "clean"]
+    capability.adapter.abort_native_forward(capability)
+    assert capability.adapter._scan_requests == set()
+
+
+def test_canonical_trainer_rejects_distributed_configuration_before_sync() -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(distributed_parallelism="ddp"))
+    with pytest.raises(RuntimeError, match="distributed-parallel configuration"):
+        trainer.training_step(
+            object(), object(), None, SimpleNamespace(is_enabled=lambda: False), {"canonical_production_segment_mode": True}
+        )
 
 
 def _production_model(*, memory_init_training) -> tuple[SimpleNamespace, list[str]]:
@@ -660,7 +720,7 @@ def test_canonical_forward_never_calls_ordinary_or_legacy_preparation() -> None:
     original = module.build_sequence_plans_from_data_batch
     module.build_sequence_plans_from_data_batch = lambda **kwargs: kwargs["data_batch"]["sequence_plan"]
     try:
-        with pytest.raises(RuntimeError, match="native forward seam is unavailable"):
+        with pytest.raises(RuntimeError, match="requires an injected CPU/static native loss seam"):
             OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1)
     finally:
         module.build_sequence_plans_from_data_batch = original

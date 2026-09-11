@@ -53,6 +53,7 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
     context_parallel_broadcast_tensor_list,
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
+    CanonicalNativeLossSplit,
     CanonicalProductionAdapter,
     CanonicalProductionSegmentRequest,
     CanonicalRawRowCarrier,
@@ -131,6 +132,19 @@ _CANONICAL_PRODUCTION_CARRIER_KEY = "canonical_production_segment_carrier"
 _LEGACY_LOCAL_MARKER_KEYS = frozenset(
     {"psm_local_memory_active", "psm_local_memory_prepared", "canonical_local_memory_segment"}
 )
+
+
+def _canonical_native_cpu_static_loss_split_from_model(
+    model: Any, prepared: Any
+) -> CanonicalNativeLossSplit:
+    """Obtain the explicitly injected CPU/static native-loss witness for one prepared scan."""
+    seam = getattr(model, "_psm_canonical_native_cpu_static_loss_split", None)
+    if not callable(seam):
+        raise RuntimeError("canonical-production requires an injected CPU/static native loss seam")
+    loss_split = seam(prepared)
+    if not isinstance(loss_split, CanonicalNativeLossSplit):
+        raise RuntimeError("canonical-production CPU/static native loss seam returned an invalid split")
+    return loss_split
 
 
 def _canonical_production_request_from_batch(
@@ -1408,9 +1422,11 @@ class OmniMoTModel(ImaginaireModel):
     def _canonical_production_segment_forward(
         self, request: CanonicalProductionSegmentRequest, carrier: CanonicalRawRowCarrier, iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        """Reserve the canonical ABI branch; its native pack/forward seam is P2-owned."""
+        """Run the CPU/static canonical-native continuation for one exact pending scan."""
         if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
             raise RuntimeError("canonical-production rejects context parallelism before scan")
+        if dist.is_initialized():
+            raise RuntimeError("canonical-production rejects initialized distributed process groups before scan")
         expected = carrier.preflight(
             request, input_image_key=self.input_image_key, input_video_key=self.input_video_key
         )
@@ -1440,7 +1456,9 @@ class OmniMoTModel(ImaginaireModel):
                 data_resolutions=native_inputs[4],
                 vae_pixel_shapes=native_inputs[5],
             )
-            raise RuntimeError("canonical-production native forward seam is unavailable")
+            loss_split = _canonical_native_cpu_static_loss_split_from_model(self, prepared)
+            capability = adapter.bind_native_forward(prepared, loss_split)
+            return {"psm_canonical_native_forward": capability}, loss_split.consumer_loss + loss_split.auxiliary_loss
         except Exception:
             if adapter._scan_results.get(id(result)) is request:
                 adapter.abort_scan(request, result)
