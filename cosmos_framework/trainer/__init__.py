@@ -39,11 +39,31 @@ def _canonical_native_cpu_static_topology_error(trainer: Any, model_ddp: torch.n
     if model_ddp.__class__.__name__ == "FullyShardedDataParallel":
         return "FSDP wrapper"
     if dist.is_initialized():
+        if dist.get_world_size() != 1:
+            return "world-size other than one"
         return "initialized distributed process group"
     trainer_config = getattr(getattr(trainer, "config", None), "trainer", None)
     if getattr(trainer_config, "distributed_parallelism", "none") != "none":
         return "distributed-parallel configuration"
     return None
+
+
+def _abort_canonical_native_pre_backward_exit(output_batch: dict[str, object], code: str) -> None:
+    """Terminalize one canonical-native capability that cannot enter its backward owner."""
+    from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
+        CanonicalNativeForwardCapability,
+    )
+
+    capability = output_batch.get("psm_canonical_native_forward")
+    if not isinstance(capability, CanonicalNativeForwardCapability):
+        return
+    adapter = capability.adapter
+    request = capability.prepared.request
+    adapter.validate_native_forward(capability)
+    for parameter in capability.slow_parameters:
+        parameter.grad = None
+    adapter.abort_native_forward(capability)
+    request.transaction.terminalize(request.member_index, code)
 
 
 
@@ -552,16 +572,25 @@ class ImaginaireTrainer:
                     )
             if armed_prepared is not None:
                 self._psm_active_armed_prepared = None
-            self.callbacks.on_after_forward(iteration=iteration)
+            try:
+                self.callbacks.on_after_forward(iteration=iteration)
+            except Exception:
+                _abort_canonical_native_pre_backward_exit(output_batch, "CANONICAL_NATIVE_AFTER_FORWARD_FAILURE")
+                raise
             if capture_only:
+                _abort_canonical_native_pre_backward_exit(output_batch, "CANONICAL_NATIVE_CAPTURE_ONLY")
                 return output_batch, loss, 0
             is_active_step = "psm_local_memory_active_forward" in output_batch
-            if is_active_step:
-                _dispatch_active_callbacks_excluding_ttt(
-                    self.callbacks, "on_before_backward", model=model, loss=loss, iteration=iteration
-                )
-            else:
-                self.callbacks.on_before_backward(model, loss, iteration=iteration)
+            try:
+                if is_active_step:
+                    _dispatch_active_callbacks_excluding_ttt(
+                        self.callbacks, "on_before_backward", model=model, loss=loss, iteration=iteration
+                    )
+                else:
+                    self.callbacks.on_before_backward(model, loss, iteration=iteration)
+            except Exception:
+                _abort_canonical_native_pre_backward_exit(output_batch, "CANONICAL_NATIVE_BEFORE_BACKWARD_FAILURE")
+                raise
             with self.training_timer("backward"):
                 with self.straggler_detector.profile_section(
                     "bwd", self.config.trainer.straggler_detection.analyze_backward

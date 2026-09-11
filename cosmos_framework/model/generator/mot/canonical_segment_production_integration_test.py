@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -618,6 +619,109 @@ def test_canonical_trainer_rejects_distributed_configuration_before_sync() -> No
         trainer.training_step(
             object(), object(), None, SimpleNamespace(is_enabled=lambda: False), {"canonical_production_segment_mode": True}
         )
+
+
+@pytest.mark.parametrize(
+    ("model_ddp", "error"),
+    (
+        (torch.nn.DataParallel(torch.nn.Linear(1, 1)), "data-parallel wrapper"),
+        (type("FullyShardedDataParallel", (), {})(), "FSDP wrapper"),
+    ),
+)
+def test_canonical_trainer_rejects_wrapper_topology_before_callbacks(
+    model_ddp: object, error: str
+) -> None:
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(distributed_parallelism="none"))
+    with pytest.raises(RuntimeError, match=error):
+        trainer.training_step(
+            model_ddp, object(), None, SimpleNamespace(is_enabled=lambda: False), {"canonical_production_segment_mode": True}
+        )
+
+
+@pytest.mark.parametrize(("world_size", "error"), ((1, "initialized distributed process group"), (2, "world-size other than one")))
+def test_canonical_trainer_rejects_process_group_before_callbacks(
+    monkeypatch: pytest.MonkeyPatch, world_size: int, error: str
+) -> None:
+    import cosmos_framework.trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trainer_module.dist, "get_world_size", lambda: world_size)
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(distributed_parallelism="none"))
+    with pytest.raises(RuntimeError, match=error):
+        trainer.training_step(
+            object(), object(), None, SimpleNamespace(is_enabled=lambda: False), {"canonical_production_segment_mode": True}
+        )
+
+
+def _canonical_native_cpu_static_output(monkeypatch: pytest.MonkeyPatch):
+    request, carrier = _bound_request_and_carrier()
+    model, _ = _production_model(memory_init_training=lambda value, batch, indexes: (value, {}))
+    anchor = torch.ones((), requires_grad=True)
+    model._psm_canonical_native_cpu_static_loss_split = lambda prepared: build_canonical_native_loss_split(
+        consumer_identities=prepared.traversal.identities,
+        modalities={
+            "vision": CanonicalNativeModalityTerms(
+                torch.ones(prepared.result.gathered.item_count, requires_grad=True),
+                tuple(range(prepared.result.gathered.item_count)),
+                1.0,
+            )
+        },
+        sample_level_scale=torch.ones(()),
+        auxiliary_loss=anchor * 0.0,
+        graph_anchor=anchor,
+    )
+    import cosmos_framework.model.generator.omni_mot_model as model_module
+
+    monkeypatch.setattr(model_module, "build_sequence_plans_from_data_batch", lambda **kwargs: kwargs["data_batch"]["sequence_plan"])
+    return OmniMoTModel._canonical_production_segment_forward(model, request, carrier, 1), request
+
+
+@pytest.mark.parametrize(
+    ("phase", "code"),
+    (
+        ("after", "CANONICAL_NATIVE_AFTER_FORWARD_FAILURE"),
+        ("capture", "CANONICAL_NATIVE_CAPTURE_ONLY"),
+        ("before", "CANONICAL_NATIVE_BEFORE_BACKWARD_FAILURE"),
+    ),
+)
+def test_canonical_trainer_pre_backward_exit_aborts_real_model_capability(
+    monkeypatch: pytest.MonkeyPatch, phase: str, code: str
+) -> None:
+    (output, loss), request = _canonical_native_cpu_static_output(monkeypatch)
+    capability = output["psm_canonical_native_forward"]
+    scheduler_before = request.scheduler.snapshot
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer.config = SimpleNamespace(
+        trainer=SimpleNamespace(
+            distributed_parallelism="none", grad_accum_iter=1,
+            straggler_detection=SimpleNamespace(analyze_forward=False, analyze_backward=False),
+        )
+    )
+    trainer.training_timer = lambda _: nullcontext()
+    trainer.straggler_detector = SimpleNamespace(profile_section=lambda *args: nullcontext())
+    trainer._run_active_forward_with_exact_retry = lambda *args: (output, loss)
+    trainer.callbacks = SimpleNamespace(
+        on_before_forward=lambda **kwargs: None,
+        on_after_forward=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("after")) if phase == "after" else None,
+        on_before_backward=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("before")) if phase == "before" else None,
+    )
+    import cosmos_framework.trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module.distributed, "ddp_sync_grad", lambda *args: nullcontext())
+    if phase == "capture":
+        monkeypatch.setenv("PSM_R08_GATE_B_CAPTURE_ONLY", "1")
+        trainer.training_step(object(), object(), None, SimpleNamespace(is_enabled=lambda: False), {"canonical_production_segment_mode": True})
+    else:
+        with pytest.raises(RuntimeError, match=phase):
+            trainer.training_step(object(), object(), None, SimpleNamespace(is_enabled=lambda: False), {"canonical_production_segment_mode": True})
+    assert capability.adapter._native_forward_capabilities == {}
+    assert capability.adapter._scan_requests == set() and capability.adapter._scan_results == {}
+    assert capability.adapter.frontier._states == {}
+    assert request.scheduler.snapshot == scheduler_before
+    assert request.transaction.snapshot().terminal_failure_code == code
+    assert all(parameter.grad is None for parameter in capability.slow_parameters)
 
 
 def _production_model(*, memory_init_training) -> tuple[SimpleNamespace, list[str]]:
