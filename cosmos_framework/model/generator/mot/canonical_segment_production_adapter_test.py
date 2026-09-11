@@ -467,6 +467,50 @@ def test_adapter_retry_preserves_original_frozen_transition_exactly_once() -> No
     assert retry_request.transaction.snapshot().completed_members == (0,)
 
 
+def test_adapter_consumes_exact_committed_prefix_suffix_recovery_once() -> None:
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+
+    def member(index: int, count: int) -> MicrobatchPlanMember:
+        identity = SegmentIdentity(0, "episode", "category", index, index, "source")
+        record = ChronologyCountRecord(0, "episode", "category", "source", 0, count, False, "manifest")
+        return MicrobatchPlanMember(
+            index, (identity,), (provenance,), (record,), (count,), count,
+            QueueEpochSnapshot(1, 0, "catalog", (("category", 0),)), (),
+        )
+
+    def batch(count: int) -> SegmentBatch:
+        return SegmentBatch(
+            torch.zeros(1, count, 96), tuple(tuple(f"s{step}" for step in range(count)) for _ in range(1)),
+            torch.ones(1, count, dtype=torch.bool), torch.arange(count).reshape(1, count),
+            torch.zeros(1, count, 96), torch.zeros(1, count, 10),
+            torch.tensor([[False, *([True] * (count - 1))]]),
+            torch.tensor([[-1, *range(count - 1)]]), torch.tensor([0]), ("episode",), ("category",), provenance,
+        )
+
+    members = (member(0, 2), member(1, 5), member(2, 3))
+    plan = CanonicalGAWindowPlan(members, 10, 3, "suffix")
+    scheduler = CanonicalBatchScheduler(ProjectedSchedulerState(QueueEpochSnapshot(1, 0, "catalog", ()), ()))
+    transaction = CanonicalBatchWindowTransaction(plan)
+    transaction.mark_backward_started(0)
+    transaction.mark_reconciled(0)
+    request = CanonicalProductionSegmentRequest(scheduler, plan, transaction, members[1], 1, batch(5))
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+
+    with pytest.raises(CanonicalSegmentContractError, match="transient source"):
+        adapter.derive_suffix_recovery(request, failure_kind="NONFINITE")
+    capability = adapter.derive_suffix_recovery(request, failure_kind="LOAD_DECODE_TRANSIENT")
+    recovered = adapter.consume_suffix_recovery(capability, segment_batches=(batch(5), batch(3)))
+    assert tuple(item.member_index for item in recovered) == (0, 1)
+    assert recovered[0].member is members[1] and recovered[1].member is members[2]
+    assert recovered[0].plan.original_n_valid_window == 8
+    assert recovered[0].plan.original_ga_effective == 2
+    with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
+        adapter.consume_suffix_recovery(capability, segment_batches=(batch(5), batch(3)))
+
+
 def test_fast_state_frontier_preserves_w0_gradients_and_slot_isolation() -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
     identities = (

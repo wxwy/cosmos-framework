@@ -149,6 +149,45 @@ def test_committed_prefix_derives_one_exact_suffix_recovery() -> None:
         transaction.derive_suffix_recovery(1)
 
 
+def test_non_degenerate_normal_and_suffix_recovery_objectives_have_exact_scaling() -> None:
+    normal = CanonicalGAWindowPlan(
+        (
+            _single_member(index=0, stop=2, exposure=(("a", 0),)),
+            _single_member(index=1, stop=5, exposure=(("a", 2),)),
+        ),
+        7,
+        2,
+        "normal-non-degenerate",
+    )
+    normal_values = (
+        normal.objective(0, torch.tensor(7.0), torch.tensor(3.0), 2),
+        normal.objective(1, torch.tensor(11.0), torch.tensor(3.0), 5),
+    )
+    torch.testing.assert_close(normal_values[0], torch.tensor(2 / 7 * 7 + 3 / 2))
+    torch.testing.assert_close(normal_values[1], torch.tensor(5 / 7 * 11 + 3 / 2))
+
+    original = CanonicalGAWindowPlan(
+        (
+            _single_member(index=0, stop=2, exposure=(("a", 0),)),
+            _single_member(index=1, stop=5, exposure=(("a", 2),)),
+            _single_member(index=2, stop=3, exposure=(("a", 7),)),
+        ),
+        10,
+        3,
+        "recovery-non-degenerate",
+    )
+    transaction = CanonicalBatchWindowTransaction(original)
+    transaction.mark_backward_started(0)
+    transaction.mark_reconciled(0)
+    recovery = transaction.derive_suffix_recovery(1).recovery_plan
+    recovery_values = (
+        recovery.objective(0, torch.tensor(13.0), torch.tensor(5.0), 5),
+        recovery.objective(1, torch.tensor(17.0), torch.tensor(5.0), 3),
+    )
+    torch.testing.assert_close(recovery_values[0], torch.tensor(5 / 8 * 13 + 5 / 2))
+    torch.testing.assert_close(recovery_values[1], torch.tensor(3 / 8 * 17 + 5 / 2))
+
+
 def test_full_valid_ga_consumer_term_degenerates_to_one_over_ga() -> None:
     first = _member()
     second = _member(index=1, exposure=(("a", 2), ("b", 1)))

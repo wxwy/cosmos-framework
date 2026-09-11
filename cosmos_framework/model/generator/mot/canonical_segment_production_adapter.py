@@ -13,6 +13,7 @@ from .canonical_segment_adapter_scheduler import (
     CanonicalBatchWindowTransaction,
     CanonicalGAWindowPlan,
     CanonicalSegmentContractError,
+    CanonicalSuffixRecovery,
     MicrobatchPlanMember,
     NativeConsumerBatch,
     PreparedCanonicalReconcile,
@@ -426,6 +427,14 @@ class CanonicalProductionRetryCapability:
     retry_transaction: CanonicalBatchWindowTransaction
 
 
+@dataclass(frozen=True)
+class CanonicalProductionSuffixRecoveryCapability:
+    """One-shot adapter authority to turn an exact suffix into local requests."""
+
+    original_request: CanonicalProductionSegmentRequest
+    recovery: CanonicalSuffixRecovery
+
+
 def _fp32_clone(state: ContinualTTTFastState, *, detach: bool) -> ContinualTTTFastState:
     values = (value.detach() if detach else value for value in state)
     return ContinualTTTFastState(*(value.to(dtype=torch.float32).clone() for value in values))
@@ -488,6 +497,7 @@ class CanonicalProductionAdapter:
         self._post_mutation_commits: set[int] = set()
         self._native_forward_capabilities: dict[int, CanonicalNativeForwardCapability] = {}
         self._retry_capabilities: set[int] = set()
+        self._suffix_recovery_capabilities: set[int] = set()
 
     def retry_first_member_pre_backward(
         self, request: CanonicalProductionSegmentRequest
@@ -544,6 +554,61 @@ class CanonicalProductionAdapter:
             raise CanonicalSegmentContractError("retry capability lineage is foreign or stale")
         self._retry_capabilities.remove(id(capability))
         return retry
+
+    def derive_suffix_recovery(
+        self, request: CanonicalProductionSegmentRequest, *, failure_kind: str
+    ) -> CanonicalProductionSuffixRecoveryCapability:
+        """Mint the sole typed suffix authority after an exact committed prefix."""
+        if (
+            failure_kind != "LOAD_DECODE_TRANSIENT"
+            or request.plan.attempt != 0
+            or request.member_index <= 0
+            or request.member_index >= len(request.plan.members)
+            or request.plan.members[request.member_index] is not request.member
+            or request.transaction.plan is not request.plan
+            or id(request) in self._scan_requests
+        ):
+            raise CanonicalSegmentContractError("suffix recovery requires an exact unscanned transient source failure")
+        recovery = request.transaction.derive_suffix_recovery(request.member_index)
+        capability = CanonicalProductionSuffixRecoveryCapability(request, recovery)
+        self._suffix_recovery_capabilities.add(id(capability))
+        return capability
+
+    def consume_suffix_recovery(
+        self, capability: CanonicalProductionSuffixRecoveryCapability, *, segment_batches: tuple[SegmentBatch, ...]
+    ) -> tuple[CanonicalProductionSegmentRequest, ...]:
+        """Consume one typed recovery using only its exact original suffix members."""
+        if id(capability) not in self._suffix_recovery_capabilities:
+            raise CanonicalSegmentContractError("suffix recovery capability is foreign or already consumed")
+        original, recovery = capability.original_request, capability.recovery
+        if (
+            original.plan is not recovery.original_plan
+            or original.transaction is not recovery.original_transaction
+            or original.scheduler is None
+            or recovery.original_transaction.snapshot().completed_members
+            != tuple(range(original.member_index))
+            or len(segment_batches) != len(recovery.recovery_plan.members)
+        ):
+            raise CanonicalSegmentContractError("suffix recovery capability lineage is foreign or stale")
+        requests = tuple(
+            CanonicalProductionSegmentRequest(
+                original.scheduler,
+                recovery.recovery_plan,
+                recovery.recovery_transaction,
+                member,
+                local_index,
+                batch,
+            )
+            for local_index, (member, batch) in enumerate(
+                zip(recovery.recovery_plan.members, segment_batches, strict=True)
+            )
+        )
+        for request, original_index in zip(requests, recovery.original_member_indexes, strict=True):
+            if request.member is not recovery.original_plan.members[original_index]:
+                raise CanonicalSegmentContractError("suffix recovery member identity is foreign")
+            request.member.validate_batch(request.segment_batch)
+        self._suffix_recovery_capabilities.remove(id(capability))
+        return requests
 
     def scan(self, request: CanonicalProductionSegmentRequest) -> CanonicalProductionScanResult:
         if (
