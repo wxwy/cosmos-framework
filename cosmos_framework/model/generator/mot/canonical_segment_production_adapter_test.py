@@ -15,6 +15,7 @@ from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler im
     MicrobatchPlanMember,
     ProjectedSchedulerState,
     QueueEpochSnapshot,
+    queue_permutation,
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
     CanonicalProductionAdapter,
@@ -533,6 +534,70 @@ def test_adapter_consumes_exact_committed_prefix_suffix_recovery_once() -> None:
         adapter.complete_suffix_recovery(capability.recovery)
     with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
         adapter.consume_suffix_recovery(capability, segment_batches=(batch(5), batch(3)))
+
+
+def test_adapter_suffix_recovery_commits_each_exact_member_then_reconciles_once() -> None:
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    counts = (2, 5, 3)
+    rows = tuple(
+        CatalogRow(
+            SegmentIdentity(0, "episode", "category", index, index, "source", index == 2),
+            ChronologyCountRecord(0, "episode", "category", "source", 0, count, index == 2, "manifest"),
+            provenance,
+        )
+        for index, count in enumerate(counts)
+    )
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            QueueEpochSnapshot(
+                1, 0, "catalog", (("category", 0),),
+                (("category", queue_permutation(queue_seed=1, epoch=0, category="category", catalog_size=1)),),
+            ),
+            (("category", 0),), target_distribution=(("category", 1.0),), catalog=rows,
+        )
+    )
+    plan = scheduler.freeze_plan(slot_groups=((0,), (0,), (0,)), plan_chain_id="suffix-lifecycle")
+
+    def batch(member: MicrobatchPlanMember) -> SegmentBatch:
+        count = member.planned_n_valid
+        identity = member.row_identities[0]
+        return SegmentBatch(
+            torch.zeros(1, count, 96), (tuple(f"s{index}" for index in range(count)),),
+            torch.ones(1, count, dtype=torch.bool), torch.arange(count).reshape(1, count),
+            torch.zeros(1, count, 96), torch.zeros(1, count, 10),
+            torch.tensor([[False, *([True] * (count - 1))]]), torch.tensor([[-1, *range(count - 1)]]),
+            torch.tensor([identity.slot_id]), (identity.episode_id,), (identity.category,), provenance,
+        )
+
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+    prefix = CanonicalProductionSegmentRequest(
+        scheduler, plan, CanonicalBatchWindowTransaction(plan), plan.members[0], 0, batch(plan.members[0])
+    )
+    prefix_result = adapter.scan(prefix)
+    prefix_commit = adapter.prepare_commit(prefix, prefix_result)
+    prefix.transaction.mark_backward_started(0)
+    adapter.commit_success(prefix_commit)
+    prefix_frontier = dict(adapter.frontier._states)
+    failed = CanonicalProductionSegmentRequest(
+        scheduler, plan, prefix.transaction, plan.members[1], 1, batch(plan.members[1])
+    )
+    capability = adapter.derive_suffix_recovery(failed, failure_kind="LOAD_DECODE_TRANSIENT")
+    recovered = adapter.consume_suffix_recovery(
+        capability, segment_batches=(batch(plan.members[1]), batch(plan.members[2]))
+    )
+    for request in recovered:
+        result = adapter.scan(request)
+        commit = adapter.prepare_commit(request, result)
+        request.transaction.mark_backward_started(request.member_index)
+        adapter.commit_success(commit)
+    adapter.complete_suffix_recovery(capability.recovery)
+    assert prefix_frontier
+    assert prefix.transaction.snapshot().slow_grads_cleared
+    assert prefix.transaction.snapshot().suffix_recovery_reconciled
+    assert scheduler._frozen_transitions == []
 
 
 def test_fast_state_frontier_preserves_w0_gradients_and_slot_isolation() -> None:
