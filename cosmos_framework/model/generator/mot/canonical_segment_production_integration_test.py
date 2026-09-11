@@ -315,12 +315,16 @@ def test_activation_matrix_fails_before_legacy_routes() -> None:
 def test_adapter_binds_only_the_exact_registered_canonical_modules() -> None:
     encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
     core = ContinualTTTLocalMemoryCore(evidence_dim=256)
-    model = SimpleNamespace(net=SimpleNamespace(local_history_runtime=SimpleNamespace(encoder=encoder, recurrent_backend=core)))
+    runtime = SimpleNamespace(evidence_encoder=encoder, ttt_core=core)
+    model = SimpleNamespace(net=SimpleNamespace(local_memory_runtime=runtime))
     adapter = _canonical_production_adapter_from_model(model)
     assert adapter.encoder is encoder and adapter.core is core
     assert _canonical_production_adapter_from_model(model) is adapter
-    model._canonical_production_adapter = object()
+    runtime.ttt_core = ContinualTTTLocalMemoryCore(evidence_dim=256)
     with pytest.raises(RuntimeError, match="not bound"):
+        _canonical_production_adapter_from_model(model)
+    model = SimpleNamespace(net=SimpleNamespace(local_history_runtime=SimpleNamespace(encoder=encoder, recurrent_backend=core)))
+    with pytest.raises(RuntimeError, match="requires registered"):
         _canonical_production_adapter_from_model(model)
 
 
