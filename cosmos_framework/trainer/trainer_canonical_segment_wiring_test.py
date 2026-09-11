@@ -11,14 +11,17 @@ from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler im
     CanonicalBatchScheduler,
     CanonicalBatchWindowTransaction,
     CatalogRow,
+    ChronologyCountRecord,
     ProjectedSchedulerState,
     QueueEpochSnapshot,
+    queue_permutation,
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
+    CanonicalNativeModalityTerms,
     CanonicalProductionAdapter,
     CanonicalProductionCommitCapability,
     CanonicalProductionSegmentRequest,
-    CanonicalNativeModalityTerms,
+    CanonicalRawRowCarrier,
     build_canonical_native_loss_split,
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_integration_test import (
@@ -29,6 +32,7 @@ from cosmos_framework.model.generator.mot.local_evidence import (
     ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
 )
+from cosmos_framework.model.generator.mot.local_memory_segment import SegmentBatch, SegmentIdentity, SegmentProvenance
 from cosmos_framework.model.generator.mot.production_segment_wiring import run_native_forward_for_test
 from cosmos_framework.model.generator.mot.production_segment_wiring_test import _fixture
 from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
@@ -47,6 +51,21 @@ def _model_marker_output(wiring, segment, identity, transaction):
             "canonical_member_index": 0,
         },
         0,
+    )
+
+
+def _synthetic_carrier_for_request(request: CanonicalProductionSegmentRequest) -> CanonicalRawRowCarrier:
+    """Build an in-memory canonical carrier for one frozen synthetic member."""
+    member, batch = request.member, request.segment_batch
+    count = member.planned_n_valid
+    identity = member.row_identities[0]
+    raw = tuple({"canonical_identity": (identity.slot_id, identity.episode_id, step)} for step in range(count))
+    samples = tuple({"canonical_identity": value["canonical_identity"], "images": value, "sequence_plan": SequencePlan(has_text=False)} for value in raw)
+    return CanonicalRawRowCarrier(
+        request, member, batch, member.row_identities, member.row_chronology, (raw,), (samples,),
+        {"images": [sample["images"] for sample in samples], "sequence_plan": [sample["sequence_plan"] for sample in samples]},
+        raw_row_source_identities=(tuple((identity.slot_id, identity.episode_id, identity.source_digest, step) for step in range(count)),),
+        row_model_source_rows=(raw,),
     )
 
 
@@ -258,6 +277,109 @@ def test_canonical_native_dispatcher_scales_and_backwards_exactly_once() -> None
     assert scaler.scaled == [objective] and scaler.backward_calls == 1
     torch.testing.assert_close(objective, torch.tensor(2 / 7 * 7 + 3 / 2))
     assert request.transaction.snapshot().completed_members == (0,)
+
+
+def test_canonical_native_dispatcher_recovery_scales_and_commits_exact_suffix_once() -> None:
+    """Exercise the frozen ``(5, 3)`` recovery plan through the real dispatcher seam."""
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    counts = (2, 5, 3)
+    rows = tuple(
+        CatalogRow(
+            SegmentIdentity(0, "episode", "category", index, index, "source", index == 2),
+            ChronologyCountRecord(0, "episode", "category", "source", 0, count, index == 2, "manifest"),
+            provenance,
+        )
+        for index, count in enumerate(counts)
+    )
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            QueueEpochSnapshot(
+                1, 0, "catalog", (("category", 0),),
+                (("category", queue_permutation(queue_seed=1, epoch=0, category="category", catalog_size=1)),),
+            ),
+            (("category", 0),), target_distribution=(("category", 1.0),), catalog=rows,
+        )
+    )
+    plan = scheduler.freeze_plan(slot_groups=((0,), (0,), (0,)), plan_chain_id="recovery-native-dispatch")
+    assert (tuple(member.planned_n_valid for member in plan.members), plan.original_n_valid_window, plan.original_ga_effective) == ((2, 5, 3), 10, 3)
+
+    def batch(member) -> SegmentBatch:
+        count = member.planned_n_valid
+        identity = member.row_identities[0]
+        return SegmentBatch(
+            torch.zeros(1, count, 96), (tuple(f"s{index}" for index in range(count)),),
+            torch.ones(1, count, dtype=torch.bool), torch.arange(count).reshape(1, count),
+            torch.zeros(1, count, 96), torch.zeros(1, count, 10),
+            torch.tensor([[False, *([True] * (count - 1))]]), torch.tensor([[-1, *range(count - 1)]]),
+            torch.tensor([identity.slot_id]), (identity.episode_id,), (identity.category,), provenance,
+        )
+
+    class CountingScaler:
+        def __init__(self) -> None:
+            self.scaled: list[torch.Tensor] = []
+            self.backward_calls = 0
+
+        def is_enabled(self) -> bool:
+            return False
+
+        def scale(self, value: torch.Tensor):
+            self.scaled.append(value)
+            owner = self
+
+            class CountedTensor:
+                def backward(self) -> None:
+                    owner.backward_calls += 1
+                    value.backward()
+
+            return CountedTensor()
+
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+    original = CanonicalBatchWindowTransaction(plan)
+    prefix = CanonicalProductionSegmentRequest(scheduler, plan, original, plan.members[0], 0, batch(plan.members[0]))
+    prefix_result = adapter.scan(prefix)
+    prefix_commit = adapter.prepare_commit(prefix, prefix_result)
+    original.mark_backward_started(0)
+    adapter.commit_success(prefix_commit)
+    prefix_frontier = dict(adapter.frontier._states)
+    failed = CanonicalProductionSegmentRequest(scheduler, plan, original, plan.members[1], 1, batch(plan.members[1]))
+    recovery_capability = adapter.derive_suffix_recovery(
+        failed, source_transient=adapter.declare_retryable_source_transient(failed)
+    )
+    recovered = adapter.consume_suffix_recovery(
+        recovery_capability, segment_batches=tuple(batch(member) for member in plan.members[1:])
+    )
+    assert (tuple(request.member.planned_n_valid for request in recovered), recovered[0].plan.original_n_valid_window, recovered[0].plan.original_ga_effective) == ((5, 3), 8, 2)
+    scaler = CountingScaler()
+    objectives = []
+    for request, primary_value in zip(recovered, (13.0, 17.0), strict=True):
+        result = adapter.scan(request)
+        prepared = adapter.attach_native_preparation(
+            adapter.prepare_native_inputs(
+                request, result, _synthetic_carrier_for_request(request), input_image_key="images", input_video_key="video"
+            ),
+            input_text_indexes=[[] for _ in range(request.member.planned_n_valid)],
+            sequence_plans=[SequencePlan(has_text=False, has_local_memory=prefix is not None) for prefix in result.gathered.local_prefixes],
+            gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[],
+        )
+        anchor = torch.nn.Parameter(torch.ones(()))
+        capability = adapter.bind_native_forward(
+            prepared,
+            build_canonical_native_loss_split(
+                consumer_identities=prepared.traversal.identities,
+                modalities={"vision": CanonicalNativeModalityTerms(torch.full((request.member.planned_n_valid,), primary_value, requires_grad=True), tuple(range(request.member.planned_n_valid)), 1.0)},
+                sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 5.0, graph_anchor=anchor,
+            ),
+        )
+        objectives.append(object.__new__(ImaginaireTrainer)._run_canonical_native_backward({"psm_canonical_native_forward": capability}, scaler))
+    torch.testing.assert_close(torch.stack(objectives), torch.tensor((10.625, 8.875)))
+    assert scaler.scaled == objectives and scaler.backward_calls == 2
+    adapter.complete_suffix_recovery(recovery_capability.recovery)
+    assert prefix_frontier and original.snapshot().slow_grads_cleared
+    assert original.snapshot().suffix_recovery_reconciled and scheduler._frozen_transitions == []
+    assert not adapter._suffix_recovery_requests and not adapter._suffix_recovery_scans
 
 
 @pytest.mark.parametrize("scaler_enabled", (True, False))
