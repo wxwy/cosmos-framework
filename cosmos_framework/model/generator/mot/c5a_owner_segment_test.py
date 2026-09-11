@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from .c5a_owner_segment import AdmissionAuthority, AdmissionCapability, C5AOwnerSegmentCPU
+from .config_checkpoint_contract import SELECTORS
 from .local_evidence import ContinualTTTLocalMemoryCore, LocalEvidenceEncoder, StatelessLocalReplayReadout
 
 
@@ -180,6 +181,16 @@ def test_fast_state_is_not_registered_as_slow_parameters() -> None:
     _, runtime, _ = _runtime()
     names = {name for name, _ in runtime.core.named_parameters()}
     assert names == {
+        "slot_queries", "w0_fast_in_weight", "w0_fast_in_bias", "w0_fast_out_weight", "w0_fast_out_bias",
+        "key_proj.weight", "key_proj.bias", "query_proj.weight", "query_proj.bias", "value_proj.weight", "value_proj.bias",
+    }
+
+
+def test_core_slow_keys_match_the_frozen_ttt_selector_namespace() -> None:
+    _, runtime, _ = _runtime()
+    names = {f"local_memory_runtime.ttt_core.{name}" for name, _ in runtime.core.named_parameters()}
+    assert all(name.startswith(SELECTORS[1]) for name in names)
+    assert {name.removeprefix(SELECTORS[1]) for name in names} == {
         "slot_queries", "w0_fast_in_weight", "w0_fast_in_bias", "w0_fast_out_weight", "w0_fast_out_bias",
         "key_proj.weight", "key_proj.bias", "query_proj.weight", "query_proj.bias", "value_proj.weight", "value_proj.bias",
     }

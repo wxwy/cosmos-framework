@@ -159,9 +159,9 @@ def _canonical_production_request_from_batch(
 
 def _canonical_production_adapter_from_model(model: Any) -> CanonicalProductionAdapter:
     """Return only an adapter bound to the model's already-registered modules."""
-    runtime = getattr(getattr(model, "net", None), "local_history_runtime", None)
-    encoder = getattr(runtime, "encoder", None)
-    core = getattr(runtime, "recurrent_backend", None)
+    runtime = getattr(getattr(model, "net", None), "local_memory_runtime", None)
+    encoder = getattr(runtime, "evidence_encoder", None)
+    core = getattr(runtime, "ttt_core", None)
     if not isinstance(encoder, LocalEvidenceEncoder) or not isinstance(core, ContinualTTTLocalMemoryCore):
         raise RuntimeError("canonical-production requires registered canonical encoder and TTT core")
     if encoder.feature_config is not CANONICAL_EVIDENCE_FEATURE_CONFIG:
@@ -410,22 +410,29 @@ class OmniMoTModel(ImaginaireModel):
                         )
                 else:
                     raise ValueError(f"unsupported local_history_backend: {self.config.local_history_backend}")
-                net.local_history_runtime = LocalHistoryRuntime(
-                    LocalEvidenceEncoder(
-                        evidence_dim=self.config.local_history_evidence_dim,
-                        visual_dim=96,
-                        feature_config=(
-                            CANONICAL_EVIDENCE_FEATURE_CONFIG
-                            if self.config.local_ttt_enabled
-                            else LEGACY_EVIDENCE_FEATURE_CONFIG
-                        ),
+                encoder = LocalEvidenceEncoder(
+                    evidence_dim=self.config.local_history_evidence_dim,
+                    visual_dim=96,
+                    feature_config=(
+                        CANONICAL_EVIDENCE_FEATURE_CONFIG
+                        if self.config.local_ttt_enabled
+                        else LEGACY_EVIDENCE_FEATURE_CONFIG
                     ),
-                    StatelessLocalReplayReadout(
-                        evidence_dim=self.config.local_history_evidence_dim,
-                        local_dim=self.config.local_memory_dim,
-                    ),
-                    local_backend,
                 )
+                if self.config.local_ttt_enabled:
+                    runtime = torch.nn.Module()
+                    runtime.evidence_encoder = encoder
+                    runtime.ttt_core = local_backend
+                    net.local_memory_runtime = runtime
+                else:
+                    net.local_history_runtime = LocalHistoryRuntime(
+                        encoder,
+                        StatelessLocalReplayReadout(
+                            evidence_dim=self.config.local_history_evidence_dim,
+                            local_dim=self.config.local_memory_dim,
+                        ),
+                        local_backend,
+                    )
             net.pad_for_cuda_graphs = self.config.compile.use_cuda_graphs
 
             # Inject LoRA BEFORE FSDP wrap, while still on meta device. The
@@ -1060,6 +1067,8 @@ class OmniMoTModel(ImaginaireModel):
     def _inject_local_history(self, data_batch: dict[str, Any], sequence_plans: list[SequencePlan]) -> None:
         """Convert dataset history fields into optional clean Local payloads."""
         local_history_runtime = getattr(self.net, "local_history_runtime", None)
+        if local_history_runtime is None and getattr(self.config, "local_ttt_enabled", False):
+            local_history_runtime = getattr(self.net, "local_memory_runtime", None)
         if local_history_runtime is None:
             return
         required = (

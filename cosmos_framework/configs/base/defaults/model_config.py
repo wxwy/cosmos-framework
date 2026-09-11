@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-from typing import Any, Literal
-
 import math
+from typing import Any, Callable, Literal
 
 import attrs
 
@@ -168,14 +167,24 @@ def _require_ttt_finite_positive_scalar(inst: object, attr: attrs.Attribute, val
 
 def _require_ttt_k_local(inst: object, attr: attrs.Attribute, value: object) -> None:
     del inst
-    if isinstance(value, bool) or value not in (1, 4, 8):
-        raise ValueError(f"{attr.name} must be a positive integer in {{1, 4, 8}}.")
+    if isinstance(value, bool) or not isinstance(value, int) or value != 1:
+        raise ValueError(f"{attr.name} must be exactly 1.")
+
+
+def _require_ttt_exact_string(expected: str) -> Callable[[object, attrs.Attribute, object], None]:
+    """Build the strict first-rollout validator for a versioned TTT identity field."""
+
+    def _validator(inst: object, attr: attrs.Attribute, value: object) -> None:
+        del inst
+        if value != expected:
+            raise ValueError(f"{attr.name} must be {expected!r}.")
+
+    return _validator
 
 
 def _require_ttt_runtime_evidence_steps(inst: object, attr: attrs.Attribute, value: object) -> None:
     del inst
-    if isinstance(value, bool) or not isinstance(value, int) or value != 1:
-        raise ValueError(f"{attr.name} is fixed at 1.")
+    raise ValueError(f"{attr.name} was removed from the Local Memory config identity.")
 
 
 # Don't have any defaults and init only in config file.
@@ -346,14 +355,22 @@ class OmniMoTModelConfig:
     # R09-B TTT active training wiring. Disabled by default so No-Memory and
     # R08/B1 checkpoints and runtime behavior remain unchanged. Validation
     # mirrors config_checkpoint_contract.LocalMemoryConfig: positive int /
-    # finite positive scalar / k_local in {1,4,8} / runtime_evidence_steps
-    # fixed at 1 / bool rejected. ``local_ttt_enabled=True`` requires
+    # finite positive scalar / k_local exactly 1 / versioned feature, fast-state
+    # and resume identity / bool rejected. ``local_ttt_enabled=True`` requires
     # ``local_history_enabled=True`` and ``local_history_backend="ttt_fast_weight"``.
     local_ttt_enabled: bool = attrs.field(default=False, validator=_require_ttt_bool)
     ttt_tbptt_steps: int = attrs.field(default=16, validator=_require_ttt_positive_int)
     ttt_inner_lr: float = attrs.field(default=0.1, validator=_require_ttt_finite_positive_scalar)
     k_local: int = attrs.field(default=1, validator=_require_ttt_k_local)
-    runtime_evidence_steps: int = attrs.field(default=1, validator=_require_ttt_runtime_evidence_steps)
+    local_evidence_feature_version: str = attrs.field(
+        default="causal_visual96_executed_action10_v1",
+        validator=_require_ttt_exact_string("causal_visual96_executed_action10_v1"),
+    )
+    local_fast_state_dtype: str = attrs.field(default="fp32", validator=_require_ttt_exact_string("fp32"))
+    local_runtime_resume_mode: str = attrs.field(
+        default="slow_only_no_mid_episode_resume",
+        validator=_require_ttt_exact_string("slow_only_no_mid_episode_resume"),
+    )
 
     # When False, removes bias from vae2llm, sound2llm, and the two Linear layers inside
     # time_embedder.  These biases seem to inject token-constant DC offsets that dominate

@@ -72,22 +72,46 @@ def test_default_setup_loads_vision_tokenizer(monkeypatch: pytest.MonkeyPatch) -
 def test_canonical_marker_has_disable_first_precedence_without_legacy_lifecycle() -> None:
     from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
 
-    sentinel = object()
     lifecycle = SimpleNamespace(process_sample=Mock())
     enabled = SimpleNamespace(
         config=SimpleNamespace(local_ttt_enabled=True),
-        _canonical_local_memory_segment_forward=Mock(return_value=sentinel),
+        _canonical_local_memory_segment_forward=Mock(),
         _ttt_lifecycle=lifecycle,
     )
-    assert OmniMoTModel.training_step(enabled, {"canonical_local_memory_segment": True}, 0) is sentinel
-    enabled._canonical_local_memory_segment_forward.assert_called_once()
+    with pytest.raises(ValueError, match="exact canonical-production mode"):
+        OmniMoTModel.training_step(enabled, {"canonical_local_memory_segment": True}, 0)
+    enabled._canonical_local_memory_segment_forward.assert_not_called()
     lifecycle.process_sample.assert_not_called()
 
     disabled = SimpleNamespace(
         config=SimpleNamespace(local_ttt_enabled=False),
         _canonical_local_memory_segment_forward=Mock(side_effect=AssertionError("canonical marker must be disabled")),
-        _get_training_inputs=Mock(side_effect=RuntimeError("native path reached")),
+        _get_training_inputs=Mock(),
     )
-    with pytest.raises(RuntimeError, match="native path reached"):
+    with pytest.raises(ValueError, match="canonical or legacy Local-Memory markers"):
         OmniMoTModel.training_step(disabled, {"canonical_local_memory_segment": True}, 0)
     disabled._canonical_local_memory_segment_forward.assert_not_called()
+    disabled._get_training_inputs.assert_not_called()
+
+
+def test_canonical_adapter_binds_only_the_registered_ttt_owner() -> None:
+    import torch
+
+    from cosmos_framework.model.generator.mot.local_evidence import (
+        CANONICAL_EVIDENCE_FEATURE_CONFIG,
+        ContinualTTTLocalMemoryCore,
+        LocalEvidenceEncoder,
+    )
+    from cosmos_framework.model.generator.omni_mot_model import _canonical_production_adapter_from_model
+
+    runtime = torch.nn.Module()
+    runtime.evidence_encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
+    runtime.ttt_core = ContinualTTTLocalMemoryCore()
+    model = SimpleNamespace(net=SimpleNamespace(local_memory_runtime=runtime))
+
+    adapter = _canonical_production_adapter_from_model(model)
+    assert adapter.encoder is runtime.evidence_encoder
+    assert adapter.core is runtime.ttt_core
+    assert _canonical_production_adapter_from_model(model) is adapter
+    model.net.local_history_runtime = SimpleNamespace(encoder=runtime.evidence_encoder, recurrent_backend=runtime.ttt_core)
+    assert _canonical_production_adapter_from_model(model) is adapter
