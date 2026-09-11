@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
+from cosmos_framework.data.generator.sequence_packing import SequencePlan
 from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler import (
     CanonicalBatchScheduler,
     CanonicalBatchWindowTransaction,
@@ -16,6 +17,10 @@ from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler im
 from cosmos_framework.model.generator.mot.canonical_segment_production_adapter import (
     CanonicalProductionAdapter,
     CanonicalProductionSegmentRequest,
+    build_canonical_native_loss_split,
+)
+from cosmos_framework.model.generator.mot.canonical_segment_production_integration_test import (
+    _bound_request_and_carrier,
 )
 from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
@@ -250,6 +255,60 @@ def test_restore_rejects_late_optimizer_or_scheduler_defect_before_mutation() ->
     assert all(torch.equal(value, before_slow[name]) for name, value in expected.items())
     _assert_state_equal(optimizer.state_dict(), before_optimizer)
     _assert_state_equal(state_scheduler.state_dict(), before_scheduler)
+
+
+def test_restore_rejects_reordered_duplicate_and_missing_optimizer_membership_before_mutation() -> None:
+    root, projector, modality, adapter, scheduler = _fixture()
+    expected = canonical_slow_inventory(root, projector, modality)
+    optimizer, state_scheduler = _optimizer_and_scheduler(expected)
+    payload = slow_checkpoint_payload(expected, LocalMemoryConfig(), optimizer=optimizer, scheduler=state_scheduler)
+    before = {name: value.detach().clone() for name, value in expected.items()}
+    candidates = (
+        torch.optim.AdamW(tuple(reversed(tuple(expected.values()))), lr=0.1),
+        torch.optim.AdamW(tuple(expected.values())[:-1], lr=0.1),
+    )
+    for candidate in candidates:
+        with pytest.raises(ValueError, match="optimizer group"):
+            _restore(root, projector, modality, adapter, scheduler, payload, expected, optimizer=candidate, state_scheduler=state_scheduler)
+        assert all(torch.equal(value, before[name]) for name, value in expected.items())
+    duplicate = torch.optim.AdamW((tuple(expected.values())[0], *tuple(expected.values())), lr=0.1)
+    with pytest.raises(ValueError, match="optimizer group"):
+        _restore(root, projector, modality, adapter, scheduler, payload, expected, optimizer=duplicate, state_scheduler=state_scheduler)
+    assert all(torch.equal(value, before[name]) for name, value in expected.items())
+
+
+def test_restore_rejects_real_native_forward_commit_and_retry_authorities_before_mutation() -> None:
+    root, projector, modality, adapter, _ = _fixture()
+    expected = canonical_slow_inventory(root, projector, modality)
+    payload = slow_checkpoint_payload(expected, LocalMemoryConfig())
+    before = {name: value.detach().clone() for name, value in expected.items()}
+    request, carrier = _bound_request_and_carrier()
+    result = adapter.scan(request)
+    prepared = adapter.prepare_native_inputs(request, result, carrier, input_image_key="images", input_video_key="video")
+    prepared = adapter.attach_native_preparation(
+        prepared, input_text_indexes=[[], []], sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)],
+        gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[]
+    )
+    anchor = torch.ones((), requires_grad=True)
+    native = adapter.bind_native_forward(
+        prepared,
+        build_canonical_native_loss_split(
+            consumer_identities=prepared.traversal.identities,
+            modalities={},
+            sample_level_scale=torch.ones(()),
+            auxiliary_loss=anchor * 0.0,
+            graph_anchor=anchor,
+        ),
+    )
+    with pytest.raises(ValueError, match="pending"):
+        _restore(root, projector, modality, adapter, request.scheduler, payload, expected)
+    adapter.abort_native_forward(native)
+    scheduler, transaction, retry_request, _ = _real_request()
+    retry = adapter.retry_first_member_pre_backward(retry_request)
+    with pytest.raises(ValueError, match="pending"):
+        _restore(root, projector, modality, adapter, scheduler, payload, expected)
+    adapter.consume_retry(retry)
+    assert all(torch.equal(value, before[name]) for name, value in expected.items())
 
 
 def test_restore_rejects_real_pending_and_committed_runtime_authorities_before_mutation() -> None:
