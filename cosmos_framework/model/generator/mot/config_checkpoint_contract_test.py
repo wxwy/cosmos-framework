@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import json
 from dataclasses import replace
 
 import pytest
@@ -36,6 +38,7 @@ from cosmos_framework.model.generator.mot.local_memory_segment import (
     SegmentProvenance,
 )
 
+from . import config_checkpoint_contract as checkpoint_contract
 from .config_checkpoint_contract import (
     FeatureConfigIdentity,
     LocalMemoryConfig,
@@ -112,6 +115,44 @@ def _assert_state_equal(actual: object, expected: object) -> None:
         assert actual == expected
 
 
+def _canonical_sha256(value: dict[str, object]) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _identity_reject_snapshot(root: _RuntimeRoot, projector: nn.Linear, modality: nn.Parameter, adapter: CanonicalProductionAdapter, scheduler: CanonicalBatchScheduler, expected: dict[str, nn.Parameter], optimizer: torch.optim.Optimizer, state_scheduler: torch.optim.lr_scheduler.ExponentialLR) -> dict[str, object]:
+    pending_names = (
+        "_scan_requests", "_scan_results", "_commit_capabilities", "_post_mutation_commits",
+        "_native_forward_capabilities", "_retry_capabilities", "_suffix_recovery_capabilities",
+        "_retryable_source_transient_capabilities", "_suffix_recovery_requests",
+        "_active_suffix_recoveries", "_suffix_recovery_request_ids", "_suffix_recovery_scans",
+        "_suffix_recovery_commits",
+    )
+    return {
+        "slow": {name: value.detach().clone() for name, value in expected.items()},
+        "optimizer": copy.deepcopy(optimizer.state_dict()),
+        "state_scheduler": copy.deepcopy(state_scheduler.state_dict()),
+        "iteration": 0,
+        "objects": (id(root), id(root.evidence_encoder), id(root.ttt_core), id(projector), id(modality), id(adapter), id(adapter.frontier), id(scheduler), *(id(value) for value in expected.values())),
+        "frontier": copy.deepcopy(adapter.frontier._states),
+        "pending": {name: (id(getattr(adapter, name)), copy.deepcopy(getattr(adapter, name))) for name in pending_names},
+        "frozen_transitions": (id(scheduler._frozen_transitions), copy.deepcopy(scheduler._frozen_transitions)),
+    }
+
+
+def _assert_identity_reject_snapshot(snapshot: dict[str, object], root: _RuntimeRoot, projector: nn.Linear, modality: nn.Parameter, adapter: CanonicalProductionAdapter, scheduler: CanonicalBatchScheduler, expected: dict[str, nn.Parameter], optimizer: torch.optim.Optimizer, state_scheduler: torch.optim.lr_scheduler.ExponentialLR) -> None:
+    assert all(torch.equal(value, snapshot["slow"][name]) for name, value in expected.items())
+    _assert_state_equal(optimizer.state_dict(), snapshot["optimizer"])
+    _assert_state_equal(state_scheduler.state_dict(), snapshot["state_scheduler"])
+    assert snapshot["iteration"] == 0
+    assert snapshot["objects"] == (id(root), id(root.evidence_encoder), id(root.ttt_core), id(projector), id(modality), id(adapter), id(adapter.frontier), id(scheduler), *(id(value) for value in expected.values()))
+    assert adapter.frontier._states == snapshot["frontier"]
+    for name, (object_id, value) in snapshot["pending"].items():
+        assert id(getattr(adapter, name)) == object_id
+        assert getattr(adapter, name) == value
+    assert id(scheduler._frozen_transitions) == snapshot["frozen_transitions"][0]
+    assert scheduler._frozen_transitions == snapshot["frozen_transitions"][1]
+
+
 def _real_request() -> tuple[CanonicalBatchScheduler, CanonicalBatchWindowTransaction, CanonicalProductionSegmentRequest, SegmentBatch]:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
     identity = SegmentIdentity(0, "episode", "category", 0, 0, "source")
@@ -178,6 +219,24 @@ def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
     assert identity["schema"] == "synthetic_cpu_static_v1"
     assert "child_git_revision" not in identity
     assert all(len(identity[name]) == 64 for name in identity if name != "schema")
+    descriptor = {
+        "schema": "synthetic_cpu_static_fixture_descriptor_v1",
+        "fixture_kind": "local_memory_checkpoint_cpu_static",
+        "feature_config_schema": "canonical_native_local_ttt_config_v2",
+    }
+    manifest = {
+        "schema": "synthetic_cpu_static_fixture_manifest_v1",
+        "fixture_descriptor_sha256": _canonical_sha256(descriptor),
+        "payload_version": 1,
+    }
+    source = {
+        "schema": "synthetic_cpu_static_fixture_source_v1",
+        "fixture_manifest_sha256": _canonical_sha256(manifest),
+        "contract_module": "cosmos_framework.model.generator.mot.config_checkpoint_contract",
+    }
+    assert identity["fixture_descriptor_sha256"] == _canonical_sha256(descriptor)
+    assert identity["fixture_manifest_sha256"] == _canonical_sha256(manifest)
+    assert identity["fixture_source_sha256"] == _canonical_sha256(source)
 
 
 def test_pristine_progress_predicate_is_exact_and_fail_closed() -> None:
@@ -308,6 +367,44 @@ def test_slow_payload_rejects_runtime_keys_and_stages_without_mutation() -> None
     with pytest.raises(ValueError, match="registered Local Memory ABI"):
         _restore(feature_root, feature_projector, feature_modality, feature_adapter, feature_scheduler, _payload(feature_expected), feature_expected)
     assert all(torch.equal(value, before[name]) for name, value in expected.items())
+
+
+def test_synthetic_identity_rejects_preserve_full_live_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    root, projector, modality, adapter, scheduler = _fixture()
+    expected = canonical_slow_inventory(root, projector, modality)
+    optimizer, state_scheduler = _optimizer_and_scheduler(expected)
+    payload = _payload(expected, optimizer=optimizer, scheduler=state_scheduler, iteration=0)
+    snapshot = _identity_reject_snapshot(root, projector, modality, adapter, scheduler, expected, optimizer, state_scheduler)
+    base_identity = payload["base_identity"]
+    production_identity = {
+        "schema": "root_gitlink_authority_v1",
+        "root_git_revision": "a" * 40,
+        "root_tree_sha256": "b" * 64,
+        "submodule_path": "cosmos-framework",
+        "child_git_revision": "da95139d338ef2ab2cff89d7bdb2a237f711877c",
+        "child_tree_sha256": "c" * 64,
+        "canonical_model_config_sha256": base_identity["canonical_model_config_sha256"],
+        "checkpoint_source_descriptor_sha256": "d" * 64,
+    }
+    identities = (
+        {key: value for key, value in base_identity.items() if key != "fixture_descriptor_sha256"},
+        {**base_identity, "foreign": "x"},
+        {**base_identity, "fixture_manifest_sha256": "g" * 64},
+        {**base_identity, "fixture_source_sha256": 1},
+        {**base_identity, "child_git_revision": "d0d73338ca1b0e8ae350d447181a804308241390"},
+        {**base_identity, "child_git_revision": "da95139d338ef2ab2cff89d7bdb2a237f711877c"},
+        production_identity,
+    )
+    for identity in identities:
+        damaged = copy.deepcopy(payload)
+        damaged["base_identity"] = identity
+        with pytest.raises(ValueError, match="identity"):
+            _restore(root, projector, modality, adapter, scheduler, damaged, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
+        _assert_identity_reject_snapshot(snapshot, root, projector, modality, adapter, scheduler, expected, optimizer, state_scheduler)
+    monkeypatch.setitem(checkpoint_contract._SYNTHETIC_FIXTURE_DESCRIPTOR, "fixture_kind", "drifted_fixture")
+    with pytest.raises(ValueError, match="synthetic fixture descriptor"):
+        _restore(root, projector, modality, adapter, scheduler, payload, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
+    _assert_identity_reject_snapshot(snapshot, root, projector, modality, adapter, scheduler, expected, optimizer, state_scheduler)
 
 
 def test_restore_preflight_is_atomic() -> None:

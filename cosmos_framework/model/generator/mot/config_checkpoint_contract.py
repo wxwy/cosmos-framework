@@ -53,6 +53,14 @@ _SYNTHETIC_FIXTURE_AUTHORITY_KEYS = frozenset(
         "fixture_source_sha256",
     }
 )
+_SYNTHETIC_FIXTURE_DESCRIPTOR = {
+    "schema": "synthetic_cpu_static_fixture_descriptor_v1",
+    "fixture_kind": "local_memory_checkpoint_cpu_static",
+    "feature_config_schema": _FEATURE_CONFIG_SCHEMA,
+}
+_SYNTHETIC_FIXTURE_DESCRIPTOR_KEYS = frozenset({"schema", "fixture_kind", "feature_config_schema"})
+_SYNTHETIC_FIXTURE_MANIFEST_SCHEMA = "synthetic_cpu_static_fixture_manifest_v1"
+_SYNTHETIC_FIXTURE_SOURCE_SCHEMA = "synthetic_cpu_static_fixture_source_v1"
 _OPTIMIZER_IDENTITY_SCHEMA = "canonical_native_local_ttt_optimizer_v1"
 _SCHEDULER_IDENTITY_SCHEMA = "canonical_native_local_ttt_scheduler_v1"
 _RUNTIME_KEY_FRAGMENTS = ("continualtttfaststate", "fast_state", "frontier", "pending", "scan", "native_forward", "commit", "retry", "suffix", "transaction", "receipt", "cursor", "queue", "rng", "grad")
@@ -119,11 +127,45 @@ def _is_lower_hex(value: object, length: int) -> bool:
 
 def _synthetic_fixture_authority() -> dict[str, object]:
     """Return the fixed in-memory fixture authority, never production Git provenance."""
+    descriptor = dict(_SYNTHETIC_FIXTURE_DESCRIPTOR)
+    if (
+        set(descriptor) != _SYNTHETIC_FIXTURE_DESCRIPTOR_KEYS
+        or descriptor.get("schema") != "synthetic_cpu_static_fixture_descriptor_v1"
+        or descriptor.get("fixture_kind") != "local_memory_checkpoint_cpu_static"
+        or descriptor.get("feature_config_schema") != _FEATURE_CONFIG_SCHEMA
+    ):
+        raise ValueError("synthetic fixture descriptor is not canonical")
+    descriptor_sha256 = _canonical_sha256(descriptor)
+    manifest = {
+        "schema": _SYNTHETIC_FIXTURE_MANIFEST_SCHEMA,
+        "fixture_descriptor_sha256": descriptor_sha256,
+        "payload_version": _PAYLOAD_VERSION,
+    }
+    if (
+        set(manifest) != {"schema", "fixture_descriptor_sha256", "payload_version"}
+        or manifest["schema"] != _SYNTHETIC_FIXTURE_MANIFEST_SCHEMA
+        or not _is_lower_hex(manifest["fixture_descriptor_sha256"], 64)
+        or manifest["payload_version"] != _PAYLOAD_VERSION
+    ):
+        raise ValueError("synthetic fixture manifest is not canonical")
+    manifest_sha256 = _canonical_sha256(manifest)
+    source = {
+        "schema": _SYNTHETIC_FIXTURE_SOURCE_SCHEMA,
+        "fixture_manifest_sha256": manifest_sha256,
+        "contract_module": "cosmos_framework.model.generator.mot.config_checkpoint_contract",
+    }
+    if (
+        set(source) != {"schema", "fixture_manifest_sha256", "contract_module"}
+        or source["schema"] != _SYNTHETIC_FIXTURE_SOURCE_SCHEMA
+        or not _is_lower_hex(source["fixture_manifest_sha256"], 64)
+        or source["contract_module"] != "cosmos_framework.model.generator.mot.config_checkpoint_contract"
+    ):
+        raise ValueError("synthetic fixture source is not canonical")
     result = {
         "schema": _SYNTHETIC_FIXTURE_AUTHORITY_SCHEMA,
-        "fixture_descriptor_sha256": "d" * 64,
-        "fixture_manifest_sha256": "a" * 64,
-        "fixture_source_sha256": "b" * 64,
+        "fixture_descriptor_sha256": descriptor_sha256,
+        "fixture_manifest_sha256": manifest_sha256,
+        "fixture_source_sha256": _canonical_sha256(source),
     }
     if (
         set(result) != _SYNTHETIC_FIXTURE_AUTHORITY_KEYS
