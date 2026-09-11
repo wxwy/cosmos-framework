@@ -115,3 +115,73 @@ def test_canonical_adapter_binds_only_the_registered_ttt_owner() -> None:
     assert _canonical_production_adapter_from_model(model) is adapter
     model.net.local_history_runtime = SimpleNamespace(encoder=runtime.evidence_encoder, recurrent_backend=runtime.ttt_core)
     assert _canonical_production_adapter_from_model(model) is adapter
+
+
+def test_build_net_registers_only_active_ttt_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch
+
+    from cosmos_framework.model.generator import omni_mot_model
+
+    class _Network(torch.nn.Module):
+        def __init__(self, **_: object) -> None:
+            super().__init__()
+
+        def to_empty(self, **_: object) -> "_Network":
+            return self
+
+    config = SimpleNamespace(
+        lora_enabled=False,
+        lbl=SimpleNamespace(method="none", coeff_und=None, coeff_gen=None),
+        rectified_flow_inference_config=SimpleNamespace(num_train_timesteps=1000),
+        diffusion_expert_config=SimpleNamespace(
+            patch_spatial=2, max_vae_latent_side_after_patchify=20, enable_fps_modulation=False,
+            enable_vision_modality_embeddings=False, enable_media_modality_embedding=False,
+            base_fps=24, timestep_range=1.0,
+        ),
+        latent_downsample_factor=8,
+        state_ch=16,
+        state_t=4,
+        vision_gen=True,
+        action_gen=False,
+        sound_gen=False,
+        joint_attn_implementation="eager",
+        flex_attention=SimpleNamespace(enabled=False, backend="", mask=SimpleNamespace(noisy_attention_scope="all")),
+        max_action_dim=32,
+        num_embodiment_domains=1,
+        tokenizer=SimpleNamespace(temporal_compression_factor=4),
+        natten_parameter_list=(),
+        video_temporal_causal=False,
+        sound_dim=None,
+        sound_latent_fps=25,
+        local_memory_enabled=True,
+        local_memory_dim=32,
+        enable_input_bias=True,
+        local_history_enabled=True,
+        local_history_backend="ttt_fast_weight",
+        local_ttt_enabled=True,
+        local_history_evidence_dim=8,
+        ttt_inner_lr=0.1,
+        ttt_tbptt_steps=16,
+        k_local=1,
+        compile=SimpleNamespace(use_cuda_graphs=False),
+        quantization=SimpleNamespace(modelopt_fp8_checkpoint_path=None),
+        activation_checkpointing=SimpleNamespace(),
+    )
+    model = SimpleNamespace(
+        config=config,
+        vlm_config=SimpleNamespace(model_instance=object()),
+        tokenizer_vision_gen=None,
+        parallel_dims=object(),
+        install_attention_dispatch=lambda _: None,
+    )
+    monkeypatch.setattr(omni_mot_model, "lazy_instantiate", lambda *_: SimpleNamespace(config=SimpleNamespace()))
+    monkeypatch.setattr(omni_mot_model, "Cosmos3VFMNetworkConfig", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(omni_mot_model, "Cosmos3VFMNetwork", lambda **kwargs: _Network(**kwargs))
+    monkeypatch.setattr(omni_mot_model, "parallelize_vfm_network", lambda net, **_: net)
+    monkeypatch.setattr(omni_mot_model, "DEVICE", omni_mot_model.Device.CPU)
+
+    net = omni_mot_model.OmniMoTModel.build_net(model, torch.float32)
+
+    assert tuple(net.local_memory_runtime._modules) == ("evidence_encoder", "ttt_core")
+    assert not hasattr(net, "local_history_runtime")
+    assert not hasattr(net, "readout")
