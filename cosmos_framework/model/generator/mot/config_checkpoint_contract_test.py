@@ -9,8 +9,10 @@ from cosmos_framework.data.generator.sequence_packing import SequencePlan
 from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler import (
     CanonicalBatchScheduler,
     CanonicalBatchWindowTransaction,
+    CanonicalGAWindowPlan,
     CatalogRow,
     ChronologyCountRecord,
+    MicrobatchPlanMember,
     ProjectedSchedulerState,
     QueueEpochSnapshot,
 )
@@ -309,6 +311,45 @@ def test_restore_rejects_real_native_forward_commit_and_retry_authorities_before
         _restore(root, projector, modality, adapter, scheduler, payload, expected)
     adapter.consume_retry(retry)
     assert all(torch.equal(value, before[name]) for name, value in expected.items())
+
+
+def test_restore_rejects_real_suffix_recovery_and_receipt_authorities_before_mutation() -> None:
+    root, projector, modality, adapter, scheduler = _fixture()
+    expected = canonical_slow_inventory(root, projector, modality)
+    payload = slow_checkpoint_payload(expected, LocalMemoryConfig())
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+
+    def member(index: int, count: int) -> MicrobatchPlanMember:
+        identity = SegmentIdentity(0, "episode", "category", index, index, "source")
+        record = ChronologyCountRecord(0, "episode", "category", "source", 0, count, False, "manifest")
+        return MicrobatchPlanMember(
+            index, (identity,), (provenance,), (record,), (count,), count,
+            QueueEpochSnapshot(1, 0, "catalog", (("category", 0),)), (),
+        )
+
+    def batch(count: int) -> SegmentBatch:
+        return SegmentBatch(
+            torch.zeros(1, count, 96), (tuple(f"s{step}" for step in range(count)),),
+            torch.ones(1, count, dtype=torch.bool), torch.arange(count).reshape(1, count),
+            torch.zeros(1, count, 96), torch.zeros(1, count, 10),
+            torch.tensor([[False, *([True] * (count - 1))]]), torch.tensor([[-1, *range(count - 1)]]),
+            torch.tensor([0]), ("episode",), ("category",), provenance,
+        )
+
+    members = (member(0, 2), member(1, 5), member(2, 3))
+    plan = CanonicalGAWindowPlan(members, 10, 3, "restore-suffix")
+    transaction = CanonicalBatchWindowTransaction(plan)
+    transaction.mark_backward_started(0)
+    transaction.mark_reconciled(0)
+    request = CanonicalProductionSegmentRequest(scheduler, plan, transaction, members[1], 1, batch(5))
+    before = {name: value.detach().clone() for name, value in expected.items()}
+    suffix = adapter.derive_suffix_recovery(request, source_transient=adapter.declare_retryable_source_transient(request))
+    with pytest.raises(ValueError, match="pending"):
+        _restore(root, projector, modality, adapter, scheduler, payload, expected)
+    recovered = adapter.consume_suffix_recovery(suffix, segment_batches=(batch(5), batch(3)))
+    with pytest.raises(ValueError, match="pending"):
+        _restore(root, projector, modality, adapter, scheduler, payload, expected)
+    assert recovered and all(torch.equal(value, before[name]) for name, value in expected.items())
 
 
 def test_restore_rejects_real_pending_and_committed_runtime_authorities_before_mutation() -> None:
