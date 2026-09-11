@@ -205,6 +205,56 @@ def test_canonical_native_scaler_rejection_disposes_before_backward() -> None:
     assert request.transaction.snapshot().terminal_failure_code == "CANONICAL_NATIVE_SCALER_UNSUPPORTED"
 
 
+def test_canonical_native_dispatcher_scales_and_backwards_exactly_once() -> None:
+    request, carrier = _bound_request_and_carrier()
+    identity = request.member.row_identities[0]
+    chronology = request.member.row_chronology[0]
+    provenance = request.member.row_provenances[0]
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            QueueEpochSnapshot(1, 0, "catalog", (("category", 0),), (("category", (0,)),)),
+            (("category", 0),), target_distribution=(("category", 1.0),),
+            catalog=(CatalogRow(identity, chronology, provenance),),
+        )
+    )
+    plan = scheduler.freeze_plan(slot_groups=((0,),), plan_chain_id="single-dispatch")
+    request = CanonicalProductionSegmentRequest(
+        scheduler, plan, CanonicalBatchWindowTransaction(plan), plan.members[0], 0, request.segment_batch
+    )
+    carrier = replace(carrier, request=request, member=plan.members[0], row_identities=plan.members[0].row_identities, row_chronology=plan.members[0].row_chronology)
+    adapter = CanonicalProductionAdapter(LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256))
+    result = adapter.scan(request)
+    prepared = adapter.attach_native_preparation(adapter.prepare_native_inputs(request, result, carrier, input_image_key="images", input_video_key="video"), input_text_indexes=[[], []], sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)], gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[])
+    anchor = torch.nn.Parameter(torch.ones(()))
+    capability = adapter.bind_native_forward(prepared, build_canonical_native_loss_split(consumer_identities=prepared.traversal.identities, modalities={}, sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 3.0, graph_anchor=anchor))
+
+    class CountingScaler:
+        def __init__(self) -> None:
+            self.scaled: list[torch.Tensor] = []
+            self.backward_calls = 0
+
+        def is_enabled(self) -> bool:
+            return False
+
+        def scale(self, value: torch.Tensor):
+            self.scaled.append(value)
+            owner = self
+
+            class CountedTensor:
+                def backward(self) -> None:
+                    owner.backward_calls += 1
+                    value.backward()
+
+            return CountedTensor()
+
+    scaler = CountingScaler()
+    objective = object.__new__(ImaginaireTrainer)._run_canonical_native_backward(
+        {"psm_canonical_native_forward": capability}, scaler
+    )
+    assert scaler.scaled == [objective] and scaler.backward_calls == 1
+    assert request.transaction.snapshot().completed_members == (0,)
+
+
 @pytest.mark.parametrize("scaler_enabled", (True, False))
 def test_canonical_training_step_rejects_before_model_forward(scaler_enabled: bool) -> None:
     trainer = object.__new__(ImaginaireTrainer)
