@@ -450,7 +450,7 @@ def test_canonical_forward_aborts_real_pending_scan_before_hard_stop() -> None:
         parallel_dims=None,
         input_image_key="images",
         input_video_key="video",
-        net=SimpleNamespace(local_history_runtime=SimpleNamespace(encoder=encoder, recurrent_backend=core)),
+        net=SimpleNamespace(local_memory_runtime=SimpleNamespace(evidence_encoder=encoder, ttt_core=core)),
         _load_and_tokenize_text_data=lambda batch, iteration: calls.append("text") or [[1], [2]],
         get_data_and_condition=lambda batch, iteration, **kwargs: calls.append("clean") or clean,
         memory_init_training=lambda value, batch, indexes: (calls.append("memory") or value, {}),
@@ -485,7 +485,7 @@ def _production_model(*, memory_init_training) -> tuple[SimpleNamespace, list[st
         parallel_dims=None,
         input_image_key="images",
         input_video_key="video",
-        net=SimpleNamespace(local_history_runtime=SimpleNamespace(encoder=encoder, recurrent_backend=core)),
+        net=SimpleNamespace(local_memory_runtime=SimpleNamespace(evidence_encoder=encoder, ttt_core=core)),
         _load_and_tokenize_text_data=lambda batch, iteration: calls.append("text") or [[1], [2]],
         get_data_and_condition=lambda batch, iteration, **kwargs: calls.append("clean") or clean,
         memory_init_training=memory_init_training,
@@ -515,7 +515,7 @@ def test_canonical_forward_aborts_gather_mismatch_without_commit() -> None:
     request, carrier = _bound_request_and_carrier()
     model, _ = _production_model(memory_init_training=lambda value, batch, indexes: (value, {}))
     adapter = CanonicalProductionAdapter(
-        model.net.local_history_runtime.encoder, model.net.local_history_runtime.recurrent_backend
+        model.net.local_memory_runtime.evidence_encoder, model.net.local_memory_runtime.ttt_core
     )
     model._canonical_production_adapter = adapter
     scan = adapter.scan
