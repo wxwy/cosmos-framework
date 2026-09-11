@@ -12,6 +12,7 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 import torch.utils.data
+from torch.distributed.fsdp import FSDPModule
 
 from cosmos_framework.utils.flags import INTERNAL
 from cosmos_framework.utils.context_managers import distributed_init
@@ -36,7 +37,7 @@ def _canonical_native_cpu_static_topology_error(trainer: Any, model_ddp: torch.n
     """Reject every distributed wrapper before the canonical CPU/static scan boundary."""
     if isinstance(model_ddp, (torch.nn.DataParallel, distributed.DistributedDataParallel)):
         return "data-parallel wrapper"
-    if model_ddp.__class__.__name__ == "FullyShardedDataParallel":
+    if isinstance(model_ddp, FSDPModule) or model_ddp.__class__.__name__ == "FullyShardedDataParallel":
         return "FSDP wrapper"
     if dist.is_initialized():
         if dist.get_world_size() != 1:

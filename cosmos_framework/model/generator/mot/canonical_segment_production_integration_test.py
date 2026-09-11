@@ -655,6 +655,46 @@ def test_canonical_trainer_rejects_process_group_before_callbacks(
         )
 
 
+@pytest.mark.parametrize("topology", ("project_ddp", "fsdp_module"))
+def test_canonical_trainer_rejects_project_topology_before_every_entry(
+    monkeypatch: pytest.MonkeyPatch, topology: str
+) -> None:
+    import cosmos_framework.trainer as trainer_module
+
+    entries: list[str] = []
+
+    class ProjectDDP:
+        pass
+
+    if topology == "project_ddp":
+        monkeypatch.setattr(trainer_module.distributed, "DistributedDataParallel", ProjectDDP)
+        model_ddp = ProjectDDP()
+    else:
+        class ProjectFSDPModule:
+            pass
+
+        monkeypatch.setattr(trainer_module, "FSDPModule", ProjectFSDPModule)
+        model_ddp = ProjectFSDPModule()
+    trainer = object.__new__(ImaginaireTrainer)
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(distributed_parallelism="none", grad_accum_iter=1))
+    trainer.callbacks = SimpleNamespace(
+        on_before_forward=lambda **kwargs: entries.append("before_forward"),
+        on_after_forward=lambda **kwargs: entries.append("after_forward"),
+        on_before_backward=lambda *args, **kwargs: entries.append("before_backward"),
+    )
+    trainer._run_active_forward_with_exact_retry = lambda *args: entries.append("model_forward")
+    monkeypatch.setattr(
+        trainer_module.distributed,
+        "ddp_sync_grad",
+        lambda *args: (_ for _ in ()).throw(AssertionError("ddp_sync entered")),
+    )
+    with pytest.raises(RuntimeError, match="(data-parallel wrapper|FSDP wrapper)"):
+        trainer.training_step(
+            model_ddp, object(), None, SimpleNamespace(is_enabled=lambda: False), {"canonical_production_segment_mode": True}
+        )
+    assert entries == []
+
+
 def _canonical_native_cpu_static_output(monkeypatch: pytest.MonkeyPatch):
     request, carrier = _bound_request_and_carrier()
     model, _ = _production_model(memory_init_training=lambda value, batch, indexes: (value, {}))
