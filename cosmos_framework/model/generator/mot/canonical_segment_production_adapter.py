@@ -435,6 +435,13 @@ class CanonicalProductionSuffixRecoveryCapability:
     recovery: CanonicalSuffixRecovery
 
 
+@dataclass(frozen=True)
+class CanonicalRetryableSourceTransientCapability:
+    """One-shot synthetic source-failure authority for one unscanned request."""
+
+    request: CanonicalProductionSegmentRequest
+
+
 def _fp32_clone(state: ContinualTTTFastState, *, detach: bool) -> ContinualTTTFastState:
     values = (value.detach() if detach else value for value in state)
     return ContinualTTTFastState(*(value.to(dtype=torch.float32).clone() for value in values))
@@ -498,8 +505,12 @@ class CanonicalProductionAdapter:
         self._native_forward_capabilities: dict[int, CanonicalNativeForwardCapability] = {}
         self._retry_capabilities: set[int] = set()
         self._suffix_recovery_capabilities: set[int] = set()
+        self._retryable_source_transient_capabilities: set[int] = set()
         self._suffix_recovery_requests: dict[int, CanonicalProductionSuffixRecoveryCapability] = {}
         self._active_suffix_recoveries: dict[int, CanonicalProductionSuffixRecoveryCapability] = {}
+        self._suffix_recovery_request_ids: dict[int, frozenset[int]] = {}
+        self._suffix_recovery_scans: dict[int, CanonicalProductionSuffixRecoveryCapability] = {}
+        self._suffix_recovery_commits: dict[int, set[int]] = {}
 
     def retry_first_member_pre_backward(
         self, request: CanonicalProductionSegmentRequest
@@ -557,12 +568,29 @@ class CanonicalProductionAdapter:
         self._retry_capabilities.remove(id(capability))
         return retry
 
+    def declare_retryable_source_transient(
+        self, request: CanonicalProductionSegmentRequest
+    ) -> CanonicalRetryableSourceTransientCapability:
+        if (
+            request.plan.attempt != 0
+            or request.member_index <= 0
+            or request.member_index >= len(request.plan.members)
+            or request.plan.members[request.member_index] is not request.member
+            or request.transaction.plan is not request.plan
+            or id(request) in self._scan_requests
+        ):
+            raise CanonicalSegmentContractError("retryable source transient requires an exact unscanned suffix request")
+        capability = CanonicalRetryableSourceTransientCapability(request)
+        self._retryable_source_transient_capabilities.add(id(capability))
+        return capability
+
     def derive_suffix_recovery(
-        self, request: CanonicalProductionSegmentRequest, *, failure_kind: str
+        self, request: CanonicalProductionSegmentRequest, *, source_transient: CanonicalRetryableSourceTransientCapability
     ) -> CanonicalProductionSuffixRecoveryCapability:
         """Mint the sole typed suffix authority after an exact committed prefix."""
         if (
-            failure_kind != "LOAD_DECODE_TRANSIENT"
+            id(source_transient) not in self._retryable_source_transient_capabilities
+            or source_transient.request is not request
             or request.plan.attempt != 0
             or request.member_index <= 0
             or request.member_index >= len(request.plan.members)
@@ -571,6 +599,7 @@ class CanonicalProductionAdapter:
             or id(request) in self._scan_requests
         ):
             raise CanonicalSegmentContractError("suffix recovery requires an exact unscanned transient source failure")
+        self._retryable_source_transient_capabilities.remove(id(source_transient))
         recovery = request.transaction.derive_suffix_recovery(request.member_index)
         capability = CanonicalProductionSuffixRecoveryCapability(request, recovery)
         self._suffix_recovery_capabilities.add(id(capability))
@@ -612,6 +641,8 @@ class CanonicalProductionAdapter:
         self._suffix_recovery_capabilities.remove(id(capability))
         self._suffix_recovery_requests.update({id(request): capability for request in requests})
         self._active_suffix_recoveries[id(recovery)] = capability
+        self._suffix_recovery_request_ids[id(recovery)] = frozenset(id(request) for request in requests)
+        self._suffix_recovery_commits[id(recovery)] = set()
         return requests
 
     def complete_suffix_recovery(self, recovery: CanonicalSuffixRecovery) -> None:
@@ -622,10 +653,14 @@ class CanonicalProductionAdapter:
             or capability.recovery is not recovery
             or recovery.recovery_transaction.snapshot().completed_members
             != tuple(range(len(recovery.recovery_plan.members)))
+            or self._suffix_recovery_commits.get(id(recovery)) != self._suffix_recovery_request_ids.get(id(recovery))
+            or any(request_id in self._suffix_recovery_requests or request_id in self._suffix_recovery_scans for request_id in self._suffix_recovery_request_ids.get(id(recovery), ()))
         ):
             raise CanonicalSegmentContractError("suffix recovery completion is foreign, stale, or incomplete")
         recovery.original_transaction.consume_suffix_success_receipt(recovery.success_receipt)
         self._active_suffix_recoveries.pop(id(recovery))
+        self._suffix_recovery_request_ids.pop(id(recovery))
+        self._suffix_recovery_commits.pop(id(recovery))
 
     def scan(self, request: CanonicalProductionSegmentRequest) -> CanonicalProductionScanResult:
         if request.plan.attempt == 1 and request.plan.member_index_offset > 0:
@@ -637,6 +672,7 @@ class CanonicalProductionAdapter:
                 or request.member is not request.plan.members[request.member_index]
             ):
                 raise CanonicalSegmentContractError("suffix recovery scan requires an exact consumed capability")
+            self._suffix_recovery_scans[id(request)] = capability
         if (
             request.transaction.plan is not request.plan
             or request.member_index < 0
@@ -852,6 +888,9 @@ class CanonicalProductionAdapter:
         self.frontier.commit(request.member, result.candidate_state_out)
         request.scheduler.consume_prepared_reconcile(capability.prepared_reconcile)
         request.transaction.mark_reconciled(request.member_index)
+        suffix_capability = self._suffix_recovery_scans.pop(id(request), None)
+        if suffix_capability is not None:
+            self._suffix_recovery_commits[id(suffix_capability.recovery)].add(id(request))
         self._commit_capabilities.remove(id(capability))
         self._post_mutation_commits.remove(id(capability))
 

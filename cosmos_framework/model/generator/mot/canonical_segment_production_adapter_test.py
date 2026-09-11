@@ -501,8 +501,9 @@ def test_adapter_consumes_exact_committed_prefix_suffix_recovery_once() -> None:
     )
 
     with pytest.raises(CanonicalSegmentContractError, match="transient source"):
-        adapter.derive_suffix_recovery(request, failure_kind="NONFINITE")
-    capability = adapter.derive_suffix_recovery(request, failure_kind="LOAD_DECODE_TRANSIENT")
+        adapter.derive_suffix_recovery(request, source_transient=object())
+    source_transient = adapter.declare_retryable_source_transient(request)
+    capability = adapter.derive_suffix_recovery(request, source_transient=source_transient)
     direct = CanonicalProductionSegmentRequest(
         scheduler, capability.recovery.recovery_plan, capability.recovery.recovery_transaction, members[1], 0, batch(5)
     )
@@ -528,8 +529,6 @@ def test_adapter_consumes_exact_committed_prefix_suffix_recovery_once() -> None:
     for index in range(2):
         recovered[0].transaction.mark_backward_started(index)
         recovered[0].transaction.mark_reconciled(index)
-    adapter.complete_suffix_recovery(capability.recovery)
-    assert transaction.snapshot().suffix_recovery_reconciled
     with pytest.raises(CanonicalSegmentContractError, match="foreign, stale, or incomplete"):
         adapter.complete_suffix_recovery(capability.recovery)
     with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
@@ -584,7 +583,9 @@ def test_adapter_suffix_recovery_commits_each_exact_member_then_reconciles_once(
     failed = CanonicalProductionSegmentRequest(
         scheduler, plan, prefix.transaction, plan.members[1], 1, batch(plan.members[1])
     )
-    capability = adapter.derive_suffix_recovery(failed, failure_kind="LOAD_DECODE_TRANSIENT")
+    capability = adapter.derive_suffix_recovery(
+        failed, source_transient=adapter.declare_retryable_source_transient(failed)
+    )
     recovered = adapter.consume_suffix_recovery(
         capability, segment_batches=(batch(plan.members[1]), batch(plan.members[2]))
     )
