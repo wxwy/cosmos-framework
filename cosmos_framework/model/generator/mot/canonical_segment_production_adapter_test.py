@@ -589,9 +589,14 @@ def test_adapter_suffix_recovery_commits_each_exact_member_then_reconciles_once(
     recovered = adapter.consume_suffix_recovery(
         capability, segment_batches=(batch(plan.members[1]), batch(plan.members[2]))
     )
-    for request in recovered:
+    backward_calls = 0
+    for request, primary in zip(recovered, (torch.tensor(13.0, requires_grad=True), torch.tensor(17.0, requires_grad=True)), strict=True):
         result = adapter.scan(request)
         commit = adapter.prepare_commit(request, result)
+        auxiliary = torch.tensor(5.0, requires_grad=True)
+        objective = request.plan.objective(request.member_index, primary, auxiliary, request.member.planned_n_valid)
+        objective.backward()
+        backward_calls += 1
         request.transaction.mark_backward_started(request.member_index)
         adapter.commit_success(commit)
     adapter.complete_suffix_recovery(capability.recovery)
@@ -599,6 +604,7 @@ def test_adapter_suffix_recovery_commits_each_exact_member_then_reconciles_once(
     assert prefix.transaction.snapshot().slow_grads_cleared
     assert prefix.transaction.snapshot().suffix_recovery_reconciled
     assert scheduler._frozen_transitions == []
+    assert backward_calls == 2
 
 
 def test_fast_state_frontier_preserves_w0_gradients_and_slot_isolation() -> None:
