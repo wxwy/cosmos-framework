@@ -170,12 +170,14 @@ def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
     identity = build_base_identity(feature_config=feature)
     assert set(identity) == {
         "schema",
-        "child_git_revision",
         "canonical_model_config_sha256",
-        "checkpoint_source_fingerprint",
-        "manifest_sha256",
-        "source_sha256",
+        "fixture_descriptor_sha256",
+        "fixture_manifest_sha256",
+        "fixture_source_sha256",
     }
+    assert identity["schema"] == "synthetic_cpu_static_v1"
+    assert "child_git_revision" not in identity
+    assert all(len(identity[name]) == 64 for name in identity if name != "schema")
 
 
 def test_pristine_progress_predicate_is_exact_and_fail_closed() -> None:
@@ -252,13 +254,38 @@ def test_slow_payload_rejects_runtime_keys_and_stages_without_mutation() -> None
     with pytest.raises(ValueError, match="identity"):
         _restore(root, projector, modality, adapter, scheduler, feature_drift, expected)
     base_drift = copy.deepcopy(payload)
-    base_drift["base_identity"]["source_sha256"] = "d" * 64
+    base_drift["base_identity"]["fixture_source_sha256"] = "c" * 64
     with pytest.raises(ValueError, match="identity"):
         _restore(root, projector, modality, adapter, scheduler, base_drift, expected)
-    foreign_child = copy.deepcopy(payload)
-    foreign_child["base_identity"]["child_git_revision"] = "e" * 40
+    for bad_identity in (
+        {key: value for key, value in payload["base_identity"].items() if key != "fixture_manifest_sha256"},
+        {**payload["base_identity"], "foreign": "x"},
+        {**payload["base_identity"], "fixture_descriptor_sha256": "g" * 64},
+        {**payload["base_identity"], "fixture_manifest_sha256": 1},
+        {**payload["base_identity"], "child_git_revision": "d0d73338ca1b0e8ae350d447181a804308241390"},
+        {**payload["base_identity"], "child_git_revision": "da95139d338ef2ab2cff89d7bdb2a237f711877c"},
+    ):
+        legacy_or_drift = copy.deepcopy(payload)
+        legacy_or_drift["base_identity"] = bad_identity
+        with pytest.raises(ValueError, match="identity"):
+            _restore(root, projector, modality, adapter, scheduler, legacy_or_drift, expected)
+    production_identity = copy.deepcopy(payload)
+    production_identity["base_identity"] = {
+        "schema": "root_gitlink_authority_v1",
+        "root_git_revision": "a" * 40,
+        "root_tree_sha256": "b" * 64,
+        "submodule_path": "cosmos-framework",
+        "child_git_revision": "da95139d338ef2ab2cff89d7bdb2a237f711877c",
+        "child_tree_sha256": "c" * 64,
+        "canonical_model_config_sha256": payload["base_identity"]["canonical_model_config_sha256"],
+        "checkpoint_source_descriptor_sha256": "d" * 64,
+    }
     with pytest.raises(ValueError, match="identity"):
-        _restore(root, projector, modality, adapter, scheduler, foreign_child, expected)
+        _restore(root, projector, modality, adapter, scheduler, production_identity, expected)
+    with pytest.raises(TypeError):
+        _payload(expected, base_identity={})
+    with pytest.raises(TypeError):
+        strict_restore(payload, expected, LocalMemoryConfig(), feature_config=_feature_config(), base_identity={})
     no_bias_projector = nn.Linear(32, 2048, bias=False)
     with pytest.raises(ValueError, match="registered Local Memory ABI"):
         _restore(root, no_bias_projector, modality, adapter, scheduler, payload, expected)

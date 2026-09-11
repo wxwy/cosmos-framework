@@ -34,21 +34,25 @@ _FEATURE_CONFIG_KEYS = frozenset(
         "local_runtime_resume_mode",
     }
 )
-_BASE_IDENTITY_SCHEMA = "canonical_native_local_ttt_base_v1"
+_BASE_IDENTITY_SCHEMA = "synthetic_cpu_static_v1"
 _BASE_IDENTITY_KEYS = frozenset(
     {
         "schema",
-        "child_git_revision",
         "canonical_model_config_sha256",
-        "checkpoint_source_fingerprint",
-        "manifest_sha256",
-        "source_sha256",
+        "fixture_descriptor_sha256",
+        "fixture_manifest_sha256",
+        "fixture_source_sha256",
     }
 )
-_SOURCE_DESCRIPTOR_SCHEMA = "canonical_native_local_ttt_source_v1"
-_SOURCE_DESCRIPTOR_KEYS = frozenset({"schema", "source_kind", "source_id_sha256", "source_manifest_sha256", "source_sha256"})
-_LINEAGE_OWNER_SCHEMA = "canonical_native_local_ttt_lineage_owner_v1"
-_LINEAGE_OWNER_KEYS = frozenset({"schema", "child_git_revision", "manifest_sha256", "source_descriptor"})
+_SYNTHETIC_FIXTURE_AUTHORITY_SCHEMA = "synthetic_cpu_static_fixture_authority_v1"
+_SYNTHETIC_FIXTURE_AUTHORITY_KEYS = frozenset(
+    {
+        "schema",
+        "fixture_descriptor_sha256",
+        "fixture_manifest_sha256",
+        "fixture_source_sha256",
+    }
+)
 _OPTIMIZER_IDENTITY_SCHEMA = "canonical_native_local_ttt_optimizer_v1"
 _SCHEDULER_IDENTITY_SCHEMA = "canonical_native_local_ttt_scheduler_v1"
 _RUNTIME_KEY_FRAGMENTS = ("continualtttfaststate", "fast_state", "frontier", "pending", "scan", "native_forward", "commit", "retry", "suffix", "transaction", "receipt", "cursor", "queue", "rng", "grad")
@@ -113,83 +117,40 @@ def _is_lower_hex(value: object, length: int) -> bool:
     return isinstance(value, str) and len(value) == length and all(character in "0123456789abcdef" for character in value)
 
 
-def _source_fingerprint(source_descriptor: Mapping[str, object]) -> str:
+def _synthetic_fixture_authority() -> dict[str, object]:
+    """Return the fixed in-memory fixture authority, never production Git provenance."""
+    result = {
+        "schema": _SYNTHETIC_FIXTURE_AUTHORITY_SCHEMA,
+        "fixture_descriptor_sha256": "d" * 64,
+        "fixture_manifest_sha256": "a" * 64,
+        "fixture_source_sha256": "b" * 64,
+    }
     if (
-        not isinstance(source_descriptor, Mapping)
-        or set(source_descriptor) != _SOURCE_DESCRIPTOR_KEYS
-        or source_descriptor.get("schema") != _SOURCE_DESCRIPTOR_SCHEMA
-        or not isinstance(source_descriptor.get("source_kind"), str)
-        or not source_descriptor["source_kind"]
-        or not _is_lower_hex(source_descriptor.get("source_id_sha256"), 64)
-        or not _is_lower_hex(source_descriptor.get("source_manifest_sha256"), 64)
-        or not _is_lower_hex(source_descriptor.get("source_sha256"), 64)
+        set(result) != _SYNTHETIC_FIXTURE_AUTHORITY_KEYS
+        or result["schema"] != _SYNTHETIC_FIXTURE_AUTHORITY_SCHEMA
+        or any(not _is_lower_hex(result[name], 64) for name in _SYNTHETIC_FIXTURE_AUTHORITY_KEYS if name != "schema")
     ):
-        raise ValueError("checkpoint source descriptor is not canonical")
-    return _canonical_sha256(source_descriptor)
+        raise ValueError("synthetic fixture authority is not canonical")
+    return result
 
 
-@dataclass(frozen=True)
-class LineageOwnerIdentity:
-    child_git_revision: str
-    manifest_sha256: str
-    source_descriptor: Mapping[str, object]
-
-    def to_mapping(self) -> dict[str, object]:
-        result = {
-            "schema": _LINEAGE_OWNER_SCHEMA,
-            "child_git_revision": self.child_git_revision,
-            "manifest_sha256": self.manifest_sha256,
-            "source_descriptor": dict(self.source_descriptor),
-        }
-        if (
-            set(result) != _LINEAGE_OWNER_KEYS
-            or not _is_lower_hex(result["child_git_revision"], 40)
-            or not _is_lower_hex(result["manifest_sha256"], 64)
-        ):
-            raise ValueError("lineage owner is not canonical")
-        _source_fingerprint(result["source_descriptor"])
-        return result
-
-
-def _build_base_identity_from_owner(*, lineage_owner: LineageOwnerIdentity, feature_config: FeatureConfigIdentity) -> dict[str, object]:
-    owner = lineage_owner.to_mapping()
-    source_descriptor = owner["source_descriptor"]
-    assert isinstance(source_descriptor, Mapping)
-    feature_digest = _canonical_sha256(feature_config.to_mapping())
+def build_base_identity(*, feature_config: FeatureConfigIdentity) -> dict[str, object]:
+    """Derive the only trusted CPU/static fixture identity; callers cannot supply one."""
+    fixture_authority = _synthetic_fixture_authority()
     result = {
         "schema": _BASE_IDENTITY_SCHEMA,
-        "child_git_revision": owner["child_git_revision"],
-        "canonical_model_config_sha256": feature_digest,
-        "checkpoint_source_fingerprint": _source_fingerprint(source_descriptor),
-        "manifest_sha256": owner["manifest_sha256"],
-        "source_sha256": source_descriptor["source_sha256"],
+        "canonical_model_config_sha256": _canonical_sha256(feature_config.to_mapping()),
+        "fixture_descriptor_sha256": fixture_authority["fixture_descriptor_sha256"],
+        "fixture_manifest_sha256": fixture_authority["fixture_manifest_sha256"],
+        "fixture_source_sha256": fixture_authority["fixture_source_sha256"],
     }
     if (
         set(result) != _BASE_IDENTITY_KEYS
         or result["schema"] != _BASE_IDENTITY_SCHEMA
-        or not _is_lower_hex(result["child_git_revision"], 40)
-        or any(not _is_lower_hex(result[name], 64) for name in ("canonical_model_config_sha256", "checkpoint_source_fingerprint", "manifest_sha256", "source_sha256"))
+        or any(not _is_lower_hex(result[name], 64) for name in _BASE_IDENTITY_KEYS if name != "schema")
     ):
-        raise ValueError("base identity must contain canonical immutable lineage digests")
+        raise ValueError("base identity must contain canonical synthetic fixture digests")
     return result
-
-
-_CPU_STATIC_TRUSTED_LINEAGE_OWNER = LineageOwnerIdentity(
-    child_git_revision="d0d73338ca1b0e8ae350d447181a804308241390",
-    manifest_sha256="a" * 64,
-    source_descriptor={
-        "schema": _SOURCE_DESCRIPTOR_SCHEMA,
-        "source_kind": "canonical_cpu_static_gate",
-        "source_id_sha256": "d" * 64,
-        "source_manifest_sha256": "a" * 64,
-        "source_sha256": "b" * 64,
-    },
-)
-
-
-def build_base_identity(*, feature_config: FeatureConfigIdentity) -> dict[str, object]:
-    """Derive the only trusted CPU/static lineage identity; callers cannot supply one."""
-    return _build_base_identity_from_owner(lineage_owner=_CPU_STATIC_TRUSTED_LINEAGE_OWNER, feature_config=feature_config)
 
 
 def _validate_base_identity(value: Mapping[str, object]) -> dict[str, object]:
@@ -197,10 +158,9 @@ def _validate_base_identity(value: Mapping[str, object]) -> dict[str, object]:
         raise ValueError("base identity is not the canonical versioned mapping")
     result = dict(value)
     if (
-        not _is_lower_hex(result["child_git_revision"], 40)
-        or any(not _is_lower_hex(result[name], 64) for name in ("canonical_model_config_sha256", "checkpoint_source_fingerprint", "manifest_sha256", "source_sha256"))
+        any(not _is_lower_hex(result[name], 64) for name in _BASE_IDENTITY_KEYS if name != "schema")
     ):
-        raise ValueError("base identity contains a non-canonical lineage digest")
+        raise ValueError("base identity contains a non-canonical synthetic fixture digest")
     return result
 
 
