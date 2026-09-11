@@ -1,7 +1,6 @@
 """CPU/static contract for Local Memory config, selectors and slow checkpoints."""
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import math
@@ -46,6 +45,8 @@ _BASE_IDENTITY_KEYS = frozenset(
         "source_sha256",
     }
 )
+_SOURCE_DESCRIPTOR_SCHEMA = "canonical_native_local_ttt_source_v1"
+_SOURCE_DESCRIPTOR_KEYS = frozenset({"schema", "source_sha256"})
 _RUNTIME_KEY_FRAGMENTS = ("continualtttfaststate", "fast_state", "frontier", "pending", "scan", "native_forward", "commit", "retry", "suffix", "transaction", "receipt", "cursor", "queue", "rng", "grad")
 
 SELECTORS = (
@@ -104,18 +105,38 @@ class FeatureConfigIdentity:
         return result
 
 
-def build_base_identity(*, child_git_revision: str, feature_config: FeatureConfigIdentity, checkpoint_source_fingerprint: str, manifest_sha256: str, source_sha256: str) -> dict[str, object]:
+def _is_lower_hex(value: object, length: int) -> bool:
+    return isinstance(value, str) and len(value) == length and all(character in "0123456789abcdef" for character in value)
+
+
+def _source_fingerprint(source_descriptor: Mapping[str, object]) -> str:
+    if (
+        not isinstance(source_descriptor, Mapping)
+        or set(source_descriptor) != _SOURCE_DESCRIPTOR_KEYS
+        or source_descriptor.get("schema") != _SOURCE_DESCRIPTOR_SCHEMA
+        or not _is_lower_hex(source_descriptor.get("source_sha256"), 64)
+    ):
+        raise ValueError("checkpoint source descriptor is not canonical")
+    return _canonical_sha256(source_descriptor)
+
+
+def build_base_identity(*, child_git_revision: str, feature_config: FeatureConfigIdentity, checkpoint_source_descriptor: Mapping[str, object], manifest_sha256: str, source_sha256: str) -> dict[str, object]:
     feature_digest = _canonical_sha256(feature_config.to_mapping())
     result = {
         "schema": _BASE_IDENTITY_SCHEMA,
         "child_git_revision": child_git_revision,
         "canonical_model_config_sha256": feature_digest,
-        "checkpoint_source_fingerprint": checkpoint_source_fingerprint,
+        "checkpoint_source_fingerprint": _source_fingerprint(checkpoint_source_descriptor),
         "manifest_sha256": manifest_sha256,
         "source_sha256": source_sha256,
     }
-    if set(result) != _BASE_IDENTITY_KEYS or any(not isinstance(value, str) or not value for value in result.values()):
-        raise ValueError("base identity must contain immutable non-empty strings")
+    if (
+        set(result) != _BASE_IDENTITY_KEYS
+        or result["schema"] != _BASE_IDENTITY_SCHEMA
+        or not _is_lower_hex(result["child_git_revision"], 40)
+        or any(not _is_lower_hex(result[name], 64) for name in ("canonical_model_config_sha256", "checkpoint_source_fingerprint", "manifest_sha256", "source_sha256"))
+    ):
+        raise ValueError("base identity must contain canonical immutable lineage digests")
     return result
 
 
@@ -123,8 +144,11 @@ def _validate_base_identity(value: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) != _BASE_IDENTITY_KEYS or value.get("schema") != _BASE_IDENTITY_SCHEMA:
         raise ValueError("base identity is not the canonical versioned mapping")
     result = dict(value)
-    if any(not isinstance(item, str) or not item for item in result.values()):
-        raise ValueError("base identity contains an empty or non-string field")
+    if (
+        not _is_lower_hex(result["child_git_revision"], 40)
+        or any(not _is_lower_hex(result[name], 64) for name in ("canonical_model_config_sha256", "checkpoint_source_fingerprint", "manifest_sha256", "source_sha256"))
+    ):
+        raise ValueError("base identity contains a non-canonical lineage digest")
     return result
 
 
@@ -140,6 +164,24 @@ def _validate_feature_config_for_local(feature_config: FeatureConfigIdentity, co
         or feature_config.local_runtime_resume_mode != config.local_runtime_resume_mode
     ):
         raise ValueError("FeatureConfigIdentity and LocalMemoryConfig disagree")
+
+
+def _validate_feature_config_against_runtime(feature_config: FeatureConfigIdentity, runtime_encoder: nn.Module, runtime_core: nn.Module, local_memory2llm: nn.Module, modality: nn.Parameter) -> None:
+    """Reject feature identities that are decoupled from the registered live ABI."""
+    if (
+        getattr(runtime_encoder, "evidence_dim", None) != feature_config.local_history_evidence_dim
+        or getattr(runtime_core, "evidence_dim", None) != feature_config.local_history_evidence_dim
+        or getattr(runtime_core, "local_dim", None) != feature_config.local_memory_dim
+        or getattr(runtime_core, "k_local", None) != feature_config.k_local
+        or getattr(runtime_core, "ttt_tbptt_steps", None) != feature_config.ttt_tbptt_steps
+        or getattr(runtime_core, "inner_lr", None) != feature_config.ttt_inner_lr
+        or not isinstance(local_memory2llm, nn.Linear)
+        or local_memory2llm.in_features != feature_config.local_memory_dim
+        or local_memory2llm.out_features != 2048
+        or (local_memory2llm.bias is not None) != feature_config.enable_input_bias
+        or tuple(modality.shape) != (2048,)
+    ):
+        raise ValueError("FeatureConfigIdentity does not match the registered Local Memory ABI")
 
 
 def _validate_identity_binding(feature_config: FeatureConfigIdentity, base_identity: Mapping[str, object]) -> dict[str, object]:
@@ -250,7 +292,10 @@ def _clone_value(value: Any) -> Any:
 
 
 def _fully_qualified_class(value: object) -> str:
-    value_type = type(value)
+    return _fully_qualified_type(type(value))
+
+
+def _fully_qualified_type(value_type: type[object]) -> str:
     return f"{value_type.__module__}.{value_type.__qualname__}"
 
 
@@ -265,13 +310,16 @@ def _value_schema(value: object) -> object:
 
 
 def _optimizer_identity(optimizer: torch.optim.Optimizer, expected: Mapping[str, torch.Tensor]) -> dict[str, object]:
+    if not isinstance(optimizer, torch.optim.AdamW):
+        raise ValueError("only canonical AdamW optimizer identity is supported")
     names_by_id = {id(parameter): name for name, parameter in expected.items()}
     groups: list[dict[str, object]] = []
     seen: set[int] = set()
-    for group in optimizer.param_groups:
+    for index, group in enumerate(optimizer.param_groups):
         parameters = group.get("params")
-        if not isinstance(parameters, list):
-            raise ValueError("optimizer group parameters must be a list")
+        group_name = group.get("name")
+        if not isinstance(parameters, list) or not isinstance(group_name, str) or not group_name:
+            raise ValueError("optimizer group must have a canonical non-empty name")
         members: list[str] = []
         for parameter in parameters:
             name = names_by_id.get(id(parameter))
@@ -279,20 +327,81 @@ def _optimizer_identity(optimizer: torch.optim.Optimizer, expected: Mapping[str,
                 raise ValueError("checkpoint optimizer group members must exactly match slow inventory")
             seen.add(id(parameter))
             members.append(name)
-        groups.append({"members": members, "hyperparameters": {key: _clone_value(value) for key, value in group.items() if key != "params"}})
+        groups.append(
+            {
+                "name": group_name,
+                "index": index,
+                "members": members,
+                "hyperparameters": {key: _clone_value(value) for key, value in group.items() if key not in {"params", "name"}},
+                "member_state_schema": {name: _value_schema(optimizer.state.get(parameter, {})) for name, parameter in zip(members, parameters, strict=True)},
+            }
+        )
     if tuple(name for group in groups for name in group["members"]) != tuple(expected) or len(seen) != len(expected):
         raise ValueError("checkpoint optimizer group member order must exactly match slow inventory")
+    if len({group["name"] for group in groups}) != len(groups):
+        raise ValueError("optimizer group names must be unique")
     return {"class": _fully_qualified_class(optimizer), "groups": groups}
 
 
-def _scheduler_identity(scheduler: object) -> dict[str, object]:
+def _scheduler_identity(scheduler: object, expected: Mapping[str, torch.Tensor]) -> dict[str, object]:
+    if not isinstance(scheduler, torch.optim.lr_scheduler.ExponentialLR):
+        raise ValueError("only canonical ExponentialLR scheduler identity is supported")
     state_dict = getattr(scheduler, "state_dict", None)
     if not callable(state_dict):
         raise ValueError("scheduler must provide state_dict")
     state = state_dict()
     if not isinstance(state, Mapping):
         raise ValueError("scheduler state must be a mapping")
-    return {"class": _fully_qualified_class(scheduler), "state_schema": _value_schema(state)}
+    return {
+        "class": _fully_qualified_class(scheduler),
+        "optimizer_identity": _optimizer_identity(scheduler.optimizer, expected),
+        "constructor": {"gamma": scheduler.gamma},
+        "state_schema": _value_schema(state),
+    }
+
+
+def _build_pristine_optimizer(identity: Mapping[str, object], expected: Mapping[str, torch.Tensor]) -> torch.optim.AdamW:
+    if not isinstance(identity, Mapping) or identity.get("class") != _fully_qualified_type(torch.optim.AdamW):
+        raise ValueError("optimizer identity class is not canonical AdamW")
+    groups = identity.get("groups")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("optimizer identity groups are invalid")
+    shadows = {name: nn.Parameter(torch.empty_like(parameter)) for name, parameter in expected.items()}
+    group_specs: list[dict[str, object]] = []
+    for index, group in enumerate(groups):
+        if not isinstance(group, Mapping) or group.get("index") != index or not isinstance(group.get("name"), str) or not isinstance(group.get("members"), list) or not isinstance(group.get("hyperparameters"), Mapping) or not isinstance(group.get("member_state_schema"), Mapping):
+            raise ValueError("optimizer identity group schema is invalid")
+        members = group["members"]
+        if any(not isinstance(name, str) or name not in shadows for name in members):
+            raise ValueError("optimizer identity members are invalid")
+        group_specs.append({"params": [shadows[name] for name in members]})
+    shadow = torch.optim.AdamW(group_specs)
+    for shadow_group, identity_group in zip(shadow.param_groups, groups, strict=True):
+        shadow_group.update(_clone_value(identity_group["hyperparameters"]))
+        shadow_group["name"] = identity_group["name"]
+    if _optimizer_identity(shadow, shadows) != dict(identity):
+        raise ValueError("optimizer identity cannot reconstruct a pristine shadow")
+    return shadow
+
+
+def _build_pristine_scheduler(optimizer_identity: Mapping[str, object], scheduler_identity: Mapping[str, object], expected: Mapping[str, torch.Tensor]) -> tuple[torch.optim.AdamW, torch.optim.lr_scheduler.ExponentialLR]:
+    if not isinstance(scheduler_identity, Mapping) or scheduler_identity.get("class") != _fully_qualified_type(torch.optim.lr_scheduler.ExponentialLR):
+        raise ValueError("scheduler identity class is not canonical ExponentialLR")
+    if scheduler_identity.get("optimizer_identity") != dict(optimizer_identity):
+        raise ValueError("scheduler identity is not bound to optimizer identity")
+    constructor = scheduler_identity.get("constructor")
+    if not isinstance(constructor, Mapping) or set(constructor) != {"gamma"} or isinstance(constructor["gamma"], bool) or not isinstance(constructor["gamma"], (int, float)) or not math.isfinite(float(constructor["gamma"])) or constructor["gamma"] <= 0:
+        raise ValueError("scheduler constructor identity is invalid")
+    optimizer = _build_pristine_optimizer(optimizer_identity, expected)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=float(constructor["gamma"]))
+    shadow_expected = {
+        name: parameter
+        for group, shadow_group in zip(optimizer_identity["groups"], optimizer.param_groups, strict=True)
+        for name, parameter in zip(group["members"], shadow_group["params"], strict=True)
+    }
+    if _scheduler_identity(scheduler, shadow_expected) != dict(scheduler_identity):
+        raise ValueError("scheduler identity cannot reconstruct a pristine shadow")
+    return optimizer, scheduler
 
 
 def _contains_runtime_key(names: Mapping[str, object]) -> bool:
@@ -330,6 +439,20 @@ def slow_checkpoint_payload(named_parameters: Mapping[str, torch.Tensor], config
         raise ValueError("iteration must be a non-negative integer")
     _validate_feature_config_for_local(feature_config, config)
     base_identity = _validate_identity_binding(feature_config, base_identity)
+    if (optimizer is None) != (scheduler is None):
+        raise ValueError("checkpoint optimizer and scheduler must be jointly present or absent")
+    optimizer_identity = None if optimizer is None else _optimizer_identity(optimizer, named_parameters)
+    scheduler_identity = None if scheduler is None else _scheduler_identity(scheduler, named_parameters)
+    if optimizer is not None:
+        _, pristine_scheduler = _build_pristine_scheduler(optimizer_identity, scheduler_identity, named_parameters)
+        validate_pristine_progress(
+            iteration=iteration,
+            optimizer_state=optimizer.state_dict(),
+            scheduler_state=scheduler.state_dict(),
+            pristine_scheduler_state=pristine_scheduler.state_dict(),
+            optimizer_present=True,
+            scheduler_present=True,
+        )
     return {
         "version": _PAYLOAD_VERSION,
         "config": config.to_mapping(),
@@ -337,9 +460,9 @@ def slow_checkpoint_payload(named_parameters: Mapping[str, torch.Tensor], config
         "base_identity": _clone_value(base_identity),
         "parameters": {name: value.detach().clone() for name, value in named_parameters.items()},
         "optimizer": None if optimizer is None else _clone_value(optimizer.state_dict()),
-        "optimizer_identity": None if optimizer is None else _optimizer_identity(optimizer, named_parameters),
+        "optimizer_identity": optimizer_identity,
         "scheduler": None if scheduler is None else _clone_value(scheduler.state_dict()),
-        "scheduler_identity": None if scheduler is None else _scheduler_identity(scheduler),
+        "scheduler_identity": scheduler_identity,
         "iteration": iteration,
     }
 
@@ -368,10 +491,20 @@ def _stage_restore(payload: Mapping[str, object], expected: Mapping[str, torch.T
         or (payload.get("scheduler_identity") is None) != (scheduler is None)
     ):
         raise ValueError("checkpoint optimizer or scheduler presence mismatch")
+    pristine_scheduler_state = None
+    shadow_optimizer: torch.optim.AdamW | None = None
+    shadow_scheduler: torch.optim.lr_scheduler.ExponentialLR | None = None
+    if optimizer is not None:
+        optimizer_identity = _optimizer_identity(optimizer, expected)
+        scheduler_identity = _scheduler_identity(scheduler, expected)
+        if payload.get("optimizer_identity") != optimizer_identity:
+            raise ValueError("checkpoint optimizer identity mismatch")
+        if payload.get("scheduler_identity") != scheduler_identity:
+            raise ValueError("checkpoint scheduler identity mismatch")
+        shadow_optimizer, shadow_scheduler = _build_pristine_scheduler(optimizer_identity, scheduler_identity, expected)
+        pristine_scheduler_state = shadow_scheduler.state_dict()
     if optimizer is not None:
         candidate = payload["optimizer"]
-        if payload.get("optimizer_identity") != _optimizer_identity(optimizer, expected):
-            raise ValueError("checkpoint optimizer identity mismatch")
         live_groups = optimizer.state_dict().get("param_groups")
         live_parameters = tuple(parameter for group in optimizer.param_groups for parameter in group.get("params", ()))
         if (
@@ -402,19 +535,17 @@ def _stage_restore(payload: Mapping[str, object], expected: Mapping[str, torch.T
         ):
             raise ValueError("checkpoint optimizer state schema mismatch")
         try:
-            shadow_optimizer = copy.deepcopy(optimizer)
+            assert shadow_optimizer is not None
             shadow_optimizer.load_state_dict(_clone_value(candidate))
         except (KeyError, TypeError, ValueError, RuntimeError) as error:
             raise ValueError("checkpoint optimizer state is not loadable") from error
     if scheduler is not None:
         candidate = payload["scheduler"]
         live = scheduler.state_dict()
-        if payload.get("scheduler_identity") != _scheduler_identity(scheduler):
-            raise ValueError("checkpoint scheduler identity mismatch")
         if not isinstance(candidate, Mapping) or set(candidate) != set(live):
             raise ValueError("checkpoint scheduler schema mismatch")
         try:
-            shadow_scheduler = copy.deepcopy(scheduler)
+            assert shadow_scheduler is not None
             shadow_scheduler.load_state_dict(_clone_value(candidate))
         except (KeyError, TypeError, ValueError, RuntimeError) as error:
             raise ValueError("checkpoint scheduler state is not loadable") from error
@@ -422,7 +553,7 @@ def _stage_restore(payload: Mapping[str, object], expected: Mapping[str, torch.T
         iteration=payload.get("iteration"),
         optimizer_state=payload.get("optimizer"),
         scheduler_state=payload.get("scheduler"),
-        pristine_scheduler_state=None if scheduler is None else scheduler.state_dict(),
+        pristine_scheduler_state=pristine_scheduler_state,
         optimizer_present=optimizer is not None,
         scheduler_present=scheduler is not None,
     )
@@ -458,6 +589,7 @@ def validate_runtime_admission(*, adapter: object, scheduler: object, transactio
 
 def strict_restore_into(root: nn.Module, payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, runtime_encoder: nn.Module, runtime_core: nn.Module, local_memory2llm: nn.Module, modality: nn.Parameter, adapter: object, scheduler: object, transaction: object | None = None, optimizer: torch.optim.Optimizer | None = None, state_scheduler: object | None = None, iteration: int = 0, feature_config: FeatureConfigIdentity, base_identity: Mapping[str, object]) -> nn.Module:
     """Preflight every fallible contract before copying into existing objects once."""
+    _validate_feature_config_against_runtime(feature_config, runtime_encoder, runtime_core, local_memory2llm, modality)
     validate_slow_inventory(root, runtime_encoder=runtime_encoder, runtime_core=runtime_core, adapter=adapter)
     inventory = canonical_slow_inventory(root, local_memory2llm, modality)
     validate_exact_optimizer_membership(expected, inventory)

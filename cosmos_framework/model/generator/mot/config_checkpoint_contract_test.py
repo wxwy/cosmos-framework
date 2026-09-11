@@ -54,8 +54,8 @@ from .config_checkpoint_contract import (
 class _RuntimeRoot(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.evidence_encoder = LocalEvidenceEncoder(evidence_dim=8, feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
-        self.ttt_core = ContinualTTTLocalMemoryCore(evidence_dim=8, ttt_dim=4, fast_hidden_dim=8)
+        self.evidence_encoder = LocalEvidenceEncoder(evidence_dim=96, feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
+        self.ttt_core = ContinualTTTLocalMemoryCore(evidence_dim=96, ttt_dim=4, fast_hidden_dim=8)
 
 
 def _fixture() -> tuple[_RuntimeRoot, nn.Linear, nn.Parameter, CanonicalProductionAdapter, CanonicalBatchScheduler]:
@@ -70,9 +70,9 @@ def _base_identity() -> dict[str, object]:
     return build_base_identity(
         child_git_revision="f" * 40,
         feature_config=FeatureConfigIdentity(),
-        checkpoint_source_fingerprint="synthetic-source",
-        manifest_sha256="m" * 64,
-        source_sha256="s" * 64,
+        checkpoint_source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "c" * 64},
+        manifest_sha256="a" * 64,
+        source_sha256="b" * 64,
     )
 
 
@@ -97,7 +97,7 @@ def _restore(root: _RuntimeRoot, projector: nn.Linear, modality: nn.Parameter, a
 
 
 def _optimizer_and_scheduler(expected: dict[str, nn.Parameter]) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.ExponentialLR]:
-    optimizer = torch.optim.AdamW(tuple(expected.values()), lr=0.1)
+    optimizer = torch.optim.AdamW(({"params": tuple(expected.values()), "name": "canonical_slow"},), lr=0.1)
     return optimizer, torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
 
 
@@ -175,9 +175,9 @@ def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
     identity = build_base_identity(
         child_git_revision="f" * 40,
         feature_config=feature,
-        checkpoint_source_fingerprint="source-fingerprint",
-        manifest_sha256="m" * 64,
-        source_sha256="s" * 64,
+        checkpoint_source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "c" * 64},
+        manifest_sha256="a" * 64,
+        source_sha256="b" * 64,
     )
     assert set(identity) == {
         "schema",
@@ -191,9 +191,17 @@ def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
         build_base_identity(
             child_git_revision="",
             feature_config=feature,
-            checkpoint_source_fingerprint="source-fingerprint",
-            manifest_sha256="m" * 64,
-            source_sha256="s" * 64,
+            checkpoint_source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "c" * 64},
+            manifest_sha256="a" * 64,
+            source_sha256="b" * 64,
+        )
+    with pytest.raises(ValueError):
+        build_base_identity(
+            child_git_revision="f" * 40,
+            feature_config=feature,
+            checkpoint_source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "not-a-digest"},
+            manifest_sha256="a" * 64,
+            source_sha256="b" * 64,
         )
 
 
@@ -274,6 +282,12 @@ def test_slow_payload_rejects_runtime_keys_and_stages_without_mutation() -> None
     base_drift["base_identity"]["source_sha256"] = "d" * 64
     with pytest.raises(ValueError, match="identity"):
         _restore(root, projector, modality, adapter, scheduler, base_drift, expected)
+    no_bias_projector = nn.Linear(32, 2048, bias=False)
+    with pytest.raises(ValueError, match="registered Local Memory ABI"):
+        _restore(root, no_bias_projector, modality, adapter, scheduler, payload, expected)
+    root.ttt_core.evidence_dim = 8
+    with pytest.raises(ValueError, match="registered Local Memory ABI"):
+        _restore(root, projector, modality, adapter, scheduler, payload, expected)
     assert all(torch.equal(value, before[name]) for name, value in expected.items())
 
 
@@ -348,6 +362,14 @@ def test_restore_rejects_late_optimizer_or_scheduler_defect_before_mutation() ->
     damaged_scheduler_identity["scheduler_identity"]["class"] = "foreign.Scheduler"
     with pytest.raises(ValueError, match="scheduler identity"):
         _restore(root, projector, modality, adapter, scheduler, damaged_scheduler_identity, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
+    damaged_member_schema = copy.deepcopy(payload)
+    first_name = next(iter(expected))
+    damaged_member_schema["optimizer_identity"]["groups"][0]["member_state_schema"][first_name] = "foreign.State"
+    with pytest.raises(ValueError, match="optimizer identity"):
+        _restore(root, projector, modality, adapter, scheduler, damaged_member_schema, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
+    configured_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.8)
+    with pytest.raises(ValueError, match="scheduler identity"):
+        _restore(root, projector, modality, adapter, scheduler, payload, expected, optimizer=optimizer, state_scheduler=configured_scheduler, iteration=0)
     assert all(torch.equal(value, before_slow[name]) for name, value in expected.items())
     _assert_state_equal(optimizer.state_dict(), before_optimizer)
     _assert_state_equal(state_scheduler.state_dict(), before_scheduler)
@@ -370,6 +392,20 @@ def test_restore_rejects_reordered_duplicate_and_missing_optimizer_membership_be
     duplicate = torch.optim.AdamW((tuple(expected.values())[0], *tuple(expected.values())), lr=0.1)
     with pytest.raises(ValueError, match="optimizer group"):
         _restore(root, projector, modality, adapter, scheduler, payload, expected, optimizer=duplicate, state_scheduler=state_scheduler)
+    assert all(torch.equal(value, before[name]) for name, value in expected.items())
+
+
+def test_restore_rejects_payload_matching_an_advanced_live_scheduler() -> None:
+    root, projector, modality, adapter, scheduler = _fixture()
+    expected = canonical_slow_inventory(root, projector, modality)
+    optimizer, state_scheduler = _optimizer_and_scheduler(expected)
+    payload = _payload(expected, optimizer=optimizer, scheduler=state_scheduler)
+    state_scheduler.last_epoch = 3
+    state_scheduler._step_count = 4
+    payload["scheduler"] = copy.deepcopy(state_scheduler.state_dict())
+    before = {name: value.detach().clone() for name, value in expected.items()}
+    with pytest.raises(ValueError, match="scheduler state is not pristine"):
+        _restore(root, projector, modality, adapter, scheduler, payload, expected, optimizer=optimizer, state_scheduler=state_scheduler)
     assert all(torch.equal(value, before[name]) for name, value in expected.items())
 
 
