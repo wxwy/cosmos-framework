@@ -212,6 +212,7 @@ class CanonicalSuffixRecovery:
     recovery_transaction: "CanonicalBatchWindowTransaction"
     original_member_indexes: tuple[int, ...]
     transition_identity: int
+    success_receipt: "CanonicalOriginalTransitionReceipt"
 
     def __post_init__(self) -> None:
         if (
@@ -226,8 +227,20 @@ class CanonicalSuffixRecovery:
             or self.recovery_plan.original_ga_effective != len(self.recovery_plan.members)
             or self.recovery_plan.member_index_offset != self.original_member_indexes[0]
             or self.recovery_plan.members != self.original_plan.members[self.original_member_indexes[0] :]
+            or self.success_receipt.original_transaction is not self.original_transaction
+            or self.success_receipt.recovery_transaction is not self.recovery_transaction
+            or self.success_receipt.transition_identity != self.transition_identity
         ):
             raise ValueError("CanonicalSuffixRecovery metadata is invalid")
+
+
+@dataclass(frozen=True)
+class CanonicalOriginalTransitionReceipt:
+    """One-shot success authority for the suppressed attempt-0 transition."""
+
+    original_transaction: "CanonicalBatchWindowTransaction"
+    recovery_transaction: "CanonicalBatchWindowTransaction"
+    transition_identity: int
 
 @dataclass(frozen=True)
 class BatchWindowSnapshot:
@@ -236,6 +249,7 @@ class BatchWindowSnapshot:
     slow_grads_cleared: bool
     terminal_failure_code: str | None
     remaining_members_suppressed: bool
+    suffix_recovery_reconciled: bool
 
 
 class CanonicalBatchWindowTransaction:
@@ -249,6 +263,8 @@ class CanonicalBatchWindowTransaction:
         self.slow_grads_cleared = False
         self.terminal_failure_code: str | None = None
         self.remaining_members_suppressed = False
+        self.suffix_recovery_reconciled = False
+        self._suffix_success_receipts: set[int] = set()
         self._closed = False
 
     def retry_first_member_pre_backward(self) -> CanonicalGAWindowPlan:
@@ -286,9 +302,26 @@ class CanonicalBatchWindowTransaction:
         self.slow_grads_cleared = True
         self.remaining_members_suppressed = True
         self._closed = True
+        receipt = CanonicalOriginalTransitionReceipt(self, recovery_transaction, id(self))
         return CanonicalSuffixRecovery(
-            self.plan, self, recovery_plan, recovery_transaction, original_indexes, id(self)
+            self.plan, self, recovery_plan, recovery_transaction, original_indexes, id(self), receipt
         )
+
+    def consume_suffix_success_receipt(self, receipt: CanonicalOriginalTransitionReceipt) -> None:
+        """Record exactly one successful reconciliation after all recovery members commit."""
+        recovery = receipt.recovery_transaction
+        if (
+            receipt.original_transaction is not self
+            or receipt.transition_identity != id(self)
+            or id(receipt) in self._suffix_success_receipts
+            or self.suffix_recovery_reconciled
+            or recovery.plan.attempt != 1
+            or recovery.snapshot().terminal_failure_code is not None
+            or recovery.snapshot().completed_members != tuple(range(len(recovery.plan.members)))
+        ):
+            raise CanonicalSegmentContractError("suffix success receipt is foreign, stale, or incomplete")
+        self._suffix_success_receipts.add(id(receipt))
+        self.suffix_recovery_reconciled = True
 
     def mark_backward_started(self, member_index: int) -> None:
         if (
@@ -348,6 +381,7 @@ class CanonicalBatchWindowTransaction:
             self.slow_grads_cleared,
             self.terminal_failure_code,
             self.remaining_members_suppressed,
+            self.suffix_recovery_reconciled,
         )
 
 

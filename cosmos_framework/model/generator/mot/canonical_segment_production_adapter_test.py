@@ -502,11 +502,35 @@ def test_adapter_consumes_exact_committed_prefix_suffix_recovery_once() -> None:
     with pytest.raises(CanonicalSegmentContractError, match="transient source"):
         adapter.derive_suffix_recovery(request, failure_kind="NONFINITE")
     capability = adapter.derive_suffix_recovery(request, failure_kind="LOAD_DECODE_TRANSIENT")
+    direct = CanonicalProductionSegmentRequest(
+        scheduler, capability.recovery.recovery_plan, capability.recovery.recovery_transaction, members[1], 0, batch(5)
+    )
+    with pytest.raises(CanonicalSegmentContractError, match="exact consumed capability"):
+        adapter.scan(direct)
+    foreign_transaction = CanonicalBatchWindowTransaction(plan)
+    foreign_transaction.mark_backward_started(0)
+    foreign_transaction.mark_reconciled(0)
+    foreign_recovery = foreign_transaction.derive_suffix_recovery(1)
+    foreign_request = CanonicalProductionSegmentRequest(
+        scheduler, foreign_recovery.recovery_plan, foreign_recovery.recovery_transaction, members[1], 0, batch(5)
+    )
+    with pytest.raises(CanonicalSegmentContractError, match="exact consumed capability"):
+        adapter.scan(foreign_request)
+    assert not adapter._scan_requests and not adapter.frontier._states
     recovered = adapter.consume_suffix_recovery(capability, segment_batches=(batch(5), batch(3)))
     assert tuple(item.member_index for item in recovered) == (0, 1)
     assert recovered[0].member is members[1] and recovered[1].member is members[2]
     assert recovered[0].plan.original_n_valid_window == 8
     assert recovered[0].plan.original_ga_effective == 2
+    with pytest.raises(CanonicalSegmentContractError, match="foreign, stale, or incomplete"):
+        adapter.complete_suffix_recovery(capability.recovery)
+    for index in range(2):
+        recovered[0].transaction.mark_backward_started(index)
+        recovered[0].transaction.mark_reconciled(index)
+    adapter.complete_suffix_recovery(capability.recovery)
+    assert transaction.snapshot().suffix_recovery_reconciled
+    with pytest.raises(CanonicalSegmentContractError, match="foreign, stale, or incomplete"):
+        adapter.complete_suffix_recovery(capability.recovery)
     with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
         adapter.consume_suffix_recovery(capability, segment_batches=(batch(5), batch(3)))
 

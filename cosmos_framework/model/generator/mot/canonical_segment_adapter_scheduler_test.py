@@ -145,6 +145,16 @@ def test_committed_prefix_derives_one_exact_suffix_recovery() -> None:
     assert tuple(member.member_index for member in recovery.recovery_plan.members) == (1, 2)
     assert recovery.recovery_plan.members == plan.members[1:]
     assert recovery.recovery_plan.members[0] is plan.members[1]
+    with pytest.raises(CanonicalSegmentContractError, match="foreign, stale, or incomplete"):
+        transaction.consume_suffix_success_receipt(recovery.success_receipt)
+    recovery.recovery_transaction.mark_backward_started(0)
+    recovery.recovery_transaction.mark_reconciled(0)
+    recovery.recovery_transaction.mark_backward_started(1)
+    recovery.recovery_transaction.mark_reconciled(1)
+    transaction.consume_suffix_success_receipt(recovery.success_receipt)
+    assert transaction.snapshot().suffix_recovery_reconciled
+    with pytest.raises(CanonicalSegmentContractError, match="foreign, stale, or incomplete"):
+        transaction.consume_suffix_success_receipt(recovery.success_receipt)
     with pytest.raises(CanonicalSegmentContractError, match="committed attempt-0 prefix"):
         transaction.derive_suffix_recovery(1)
 

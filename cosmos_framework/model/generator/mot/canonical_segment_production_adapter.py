@@ -498,6 +498,8 @@ class CanonicalProductionAdapter:
         self._native_forward_capabilities: dict[int, CanonicalNativeForwardCapability] = {}
         self._retry_capabilities: set[int] = set()
         self._suffix_recovery_capabilities: set[int] = set()
+        self._suffix_recovery_requests: dict[int, CanonicalProductionSuffixRecoveryCapability] = {}
+        self._active_suffix_recoveries: dict[int, CanonicalProductionSuffixRecoveryCapability] = {}
 
     def retry_first_member_pre_backward(
         self, request: CanonicalProductionSegmentRequest
@@ -608,9 +610,33 @@ class CanonicalProductionAdapter:
                 raise CanonicalSegmentContractError("suffix recovery member identity is foreign")
             request.member.validate_batch(request.segment_batch)
         self._suffix_recovery_capabilities.remove(id(capability))
+        self._suffix_recovery_requests.update({id(request): capability for request in requests})
+        self._active_suffix_recoveries[id(recovery)] = capability
         return requests
 
+    def complete_suffix_recovery(self, recovery: CanonicalSuffixRecovery) -> None:
+        """Consume the exact original success receipt after all suffix commits."""
+        capability = self._active_suffix_recoveries.get(id(recovery))
+        if (
+            capability is None
+            or capability.recovery is not recovery
+            or recovery.recovery_transaction.snapshot().completed_members
+            != tuple(range(len(recovery.recovery_plan.members)))
+        ):
+            raise CanonicalSegmentContractError("suffix recovery completion is foreign, stale, or incomplete")
+        recovery.original_transaction.consume_suffix_success_receipt(recovery.success_receipt)
+        self._active_suffix_recoveries.pop(id(recovery))
+
     def scan(self, request: CanonicalProductionSegmentRequest) -> CanonicalProductionScanResult:
+        if request.plan.attempt == 1 and request.plan.member_index_offset > 0:
+            capability = self._suffix_recovery_requests.pop(id(request), None)
+            if (
+                capability is None
+                or capability.recovery.recovery_plan is not request.plan
+                or capability.recovery.recovery_transaction is not request.transaction
+                or request.member is not request.plan.members[request.member_index]
+            ):
+                raise CanonicalSegmentContractError("suffix recovery scan requires an exact consumed capability")
         if (
             request.transaction.plan is not request.plan
             or request.member_index < 0
