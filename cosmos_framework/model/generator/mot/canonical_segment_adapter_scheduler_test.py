@@ -129,6 +129,24 @@ def test_unequal_count_ga_objective_and_first_member_only_retry() -> None:
     assert not hasattr(plan, "retry_first_member_pre_backward")
 
 
+def test_committed_prefix_derives_one_exact_suffix_recovery() -> None:
+    first = _single_member(index=0, stop=2, exposure=(("a", 0),))
+    second = _single_member(index=1, stop=5, exposure=(("a", 2),))
+    third = _single_member(index=2, stop=3, exposure=(("a", 7),))
+    plan = CanonicalGAWindowPlan((first, second, third), 10, 3, "suffix")
+    transaction = CanonicalBatchWindowTransaction(plan)
+    transaction.mark_backward_started(0)
+    transaction.mark_reconciled(0)
+    recovery = transaction.derive_suffix_recovery(1)
+    assert recovery.original_member_indexes == (1, 2)
+    assert recovery.recovery_plan.attempt == 1
+    assert recovery.recovery_plan.original_n_valid_window == 8
+    assert recovery.recovery_plan.original_ga_effective == 2
+    assert tuple(member.member_index for member in recovery.recovery_plan.members) == (0, 1)
+    with pytest.raises(CanonicalSegmentContractError, match="committed attempt-0 prefix"):
+        transaction.derive_suffix_recovery(1)
+
+
 def test_full_valid_ga_consumer_term_degenerates_to_one_over_ga() -> None:
     first = _member()
     second = _member(index=1, exposure=(("a", 2), ("b", 1)))

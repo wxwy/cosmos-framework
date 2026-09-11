@@ -198,6 +198,32 @@ class CanonicalGAWindowPlan:
             + auxiliary_loss / self.original_ga_effective
         )
 
+
+@dataclass(frozen=True)
+class CanonicalSuffixRecovery:
+    """One-shot public attempt-1 authority for an unconsumed immutable suffix."""
+
+    original_plan: CanonicalGAWindowPlan
+    original_transaction: "CanonicalBatchWindowTransaction"
+    recovery_plan: CanonicalGAWindowPlan
+    recovery_transaction: "CanonicalBatchWindowTransaction"
+    original_member_indexes: tuple[int, ...]
+    transition_identity: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.original_plan.attempt != 0
+            or self.recovery_plan.attempt != 1
+            or not self.original_member_indexes
+            or len(self.original_member_indexes) != len(self.recovery_plan.members)
+            or self.original_member_indexes != tuple(range(self.original_member_indexes[0], len(self.original_plan.members)))
+            or self.recovery_plan.plan_chain_id != self.original_plan.plan_chain_id
+            or self.recovery_plan.original_n_valid_window
+            != sum(member.planned_n_valid for member in self.recovery_plan.members)
+            or self.recovery_plan.original_ga_effective != len(self.recovery_plan.members)
+        ):
+            raise ValueError("CanonicalSuffixRecovery metadata is invalid")
+
 @dataclass(frozen=True)
 class BatchWindowSnapshot:
     backward_started: bool
@@ -228,6 +254,35 @@ class CanonicalBatchWindowTransaction:
         retry = replace(self.plan, attempt=1, _attempt_authority=_ATTEMPT_ONE_AUTHORITY)
         self._closed = True
         return retry
+
+    def derive_suffix_recovery(self, member_index: int) -> CanonicalSuffixRecovery:
+        """Close attempt-0 and expose its unconsumed suffix as one typed recovery."""
+        if (
+            self._closed
+            or self.plan.attempt != 0
+            or member_index <= 0
+            or member_index >= len(self.plan.members)
+            or self._active_backward_member is not None
+            or tuple(self.completed_members) != tuple(range(member_index))
+        ):
+            raise CanonicalSegmentContractError("suffix recovery requires an exact committed attempt-0 prefix")
+        original_indexes = tuple(range(member_index, len(self.plan.members)))
+        members = tuple(replace(member, member_index=index) for index, member in enumerate(self.plan.members[member_index:]))
+        recovery_plan = CanonicalGAWindowPlan(
+            members,
+            sum(member.planned_n_valid for member in members),
+            len(members),
+            self.plan.plan_chain_id,
+            attempt=1,
+            _attempt_authority=_ATTEMPT_ONE_AUTHORITY,
+        )
+        recovery_transaction = CanonicalBatchWindowTransaction(recovery_plan)
+        self.slow_grads_cleared = True
+        self.remaining_members_suppressed = True
+        self._closed = True
+        return CanonicalSuffixRecovery(
+            self.plan, self, recovery_plan, recovery_transaction, original_indexes, id(self)
+        )
 
     def mark_backward_started(self, member_index: int) -> None:
         if (
