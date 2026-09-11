@@ -601,8 +601,19 @@ def test_adapter_retry_preserves_original_frozen_transition_exactly_once() -> No
         adapter.scan(capability.retry_request)
     assert scheduler.snapshot == scheduler_before
     assert adapter._scan_requests == set() and adapter.frontier._states == {}
+    transitions_before = tuple(scheduler._frozen_transitions)
+    transaction_before = request.transaction.snapshot()
+    frontier_before = dict(adapter.frontier._states)
+    scan_requests_before = set(adapter._scan_requests)
+    scan_results_before = dict(adapter._scan_results)
+    retry_capabilities_before = set(adapter._retry_capabilities)
+    retry_requests_before = dict(adapter._retry_scan_requests)
     with pytest.raises(CanonicalSegmentContractError, match="unstarted batch window"):
         adapter.retry_first_member_pre_backward(request)
+    assert scheduler.snapshot == scheduler_before and tuple(scheduler._frozen_transitions) == transitions_before
+    assert request.transaction.snapshot() == transaction_before and adapter.frontier._states == frontier_before
+    assert adapter._scan_requests == scan_requests_before and adapter._scan_results == scan_results_before
+    assert adapter._retry_capabilities == retry_capabilities_before and adapter._retry_scan_requests == retry_requests_before
     with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
         adapter.consume_retry(replace(capability, retry_request=request))
 
@@ -676,10 +687,24 @@ def test_adapter_retry_rejects_stale_copied_duplicate_and_post_backward_paths_be
         LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
     )
     post_backward_source.transaction.mark_backward_started(0)
+    scheduler_before = post_backward_source.scheduler.snapshot
+    transitions_before = tuple(post_backward_source.scheduler._frozen_transitions)
+    transaction_before = post_backward_source.transaction.snapshot()
+    frontier_before = dict(post_backward_adapter.frontier._states)
+    scan_requests_before = set(post_backward_adapter._scan_requests)
+    scan_results_before = dict(post_backward_adapter._scan_results)
+    retry_capabilities_before = set(post_backward_adapter._retry_capabilities)
+    retry_requests_before = dict(post_backward_adapter._retry_scan_requests)
     with pytest.raises(CanonicalSegmentContractError, match="unstarted batch window"):
         post_backward_adapter.retry_first_member_pre_backward(post_backward_source)
-    assert post_backward_adapter._retry_capabilities == set()
-    assert post_backward_adapter._scan_requests == set() and post_backward_adapter.frontier._states == {}
+    assert post_backward_source.scheduler.snapshot == scheduler_before
+    assert tuple(post_backward_source.scheduler._frozen_transitions) == transitions_before
+    assert post_backward_source.transaction.snapshot() == transaction_before
+    assert post_backward_adapter.frontier._states == frontier_before
+    assert post_backward_adapter._scan_requests == scan_requests_before
+    assert post_backward_adapter._scan_results == scan_results_before
+    assert post_backward_adapter._retry_capabilities == retry_capabilities_before
+    assert post_backward_adapter._retry_scan_requests == retry_requests_before
 
 
 def test_adapter_consumes_exact_committed_prefix_suffix_recovery_once() -> None:
