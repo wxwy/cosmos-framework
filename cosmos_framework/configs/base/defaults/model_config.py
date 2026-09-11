@@ -396,3 +396,5 @@ class OmniMoTModelConfig:
             raise ValueError(
                 "local_ttt_enabled requires local_history_enabled=True and local_history_backend='ttt_fast_weight'."
             )
+        if self.local_ttt_enabled and (not self.local_memory_enabled or self.local_memory_dim != 32):
+            raise ValueError("local_ttt_enabled requires local_memory_enabled=True and local_memory_dim=32.")

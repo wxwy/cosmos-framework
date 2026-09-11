@@ -1,6 +1,7 @@
 """CPU/static contract for Local Memory config, selectors and slow checkpoints."""
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
@@ -85,6 +86,13 @@ def validate_slow_inventory(root: nn.Module, *, runtime_encoder: nn.Module, runt
 
 
 def canonical_slow_inventory(root: nn.Module, local_memory2llm: nn.Module, modality: nn.Parameter) -> dict[str, nn.Parameter]:
+    if (
+        not isinstance(local_memory2llm, nn.Linear)
+        or local_memory2llm.in_features != 32
+        or local_memory2llm.out_features != 2048
+        or tuple(modality.shape) != (2048,)
+    ):
+        raise ValueError("Local Memory projector must be the canonical per-token 32 -> 2048 ABI")
     values = {f"local_memory_runtime.{name}": value for name, value in root.named_parameters()}
     values.update({f"local_memory2llm.{name}": value for name, value in local_memory2llm.named_parameters()})
     values["local_memory_modality_embed"] = modality
@@ -163,16 +171,49 @@ def _stage_restore(payload: Mapping[str, object], expected: Mapping[str, torch.T
     if optimizer is not None:
         candidate = payload["optimizer"]
         live_groups = optimizer.state_dict().get("param_groups")
-        if not isinstance(candidate, Mapping) or not isinstance(candidate.get("param_groups"), list) or not isinstance(live_groups, list) or len(candidate["param_groups"]) != len(live_groups):
+        live_parameters = tuple(parameter for group in optimizer.param_groups for parameter in group.get("params", ()))
+        if (
+            not isinstance(candidate, Mapping)
+            or set(candidate) != {"state", "param_groups"}
+            or not isinstance(candidate.get("state"), Mapping)
+            or not isinstance(candidate.get("param_groups"), list)
+            or not isinstance(live_groups, list)
+            or len(candidate["param_groups"]) != len(live_groups)
+            or len(live_parameters) != len(expected)
+            or any(actual is not required for actual, required in zip(live_parameters, expected.values(), strict=True))
+            or len({id(parameter) for parameter in live_parameters}) != len(live_parameters)
+        ):
             raise ValueError("checkpoint optimizer group schema mismatch")
         for saved, live in zip(candidate["param_groups"], live_groups, strict=True):
-            if not isinstance(saved, Mapping) or set(saved) != set(live) or len(saved.get("params", ())) != len(live.get("params", ())):
+            if (
+                not isinstance(saved, Mapping)
+                or set(saved) != set(live)
+                or saved.get("params") != live.get("params")
+            ):
                 raise ValueError("checkpoint optimizer group schema mismatch")
+        parameter_ids = {identifier for group in candidate["param_groups"] for identifier in group["params"]}
+        if (
+            len(parameter_ids) != len(live_parameters)
+            or any(not isinstance(identifier, int) for identifier in parameter_ids)
+            or not set(candidate["state"]).issubset(parameter_ids)
+            or any(not isinstance(state, Mapping) for state in candidate["state"].values())
+        ):
+            raise ValueError("checkpoint optimizer state schema mismatch")
+        try:
+            shadow_optimizer = copy.deepcopy(optimizer)
+            shadow_optimizer.load_state_dict(_clone_value(candidate))
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            raise ValueError("checkpoint optimizer state is not loadable") from error
     if scheduler is not None:
         candidate = payload["scheduler"]
         live = scheduler.state_dict()
         if not isinstance(candidate, Mapping) or set(candidate) != set(live):
             raise ValueError("checkpoint scheduler schema mismatch")
+        try:
+            shadow_scheduler = copy.deepcopy(scheduler)
+            shadow_scheduler.load_state_dict(_clone_value(candidate))
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            raise ValueError("checkpoint scheduler state is not loadable") from error
     restored: dict[str, torch.Tensor] = {}
     for name, target in expected.items():
         value = values[name]
