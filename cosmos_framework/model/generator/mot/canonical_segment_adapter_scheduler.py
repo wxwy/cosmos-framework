@@ -173,13 +173,16 @@ class CanonicalGAWindowPlan:
     plan_chain_id: str
     attempt: int = 0
     _attempt_authority: object | None = None
+    member_index_offset: int = 0
 
     def __post_init__(self) -> None:
         if (
             not self.members
             or self.original_ga_effective != len(self.members)
             or self.original_n_valid_window != sum(member.planned_n_valid for member in self.members)
-            or tuple(member.member_index for member in self.members) != tuple(range(len(self.members)))
+            or self.member_index_offset < 0
+            or tuple(member.member_index for member in self.members)
+            != tuple(range(self.member_index_offset, self.member_index_offset + len(self.members)))
             or not self.plan_chain_id
             or self.attempt not in (0, 1)
             or (self.attempt == 0 and self._attempt_authority is not None)
@@ -221,6 +224,8 @@ class CanonicalSuffixRecovery:
             or self.recovery_plan.original_n_valid_window
             != sum(member.planned_n_valid for member in self.recovery_plan.members)
             or self.recovery_plan.original_ga_effective != len(self.recovery_plan.members)
+            or self.recovery_plan.member_index_offset != self.original_member_indexes[0]
+            or self.recovery_plan.members != self.original_plan.members[self.original_member_indexes[0] :]
         ):
             raise ValueError("CanonicalSuffixRecovery metadata is invalid")
 
@@ -267,7 +272,7 @@ class CanonicalBatchWindowTransaction:
         ):
             raise CanonicalSegmentContractError("suffix recovery requires an exact committed attempt-0 prefix")
         original_indexes = tuple(range(member_index, len(self.plan.members)))
-        members = tuple(replace(member, member_index=index) for index, member in enumerate(self.plan.members[member_index:]))
+        members = self.plan.members[member_index:]
         recovery_plan = CanonicalGAWindowPlan(
             members,
             sum(member.planned_n_valid for member in members),
@@ -275,6 +280,7 @@ class CanonicalBatchWindowTransaction:
             self.plan.plan_chain_id,
             attempt=1,
             _attempt_authority=_ATTEMPT_ONE_AUTHORITY,
+            member_index_offset=member_index,
         )
         recovery_transaction = CanonicalBatchWindowTransaction(recovery_plan)
         self.slow_grads_cleared = True
