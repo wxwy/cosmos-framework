@@ -504,6 +504,7 @@ class CanonicalProductionAdapter:
         self._post_mutation_commits: set[int] = set()
         self._native_forward_capabilities: dict[int, CanonicalNativeForwardCapability] = {}
         self._retry_capabilities: set[int] = set()
+        self._retry_scan_requests: dict[int, CanonicalProductionRetryCapability] = {}
         self._suffix_recovery_capabilities: set[int] = set()
         self._retryable_source_transient_capabilities: set[int] = set()
         self._suffix_recovery_requests: dict[int, CanonicalProductionSuffixRecoveryCapability] = {}
@@ -565,7 +566,9 @@ class CanonicalProductionAdapter:
             or retry.transaction.plan is not retry.plan
         ):
             raise CanonicalSegmentContractError("retry capability lineage is foreign or stale")
+        original.scheduler.validate_frozen_admission(original.plan, original.member)
         self._retry_capabilities.remove(id(capability))
+        self._retry_scan_requests[id(retry)] = capability
         return retry
 
     def declare_retryable_source_transient(
@@ -663,8 +666,22 @@ class CanonicalProductionAdapter:
         self._suffix_recovery_commits.pop(id(recovery))
 
     def scan(self, request: CanonicalProductionSegmentRequest) -> CanonicalProductionScanResult:
+        retry_capability = None
+        if request.plan.attempt == 1 and request.plan.member_index_offset == 0:
+            retry_capability = self._retry_scan_requests.get(id(request))
+            if (
+                retry_capability is None
+                or retry_capability.retry_request is not request
+                or retry_capability.original_request.scheduler is not request.scheduler
+                or retry_capability.original_request.member is not request.member
+            ):
+                raise CanonicalSegmentContractError("retry scan requires an exact consumed capability")
+            request.scheduler.validate_frozen_admission(
+                retry_capability.original_plan, retry_capability.original_request.member
+            )
+            self._retry_scan_requests.pop(id(request))
         if request.plan.attempt == 1 and request.plan.member_index_offset > 0:
-            capability = self._suffix_recovery_requests.pop(id(request), None)
+            capability = self._suffix_recovery_requests.get(id(request))
             if (
                 capability is None
                 or capability.recovery.recovery_plan is not request.plan
@@ -672,7 +689,11 @@ class CanonicalProductionAdapter:
                 or request.member is not request.plan.members[request.member_index]
             ):
                 raise CanonicalSegmentContractError("suffix recovery scan requires an exact consumed capability")
+            request.scheduler.validate_frozen_admission(capability.recovery.original_plan, request.member)
+            self._suffix_recovery_requests.pop(id(request))
             self._suffix_recovery_scans[id(request)] = capability
+        if request.plan.attempt == 0:
+            request.scheduler.validate_frozen_admission(request.plan, request.member)
         if (
             request.transaction.plan is not request.plan
             or request.member_index < 0

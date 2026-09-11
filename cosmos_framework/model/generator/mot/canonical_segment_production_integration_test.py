@@ -14,9 +14,8 @@ from cosmos_framework.model.generator.algorithm.loss.flow_matching import (
 from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler import (
     CanonicalBatchScheduler,
     CanonicalBatchWindowTransaction,
-    CanonicalGAWindowPlan,
+    CatalogRow,
     ChronologyCountRecord,
-    MicrobatchPlanMember,
     ProjectedSchedulerState,
     QueueEpochSnapshot,
 )
@@ -132,18 +131,19 @@ def _bound_request_and_carrier() -> tuple[CanonicalProductionSegmentRequest, Can
         ("category",),
         provenance,
     )
-    member = MicrobatchPlanMember(
-        0,
-        (SegmentIdentity(0, "episode", "category", 0, 0, "source"),),
-        (provenance,),
-        (ChronologyCountRecord(0, "episode", "category", "source", 0, 2, False, "manifest"),),
-        (2,),
-        2,
-        QueueEpochSnapshot(1, 0, "catalog", (("category", 0),)),
-        (),
+    identity = SegmentIdentity(0, "episode", "category", 0, 0, "source")
+    chronology = ChronologyCountRecord(0, "episode", "category", "source", 0, 2, False, "manifest")
+    queue_snapshot = QueueEpochSnapshot(1, 0, "catalog", (("category", 0),), (("category", (0,)),))
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            queue_snapshot,
+            (),
+            target_distribution=(("category", 1.0),),
+            catalog=(CatalogRow(identity, chronology, provenance),),
+        )
     )
-    plan = CanonicalGAWindowPlan((member,), 2, 1, "integration")
-    scheduler = CanonicalBatchScheduler(ProjectedSchedulerState(QueueEpochSnapshot(1, 0, "catalog", ()), ()))
+    plan = scheduler.freeze_plan(slot_groups=((0,),), plan_chain_id="integration")
+    member = plan.members[0]
     request = CanonicalProductionSegmentRequest(
         scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, segment_batch
     )
@@ -326,6 +326,21 @@ def test_adapter_binds_only_the_exact_registered_canonical_modules() -> None:
     model = SimpleNamespace(net=SimpleNamespace(local_history_runtime=SimpleNamespace(encoder=encoder, recurrent_backend=core)))
     with pytest.raises(RuntimeError, match="requires registered"):
         _canonical_production_adapter_from_model(model)
+
+
+def test_registered_owner_scan_backpropagates_to_the_exact_registered_slow_parameters() -> None:
+    request, _ = _bound_request_and_carrier()
+    encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
+    core = ContinualTTTLocalMemoryCore(evidence_dim=256)
+    model = SimpleNamespace(net=SimpleNamespace(local_memory_runtime=SimpleNamespace(evidence_encoder=encoder, ttt_core=core)))
+    adapter = _canonical_production_adapter_from_model(model)
+    result = adapter.scan(request)
+    result.local_tokens.sum().backward()
+    assert adapter.encoder is encoder and adapter.core is core
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in encoder.parameters())
+    required = (core.key_proj.weight, core.query_proj.weight, core.value_proj.weight, core.slot_queries, *core._w0)
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in required)
+    adapter.abort_scan(request, result)
 
 
 def test_canonical_branch_rejects_context_parallelism_before_adapter_lookup() -> None:

@@ -630,6 +630,7 @@ class CanonicalBatchScheduler:
     def __init__(self, state: ProjectedSchedulerState) -> None:
         self._state = state
         self._frozen_transitions: list[tuple[MicrobatchPlanMember, ProjectedSchedulerState, ProjectedSchedulerState]] = []
+        self._frozen_plans: dict[int, CanonicalGAWindowPlan] = {}
 
     @property
     def snapshot(self) -> ProjectedSchedulerState:
@@ -656,7 +657,16 @@ class CanonicalBatchScheduler:
             plan_chain_id,
         )
         self._frozen_transitions.extend(transitions)
+        self._frozen_plans[id(plan)] = plan
         return plan
+
+    def validate_frozen_admission(self, plan: CanonicalGAWindowPlan, member: MicrobatchPlanMember) -> None:
+        """Prove an unconsumed scan request is the exact next frozen admission."""
+        if self._frozen_plans.get(id(plan)) is not plan or not self._frozen_transitions:
+            raise CanonicalSegmentContractError("scan requires an exact scheduler frozen plan")
+        frozen, before, _ = self._frozen_transitions[0]
+        if member is not frozen or self._state != before:
+            raise CanonicalSegmentContractError("scan member is foreign, stale, or out of frozen order")
 
     def reconcile_after_backward(self, member: MicrobatchPlanMember, actual_n_valid: int) -> None:
         if actual_n_valid != member.planned_n_valid:

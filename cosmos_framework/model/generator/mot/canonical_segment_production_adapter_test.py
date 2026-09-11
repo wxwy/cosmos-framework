@@ -32,6 +32,24 @@ from cosmos_framework.model.generator.mot.local_evidence import (
 from cosmos_framework.model.generator.mot.local_memory_segment import SegmentBatch, SegmentIdentity, SegmentProvenance
 
 
+def _admitted_single_member(
+    provenance: SegmentProvenance, *, episode_id: str = "episode", source_digest: str = "source", count: int = 2
+) -> tuple[CanonicalBatchScheduler, CanonicalGAWindowPlan, MicrobatchPlanMember]:
+    identity = SegmentIdentity(0, episode_id, "category", 0, 0, source_digest)
+    chronology = ChronologyCountRecord(0, episode_id, "category", source_digest, 0, count, False, "manifest")
+    snapshot = QueueEpochSnapshot(1, 0, "catalog", (("category", 0),), (("category", (0,)),))
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            snapshot,
+            (),
+            target_distribution=(("category", 1.0),),
+            catalog=(CatalogRow(identity, chronology, provenance),),
+        )
+    )
+    plan = scheduler.freeze_plan(slot_groups=((0,),), plan_chain_id="adapter-test")
+    return scheduler, plan, plan.members[0]
+
+
 def test_adapter_scan_derives_stream_major_gather_and_fp32_state() -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
     batch = SegmentBatch(
@@ -39,13 +57,7 @@ def test_adapter_scan_derives_stream_major_gather_and_fp32_state() -> None:
         torch.zeros(1, 2, 96), torch.zeros(1, 2, 10), torch.tensor([[False, True]]), torch.tensor([[-1, 0]]),
         torch.tensor([0]), ("episode",), ("category",), provenance,
     )
-    member = MicrobatchPlanMember(
-        0, (SegmentIdentity(0, "episode", "category", 0, 0, "source"),), (provenance,),
-        (ChronologyCountRecord(0, "episode", "category", "source", 0, 2, False, "manifest"),), (2,), 2,
-        QueueEpochSnapshot(1, 0, "catalog", (("category", 0),)), (),
-    )
-    plan = CanonicalGAWindowPlan((member,), 2, 1, "chain")
-    scheduler = CanonicalBatchScheduler(ProjectedSchedulerState(QueueEpochSnapshot(1, 0, "catalog", ()), ()))
+    scheduler, plan, member = _admitted_single_member(provenance)
     request = CanonicalProductionSegmentRequest(scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, batch)
     core = ContinualTTTLocalMemoryCore(evidence_dim=256)
     adapter = CanonicalProductionAdapter(LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), core)
@@ -64,6 +76,29 @@ def test_adapter_scan_derives_stream_major_gather_and_fp32_state() -> None:
     adapter.abort_scan(request, adapter.scan(request))
 
 
+def test_adapter_scan_rejects_reconstructed_frozen_plan_before_frontier_or_core_scan() -> None:
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    scheduler, plan, member = _admitted_single_member(provenance)
+    batch = SegmentBatch(
+        torch.zeros(1, 2, 96), (('s0', 's1'),), torch.tensor([[True, True]]), torch.tensor([[0, 1]]),
+        torch.zeros(1, 2, 96), torch.zeros(1, 2, 10), torch.tensor([[False, True]]), torch.tensor([[-1, 0]]),
+        torch.tensor([0]), ("episode",), ("category",), provenance,
+    )
+    copied_plan = replace(plan)
+    request = CanonicalProductionSegmentRequest(
+        scheduler, copied_plan, CanonicalBatchWindowTransaction(copied_plan), member, 0, batch
+    )
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(evidence_dim=256),
+    )
+    scheduler_before = scheduler.snapshot
+    with pytest.raises(CanonicalSegmentContractError, match="exact scheduler frozen plan"):
+        adapter.scan(request)
+    assert scheduler.snapshot == scheduler_before
+    assert adapter._scan_requests == set() and adapter.frontier._states == {}
+
+
 def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity() -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
     batch = SegmentBatch(
@@ -73,16 +108,25 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
         torch.tensor([[-1, 0, -1], [-1, 0, 1]]), torch.tensor([0, 1]), ("episode-0", "episode-1"),
         ("category", "category"), provenance,
     )
-    member = MicrobatchPlanMember(
-        0,
-        (SegmentIdentity(0, "episode-0", "category", 0, 0, "source"), SegmentIdentity(1, "episode-1", "category", 0, 0, "source")),
-        (provenance, provenance),
-        (ChronologyCountRecord(0, "episode-0", "category", "source", 0, 2, False, "manifest"), ChronologyCountRecord(1, "episode-1", "category", "source", 0, 3, False, "manifest")),
-        (2, 3), 5,
-        QueueEpochSnapshot(1, 0, "catalog", (("category", 0),)), (),
+    identities = (
+        SegmentIdentity(0, "episode-0", "category", 0, 0, "source"),
+        SegmentIdentity(1, "episode-1", "category", 0, 0, "source"),
     )
-    plan = CanonicalGAWindowPlan((member,), 5, 1, "carrier")
-    scheduler = CanonicalBatchScheduler(ProjectedSchedulerState(QueueEpochSnapshot(1, 0, "catalog", ()), ()))
+    chronology = (
+        ChronologyCountRecord(0, "episode-0", "category", "source", 0, 2, False, "manifest"),
+        ChronologyCountRecord(1, "episode-1", "category", "source", 0, 3, False, "manifest"),
+    )
+    snapshot = QueueEpochSnapshot(1, 0, "catalog", (("category", 0),), (("category", (0, 1)),))
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            snapshot,
+            (),
+            target_distribution=(("category", 1.0),),
+            catalog=tuple(CatalogRow(identity, record, provenance) for identity, record in zip(identities, chronology, strict=True)),
+        )
+    )
+    plan = scheduler.freeze_plan(slot_groups=((0, 1),), plan_chain_id="carrier")
+    member = plan.members[0]
     request = CanonicalProductionSegmentRequest(scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, batch)
     samples = tuple(
         tuple({"canonical_identity": (row, f"episode-{row}", step)} if step >= 0 else None for step in steps)
@@ -274,8 +318,8 @@ def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity(
 
 def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
-    identity = SegmentIdentity(0, "episode", "category", 0, 0, "source")
-    record = ChronologyCountRecord(0, "episode", "category", "source", 0, 2, False, "manifest")
+    identity = SegmentIdentity(0, "episode", "category", 0, 0, "source", True)
+    record = ChronologyCountRecord(0, "episode", "category", "source", 0, 2, True, "manifest")
     state = ProjectedSchedulerState(
         QueueEpochSnapshot(
             1,
@@ -318,9 +362,15 @@ def test_adapter_commit_is_exact_once_and_preflights_before_frontier_mutation() 
     )
     with pytest.raises(CanonicalSegmentContractError, match="lacks exact committed"):
         adapter.frontier.state_for(continuation)
+    retired_key = (0, "episode", "source", 0)
+    preserved_key = (1, "other", "other-source", 0)
+    adapter.frontier._states[retired_key] = core.initial_state(1, dtype=torch.float32)
+    adapter.frontier._states[preserved_key] = core.initial_state(1, dtype=torch.float32)
     transaction.mark_backward_started(0)
     adapter.commit_success(capability)
     assert transaction.snapshot().completed_members == (0,)
+    assert retired_key not in adapter.frontier._states
+    assert preserved_key in adapter.frontier._states
     with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
         adapter.commit_success(capability)
 
@@ -452,6 +502,11 @@ def test_adapter_retry_preserves_original_frozen_transition_exactly_once() -> No
     assert capability.retry_plan.original_ga_effective == plan.original_ga_effective
     assert capability.retry_plan.plan_chain_id == plan.plan_chain_id
     assert len(scheduler._frozen_transitions) == 1
+    scheduler_before = scheduler.snapshot
+    with pytest.raises(CanonicalSegmentContractError, match="exact consumed capability"):
+        adapter.scan(capability.retry_request)
+    assert scheduler.snapshot == scheduler_before
+    assert adapter._scan_requests == set() and adapter.frontier._states == {}
     with pytest.raises(CanonicalSegmentContractError, match="unstarted batch window"):
         adapter.retry_first_member_pre_backward(request)
     with pytest.raises(CanonicalSegmentContractError, match="foreign or already consumed"):
