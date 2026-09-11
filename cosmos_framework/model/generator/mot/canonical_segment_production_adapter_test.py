@@ -114,7 +114,9 @@ def test_adapter_scan_derives_stream_major_gather_and_fp32_state() -> None:
     adapter.abort_scan(request, adapter.scan(request))
 
 
-def test_adapter_scan_rejects_reconstructed_frozen_plan_before_frontier_or_core_scan() -> None:
+def test_adapter_scan_rejects_reconstructed_frozen_plan_before_frontier_or_core_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
     scheduler, plan, member = _admitted_single_member(provenance)
     batch = SegmentBatch(
@@ -130,11 +132,7 @@ def test_adapter_scan_rejects_reconstructed_frozen_plan_before_frontier_or_core_
         LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
         ContinualTTTLocalMemoryCore(evidence_dim=256),
     )
-    scheduler_before = scheduler.snapshot
-    with pytest.raises(CanonicalSegmentContractError, match="exact scheduler frozen plan"):
-        adapter.scan(request)
-    assert scheduler.snapshot == scheduler_before
-    assert adapter._scan_requests == set() and adapter.frontier._states == {}
+    _assert_pre_scan_rejected_without_core_scan(monkeypatch, adapter, request)
 
 
 def test_adapter_scan_rejects_foreign_stale_and_copied_admission_before_core_scan(
@@ -160,6 +158,39 @@ def test_adapter_scan_rejects_foreign_stale_and_copied_admission_before_core_sca
         LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
     )
     _assert_pre_scan_rejected_without_core_scan(monkeypatch, stale_adapter, stale)
+
+
+def test_adapter_scan_rejects_exact_later_frozen_member_out_of_order_before_core_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    rows = tuple(
+        CatalogRow(
+            SegmentIdentity(0, episode, "category", 0, 0, digest),
+            ChronologyCountRecord(0, episode, "category", digest, 0, 2, False, "manifest"),
+            provenance,
+        )
+        for episode, digest in (("episode-a", "a"), ("episode-b", "b"))
+    )
+    scheduler = CanonicalBatchScheduler(
+        ProjectedSchedulerState(
+            QueueEpochSnapshot(1, 0, "catalog", (("category", 0),), (("category", queue_permutation(queue_seed=1, epoch=0, category="category", catalog_size=2)),)),
+            (), target_distribution=(("category", 1.0),), catalog=rows,
+        )
+    )
+    plan = scheduler.freeze_plan(slot_groups=((0,), (1,)), plan_chain_id="out-of-order")
+    member = plan.members[1]
+    identity = member.row_identities[0]
+    batch = SegmentBatch(
+        torch.zeros(1, 2, 96), (("s0", "s1"),), torch.tensor([[True, True]]), torch.tensor([[0, 1]]),
+        torch.zeros(1, 2, 96), torch.zeros(1, 2, 10), torch.tensor([[False, True]]), torch.tensor([[-1, 0]]),
+        torch.tensor([identity.slot_id]), (identity.episode_id,), (identity.category,), provenance,
+    )
+    request = CanonicalProductionSegmentRequest(scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 1, batch)
+    adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
+    )
+    _assert_pre_scan_rejected_without_core_scan(monkeypatch, adapter, request)
 
 
 def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity() -> None:
@@ -594,9 +625,12 @@ def test_adapter_retry_rejects_stale_copied_duplicate_and_post_backward_paths_be
         LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
     )
     copied_capability = copied_adapter.retry_first_member_pre_backward(copied_source)
+    copied_exact = copied_adapter.consume_retry(copied_capability)
+    retry_authority_before = dict(copied_adapter._retry_scan_requests)
     _assert_pre_scan_rejected_without_core_scan(
-        monkeypatch, copied_adapter, replace(copied_capability.retry_request)
+        monkeypatch, copied_adapter, replace(copied_exact)
     )
+    assert copied_adapter._retry_scan_requests == retry_authority_before
 
     stale_source = _single_member_request()
     stale_adapter = CanonicalProductionAdapter(
@@ -612,6 +646,20 @@ def test_adapter_retry_rejects_stale_copied_duplicate_and_post_backward_paths_be
     assert stale_source.transaction.snapshot() == transaction_before
     assert stale_adapter._retry_capabilities == {id(stale_capability)}
     assert stale_adapter._retry_scan_requests == {} and stale_adapter._scan_requests == set()
+
+    stale_scan_source = _single_member_request()
+    stale_scan_adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
+    )
+    stale_scan_request = stale_scan_adapter.consume_retry(
+        stale_scan_adapter.retry_first_member_pre_backward(stale_scan_source)
+    )
+    stale_scan_source.scheduler.reconcile_after_backward(
+        stale_scan_source.member, stale_scan_source.member.planned_n_valid
+    )
+    retry_authority_before = dict(stale_scan_adapter._retry_scan_requests)
+    _assert_pre_scan_rejected_without_core_scan(monkeypatch, stale_scan_adapter, stale_scan_request)
+    assert stale_scan_adapter._retry_scan_requests == retry_authority_before
 
     replay_source = _single_member_request()
     replay_adapter = CanonicalProductionAdapter(
