@@ -241,15 +241,7 @@ def test_canonical_native_dispatcher_scales_and_backwards_exactly_once() -> None
     )
     plan = scheduler.freeze_plan(slot_groups=((0,), (0,)), plan_chain_id="normal-non-degenerate-dispatch")
     assert (tuple(member.planned_n_valid for member in plan.members), plan.original_n_valid_window, plan.original_ga_effective) == ((2, 5), 7, 2)
-    request = CanonicalProductionSegmentRequest(
-        scheduler, plan, CanonicalBatchWindowTransaction(plan), plan.members[0], 0, request.segment_batch
-    )
-    carrier = replace(carrier, request=request, member=plan.members[0], row_identities=plan.members[0].row_identities, row_chronology=plan.members[0].row_chronology)
     adapter = CanonicalProductionAdapter(LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256))
-    result = adapter.scan(request)
-    prepared = adapter.attach_native_preparation(adapter.prepare_native_inputs(request, result, carrier, input_image_key="images", input_video_key="video"), input_text_indexes=[[], []], sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)], gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[])
-    anchor = torch.nn.Parameter(torch.ones(()))
-    capability = adapter.bind_native_forward(prepared, build_canonical_native_loss_split(consumer_identities=prepared.traversal.identities, modalities={"vision": CanonicalNativeModalityTerms(torch.tensor([7.0, 7.0], requires_grad=True), (0, 1), 1.0)}, sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 3.0, graph_anchor=anchor))
 
     class CountingScaler:
         def __init__(self) -> None:
@@ -270,13 +262,44 @@ def test_canonical_native_dispatcher_scales_and_backwards_exactly_once() -> None
 
             return CountedTensor()
 
+    def batch(member) -> SegmentBatch:
+        count = member.planned_n_valid
+        member_identity = member.row_identities[0]
+        return SegmentBatch(
+            torch.zeros(1, count, 96), (tuple(f"s{index}" for index in range(count)),),
+            torch.ones(1, count, dtype=torch.bool), torch.arange(count).reshape(1, count),
+            torch.zeros(1, count, 96), torch.zeros(1, count, 10),
+            torch.tensor([[False, *([True] * (count - 1))]]), torch.tensor([[-1, *range(count - 1)]]),
+            torch.tensor([member_identity.slot_id]), (member_identity.episode_id,), (member_identity.category,), provenance,
+        )
+
+    transaction = CanonicalBatchWindowTransaction(plan)
     scaler = CountingScaler()
-    objective = object.__new__(ImaginaireTrainer)._run_canonical_native_backward(
-        {"psm_canonical_native_forward": capability}, scaler
-    )
-    assert scaler.scaled == [objective] and scaler.backward_calls == 1
-    torch.testing.assert_close(objective, torch.tensor(2 / 7 * 7 + 3 / 2))
-    assert request.transaction.snapshot().completed_members == (0,)
+    objectives = []
+    for member, primary_value in zip(plan.members, (7.0, 11.0), strict=True):
+        request = CanonicalProductionSegmentRequest(scheduler, plan, transaction, member, member.member_index, batch(member))
+        result = adapter.scan(request)
+        prepared = adapter.attach_native_preparation(
+            adapter.prepare_native_inputs(
+                request, result, _synthetic_carrier_for_request(request), input_image_key="images", input_video_key="video"
+            ),
+            input_text_indexes=[[] for _ in range(member.planned_n_valid)],
+            sequence_plans=[SequencePlan(has_text=False, has_local_memory=local_prefix is not None) for local_prefix in result.gathered.local_prefixes],
+            gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[],
+        )
+        anchor = torch.nn.Parameter(torch.ones(()))
+        capability = adapter.bind_native_forward(
+            prepared,
+            build_canonical_native_loss_split(
+                consumer_identities=prepared.traversal.identities,
+                modalities={"vision": CanonicalNativeModalityTerms(torch.full((member.planned_n_valid,), primary_value, requires_grad=True), tuple(range(member.planned_n_valid)), 1.0)},
+                sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 3.0, graph_anchor=anchor,
+            ),
+        )
+        objectives.append(object.__new__(ImaginaireTrainer)._run_canonical_native_backward({"psm_canonical_native_forward": capability}, scaler))
+    torch.testing.assert_close(torch.stack(objectives), torch.tensor((3.5, 5 / 7 * 11 + 3 / 2)))
+    assert scaler.scaled == objectives and scaler.backward_calls == 2
+    assert transaction.snapshot().completed_members == (0, 1)
 
 
 def test_canonical_native_dispatcher_recovery_scales_and_commits_exact_suffix_once() -> None:
