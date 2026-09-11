@@ -36,13 +36,16 @@ from cosmos_framework.model.generator.mot.local_memory_segment import (
 )
 
 from .config_checkpoint_contract import (
+    FeatureConfigIdentity,
     LocalMemoryConfig,
+    build_base_identity,
     canonical_slow_inventory,
     slow_checkpoint_payload,
     strict_restore,
     strict_restore_into,
     validate_exact_optimizer_membership,
     validate_optimizer_membership,
+    validate_pristine_progress,
     validate_runtime_admission,
     validate_slow_inventory,
 )
@@ -63,18 +66,38 @@ def _fixture() -> tuple[_RuntimeRoot, nn.Linear, nn.Parameter, CanonicalProducti
     return root, projector, modality, adapter, scheduler
 
 
+def _base_identity() -> dict[str, object]:
+    return build_base_identity(
+        child_git_revision="f" * 40,
+        feature_config=FeatureConfigIdentity(),
+        checkpoint_source_fingerprint="synthetic-source",
+        manifest_sha256="m" * 64,
+        source_sha256="s" * 64,
+    )
+
+
+def _feature_config(config: LocalMemoryConfig = LocalMemoryConfig()) -> FeatureConfigIdentity:
+    return FeatureConfigIdentity(
+        ttt_tbptt_steps=config.ttt_tbptt_steps,
+        ttt_inner_lr=config.ttt_inner_lr,
+        k_local=config.k_local,
+        local_evidence_feature_version=config.local_evidence_feature_version,
+        local_fast_state_dtype=config.local_fast_state_dtype,
+        local_runtime_resume_mode=config.local_runtime_resume_mode,
+    )
+
+
+def _payload(expected: dict[str, nn.Parameter], config: LocalMemoryConfig = LocalMemoryConfig(), **kwargs: object) -> dict[str, object]:
+    return slow_checkpoint_payload(expected, config, feature_config=_feature_config(config), base_identity=_base_identity(), **kwargs)
+
+
 def _restore(root: _RuntimeRoot, projector: nn.Linear, modality: nn.Parameter, adapter: CanonicalProductionAdapter, scheduler: CanonicalBatchScheduler, payload: dict[str, object], expected: dict[str, nn.Parameter], **kwargs: object) -> None:
-    strict_restore_into(root, payload, expected, LocalMemoryConfig(), runtime_encoder=root.evidence_encoder, runtime_core=root.ttt_core, local_memory2llm=projector, modality=modality, adapter=adapter, scheduler=scheduler, **kwargs)
+    config = LocalMemoryConfig()
+    strict_restore_into(root, payload, expected, config, runtime_encoder=root.evidence_encoder, runtime_core=root.ttt_core, local_memory2llm=projector, modality=modality, adapter=adapter, scheduler=scheduler, feature_config=_feature_config(config), base_identity=_base_identity(), **kwargs)
 
 
 def _optimizer_and_scheduler(expected: dict[str, nn.Parameter]) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.ExponentialLR]:
     optimizer = torch.optim.AdamW(tuple(expected.values()), lr=0.1)
-    for parameter in expected.values():
-        optimizer.state[parameter] = {
-            "step": torch.tensor(1.0),
-            "exp_avg": torch.zeros_like(parameter),
-            "exp_avg_sq": torch.zeros_like(parameter),
-        }
     return optimizer, torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
 
 
@@ -136,6 +159,64 @@ def test_config_identity_is_versioned_deterministic_and_fail_closed() -> None:
             LocalMemoryConfig.from_mapping(bad)
 
 
+def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
+    feature = FeatureConfigIdentity()
+    mapping = feature.to_mapping()
+    assert len(mapping) == 15
+    assert FeatureConfigIdentity.from_mapping(mapping) == feature
+    for bad in (
+        {key: value for key, value in mapping.items() if key != "enable_input_bias"},
+        {**mapping, "foreign": 1},
+        {**mapping, "local_memory_dim": 31},
+        {**mapping, "local_history_state_enabled": True},
+    ):
+        with pytest.raises(ValueError):
+            FeatureConfigIdentity.from_mapping(bad)
+    identity = build_base_identity(
+        child_git_revision="f" * 40,
+        feature_config=feature,
+        checkpoint_source_fingerprint="source-fingerprint",
+        manifest_sha256="m" * 64,
+        source_sha256="s" * 64,
+    )
+    assert set(identity) == {
+        "schema",
+        "child_git_revision",
+        "canonical_model_config_sha256",
+        "checkpoint_source_fingerprint",
+        "manifest_sha256",
+        "source_sha256",
+    }
+    with pytest.raises(ValueError):
+        build_base_identity(
+            child_git_revision="",
+            feature_config=feature,
+            checkpoint_source_fingerprint="source-fingerprint",
+            manifest_sha256="m" * 64,
+            source_sha256="s" * 64,
+        )
+
+
+def test_pristine_progress_predicate_is_exact_and_fail_closed() -> None:
+    pristine = {"last_epoch": 0, "_step_count": 1}
+    validate_pristine_progress(
+        iteration=0,
+        optimizer_state={"state": {}, "param_groups": []},
+        scheduler_state=pristine,
+        pristine_scheduler_state=pristine,
+        optimizer_present=True,
+        scheduler_present=True,
+    )
+    for kwargs in (
+        {"iteration": 1, "optimizer_state": {"state": {}, "param_groups": []}, "scheduler_state": pristine, "pristine_scheduler_state": pristine, "optimizer_present": True, "scheduler_present": True},
+        {"iteration": 0, "optimizer_state": {"state": {0: {"step": 1}}, "param_groups": []}, "scheduler_state": pristine, "pristine_scheduler_state": pristine, "optimizer_present": True, "scheduler_present": True},
+        {"iteration": 0, "optimizer_state": {"state": {}, "param_groups": []}, "scheduler_state": {"last_epoch": 1, "_step_count": 1}, "pristine_scheduler_state": pristine, "optimizer_present": True, "scheduler_present": True},
+        {"iteration": 0, "optimizer_state": None, "scheduler_state": {"last_epoch": 0}, "pristine_scheduler_state": None, "optimizer_present": False, "scheduler_present": False},
+    ):
+        with pytest.raises(ValueError):
+            validate_pristine_progress(**kwargs)
+
+
 def test_active_ttt_projection_abi_is_fail_closed() -> None:
     OmniMoTModelConfig(
         local_ttt_enabled=True,
@@ -177,21 +258,29 @@ def test_active_owner_inventory_selectors_and_adapter_are_exact() -> None:
 def test_slow_payload_rejects_runtime_keys_and_stages_without_mutation() -> None:
     root, projector, modality, adapter, scheduler = _fixture()
     expected = canonical_slow_inventory(root, projector, modality)
-    payload = slow_checkpoint_payload(expected, LocalMemoryConfig())
-    assert strict_restore(payload, expected, LocalMemoryConfig())
+    payload = _payload(expected)
+    assert strict_restore(payload, expected, LocalMemoryConfig(), feature_config=_feature_config(), base_identity=_base_identity())
     with pytest.raises(ValueError, match="runtime"):
-        slow_checkpoint_payload({"local_memory_runtime.frontier": next(iter(expected.values()))}, LocalMemoryConfig())
+        _payload({"local_memory_runtime.frontier": next(iter(expected.values()))})
     before = {name: value.detach().clone() for name, value in expected.items()}
     damaged = {**payload, "parameters": {**payload["parameters"], "local_memory2llm.weight": torch.zeros(1)}}
     with pytest.raises(ValueError, match="tensor"):
         _restore(root, projector, modality, adapter, scheduler, damaged, expected)
+    feature_drift = copy.deepcopy(payload)
+    feature_drift["feature_config"]["enable_input_bias"] = False
+    with pytest.raises(ValueError, match="identity"):
+        _restore(root, projector, modality, adapter, scheduler, feature_drift, expected)
+    base_drift = copy.deepcopy(payload)
+    base_drift["base_identity"]["source_sha256"] = "d" * 64
+    with pytest.raises(ValueError, match="identity"):
+        _restore(root, projector, modality, adapter, scheduler, base_drift, expected)
     assert all(torch.equal(value, before[name]) for name, value in expected.items())
 
 
 def test_restore_preflight_is_atomic() -> None:
     root, projector, modality, adapter, scheduler = _fixture()
     expected = canonical_slow_inventory(root, projector, modality)
-    payload = slow_checkpoint_payload(expected, LocalMemoryConfig())
+    payload = _payload(expected)
     snapshot = {name: value.detach().clone() for name, value in expected.items()}
     with torch.no_grad():
         for value in expected.values():
@@ -205,16 +294,13 @@ def test_restore_round_trip_preflights_optimizer_scheduler_and_object_membership
     root, projector, modality, adapter, scheduler = _fixture()
     expected = canonical_slow_inventory(root, projector, modality)
     optimizer, state_scheduler = _optimizer_and_scheduler(expected)
-    payload = slow_checkpoint_payload(expected, LocalMemoryConfig(), optimizer=optimizer, scheduler=state_scheduler, iteration=7)
+    payload = _payload(expected, optimizer=optimizer, scheduler=state_scheduler, iteration=0)
     slow_snapshot = {name: value.detach().clone() for name, value in expected.items()}
     optimizer_snapshot = copy.deepcopy(payload["optimizer"])
     scheduler_snapshot = copy.deepcopy(payload["scheduler"])
     with torch.no_grad():
         for value in expected.values():
             value.add_(1)
-    for state in optimizer.state.values():
-        state["step"].add_(5)
-    state_scheduler.last_epoch = 4
     _restore(
         root,
         projector,
@@ -225,7 +311,7 @@ def test_restore_round_trip_preflights_optimizer_scheduler_and_object_membership
         expected,
         optimizer=optimizer,
         state_scheduler=state_scheduler,
-        iteration=7,
+        iteration=0,
     )
     assert all(torch.equal(value, slow_snapshot[name]) for name, value in expected.items())
     _assert_state_equal(optimizer.state_dict(), optimizer_snapshot)
@@ -234,7 +320,7 @@ def test_restore_round_trip_preflights_optimizer_scheduler_and_object_membership
     foreign = torch.optim.AdamW(tuple(nn.Parameter(torch.zeros_like(value)) for value in expected.values()), lr=0.1)
     before = {name: value.detach().clone() for name, value in expected.items()}
     with pytest.raises(ValueError, match="optimizer group"):
-        _restore(root, projector, modality, adapter, scheduler, payload, expected, optimizer=foreign, state_scheduler=state_scheduler, iteration=7)
+        _restore(root, projector, modality, adapter, scheduler, payload, expected, optimizer=foreign, state_scheduler=state_scheduler, iteration=0)
     assert all(torch.equal(value, before[name]) for name, value in expected.items())
 
 
@@ -242,18 +328,26 @@ def test_restore_rejects_late_optimizer_or_scheduler_defect_before_mutation() ->
     root, projector, modality, adapter, scheduler = _fixture()
     expected = canonical_slow_inventory(root, projector, modality)
     optimizer, state_scheduler = _optimizer_and_scheduler(expected)
-    payload = slow_checkpoint_payload(expected, LocalMemoryConfig(), optimizer=optimizer, scheduler=state_scheduler, iteration=7)
+    payload = _payload(expected, optimizer=optimizer, scheduler=state_scheduler, iteration=0)
     before_slow = {name: value.detach().clone() for name, value in expected.items()}
     before_optimizer = copy.deepcopy(optimizer.state_dict())
     before_scheduler = copy.deepcopy(state_scheduler.state_dict())
     damaged_optimizer = copy.deepcopy(payload)
     damaged_optimizer["optimizer"].pop("state")
     with pytest.raises(ValueError, match="optimizer"):
-        _restore(root, projector, modality, adapter, scheduler, damaged_optimizer, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=7)
+        _restore(root, projector, modality, adapter, scheduler, damaged_optimizer, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
     damaged_scheduler = copy.deepcopy(payload)
     damaged_scheduler["scheduler"]["foreign"] = 1
     with pytest.raises(ValueError, match="scheduler"):
-        _restore(root, projector, modality, adapter, scheduler, damaged_scheduler, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=7)
+        _restore(root, projector, modality, adapter, scheduler, damaged_scheduler, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
+    damaged_optimizer_identity = copy.deepcopy(payload)
+    damaged_optimizer_identity["optimizer_identity"]["groups"][0]["hyperparameters"]["lr"] = 0.2
+    with pytest.raises(ValueError, match="optimizer identity"):
+        _restore(root, projector, modality, adapter, scheduler, damaged_optimizer_identity, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
+    damaged_scheduler_identity = copy.deepcopy(payload)
+    damaged_scheduler_identity["scheduler_identity"]["class"] = "foreign.Scheduler"
+    with pytest.raises(ValueError, match="scheduler identity"):
+        _restore(root, projector, modality, adapter, scheduler, damaged_scheduler_identity, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
     assert all(torch.equal(value, before_slow[name]) for name, value in expected.items())
     _assert_state_equal(optimizer.state_dict(), before_optimizer)
     _assert_state_equal(state_scheduler.state_dict(), before_scheduler)
@@ -263,7 +357,7 @@ def test_restore_rejects_reordered_duplicate_and_missing_optimizer_membership_be
     root, projector, modality, adapter, scheduler = _fixture()
     expected = canonical_slow_inventory(root, projector, modality)
     optimizer, state_scheduler = _optimizer_and_scheduler(expected)
-    payload = slow_checkpoint_payload(expected, LocalMemoryConfig(), optimizer=optimizer, scheduler=state_scheduler)
+    payload = _payload(expected, optimizer=optimizer, scheduler=state_scheduler)
     before = {name: value.detach().clone() for name, value in expected.items()}
     candidates = (
         torch.optim.AdamW(tuple(reversed(tuple(expected.values()))), lr=0.1),
@@ -282,7 +376,7 @@ def test_restore_rejects_reordered_duplicate_and_missing_optimizer_membership_be
 def test_restore_rejects_real_native_forward_commit_and_retry_authorities_before_mutation() -> None:
     root, projector, modality, adapter, _ = _fixture()
     expected = canonical_slow_inventory(root, projector, modality)
-    payload = slow_checkpoint_payload(expected, LocalMemoryConfig())
+    payload = _payload(expected)
     before = {name: value.detach().clone() for name, value in expected.items()}
     request, carrier = _bound_request_and_carrier()
     result = adapter.scan(request)
@@ -316,7 +410,7 @@ def test_restore_rejects_real_native_forward_commit_and_retry_authorities_before
 def test_restore_rejects_real_suffix_recovery_and_receipt_authorities_before_mutation() -> None:
     root, projector, modality, adapter, scheduler = _fixture()
     expected = canonical_slow_inventory(root, projector, modality)
-    payload = slow_checkpoint_payload(expected, LocalMemoryConfig())
+    payload = _payload(expected)
     provenance = SegmentProvenance("manifest", "config", "source", 0)
 
     def member(index: int, count: int) -> MicrobatchPlanMember:
@@ -359,7 +453,7 @@ def test_restore_rejects_real_suffix_recovery_and_receipt_authorities_before_mut
 def test_restore_rejects_real_pending_and_committed_runtime_authorities_before_mutation() -> None:
     root, projector, modality, adapter, _ = _fixture()
     expected = canonical_slow_inventory(root, projector, modality)
-    payload = slow_checkpoint_payload(expected, LocalMemoryConfig())
+    payload = _payload(expected)
     scheduler, transaction, request, _ = _real_request()
     before = {name: value.detach().clone() for name, value in expected.items()}
     result = adapter.scan(request)
