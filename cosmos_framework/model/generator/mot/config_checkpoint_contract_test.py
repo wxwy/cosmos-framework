@@ -349,6 +349,10 @@ def test_restore_rejects_real_suffix_recovery_and_receipt_authorities_before_mut
     recovered = adapter.consume_suffix_recovery(suffix, segment_batches=(batch(5), batch(3)))
     with pytest.raises(ValueError, match="pending"):
         _restore(root, projector, modality, adapter, scheduler, payload, expected)
+    fresh_adapter = CanonicalProductionAdapter(root.evidence_encoder, root.ttt_core)
+    fresh_scheduler = CanonicalBatchScheduler(ProjectedSchedulerState(QueueEpochSnapshot(1, 0, "catalog", ()), ()))
+    with pytest.raises(ValueError, match="open canonical transaction"):
+        _restore(root, projector, modality, fresh_adapter, fresh_scheduler, payload, expected, transaction=suffix.recovery)
     assert recovered and all(torch.equal(value, before[name]) for name, value in expected.items())
 
 
@@ -368,6 +372,9 @@ def test_restore_rejects_real_pending_and_committed_runtime_authorities_before_m
     result = adapter.scan(request)
     transaction.mark_backward_started(0)
     capability = adapter.prepare_commit(request, result)
+    with pytest.raises(ValueError, match="pending"):
+        _restore(root, projector, modality, adapter, scheduler, payload, expected)
+    assert all(torch.equal(value, before[name]) for name, value in expected.items())
     adapter.commit_success(capability)
     with pytest.raises(ValueError, match="fast-state frontier"):
         _restore(root, projector, modality, adapter, scheduler, payload, expected)
