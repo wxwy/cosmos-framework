@@ -50,6 +50,44 @@ def _admitted_single_member(
     return scheduler, plan, plan.members[0]
 
 
+def _single_member_request() -> CanonicalProductionSegmentRequest:
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    scheduler, plan, member = _admitted_single_member(provenance)
+    batch = SegmentBatch(
+        torch.zeros(1, 2, 96), (("s0", "s1"),), torch.tensor([[True, True]]), torch.tensor([[0, 1]]),
+        torch.zeros(1, 2, 96), torch.zeros(1, 2, 10), torch.tensor([[False, True]]), torch.tensor([[-1, 0]]),
+        torch.tensor([0]), ("episode",), ("category",), provenance,
+    )
+    return CanonicalProductionSegmentRequest(scheduler, plan, CanonicalBatchWindowTransaction(plan), member, 0, batch)
+
+
+def _assert_pre_scan_rejected_without_core_scan(
+    monkeypatch: pytest.MonkeyPatch, adapter: CanonicalProductionAdapter, request: CanonicalProductionSegmentRequest
+) -> None:
+    calls = 0
+
+    def _forbidden_core_scan(*_: object, **__: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("rejected canonical request reached the core scan seam")
+
+    monkeypatch.setattr(adapter.core, "scan_segment_masked_encoded_many", _forbidden_core_scan)
+    scheduler_before = request.scheduler.snapshot
+    transitions_before = tuple(request.scheduler._frozen_transitions)
+    transaction_before = request.transaction.snapshot()
+    frontier_before = dict(adapter.frontier._states)
+    scan_requests_before = set(adapter._scan_requests)
+    scan_results_before = dict(adapter._scan_results)
+    with pytest.raises(CanonicalSegmentContractError):
+        adapter.scan(request)
+    assert calls == 0
+    assert request.scheduler.snapshot == scheduler_before
+    assert tuple(request.scheduler._frozen_transitions) == transitions_before
+    assert request.transaction.snapshot() == transaction_before
+    assert adapter.frontier._states == frontier_before
+    assert adapter._scan_requests == scan_requests_before and adapter._scan_results == scan_results_before
+
+
 def test_adapter_scan_derives_stream_major_gather_and_fp32_state() -> None:
     provenance = SegmentProvenance("manifest", "config", "source", 0)
     batch = SegmentBatch(
@@ -97,6 +135,31 @@ def test_adapter_scan_rejects_reconstructed_frozen_plan_before_frontier_or_core_
         adapter.scan(request)
     assert scheduler.snapshot == scheduler_before
     assert adapter._scan_requests == set() and adapter.frontier._states == {}
+
+
+def test_adapter_scan_rejects_foreign_stale_and_copied_admission_before_core_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _single_member_request()
+    foreign_scheduler, _, _ = _admitted_single_member(SegmentProvenance("manifest", "config", "source", 0))
+    foreign = replace(request, scheduler=foreign_scheduler)
+    foreign_adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
+    )
+    _assert_pre_scan_rejected_without_core_scan(monkeypatch, foreign_adapter, foreign)
+
+    copied = replace(request, member=replace(request.member))
+    copied_adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
+    )
+    _assert_pre_scan_rejected_without_core_scan(monkeypatch, copied_adapter, copied)
+
+    stale = _single_member_request()
+    stale.scheduler.reconcile_after_backward(stale.member, stale.member.planned_n_valid)
+    stale_adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
+    )
+    _assert_pre_scan_rejected_without_core_scan(monkeypatch, stale_adapter, stale)
 
 
 def test_nested_carrier_derives_expected_traversal_and_rejects_foreign_identity() -> None:
@@ -521,6 +584,54 @@ def test_adapter_retry_preserves_original_frozen_transition_exactly_once() -> No
     adapter.commit_success(prepared)
     assert scheduler._frozen_transitions == []
     assert retry_request.transaction.snapshot().completed_members == (0,)
+
+
+def test_adapter_retry_rejects_stale_copied_duplicate_and_post_backward_paths_before_core_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copied_source = _single_member_request()
+    copied_adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
+    )
+    copied_capability = copied_adapter.retry_first_member_pre_backward(copied_source)
+    _assert_pre_scan_rejected_without_core_scan(
+        monkeypatch, copied_adapter, replace(copied_capability.retry_request)
+    )
+
+    stale_source = _single_member_request()
+    stale_adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
+    )
+    stale_capability = stale_adapter.retry_first_member_pre_backward(stale_source)
+    stale_source.scheduler.reconcile_after_backward(stale_source.member, stale_source.member.planned_n_valid)
+    scheduler_before = stale_source.scheduler.snapshot
+    transaction_before = stale_source.transaction.snapshot()
+    with pytest.raises(CanonicalSegmentContractError, match="exact scheduler frozen plan"):
+        stale_adapter.consume_retry(stale_capability)
+    assert stale_source.scheduler.snapshot == scheduler_before
+    assert stale_source.transaction.snapshot() == transaction_before
+    assert stale_adapter._retry_capabilities == {id(stale_capability)}
+    assert stale_adapter._retry_scan_requests == {} and stale_adapter._scan_requests == set()
+
+    replay_source = _single_member_request()
+    replay_adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
+    )
+    replay_capability = replay_adapter.retry_first_member_pre_backward(replay_source)
+    replay_request = replay_adapter.consume_retry(replay_capability)
+    result = replay_adapter.scan(replay_request)
+    _assert_pre_scan_rejected_without_core_scan(monkeypatch, replay_adapter, replay_request)
+    replay_adapter.abort_scan(replay_request, result)
+
+    post_backward_source = _single_member_request()
+    post_backward_adapter = CanonicalProductionAdapter(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG), ContinualTTTLocalMemoryCore(evidence_dim=256)
+    )
+    post_backward_source.transaction.mark_backward_started(0)
+    with pytest.raises(CanonicalSegmentContractError, match="unstarted batch window"):
+        post_backward_adapter.retry_first_member_pre_backward(post_backward_source)
+    assert post_backward_adapter._retry_capabilities == set()
+    assert post_backward_adapter._scan_requests == set() and post_backward_adapter.frontier._states == {}
 
 
 def test_adapter_consumes_exact_committed_prefix_suffix_recovery_once() -> None:

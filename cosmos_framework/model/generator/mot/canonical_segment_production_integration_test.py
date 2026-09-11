@@ -176,6 +176,73 @@ def _bound_request_and_carrier() -> tuple[CanonicalProductionSegmentRequest, Can
     return request, carrier
 
 
+def _build_registered_ttt_owner(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Materialize the canonical owner through the production build-net branch."""
+    import cosmos_framework.model.generator.omni_mot_model as module
+
+    class _Network(torch.nn.Module):
+        def __init__(self, **_: object) -> None:
+            super().__init__()
+
+    config = SimpleNamespace(
+        lora_enabled=False,
+        lbl=SimpleNamespace(method="none", coeff_und=None, coeff_gen=None),
+        rectified_flow_inference_config=SimpleNamespace(num_train_timesteps=1000),
+        diffusion_expert_config=SimpleNamespace(
+            patch_spatial=2, max_vae_latent_side_after_patchify=20, enable_fps_modulation=False,
+            enable_vision_modality_embeddings=False, enable_media_modality_embedding=False,
+            base_fps=24, timestep_range=1.0,
+        ),
+        latent_downsample_factor=8,
+        state_ch=16,
+        state_t=4,
+        vision_gen=True,
+        action_gen=False,
+        sound_gen=False,
+        joint_attn_implementation="eager",
+        flex_attention=SimpleNamespace(enabled=False, backend="", mask=SimpleNamespace(noisy_attention_scope="all")),
+        max_action_dim=32,
+        num_embodiment_domains=1,
+        tokenizer=SimpleNamespace(temporal_compression_factor=4),
+        natten_parameter_list=(),
+        video_temporal_causal=False,
+        sound_dim=None,
+        sound_latent_fps=25,
+        local_memory_enabled=True,
+        local_memory_dim=32,
+        enable_input_bias=True,
+        local_history_enabled=True,
+        local_history_backend="ttt_fast_weight",
+        local_ttt_enabled=True,
+        local_history_evidence_dim=256,
+        ttt_inner_lr=0.1,
+        ttt_tbptt_steps=16,
+        k_local=1,
+        compile=SimpleNamespace(use_cuda_graphs=False),
+        quantization=SimpleNamespace(modelopt_fp8_checkpoint_path=None),
+        activation_checkpointing=SimpleNamespace(),
+    )
+    model = SimpleNamespace(
+        config=config,
+        vlm_config=SimpleNamespace(model_instance=object()),
+        tokenizer_vision_gen=None,
+        parallel_dims=object(),
+        install_attention_dispatch=lambda _: None,
+    )
+    monkeypatch.setattr(module, "lazy_instantiate", lambda *_: SimpleNamespace(config=SimpleNamespace()))
+    monkeypatch.setattr(module, "Cosmos3VFMNetworkConfig", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(module, "Cosmos3VFMNetwork", lambda **kwargs: _Network(**kwargs))
+    monkeypatch.setattr(module, "parallelize_vfm_network", lambda net, **_: net)
+    monkeypatch.setattr(module, "DEVICE", module.Device.CPU)
+    model.net = OmniMoTModel.build_net(model, torch.float32)
+    runtime = model.net.local_memory_runtime
+    runtime.evidence_encoder.visual_proj.reset_parameters()
+    runtime.evidence_encoder.action_proj.reset_parameters()
+    runtime.evidence_encoder.norm.reset_parameters()
+    runtime.ttt_core.reset_parameters()
+    return model
+
+
 def test_native_preparation_owns_working_carrier_fields_and_aborts_on_mismatch() -> None:
     request, carrier = _bound_request_and_carrier()
     adapter = CanonicalProductionAdapter(
@@ -328,11 +395,13 @@ def test_adapter_binds_only_the_exact_registered_canonical_modules() -> None:
         _canonical_production_adapter_from_model(model)
 
 
-def test_registered_owner_scan_backpropagates_to_the_exact_registered_slow_parameters() -> None:
+def test_registered_owner_scan_backpropagates_to_the_exact_registered_slow_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     request, _ = _bound_request_and_carrier()
-    encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
-    core = ContinualTTTLocalMemoryCore(evidence_dim=256)
-    model = SimpleNamespace(net=SimpleNamespace(local_memory_runtime=SimpleNamespace(evidence_encoder=encoder, ttt_core=core)))
+    model = _build_registered_ttt_owner(monkeypatch)
+    encoder = model.net.local_memory_runtime.evidence_encoder
+    core = model.net.local_memory_runtime.ttt_core
     adapter = _canonical_production_adapter_from_model(model)
     result = adapter.scan(request)
     result.local_tokens.sum().backward()
