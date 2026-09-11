@@ -18,6 +18,7 @@ from cosmos_framework.model.generator.mot.canonical_segment_production_adapter i
     CanonicalProductionAdapter,
     CanonicalProductionCommitCapability,
     CanonicalProductionSegmentRequest,
+    CanonicalNativeModalityTerms,
     build_canonical_native_loss_split,
 )
 from cosmos_framework.model.generator.mot.canonical_segment_production_integration_test import (
@@ -210,14 +211,17 @@ def test_canonical_native_dispatcher_scales_and_backwards_exactly_once() -> None
     identity = request.member.row_identities[0]
     chronology = request.member.row_chronology[0]
     provenance = request.member.row_provenances[0]
+    second_identity = replace(identity, cursor=1, segment_id=1)
+    second_chronology = replace(chronology, consumer_step_stop_exclusive=5, consumer_step_start=0)
     scheduler = CanonicalBatchScheduler(
         ProjectedSchedulerState(
             QueueEpochSnapshot(1, 0, "catalog", (("category", 0),), (("category", (0,)),)),
             (("category", 0),), target_distribution=(("category", 1.0),),
-            catalog=(CatalogRow(identity, chronology, provenance),),
+            catalog=(CatalogRow(identity, chronology, provenance), CatalogRow(second_identity, second_chronology, provenance)),
         )
     )
-    plan = scheduler.freeze_plan(slot_groups=((0,),), plan_chain_id="single-dispatch")
+    plan = scheduler.freeze_plan(slot_groups=((0,), (0,)), plan_chain_id="normal-non-degenerate-dispatch")
+    assert (tuple(member.planned_n_valid for member in plan.members), plan.original_n_valid_window, plan.original_ga_effective) == ((2, 5), 7, 2)
     request = CanonicalProductionSegmentRequest(
         scheduler, plan, CanonicalBatchWindowTransaction(plan), plan.members[0], 0, request.segment_batch
     )
@@ -226,7 +230,7 @@ def test_canonical_native_dispatcher_scales_and_backwards_exactly_once() -> None
     result = adapter.scan(request)
     prepared = adapter.attach_native_preparation(adapter.prepare_native_inputs(request, result, carrier, input_image_key="images", input_video_key="video"), input_text_indexes=[[], []], sequence_plans=[SequencePlan(has_text=False), SequencePlan(has_text=False, has_local_memory=True)], gen_data_clean=object(), memory_info={}, data_resolutions=None, vae_pixel_shapes=[])
     anchor = torch.nn.Parameter(torch.ones(()))
-    capability = adapter.bind_native_forward(prepared, build_canonical_native_loss_split(consumer_identities=prepared.traversal.identities, modalities={}, sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 3.0, graph_anchor=anchor))
+    capability = adapter.bind_native_forward(prepared, build_canonical_native_loss_split(consumer_identities=prepared.traversal.identities, modalities={"vision": CanonicalNativeModalityTerms(torch.tensor([7.0, 7.0], requires_grad=True), (0, 1), 1.0)}, sample_level_scale=torch.ones(()), auxiliary_loss=anchor * 3.0, graph_anchor=anchor))
 
     class CountingScaler:
         def __init__(self) -> None:
@@ -252,6 +256,7 @@ def test_canonical_native_dispatcher_scales_and_backwards_exactly_once() -> None
         {"psm_canonical_native_forward": capability}, scaler
     )
     assert scaler.scaled == [objective] and scaler.backward_calls == 1
+    torch.testing.assert_close(objective, torch.tensor(2 / 7 * 7 + 3 / 2))
     assert request.transaction.snapshot().completed_members == (0,)
 
 
