@@ -151,7 +151,7 @@ class LineageOwnerIdentity:
         return result
 
 
-def build_base_identity(*, lineage_owner: LineageOwnerIdentity, feature_config: FeatureConfigIdentity) -> dict[str, object]:
+def _build_base_identity_from_owner(*, lineage_owner: LineageOwnerIdentity, feature_config: FeatureConfigIdentity) -> dict[str, object]:
     owner = lineage_owner.to_mapping()
     source_descriptor = owner["source_descriptor"]
     assert isinstance(source_descriptor, Mapping)
@@ -172,6 +172,24 @@ def build_base_identity(*, lineage_owner: LineageOwnerIdentity, feature_config: 
     ):
         raise ValueError("base identity must contain canonical immutable lineage digests")
     return result
+
+
+_CPU_STATIC_TRUSTED_LINEAGE_OWNER = LineageOwnerIdentity(
+    child_git_revision="d0d73338ca1b0e8ae350d447181a804308241390",
+    manifest_sha256="a" * 64,
+    source_descriptor={
+        "schema": _SOURCE_DESCRIPTOR_SCHEMA,
+        "source_kind": "canonical_cpu_static_gate",
+        "source_id_sha256": "d" * 64,
+        "source_manifest_sha256": "a" * 64,
+        "source_sha256": "b" * 64,
+    },
+)
+
+
+def build_base_identity(*, feature_config: FeatureConfigIdentity) -> dict[str, object]:
+    """Derive the only trusted CPU/static lineage identity; callers cannot supply one."""
+    return _build_base_identity_from_owner(lineage_owner=_CPU_STATIC_TRUSTED_LINEAGE_OWNER, feature_config=feature_config)
 
 
 def _validate_base_identity(value: Mapping[str, object]) -> dict[str, object]:
@@ -489,7 +507,7 @@ def validate_pristine_progress(*, iteration: object, optimizer_state: object, sc
         raise ValueError("checkpoint scheduler state is not pristine")
 
 
-def slow_checkpoint_payload(named_parameters: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, feature_config: FeatureConfigIdentity, base_identity: Mapping[str, object], optimizer: torch.optim.Optimizer | None = None, scheduler: object | None = None, iteration: int = 0) -> dict[str, object]:
+def slow_checkpoint_payload(named_parameters: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, feature_config: FeatureConfigIdentity, optimizer: torch.optim.Optimizer | None = None, scheduler: object | None = None, iteration: int = 0) -> dict[str, object]:
     """Create the only synthetic, in-memory slow-only checkpoint payload."""
     config.validate()
     if _contains_runtime_key(named_parameters):
@@ -497,7 +515,7 @@ def slow_checkpoint_payload(named_parameters: Mapping[str, torch.Tensor], config
     if not isinstance(iteration, int) or isinstance(iteration, bool) or iteration < 0:
         raise ValueError("iteration must be a non-negative integer")
     _validate_feature_config_for_local(feature_config, config)
-    base_identity = _validate_identity_binding(feature_config, base_identity)
+    base_identity = _validate_identity_binding(feature_config, build_base_identity(feature_config=feature_config))
     if (optimizer is None) != (scheduler is None):
         raise ValueError("checkpoint optimizer and scheduler must be jointly present or absent")
     optimizer_identity = None if optimizer is None else _optimizer_identity(optimizer, named_parameters)
@@ -526,12 +544,12 @@ def slow_checkpoint_payload(named_parameters: Mapping[str, torch.Tensor], config
     }
 
 
-def _stage_restore(payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, feature_config: FeatureConfigIdentity, base_identity: Mapping[str, object], optimizer: torch.optim.Optimizer | None, scheduler: object | None, iteration: int) -> dict[str, torch.Tensor]:
+def _stage_restore(payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, feature_config: FeatureConfigIdentity, optimizer: torch.optim.Optimizer | None, scheduler: object | None, iteration: int) -> dict[str, torch.Tensor]:
     config.validate()
     if not isinstance(payload, Mapping) or set(payload) != _PAYLOAD_KEYS or payload.get("version") != _PAYLOAD_VERSION:
         raise ValueError("checkpoint payload schema mismatch")
     _validate_feature_config_for_local(feature_config, config)
-    base_identity = _validate_identity_binding(feature_config, base_identity)
+    base_identity = _validate_identity_binding(feature_config, build_base_identity(feature_config=feature_config))
     if (
         LocalMemoryConfig.from_mapping(payload["config"]) != config
         or FeatureConfigIdentity.from_mapping(payload["feature_config"]) != feature_config
@@ -625,9 +643,9 @@ def _stage_restore(payload: Mapping[str, object], expected: Mapping[str, torch.T
     return restored
 
 
-def strict_restore(payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, feature_config: FeatureConfigIdentity, base_identity: Mapping[str, object]) -> dict[str, torch.Tensor]:
+def strict_restore(payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, feature_config: FeatureConfigIdentity) -> dict[str, torch.Tensor]:
     """Stage tensors only; this never mutates a registered object."""
-    return _stage_restore(payload, expected, config, feature_config=feature_config, base_identity=base_identity, optimizer=None, scheduler=None, iteration=0)
+    return _stage_restore(payload, expected, config, feature_config=feature_config, optimizer=None, scheduler=None, iteration=0)
 
 
 def validate_runtime_admission(*, adapter: object, scheduler: object, transaction: object | None = None) -> None:
@@ -646,13 +664,13 @@ def validate_runtime_admission(*, adapter: object, scheduler: object, transactio
         raise ValueError("restore rejects an open canonical transaction or recovery receipt")
 
 
-def strict_restore_into(root: nn.Module, payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, runtime_encoder: nn.Module, runtime_core: nn.Module, local_memory2llm: nn.Module, modality: nn.Parameter, adapter: object, scheduler: object, transaction: object | None = None, optimizer: torch.optim.Optimizer | None = None, state_scheduler: object | None = None, iteration: int = 0, feature_config: FeatureConfigIdentity, base_identity: Mapping[str, object]) -> nn.Module:
+def strict_restore_into(root: nn.Module, payload: Mapping[str, object], expected: Mapping[str, torch.Tensor], config: LocalMemoryConfig, *, runtime_encoder: nn.Module, runtime_core: nn.Module, local_memory2llm: nn.Module, modality: nn.Parameter, adapter: object, scheduler: object, transaction: object | None = None, optimizer: torch.optim.Optimizer | None = None, state_scheduler: object | None = None, iteration: int = 0, feature_config: FeatureConfigIdentity) -> nn.Module:
     """Preflight every fallible contract before copying into existing objects once."""
     _validate_feature_config_against_runtime(feature_config, runtime_encoder, runtime_core, local_memory2llm, modality)
     validate_slow_inventory(root, runtime_encoder=runtime_encoder, runtime_core=runtime_core, adapter=adapter)
     inventory = canonical_slow_inventory(root, local_memory2llm, modality)
     validate_exact_optimizer_membership(expected, inventory)
-    staged = _stage_restore(payload, expected, config, feature_config=feature_config, base_identity=base_identity, optimizer=optimizer, scheduler=state_scheduler, iteration=iteration)
+    staged = _stage_restore(payload, expected, config, feature_config=feature_config, optimizer=optimizer, scheduler=state_scheduler, iteration=iteration)
     validate_runtime_admission(adapter=adapter, scheduler=scheduler, transaction=transaction)
     with torch.no_grad():
         for name, target in expected.items():

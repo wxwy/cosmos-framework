@@ -38,7 +38,6 @@ from cosmos_framework.model.generator.mot.local_memory_segment import (
 
 from .config_checkpoint_contract import (
     FeatureConfigIdentity,
-    LineageOwnerIdentity,
     LocalMemoryConfig,
     build_base_identity,
     canonical_slow_inventory,
@@ -68,25 +67,8 @@ def _fixture() -> tuple[_RuntimeRoot, nn.Linear, nn.Parameter, CanonicalProducti
     return root, projector, modality, adapter, scheduler
 
 
-def _lineage_owner(child_git_revision: str = "f" * 40) -> LineageOwnerIdentity:
-    return LineageOwnerIdentity(
-        child_git_revision=child_git_revision,
-        manifest_sha256="a" * 64,
-        source_descriptor={
-            "schema": "canonical_native_local_ttt_source_v1",
-            "source_kind": "synthetic_cpu_static",
-            "source_id_sha256": "d" * 64,
-            "source_manifest_sha256": "a" * 64,
-            "source_sha256": "b" * 64,
-        },
-    )
-
-
 def _base_identity() -> dict[str, object]:
-    return build_base_identity(
-        lineage_owner=_lineage_owner(),
-        feature_config=FeatureConfigIdentity(),
-    )
+    return build_base_identity(feature_config=FeatureConfigIdentity())
 
 
 def _feature_config(config: LocalMemoryConfig = LocalMemoryConfig()) -> FeatureConfigIdentity:
@@ -101,12 +83,12 @@ def _feature_config(config: LocalMemoryConfig = LocalMemoryConfig()) -> FeatureC
 
 
 def _payload(expected: dict[str, nn.Parameter], config: LocalMemoryConfig = LocalMemoryConfig(), **kwargs: object) -> dict[str, object]:
-    return slow_checkpoint_payload(expected, config, feature_config=_feature_config(config), base_identity=_base_identity(), **kwargs)
+    return slow_checkpoint_payload(expected, config, feature_config=_feature_config(config), **kwargs)
 
 
 def _restore(root: _RuntimeRoot, projector: nn.Linear, modality: nn.Parameter, adapter: CanonicalProductionAdapter, scheduler: CanonicalBatchScheduler, payload: dict[str, object], expected: dict[str, nn.Parameter], **kwargs: object) -> None:
     config = LocalMemoryConfig()
-    strict_restore_into(root, payload, expected, config, runtime_encoder=root.evidence_encoder, runtime_core=root.ttt_core, local_memory2llm=projector, modality=modality, adapter=adapter, scheduler=scheduler, feature_config=_feature_config(config), base_identity=_base_identity(), **kwargs)
+    strict_restore_into(root, payload, expected, config, runtime_encoder=root.evidence_encoder, runtime_core=root.ttt_core, local_memory2llm=projector, modality=modality, adapter=adapter, scheduler=scheduler, feature_config=_feature_config(config), **kwargs)
 
 
 def _optimizer_and_scheduler(expected: dict[str, nn.Parameter]) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.ExponentialLR]:
@@ -185,10 +167,7 @@ def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
     ):
         with pytest.raises(ValueError):
             FeatureConfigIdentity.from_mapping(bad)
-    identity = build_base_identity(
-        lineage_owner=_lineage_owner(),
-        feature_config=feature,
-    )
+    identity = build_base_identity(feature_config=feature)
     assert set(identity) == {
         "schema",
         "child_git_revision",
@@ -197,20 +176,6 @@ def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
         "manifest_sha256",
         "source_sha256",
     }
-    with pytest.raises(ValueError):
-        build_base_identity(
-            lineage_owner=_lineage_owner(child_git_revision=""),
-            feature_config=feature,
-        )
-    with pytest.raises(ValueError):
-        build_base_identity(
-            lineage_owner=LineageOwnerIdentity(
-                child_git_revision="f" * 40,
-                manifest_sha256="a" * 64,
-                source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "not-a-digest"},
-            ),
-            feature_config=feature,
-        )
 
 
 def test_pristine_progress_predicate_is_exact_and_fail_closed() -> None:
@@ -275,7 +240,7 @@ def test_slow_payload_rejects_runtime_keys_and_stages_without_mutation() -> None
     root, projector, modality, adapter, scheduler = _fixture()
     expected = canonical_slow_inventory(root, projector, modality)
     payload = _payload(expected)
-    assert strict_restore(payload, expected, LocalMemoryConfig(), feature_config=_feature_config(), base_identity=_base_identity())
+    assert strict_restore(payload, expected, LocalMemoryConfig(), feature_config=_feature_config())
     with pytest.raises(ValueError, match="runtime"):
         _payload({"local_memory_runtime.frontier": next(iter(expected.values()))})
     before = {name: value.detach().clone() for name, value in expected.items()}
@@ -291,7 +256,7 @@ def test_slow_payload_rejects_runtime_keys_and_stages_without_mutation() -> None
     with pytest.raises(ValueError, match="identity"):
         _restore(root, projector, modality, adapter, scheduler, base_drift, expected)
     foreign_child = copy.deepcopy(payload)
-    foreign_child["base_identity"] = build_base_identity(lineage_owner=_lineage_owner(child_git_revision="e" * 40), feature_config=FeatureConfigIdentity())
+    foreign_child["base_identity"]["child_git_revision"] = "e" * 40
     with pytest.raises(ValueError, match="identity"):
         _restore(root, projector, modality, adapter, scheduler, foreign_child, expected)
     no_bias_projector = nn.Linear(32, 2048, bias=False)
