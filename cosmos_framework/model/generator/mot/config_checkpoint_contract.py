@@ -46,7 +46,11 @@ _BASE_IDENTITY_KEYS = frozenset(
     }
 )
 _SOURCE_DESCRIPTOR_SCHEMA = "canonical_native_local_ttt_source_v1"
-_SOURCE_DESCRIPTOR_KEYS = frozenset({"schema", "source_sha256"})
+_SOURCE_DESCRIPTOR_KEYS = frozenset({"schema", "source_kind", "source_id_sha256", "source_manifest_sha256", "source_sha256"})
+_LINEAGE_OWNER_SCHEMA = "canonical_native_local_ttt_lineage_owner_v1"
+_LINEAGE_OWNER_KEYS = frozenset({"schema", "child_git_revision", "manifest_sha256", "source_descriptor"})
+_OPTIMIZER_IDENTITY_SCHEMA = "canonical_native_local_ttt_optimizer_v1"
+_SCHEDULER_IDENTITY_SCHEMA = "canonical_native_local_ttt_scheduler_v1"
 _RUNTIME_KEY_FRAGMENTS = ("continualtttfaststate", "fast_state", "frontier", "pending", "scan", "native_forward", "commit", "retry", "suffix", "transaction", "receipt", "cursor", "queue", "rng", "grad")
 
 SELECTORS = (
@@ -114,21 +118,51 @@ def _source_fingerprint(source_descriptor: Mapping[str, object]) -> str:
         not isinstance(source_descriptor, Mapping)
         or set(source_descriptor) != _SOURCE_DESCRIPTOR_KEYS
         or source_descriptor.get("schema") != _SOURCE_DESCRIPTOR_SCHEMA
+        or not isinstance(source_descriptor.get("source_kind"), str)
+        or not source_descriptor["source_kind"]
+        or not _is_lower_hex(source_descriptor.get("source_id_sha256"), 64)
+        or not _is_lower_hex(source_descriptor.get("source_manifest_sha256"), 64)
         or not _is_lower_hex(source_descriptor.get("source_sha256"), 64)
     ):
         raise ValueError("checkpoint source descriptor is not canonical")
     return _canonical_sha256(source_descriptor)
 
 
-def build_base_identity(*, child_git_revision: str, feature_config: FeatureConfigIdentity, checkpoint_source_descriptor: Mapping[str, object], manifest_sha256: str, source_sha256: str) -> dict[str, object]:
+@dataclass(frozen=True)
+class LineageOwnerIdentity:
+    child_git_revision: str
+    manifest_sha256: str
+    source_descriptor: Mapping[str, object]
+
+    def to_mapping(self) -> dict[str, object]:
+        result = {
+            "schema": _LINEAGE_OWNER_SCHEMA,
+            "child_git_revision": self.child_git_revision,
+            "manifest_sha256": self.manifest_sha256,
+            "source_descriptor": dict(self.source_descriptor),
+        }
+        if (
+            set(result) != _LINEAGE_OWNER_KEYS
+            or not _is_lower_hex(result["child_git_revision"], 40)
+            or not _is_lower_hex(result["manifest_sha256"], 64)
+        ):
+            raise ValueError("lineage owner is not canonical")
+        _source_fingerprint(result["source_descriptor"])
+        return result
+
+
+def build_base_identity(*, lineage_owner: LineageOwnerIdentity, feature_config: FeatureConfigIdentity) -> dict[str, object]:
+    owner = lineage_owner.to_mapping()
+    source_descriptor = owner["source_descriptor"]
+    assert isinstance(source_descriptor, Mapping)
     feature_digest = _canonical_sha256(feature_config.to_mapping())
     result = {
         "schema": _BASE_IDENTITY_SCHEMA,
-        "child_git_revision": child_git_revision,
+        "child_git_revision": owner["child_git_revision"],
         "canonical_model_config_sha256": feature_digest,
-        "checkpoint_source_fingerprint": _source_fingerprint(checkpoint_source_descriptor),
-        "manifest_sha256": manifest_sha256,
-        "source_sha256": source_sha256,
+        "checkpoint_source_fingerprint": _source_fingerprint(source_descriptor),
+        "manifest_sha256": owner["manifest_sha256"],
+        "source_sha256": source_descriptor["source_sha256"],
     }
     if (
         set(result) != _BASE_IDENTITY_KEYS
@@ -170,6 +204,11 @@ def _validate_feature_config_against_runtime(feature_config: FeatureConfigIdenti
     """Reject feature identities that are decoupled from the registered live ABI."""
     if (
         getattr(runtime_encoder, "evidence_dim", None) != feature_config.local_history_evidence_dim
+        or getattr(getattr(runtime_encoder, "visual_proj", None), "in_features", None) != 96
+        or getattr(getattr(runtime_encoder, "action_proj", None), "in_features", None) != 10
+        or getattr(getattr(runtime_encoder, "feature_config", None), "state", None) is not False
+        or getattr(getattr(runtime_encoder, "feature_config", None), "dt", None) is not False
+        or getattr(getattr(runtime_encoder, "feature_config", None), "age", None) is not False
         or getattr(runtime_core, "evidence_dim", None) != feature_config.local_history_evidence_dim
         or getattr(runtime_core, "local_dim", None) != feature_config.local_memory_dim
         or getattr(runtime_core, "k_local", None) != feature_config.k_local
@@ -309,6 +348,20 @@ def _value_schema(value: object) -> object:
     return _fully_qualified_class(value)
 
 
+def _versioned_identity(schema: str, value: Mapping[str, object]) -> dict[str, object]:
+    unsigned = {"schema": schema, **dict(value)}
+    return {**unsigned, "sha256": _canonical_sha256(unsigned)}
+
+
+def _validate_versioned_identity(value: object, *, schema: str, keys: frozenset[str]) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != keys or value.get("schema") != schema:
+        raise ValueError("identity schema is not exact")
+    unsigned = {key: item for key, item in value.items() if key != "sha256"}
+    if not _is_lower_hex(value.get("sha256"), 64) or value["sha256"] != _canonical_sha256(unsigned):
+        raise ValueError("identity digest does not match canonical mapping")
+    return dict(value)
+
+
 def _optimizer_identity(optimizer: torch.optim.Optimizer, expected: Mapping[str, torch.Tensor]) -> dict[str, object]:
     if not isinstance(optimizer, torch.optim.AdamW):
         raise ValueError("only canonical AdamW optimizer identity is supported")
@@ -340,7 +393,7 @@ def _optimizer_identity(optimizer: torch.optim.Optimizer, expected: Mapping[str,
         raise ValueError("checkpoint optimizer group member order must exactly match slow inventory")
     if len({group["name"] for group in groups}) != len(groups):
         raise ValueError("optimizer group names must be unique")
-    return {"class": _fully_qualified_class(optimizer), "groups": groups}
+    return _versioned_identity(_OPTIMIZER_IDENTITY_SCHEMA, {"class": _fully_qualified_class(optimizer), "groups": groups})
 
 
 def _scheduler_identity(scheduler: object, expected: Mapping[str, torch.Tensor]) -> dict[str, object]:
@@ -352,16 +405,20 @@ def _scheduler_identity(scheduler: object, expected: Mapping[str, torch.Tensor])
     state = state_dict()
     if not isinstance(state, Mapping):
         raise ValueError("scheduler state must be a mapping")
-    return {
-        "class": _fully_qualified_class(scheduler),
-        "optimizer_identity": _optimizer_identity(scheduler.optimizer, expected),
-        "constructor": {"gamma": scheduler.gamma},
-        "state_schema": _value_schema(state),
-    }
+    return _versioned_identity(
+        _SCHEDULER_IDENTITY_SCHEMA,
+        {
+            "class": _fully_qualified_class(scheduler),
+            "optimizer_identity": _optimizer_identity(scheduler.optimizer, expected),
+            "constructor": {"gamma": scheduler.gamma},
+            "state_schema": _value_schema(state),
+        },
+    )
 
 
 def _build_pristine_optimizer(identity: Mapping[str, object], expected: Mapping[str, torch.Tensor]) -> torch.optim.AdamW:
-    if not isinstance(identity, Mapping) or identity.get("class") != _fully_qualified_type(torch.optim.AdamW):
+    identity = _validate_versioned_identity(identity, schema=_OPTIMIZER_IDENTITY_SCHEMA, keys=frozenset({"schema", "class", "groups", "sha256"}))
+    if identity.get("class") != _fully_qualified_type(torch.optim.AdamW):
         raise ValueError("optimizer identity class is not canonical AdamW")
     groups = identity.get("groups")
     if not isinstance(groups, list) or not groups:
@@ -385,7 +442,9 @@ def _build_pristine_optimizer(identity: Mapping[str, object], expected: Mapping[
 
 
 def _build_pristine_scheduler(optimizer_identity: Mapping[str, object], scheduler_identity: Mapping[str, object], expected: Mapping[str, torch.Tensor]) -> tuple[torch.optim.AdamW, torch.optim.lr_scheduler.ExponentialLR]:
-    if not isinstance(scheduler_identity, Mapping) or scheduler_identity.get("class") != _fully_qualified_type(torch.optim.lr_scheduler.ExponentialLR):
+    scheduler_identity = _validate_versioned_identity(scheduler_identity, schema=_SCHEDULER_IDENTITY_SCHEMA, keys=frozenset({"schema", "class", "optimizer_identity", "constructor", "state_schema", "sha256"}))
+    optimizer_identity = _validate_versioned_identity(optimizer_identity, schema=_OPTIMIZER_IDENTITY_SCHEMA, keys=frozenset({"schema", "class", "groups", "sha256"}))
+    if scheduler_identity.get("class") != _fully_qualified_type(torch.optim.lr_scheduler.ExponentialLR):
         raise ValueError("scheduler identity class is not canonical ExponentialLR")
     if scheduler_identity.get("optimizer_identity") != dict(optimizer_identity):
         raise ValueError("scheduler identity is not bound to optimizer identity")

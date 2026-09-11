@@ -1,4 +1,5 @@
 import copy
+from dataclasses import replace
 
 import pytest
 import torch
@@ -37,6 +38,7 @@ from cosmos_framework.model.generator.mot.local_memory_segment import (
 
 from .config_checkpoint_contract import (
     FeatureConfigIdentity,
+    LineageOwnerIdentity,
     LocalMemoryConfig,
     build_base_identity,
     canonical_slow_inventory,
@@ -66,13 +68,24 @@ def _fixture() -> tuple[_RuntimeRoot, nn.Linear, nn.Parameter, CanonicalProducti
     return root, projector, modality, adapter, scheduler
 
 
+def _lineage_owner(child_git_revision: str = "f" * 40) -> LineageOwnerIdentity:
+    return LineageOwnerIdentity(
+        child_git_revision=child_git_revision,
+        manifest_sha256="a" * 64,
+        source_descriptor={
+            "schema": "canonical_native_local_ttt_source_v1",
+            "source_kind": "synthetic_cpu_static",
+            "source_id_sha256": "d" * 64,
+            "source_manifest_sha256": "a" * 64,
+            "source_sha256": "b" * 64,
+        },
+    )
+
+
 def _base_identity() -> dict[str, object]:
     return build_base_identity(
-        child_git_revision="f" * 40,
+        lineage_owner=_lineage_owner(),
         feature_config=FeatureConfigIdentity(),
-        checkpoint_source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "c" * 64},
-        manifest_sha256="a" * 64,
-        source_sha256="b" * 64,
     )
 
 
@@ -173,11 +186,8 @@ def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
         with pytest.raises(ValueError):
             FeatureConfigIdentity.from_mapping(bad)
     identity = build_base_identity(
-        child_git_revision="f" * 40,
+        lineage_owner=_lineage_owner(),
         feature_config=feature,
-        checkpoint_source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "c" * 64},
-        manifest_sha256="a" * 64,
-        source_sha256="b" * 64,
     )
     assert set(identity) == {
         "schema",
@@ -189,19 +199,17 @@ def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
     }
     with pytest.raises(ValueError):
         build_base_identity(
-            child_git_revision="",
+            lineage_owner=_lineage_owner(child_git_revision=""),
             feature_config=feature,
-            checkpoint_source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "c" * 64},
-            manifest_sha256="a" * 64,
-            source_sha256="b" * 64,
         )
     with pytest.raises(ValueError):
         build_base_identity(
-            child_git_revision="f" * 40,
+            lineage_owner=LineageOwnerIdentity(
+                child_git_revision="f" * 40,
+                manifest_sha256="a" * 64,
+                source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "not-a-digest"},
+            ),
             feature_config=feature,
-            checkpoint_source_descriptor={"schema": "canonical_native_local_ttt_source_v1", "source_sha256": "not-a-digest"},
-            manifest_sha256="a" * 64,
-            source_sha256="b" * 64,
         )
 
 
@@ -282,12 +290,31 @@ def test_slow_payload_rejects_runtime_keys_and_stages_without_mutation() -> None
     base_drift["base_identity"]["source_sha256"] = "d" * 64
     with pytest.raises(ValueError, match="identity"):
         _restore(root, projector, modality, adapter, scheduler, base_drift, expected)
+    foreign_child = copy.deepcopy(payload)
+    foreign_child["base_identity"] = build_base_identity(lineage_owner=_lineage_owner(child_git_revision="e" * 40), feature_config=FeatureConfigIdentity())
+    with pytest.raises(ValueError, match="identity"):
+        _restore(root, projector, modality, adapter, scheduler, foreign_child, expected)
     no_bias_projector = nn.Linear(32, 2048, bias=False)
     with pytest.raises(ValueError, match="registered Local Memory ABI"):
         _restore(root, no_bias_projector, modality, adapter, scheduler, payload, expected)
     root.ttt_core.evidence_dim = 8
     with pytest.raises(ValueError, match="registered Local Memory ABI"):
         _restore(root, projector, modality, adapter, scheduler, payload, expected)
+    visual_root, visual_projector, visual_modality, visual_adapter, visual_scheduler = _fixture()
+    visual_expected = canonical_slow_inventory(visual_root, visual_projector, visual_modality)
+    visual_root.evidence_encoder.visual_proj = nn.Linear(95, 96)
+    with pytest.raises(ValueError, match="registered Local Memory ABI"):
+        _restore(visual_root, visual_projector, visual_modality, visual_adapter, visual_scheduler, _payload(visual_expected), visual_expected)
+    action_root, action_projector, action_modality, action_adapter, action_scheduler = _fixture()
+    action_expected = canonical_slow_inventory(action_root, action_projector, action_modality)
+    action_root.evidence_encoder.action_proj = nn.Linear(9, 96)
+    with pytest.raises(ValueError, match="registered Local Memory ABI"):
+        _restore(action_root, action_projector, action_modality, action_adapter, action_scheduler, _payload(action_expected), action_expected)
+    feature_root, feature_projector, feature_modality, feature_adapter, feature_scheduler = _fixture()
+    feature_expected = canonical_slow_inventory(feature_root, feature_projector, feature_modality)
+    feature_root.evidence_encoder.feature_config = replace(CANONICAL_EVIDENCE_FEATURE_CONFIG, state=True)
+    with pytest.raises(ValueError, match="registered Local Memory ABI"):
+        _restore(feature_root, feature_projector, feature_modality, feature_adapter, feature_scheduler, _payload(feature_expected), feature_expected)
     assert all(torch.equal(value, before[name]) for name, value in expected.items())
 
 
@@ -367,6 +394,10 @@ def test_restore_rejects_late_optimizer_or_scheduler_defect_before_mutation() ->
     damaged_member_schema["optimizer_identity"]["groups"][0]["member_state_schema"][first_name] = "foreign.State"
     with pytest.raises(ValueError, match="optimizer identity"):
         _restore(root, projector, modality, adapter, scheduler, damaged_member_schema, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
+    damaged_identity_digest = copy.deepcopy(payload)
+    damaged_identity_digest["optimizer_identity"]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="optimizer identity"):
+        _restore(root, projector, modality, adapter, scheduler, damaged_identity_digest, expected, optimizer=optimizer, state_scheduler=state_scheduler, iteration=0)
     configured_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.8)
     with pytest.raises(ValueError, match="scheduler identity"):
         _restore(root, projector, modality, adapter, scheduler, payload, expected, optimizer=optimizer, state_scheduler=configured_scheduler, iteration=0)
