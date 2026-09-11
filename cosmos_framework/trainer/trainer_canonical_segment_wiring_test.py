@@ -37,10 +37,8 @@ from cosmos_framework.trainer import ImaginaireTrainer
 def _model_marker_output(wiring, segment, identity, transaction):
     model = object.__new__(OmniMoTModel)
     torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(local_ttt_enabled=True)
-    return model.training_step(
+    return model._canonical_local_memory_segment_forward(
         {
-            "canonical_local_memory_segment": True,
             "canonical_segment": segment,
             "canonical_identity": identity,
             "canonical_transaction": transaction,
