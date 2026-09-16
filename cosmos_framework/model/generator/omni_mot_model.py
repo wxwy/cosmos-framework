@@ -88,6 +88,7 @@ from cosmos_framework.model.generator.mot.production_active_wiring import (
     PreparedActiveMemberCapability,
     ProductionActiveWiringRegistry,
 )
+from cosmos_framework.model.generator.mot.production_segment_bridge import NativeBatchResult
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
@@ -132,6 +133,9 @@ _CANONICAL_PRODUCTION_CARRIER_KEY = "canonical_production_segment_carrier"
 _LEGACY_LOCAL_MARKER_KEYS = frozenset(
     {"psm_local_memory_active", "psm_local_memory_prepared", "canonical_local_memory_segment"}
 )
+# Sentinel distinguishing "outer training_step call" from "inner native-consumer call
+# with no Local prefix" (None) in the shared native-consumer tail.
+_PSM_NO_LOCAL_OVERRIDE = object()
 
 
 def _canonical_native_cpu_static_loss_split_from_model(
@@ -1390,12 +1394,56 @@ class OmniMoTModel(ImaginaireModel):
         }
         return output, primary + auxiliary
 
+    _PSM_CONSUMER_LOSS_KEYS = (
+        "flow_matching_loss_vision",
+        "flow_matching_loss_action",
+        "flow_matching_loss_sound",
+    )
+    _PSM_AUXILIARY_LOSS_KEYS = ("aux_loss_und", "aux_loss_gen")
+
+    @staticmethod
+    def _psm_reduced_loss(output_batch: Mapping[str, Any], keys: tuple[str, ...]) -> torch.Tensor:
+        """Sum the present reduced loss terms of one native consumer forward."""
+        terms: list[torch.Tensor] = []
+        for key in keys:
+            value = output_batch.get(key)
+            if isinstance(value, torch.Tensor) and value.ndim == 0:
+                terms.append(value)
+        if not terms:
+            raise RuntimeError("native consumer forward produced no reducible loss term")
+        total = terms[0]
+        for term in terms[1:]:
+            total = total + term
+        return total
+
     def _run_active_local_memory_native_forward(
         self, inputs: ActiveNativeBatchInputs, iteration: int
-    ):
-        """Require the future native adapter instead of entering a test-only seam."""
-        del inputs, iteration
-        raise RuntimeError("active Local native MoT adapter is unavailable")
+    ) -> NativeBatchResult:
+        """Run the real MoT native forward for one gathered active member.
+
+        Each gathered consumer payload is an ordinary Local-neutral raw row; the
+        member's own Local prefix (absent exactly for a valid S0 consumer) is
+        attached only after the clean materialization, so the native packed
+        sequence stays Local-neutral on the way in and carries the projected
+        Memory Prefix on the way out.
+        """
+        if len(inputs.payloads) != len(inputs.locals):
+            raise RuntimeError("active native inputs lost payload/local cardinality")
+        if getattr(self, "config", None) is None or getattr(self, "net", None) is None:
+            # Fail closed instead of surfacing an opaque AttributeError deep inside the
+            # ordinary preparation path when the model was never fully constructed.
+            raise RuntimeError("active Local native forward requires a fully constructed production model")
+        consumer_losses: list[torch.Tensor] = []
+        auxiliary_losses: list[torch.Tensor] = []
+        for payload, local in zip(inputs.payloads, inputs.locals, strict=True):
+            if not isinstance(payload, Mapping):
+                raise TypeError("active native payload must be a mapping")
+            output_batch, _ = self.training_step(dict(payload), iteration, _psm_local_override=local)
+            consumer_losses.append(self._psm_reduced_loss(output_batch, self._PSM_CONSUMER_LOSS_KEYS))
+            auxiliary_losses.append(self._psm_reduced_loss(output_batch, self._PSM_AUXILIARY_LOSS_KEYS))
+        primary = torch.stack(consumer_losses).mean()
+        auxiliary = torch.stack(auxiliary_losses).mean()
+        return NativeBatchResult(primary_consumer_mean=primary, auxiliary_loss=auxiliary)
 
     def _active_local_memory_forward(
         self, data_batch: dict[str, Any], iteration: int
@@ -1516,7 +1564,11 @@ class OmniMoTModel(ImaginaireModel):
         return input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes
 
     def training_step(
-        self, data_batch: dict[str, torch.Tensor], iteration: int
+        self,
+        data_batch: dict[str, torch.Tensor],
+        iteration: int,
+        *,
+        _psm_local_override: object = _PSM_NO_LOCAL_OVERRIDE,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """
         Performs a single training step for the rectified-flow (flow-matching) model.
@@ -1539,24 +1591,42 @@ class OmniMoTModel(ImaginaireModel):
                 - Tensor: The computed loss for the training step as a PyTorch Tensor.
 
         """
-        canonical_request = _canonical_production_request_from_batch(
-            local_ttt_enabled=self.config.local_ttt_enabled, data_batch=data_batch
-        )
-        if canonical_request is not None:
-            carrier = data_batch.get(_CANONICAL_PRODUCTION_CARRIER_KEY)
-            if not isinstance(carrier, CanonicalRawRowCarrier):
-                raise TypeError("canonical-production mode requires CanonicalRawRowCarrier marker")
-            return self._canonical_production_segment_forward(canonical_request, carrier, iteration)
+        if _psm_local_override is _PSM_NO_LOCAL_OVERRIDE:
+            # The active production route owns its own Local-neutral native batch, so it
+            # must be dispatched before the canonical-production precondition below
+            # (which otherwise rejects every batch that lacks the canonical markers).
+            if data_batch.get("psm_local_memory_active") is True:
+                return self._active_local_memory_forward(data_batch, iteration)
 
-        if data_batch.get("psm_local_memory_active") is True:
-            return self._active_local_memory_forward(data_batch, iteration)
+            canonical_request = _canonical_production_request_from_batch(
+                local_ttt_enabled=self.config.local_ttt_enabled, data_batch=data_batch
+            )
+            if canonical_request is not None:
+                carrier = data_batch.get(_CANONICAL_PRODUCTION_CARRIER_KEY)
+                if not isinstance(carrier, CanonicalRawRowCarrier):
+                    raise TypeError("canonical-production mode requires CanonicalRawRowCarrier marker")
+                return self._canonical_production_segment_forward(canonical_request, carrier, iteration)
 
-        if self.config.local_ttt_enabled and data_batch.get("canonical_local_memory_segment") is True:
-            return self._canonical_local_memory_segment_forward(data_batch, iteration)
+            if self.config.local_ttt_enabled and data_batch.get("canonical_local_memory_segment") is True:
+                return self._canonical_local_memory_segment_forward(data_batch, iteration)
+        else:
+            # Inner native-consumer call: the caller already owns the exact Local
+            # payload for this consumer, so no marker may remain in the batch.
+            data_batch = {key: value for key, value in data_batch.items() if key not in _LEGACY_LOCAL_MARKER_KEYS}
+            data_batch.pop("local_memory", None)
 
         input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes = (
             self._get_training_inputs(data_batch, iteration)
         )
+
+        if _psm_local_override is not _PSM_NO_LOCAL_OVERRIDE:
+            # Attach (or detach) the exact Local prefix for this native consumer after
+            # the Local-neutral clean materialization, mirroring the canonical-production
+            # preparation order.
+            local_token = _psm_local_override
+            for plan in sequence_plans:
+                plan.has_local_memory = local_token is not None
+            gen_data_clean.x0_tokens_local_memory = None if local_token is None else [local_token]
 
         # Calculate number of tokens per sample (before 2x2 merge) for dynamic shift
         # gen_data_clean.x0_tokens_vision: B, C, T, H, W

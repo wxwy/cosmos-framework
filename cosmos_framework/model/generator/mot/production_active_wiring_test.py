@@ -423,7 +423,8 @@ def test_active_model_marker_schema_rejects_missing_extra_and_bad_capability(dat
         model.training_step(data_batch, 0)
 
 
-def test_active_production_model_fails_closed_without_the_native_adapter() -> None:
+def test_active_production_model_fails_closed_on_an_unwired_model() -> None:
+    """The production base class owns the real native forward; an unwired model must still fail closed."""
     owner, identity, segment, plan = _fixture()
     registry = ProductionActiveWiringRegistry(owner)
     prepared = registry.prepare_initial(identity, segment, plan, trainer_grad_accum_iter=0)
@@ -431,7 +432,7 @@ def test_active_production_model_fails_closed_without_the_native_adapter() -> No
     torch.nn.Module.__init__(model)
     model._psm_active_wiring_registry = registry
 
-    with pytest.raises(RuntimeError, match="native MoT adapter is unavailable"):
+    with pytest.raises(RuntimeError, match="fully constructed production model"):
         model.training_step({"psm_local_memory_active": True, "psm_local_memory_prepared": prepared}, 0)
 
 
