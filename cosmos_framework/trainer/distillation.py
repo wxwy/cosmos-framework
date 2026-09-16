@@ -141,7 +141,13 @@ class DistillationTrainer(ImaginaireTrainer):
         scheduler: PhaseScheduler,
         grad_scaler: torch.amp.GradScaler,
         iteration: int,
+        active_seal: object | None = None,
     ) -> None:
+        if active_seal is not None:
+            # The phase-based loop owns no canonical Local-Memory window, so it can
+            # neither resolve nor retire an owner seal.  Accepting the argument and
+            # dropping it would strand the owner in SLOW_RESOLUTION_PENDING.
+            raise RuntimeError("distillation does not support an active Local-Memory optimizer seal")
         if not getattr(self, "_eager_init_done", False):
             for opt_key, opt in optimizer.items():
                 self._eager_init_optimizer_state(opt, opt_key)
