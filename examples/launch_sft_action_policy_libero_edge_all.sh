@@ -31,7 +31,11 @@
 #   LIBERO_LATENT_CACHE_VERIFY_RATIO default: 0.001 (0 disables online verification)
 #   LIBERO_NUM_WORKERS    default: 12
 #   LIBERO_PREFETCH_FACTOR default: 4 (num_workers=0 时自动为 None)
-#   DISABLE_AUTO_RESUME   set 1 to ignore saved iter_* checkpoints and start fresh
+#   DISABLE_AUTO_RESUME   set 1 to ignore saved iter_* checkpoints and start fresh; this also
+#                         sets aside <checkpoints>/latest_checkpoint.txt as
+#                         latest_checkpoint.txt.disabled-<timestamp> (renamed, never deleted),
+#                         because DCP and has_resumable_checkpoint() read that marker to resume
+#                         the run and to skip the pretrained-weight seeding.  Not touched by DRY_RUN.
 #   DRY_RUN               set 1 to print the resolved command without running it
 #
 # Usage:
@@ -105,6 +109,24 @@ _print_resume_candidates() {
 
 if [[ "${DISABLE_AUTO_RESUME:-0}" == "1" ]]; then
     echo ">>> FRESH start (DISABLE_AUTO_RESUME=1; ignoring $CHECKPOINT_ROOT)"
+    # Skipping the scan below is not enough.  DCP resolves the load source from
+    # save_dirname/latest_checkpoint.txt and, when it exists, gives it priority over the
+    # recipe's `load_path` warm-start while loading every CHECKPOINT_KEYS entry
+    # unconditionally -- so a stale marker silently turns this "fresh" run into a same-job
+    # resume one iteration later.  The same file also backs has_resumable_checkpoint(),
+    # which gates the pretrained understanding-weight seeding, so it has to be moved aside
+    # rather than merely ignored.  Rename, never delete: with the marker gone DCP falls back
+    # to `load_path` with the recipe's load_training_state, i.e. the intended warm-start
+    # with a fresh optimizer/scheduler/trainer.
+    if [[ -e "$CHECKPOINT_ROOT/latest_checkpoint.txt" ]]; then
+        if [[ "${DRY_RUN:-0}" == "1" ]]; then
+            echo ">>> FRESH start (dry run): would set aside $CHECKPOINT_ROOT/latest_checkpoint.txt"
+        else
+            DISABLED_MARKER="$CHECKPOINT_ROOT/latest_checkpoint.txt.disabled-$(date '+%Y%m%d%H%M%S')"
+            mv "$CHECKPOINT_ROOT/latest_checkpoint.txt" "$DISABLED_MARKER"
+            echo ">>> FRESH start: set aside latest_checkpoint.txt -> $(basename "$DISABLED_MARKER")"
+        fi
+    fi
 elif [[ -n "${AUTO_RESUME_CHECKPOINT:-}" ]]; then
     SELECTED_CHECKPOINT="$AUTO_RESUME_CHECKPOINT"
     [[ "$SELECTED_CHECKPOINT" = /* ]] || SELECTED_CHECKPOINT="$CHECKPOINT_ROOT/$SELECTED_CHECKPOINT"
