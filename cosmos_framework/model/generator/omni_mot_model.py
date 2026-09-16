@@ -1437,16 +1437,20 @@ class OmniMoTModel(ImaginaireModel):
             # Fail closed instead of surfacing an opaque AttributeError deep inside the
             # ordinary preparation path when the model was never fully constructed.
             raise RuntimeError("active Local native forward requires a fully constructed production model")
-        consumer_losses: list[torch.Tensor] = []
-        auxiliary_losses: list[torch.Tensor] = []
-        for payload, local in zip(inputs.payloads, inputs.locals, strict=True):
+        for payload in inputs.payloads:
             if not isinstance(payload, Mapping):
                 raise TypeError("active native payload must be a mapping")
-            output_batch, _ = self.training_step(dict(payload), iteration, _psm_local_override=local)
-            consumer_losses.append(self._psm_reduced_loss(output_batch, self._PSM_CONSUMER_LOSS_KEYS))
-            auxiliary_losses.append(self._psm_reduced_loss(output_batch, self._PSM_AUXILIARY_LOSS_KEYS))
-        primary = torch.stack(consumer_losses).mean()
-        auxiliary = torch.stack(auxiliary_losses).mean()
+        # One packed native forward for the whole member: the per-consumer raw rows are
+        # collated exactly as the production DataLoader would, and the member's own Local
+        # prefix list travels through the inner-call seam aligned 1:1 with the samples.
+        # Imported lazily: the collate helper lives in the data layer, which the model
+        # layer must not require at import time.
+        from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
+
+        collated = custom_collate_fn([dict(payload) for payload in inputs.payloads])
+        output_batch, _ = self.training_step(collated, iteration, _psm_local_override=inputs.locals)
+        primary = self._psm_reduced_loss(output_batch, self._PSM_CONSUMER_LOSS_KEYS)
+        auxiliary = self._psm_reduced_loss(output_batch, self._PSM_AUXILIARY_LOSS_KEYS)
         return NativeBatchResult(primary_consumer_mean=primary, auxiliary_loss=auxiliary)
 
     def _active_local_memory_forward(
@@ -1624,13 +1628,19 @@ class OmniMoTModel(ImaginaireModel):
         )
 
         if _psm_local_override is not _PSM_NO_LOCAL_OVERRIDE:
-            # Attach (or detach) the exact Local prefix for this native consumer after
-            # the Local-neutral clean materialization, mirroring the canonical-production
-            # preparation order.
-            local_token = _psm_local_override
-            for plan in sequence_plans:
+            # Attach the exact per-sample Local prefixes for this native member after the
+            # Local-neutral clean materialization, mirroring the canonical-production
+            # preparation order. The tuple is aligned 1:1 with ``sequence_plans``; a
+            # ``None`` entry is the valid Local-neutral S0 consumer.
+            local_tokens = _psm_local_override
+            if not isinstance(local_tokens, tuple):
+                raise TypeError("active native Local override must be a per-sample tuple")
+            if len(local_tokens) != len(sequence_plans):
+                raise RuntimeError("active native Local prefix count differs from the sequence plan count")
+            for plan, local_token in zip(sequence_plans, local_tokens, strict=True):
                 plan.has_local_memory = local_token is not None
-            gen_data_clean.x0_tokens_local_memory = None if local_token is None else [local_token]
+            dense_local_memory = [token for token in local_tokens if token is not None]
+            gen_data_clean.x0_tokens_local_memory = dense_local_memory or None
 
         # Calculate number of tokens per sample (before 2x2 merge) for dynamic shift
         # gen_data_clean.x0_tokens_vision: B, C, T, H, W
