@@ -32,6 +32,7 @@ from cosmos_framework.model.generator.mot.production_active_wiring import Produc
 from cosmos_framework.model.generator.mot.production_segment_bridge import NativeBatchResult
 from cosmos_framework.model.generator.mot.production_segment_wiring import CanonicalSegmentWiring
 from cosmos_framework.trainer import ImaginaireTrainer
+from cosmos_framework.utils.callback import Callback, _missing_callback_hooks
 
 
 class _FakeStream:
@@ -265,6 +266,17 @@ def test_driver_refuses_an_unarmable_owner_phase() -> None:
 
     with pytest.raises(RuntimeError, match="unarmable owner phase: PREPARED"):
         driver.arm_next_member(trainer, model)
+
+
+def test_driver_satisfies_every_callback_group_hook() -> None:
+    """``CallBackGroup.__getattr__`` asserts each member implements every hook."""
+    registry = _registry({"suite": 1.0})
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 2
+    driver = _driver(registry, producer, (_FakeStream(0, 1, "suite"),), window_members=1)
+
+    assert isinstance(driver, Callback)
+    assert _missing_callback_hooks(driver) == []
 
 
 def test_continuation_rebinds_a_finished_episode_before_admitting_its_successor() -> None:

@@ -25,6 +25,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from cosmos_framework.utils.callback import Callback
+
 from .canonical_segment_runtime import RuntimePhase
 from .local_memory_segment import GAWindowPlan, SegmentIdentity
 from .production_active_wiring import ProductionActiveWiringRegistry
@@ -60,13 +62,18 @@ class ActiveWindowFreeze:
             raise ValueError("active window freeze is not aligned with its plan")
 
 
-class ActiveLocalMemoryWindowDriver:
+class ActiveLocalMemoryWindowDriver(Callback):
     """Freeze and arm exactly one canonical Local-Memory window per update.
 
     ``streams`` is the slot catalog: every entry is one episode's segment stream,
     and entries sharing a ``slot_id`` are consumed in the given order, so a
     finished episode is rebound to its successor without the driver knowing
     anything about the dataset beyond ``producer.block_count``.
+
+    ``Callback`` is the base class rather than a bare object because
+    ``CallBackGroup.__getattr__`` asserts every member of its callback list
+    implements every ``on_*`` hook; inheriting supplies the no-op hook surface
+    that makes this driver a legal group member.
     """
 
     def __init__(
@@ -78,6 +85,7 @@ class ActiveLocalMemoryWindowDriver:
         window_members: int,
         plan_chain_id: str = "active-local-window",
     ) -> None:
+        super().__init__()
         if window_members <= 0:
             raise ValueError("active Local window requires a positive member count")
         if not streams:
