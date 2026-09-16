@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -151,6 +152,64 @@ def test_slot_rotation_follows_the_scheduler_deficit_rule() -> None:
     # The lagging category is served first, so the second member returns to it.
     assert [member.stream.category for member in freeze.members] == ["b", "a"]
     assert [identity.slot_id for identity in freeze.identities] == [1, 0]
+
+
+def test_slot_rotation_covers_every_slot_sharing_one_category() -> None:
+    """Two slots of the same category must alternate inside one window.
+
+    Production always looks like this: ``canonical_segment_streams`` assigns a
+    suite's episodes round-robin to the two slots where
+    ``slot % len(categories) == index``.  Two such slots have an identical
+    deficit — it is computed per category — so the tie-break alone decides, and
+    a tie-break that prefers the larger slot_id starves the smaller one for the
+    whole run.
+    """
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    producer.blocks[(4, 2)] = 4
+    driver = _driver(
+        _registry({"suite": 1.0}),
+        producer,
+        (_FakeStream(0, 1, "suite"), _FakeStream(4, 2, "suite")),
+        window_members=4,
+    )
+
+    freeze = driver.freeze_window()
+
+    slots = [identity.slot_id for identity in freeze.identities]
+    assert set(slots) == {0, 4}  # was [4, 4, 4, 4]: slot 0 never selected
+    assert slots == [0, 4, 0, 4]
+    assert [identity.category for identity in freeze.identities] == ["suite"] * 4
+
+
+def test_no_slot_starves_at_the_production_stream_geometry() -> None:
+    """A ``b_stream=8`` / 4-category window must visit all eight slots.
+
+    Each category owns exactly two slots, so the window decomposes as
+    ``8 slots x 16 members = 128 = b_stream * ga`` — the shape the frozen (B)
+    ruling calls numerically equivalent to one eight-row batch.
+    """
+    categories = ("c0", "c1", "c2", "c3")
+    producer = _FakeProducer()
+    streams = []
+    for index, category in enumerate(categories):
+        for slot_id in (index, index + 4):
+            producer.blocks[(slot_id, slot_id)] = 64
+            streams.append(_FakeStream(slot_id, slot_id, category))
+    driver = _driver(
+        _registry({category: 0.25 for category in categories}),
+        producer,
+        tuple(streams),
+        window_members=128,
+    )
+
+    freeze = driver.freeze_window()
+
+    per_slot = Counter(identity.slot_id for identity in freeze.identities)
+    assert sorted(per_slot) == list(range(8))  # was [4, 5, 6, 7]
+    assert set(per_slot.values()) == {16}
+    per_category = Counter(identity.category for identity in freeze.identities)
+    assert set(per_category.values()) == {32}  # quota stays a quarter each
 
 
 def test_last_block_of_an_episode_is_terminal_and_rebinds_its_successor() -> None:

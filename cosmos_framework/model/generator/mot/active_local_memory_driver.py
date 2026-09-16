@@ -211,20 +211,28 @@ class ActiveLocalMemoryWindowDriver(Callback):
         exposure = dict(scheduler.cumulative_valid_consumer_exposure)
         members: list[ActiveWindowMember] = []
         identities: list[SegmentIdentity] = []
+        # Selections made so far in this window, per slot. The deficit is measured
+        # per category, so two slots of one category tie every round; without this
+        # counter the tie-break degenerates to "largest slot_id wins" and the
+        # smaller slot of every category is starved for the whole run.
+        used: dict[int, int] = {}
         for _ in range(self.window_members):
-            choices: list[tuple[float, str, int, tuple]] = []
+            choices: list[tuple[float, str, int, int, tuple]] = []
             for slot_id in self._by_slot:
                 view = self._peek_block(slot_id)
                 if view is None:
                     continue
                 stream, _cursor, _terminal, _rebind, _position = view
                 observed = exposure.get(stream.category, 0) / max(sum(exposure.values()), 1)
-                choices.append((target[stream.category] - observed, stream.category, slot_id, view))
+                choices.append(
+                    (target[stream.category] - observed, stream.category, -used.get(slot_id, 0), slot_id, view)
+                )
             if not choices:
                 raise RuntimeError("active Local window exhausted every segment stream")
-            _, category, slot_id, view = max(choices, key=lambda item: item[:3])
+            _, category, _used, slot_id, view = max(choices, key=lambda item: item[:3])
             stream, cursor, terminal, rebind, position = view
             self._commit_block(slot_id, stream, cursor, position)
+            used[slot_id] = used.get(slot_id, 0) + 1
             exposure[category] = exposure.get(category, 0) + planned
             members.append(ActiveWindowMember(stream, cursor, terminal, rebind))
             identities.append(
