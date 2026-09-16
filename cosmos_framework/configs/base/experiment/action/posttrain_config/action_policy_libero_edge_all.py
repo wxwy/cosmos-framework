@@ -187,12 +187,19 @@ def _action_policy_libero_edge_dataloader():
             f"LIBERO_PREFETCH_FACTOR must be a positive integer when LIBERO_NUM_WORKERS > 0, got {_prefetch_factor}"
         )
 
+    # The canonical segment route re-collates every native sample inside its own
+    # window driver (`_active_local_memory_forward` reads only the two
+    # `psm_local_memory_*` markers), so this loader's batch content is never
+    # consumed.  Fetch one sample per iteration purely to satisfy the existing
+    # fetch/device path instead of decoding 128 unused samples per member.
+    max_samples_per_batch = 1 if _strict_bool_env("PSM_R09_B_TTT_ACTIVE") else 128
+
     return L(IterativeJointDataLoader)(
         tokenizer_spatial_compression_factor=16,
         tokenizer_temporal_compression_factor=4,
         patch_spatial=2,
         max_sequence_length=None,  # None disables token packing (use max_samples_per_batch)
-        max_samples_per_batch=128,  # peak-mem bound; global = 128 x 1 x grad_accum 16 = 2048
+        max_samples_per_batch=max_samples_per_batch,  # peak-mem bound; global = 128 x 1 x grad_accum 16 = 2048
         sound_latent_fps=0,
         audio_sample_rate=48000,
         seed=None,  # deterministic round-robin 1:1:1:1 (balanced per grad-accum window)
@@ -253,6 +260,17 @@ if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
 # 单卡多 suite：替换 RankPartitionedDataLoader（world_size>=4 断言不满足）为
 # IterativeJointDataLoader 轮询等权混合（每 grad-accum 窗口 16 批 = 4 套 × 4 次）。
 action_policy_libero_edge_all["dataloader_train"] = _action_policy_libero_edge_dataloader()
+
+if _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
+    # One window is one optimizer update, and the driver arms exactly
+    # `config.trainer.grad_accum_iter` members, so this boundary *is* the window
+    # size `B_stream * GA` with the v0.3.5-frozen `B_stream = 8`.  A driver
+    # constructed over a different slot pool must be given the same count.
+    # GA=16 reproduces the baseline 2048 samples/update (128 members x 16 consumers).
+    _active_ga = int(os.environ.get("PSM_R09_B_TTT_ACTIVE_GA", "1"))
+    if _active_ga <= 0:
+        raise ValueError(f"PSM_R09_B_TTT_ACTIVE_GA must be a positive integer, got {_active_ga}")
+    action_policy_libero_edge_all["trainer"]["grad_accum_iter"] = 8 * _active_ga
 
 # Admission smoke is fully offline. Keep the safety/monitor callbacks, but do
 # not instantiate the basic group because it unconditionally initializes W&B.
