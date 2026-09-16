@@ -15,6 +15,12 @@
 # Required env vars:
 #   LIBERO_ROOT           LIBERO_LeRobot_v3 PARENT dir（含 4 个 suite 子目录，no default）
 # Optional env vars (defaults below; override to relocate data/checkpoints):
+#   TOML_FILE             default: examples/toml/sft_config/action_policy_libero_edge_all.toml
+#                         (set to the *_localmem_active.toml sibling to run the active
+#                          Local-Memory route through this same launcher)
+#   RUN_NAME              default: edge_libero_4in1 — MUST match the selected TOML's
+#                         [job].name, because auto-resume scans
+#                         $OUTPUT_ROOT/cosmos3_action_libero/action_sft/$RUN_NAME/checkpoints
 #   BASE_CHECKPOINT_PATH  default: examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp
 #   EDGE_POLICY_CHECKPOINT default: /disk/rl/models/Cosmos3-Edge-Policy-DROID (本地 Edge 包, 零下载)
 #   WAN_VAE_PATH          default: examples/checkpoints/wan22_vae/Wan2.2_VAE.pth (本地转化原生 VAE)
@@ -36,7 +42,10 @@
 #     EXTRA_TAIL_OVERRIDES="trainer.max_iter=5 trainer.logging_iter=1" \
 #     bash examples/launch_sft_action_policy_libero_edge_all.sh
 
-TOML_FILE="examples/toml/sft_config/action_policy_libero_edge_all.toml"
+# Overridable so the active Local-Memory recipe (a sibling TOML with its own
+# [job].name) reuses this launcher instead of a near-duplicate copy; the default
+# keeps the baseline recipe path, so an unset TOML_FILE behaves as before.
+: "${TOML_FILE:=examples/toml/sft_config/action_policy_libero_edge_all.toml}"
 : "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp}"
 : "${EDGE_POLICY_CHECKPOINT:=/disk/rl/models/Cosmos3-Edge-Policy-DROID}"
 : "${NPROC_PER_NODE:=1}"
@@ -76,7 +85,12 @@ TAIL_OVERRIDES=(
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_ROOT_FOR_RESUME="${OUTPUT_ROOT:-$REPO_ROOT/outputs/train}"
 [[ "$OUTPUT_ROOT_FOR_RESUME" = /* ]] || OUTPUT_ROOT_FOR_RESUME="$REPO_ROOT/$OUTPUT_ROOT_FOR_RESUME"
-CHECKPOINT_ROOT="$OUTPUT_ROOT_FOR_RESUME/cosmos3_action_libero/action_sft/edge_libero_4in1/checkpoints"
+# Auto-resume scans the run directory named by the recipe's [job].name, so
+# RUN_NAME must follow TOML_FILE.  With the active Local-Memory recipe the
+# hardcoded default would silently resume that run from the *baseline* run's
+# checkpoints (and re-apply its load_training_state), which is never intended.
+: "${RUN_NAME:=edge_libero_4in1}"
+CHECKPOINT_ROOT="$OUTPUT_ROOT_FOR_RESUME/cosmos3_action_libero/action_sft/$RUN_NAME/checkpoints"
 
 _print_resume_candidates() {
     local -a candidates=("$@")
