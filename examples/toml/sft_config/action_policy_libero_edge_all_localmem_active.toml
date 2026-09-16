@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# Edge-Policy-DROID warm-start LIBERO-all (4-suite) action-policy SFT，**active Local-Memory 路线**。
+#
+# 与 `action_policy_libero_edge_all.toml` 的唯一结构性差异：
+#
+#   [trainer] **不设** `grad_accum_iter`，也不设任何 dataloader 批大小。
+#
+# 原因（两层，均已实测/取证）：
+#   1. `load_experiment_from_toml`（configs/toml_config/sft_config.py:753-754）逐字写明
+#      「an omitted field emits no override and the base config's value wins」——只有
+#      TOML 里显式出现的键才会生成 Hydra override。基线 toml 的 `grad_accum_iter = 16`
+#      会**覆盖** config 里的值，那样 driver 的 window 边界就与 psm_local_memory_active
+#      路线不符，故本文件必须省略该键。
+#   2. active 路线上一个 optimizer window 的 member 数 **就是**
+#      `config.trainer.grad_accum_iter`（`arm_active_local_memory_initial` 与
+#      `_preflight_active_optimizer_boundary` 两端夹逼，无其它可能取值），而该值由
+#      `action_policy_libero_edge_all.py` 在 `PSM_R09_B_TTT_ACTIVE=1` 下算作
+#      `8 * PSM_R09_B_TTT_ACTIVE_GA`（8 = v0.3.5 冻结的 `B_stream`）。
+#      所以 window 大小只经环境变量调节，本文件对它保持透明。
+#   3. 同一开关下 config 把 `max_samples_per_batch` 降为 1：active 路线上外层 batch 的
+#      内容**完全不被消费**（`omni_mot_model._active_local_memory_forward` 只读
+#      `psm_local_memory_active` / `psm_local_memory_prepared` 两键，真实样本全部由
+#      driver 的 canonical producer 经 `custom_collate_fn` 自行组装），外层 loader 只
+#      需满足既有 fetch/device 路径。
+#
+# 启动所需的额外环境变量（缺一则 config 在 import 期 fail-closed）：
+#   PSM_R09_B_TTT_ACTIVE=1        # 本路线总开关
+#   PSM_R09_B_TTT_ENABLED=1       # 前置：TTT 基础设施
+#   PSM_R08_LOCAL_HISTORY_ENABLED=1
+#   PSM_R09_B_TTT_ACTIVE_GA=<n>   # 正整数；window members = 8*n
+#
+# 其余训练参数与基线逐字一致（lr / cycle / warmup / selective AC + fmha / FusedAdamW /
+# max_num_tokens_after_packing / cudnn.benchmark=false / 单卡 HSDP 设定），
+# 以保证与基线的可比性。
+#
+# LIBERO_ROOT 指向 LIBERO_LeRobot_v3 PARENT 目录（含 4 个 suite 子目录）。
+# Env: LIBERO_ROOT, BASE_CHECKPOINT_PATH, EDGE_POLICY_CHECKPOINT, WAN_VAE_PATH.
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_libero_edge_all"
+project      = "cosmos3_action_libero"
+group        = "action_sft"
+name         = "edge_libero_4in1_localmem_active"   # 独立于基线的输出目录，避免与基线 run 互相覆盖
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 74000
+
+[model.parallelism]
+data_parallel_shard_degree     = -1    # 单卡 -> 1 rank
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [16000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter     = 5000
+logging_iter = 1
+# 故意不设 grad_accum_iter：见文件头 1./2.，window 边界只由 PSM_R09_B_TTT_ACTIVE_GA 决定。
+
+[trainer.cudnn]
+# Keep bf16 VAE convolution selection aligned with the offline latent-cache builder.
+benchmark = false
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 50
