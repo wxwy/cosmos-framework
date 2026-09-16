@@ -86,6 +86,12 @@ def _action_policy_libero_edge_model_config() -> dict:
         raise ValueError("PSM_R09_B_TTT_ENABLED and PSM_R09_A1_ENABLED are mutually exclusive")
     if r09_b_ttt_enabled and os.environ.get("PSM_R09_A1_PROBE_OUTPUT"):
         raise ValueError("PSM_R09_B_TTT_ENABLED and PSM_R09_A1_PROBE_OUTPUT are mutually exclusive")
+    if _strict_bool_env("PSM_R09_B_TTT_ACTIVE") and not r09_b_ttt_enabled:
+        # The canonical segment route reuses PSM_R09_B_TTT_ENABLED for the frozen
+        # model/optimizer identity and only changes which lifecycle owns the window.
+        raise ValueError("PSM_R09_B_TTT_ACTIVE requires PSM_R09_B_TTT_ENABLED=1")
+    if _strict_bool_env("PSM_R09_B_TTT_ACTIVE") and not local_history_enabled:
+        raise ValueError("PSM_R09_B_TTT_ACTIVE requires PSM_R08_LOCAL_HISTORY_ENABLED=1")
     local_dummy_mode = os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal")
     if local_dummy_mode not in {"normal", "zero", "shuffle"}:
         raise ValueError(f"unsupported PSM_LOCAL_DUMMY_MODE: {local_dummy_mode}")
@@ -300,9 +306,11 @@ if _r09_b1_probe_output:
         output_path=_r09_b1_probe_output,
     )
 
-if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
+if _strict_bool_env("PSM_R09_B_TTT_ENABLED") and not _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
     # External-backward lifecycle seam: records the unscaled native loss before
     # the single backward, then marks/commits armed segments after it.
+    # PSM_R09_B_TTT_ACTIVE=1 selects the canonical segment route instead, which
+    # owns its own window lifecycle and must not load this superseded callback.
     action_policy_libero_edge_all["trainer"]["callbacks"]["r09_b_ttt_lifecycle"] = L(TTTLifecycleCallback)()
 
 _r08_device_monitor_every_n = os.environ.get("PSM_R08_GATE_A_DEVICE_MONITOR_EVERY_N")
