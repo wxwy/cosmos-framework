@@ -65,6 +65,7 @@ from cosmos_framework.model.generator.mot.local_evidence import (
     ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
     LocalHistoryRuntime,
+    LocalMemoryRuntime,
     RecurrentLocalMemoryBackend,
     StatelessLocalReplayReadout,
     TTTLocalMemoryBackend,
@@ -438,10 +439,7 @@ class OmniMoTModel(ImaginaireModel):
                     ),
                 )
                 if self.config.local_ttt_enabled:
-                    runtime = torch.nn.Module()
-                    runtime.evidence_encoder = encoder
-                    runtime.ttt_core = local_backend
-                    net.local_memory_runtime = runtime
+                    net.local_memory_runtime = LocalMemoryRuntime(encoder, local_backend)
                 else:
                     net.local_history_runtime = LocalHistoryRuntime(
                         encoder,
@@ -1406,7 +1404,9 @@ class OmniMoTModel(ImaginaireModel):
     _PSM_AUXILIARY_LOSS_KEYS = ("aux_loss_und", "aux_loss_gen")
 
     @staticmethod
-    def _psm_reduced_loss(output_batch: Mapping[str, Any], keys: tuple[str, ...]) -> torch.Tensor:
+    def _psm_reduced_loss(
+        output_batch: Mapping[str, Any], keys: tuple[str, ...], *, allow_empty: bool = False
+    ) -> torch.Tensor | None:
         """Sum the present reduced loss terms of one native consumer forward."""
         terms: list[torch.Tensor] = []
         for key in keys:
@@ -1414,6 +1414,8 @@ class OmniMoTModel(ImaginaireModel):
             if isinstance(value, torch.Tensor) and value.ndim == 0:
                 terms.append(value)
         if not terms:
+            if allow_empty:
+                return None
             raise RuntimeError("native consumer forward produced no reducible loss term")
         total = terms[0]
         for term in terms[1:]:
@@ -1448,9 +1450,22 @@ class OmniMoTModel(ImaginaireModel):
         from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
 
         collated = custom_collate_fn([dict(payload) for payload in inputs.payloads])
+        # Stand in for the trainer's own device move (`data_batch = misc.to(data_batch,
+        # device="cuda")`), which only ever sees the outer batch -- on this route that
+        # batch carries the two markers and nothing else, so the producer's CPU payloads
+        # would otherwise reach `training_step` on CPU.  Device comes from the model so
+        # a CPU-only run stays valid.
+        collated = misc.to(collated, device=next(self.net.parameters()).device)
         output_batch, _ = self.training_step(collated, iteration, _psm_local_override=inputs.locals)
         primary = self._psm_reduced_loss(output_batch, self._PSM_CONSUMER_LOSS_KEYS)
-        auxiliary = self._psm_reduced_loss(output_batch, self._PSM_AUXILIARY_LOSS_KEYS)
+        auxiliary = self._psm_reduced_loss(output_batch, self._PSM_AUXILIARY_LOSS_KEYS, allow_empty=True)
+        if auxiliary is None:
+            # The auxiliary slot carries the load-balancing term, which ``_compute_losses``
+            # emits only when the backbone reports ``lbl_metadata_{und,gen}``.  A Dense
+            # backbone reports neither, so the slot is absent rather than zero-valued; the
+            # objective adds it as ``auxiliary_loss / ga_effective``, making an absent term
+            # an exact zero contribution instead of a contract failure.
+            auxiliary = torch.zeros((), device=primary.device, dtype=primary.dtype)
         return NativeBatchResult(primary_consumer_mean=primary, auxiliary_loss=auxiliary)
 
     def _active_local_memory_forward(

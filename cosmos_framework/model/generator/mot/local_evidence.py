@@ -848,6 +848,29 @@ class ContinualTTTFastStateTransition(nn.Module):
         return tokens, state_out, present, next_counter
 
 
+class LocalMemoryRuntime(nn.Module):
+    """Active-route runtime holding the evidence encoder and its continual core.
+
+    The container owns no parameters of its own. It exists so that the network's
+    post-materialization ``init_weights`` can reach both submodules: the active
+    route builds this runtime on the meta device, and ``to_empty`` discards the
+    initialization performed in ``__init__``.
+    """
+
+    def __init__(self, evidence_encoder: LocalEvidenceEncoder, ttt_core: ContinualTTTLocalMemoryCore) -> None:
+        super().__init__()
+        if evidence_encoder.evidence_dim != ttt_core.evidence_dim:
+            raise ValueError("Local memory encoder/core evidence dimensions must match.")
+        self.evidence_encoder = evidence_encoder
+        self.ttt_core = ttt_core
+
+    def reset_parameters(self) -> None:
+        """Initialize active-route Local parameters after meta-device materialization."""
+        for module in self.modules():
+            if module is not self and hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+
+
 class LocalHistoryRuntime(nn.Module):
     """Encode a batched causal history and gate absent samples out of Local."""
 

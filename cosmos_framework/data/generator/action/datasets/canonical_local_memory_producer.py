@@ -35,6 +35,15 @@ from cosmos_framework.model.generator.mot.local_memory_segment import (
 
 VISUAL_SUMMARY_DIM = 96
 
+# Keys the joint loader keeps as per-sample single-element lists so that a packed
+# sample may carry several items.  ``IterativeJointDataLoader._get_next_sample``
+# wraps them (``v[i : i + 1]``) on the loader route; payloads produced here reach
+# ``custom_collate_fn`` directly, which only collects per-sample values, so the
+# wrapping has to happen here.  A bare tensor is not merely cosmetic:
+# ``get_data_and_condition`` requires ``len(cached_video_latents[i]) == 1``, and its
+# multi-vision probe reads a bare tensor's first dim as an item count.
+MULTI_ITEM_KEYS = ("text_token_ids", "images", "video", "video_latent", "action", "action_raw", "sound")
+
 
 @dataclass(frozen=True)
 class CanonicalSegmentStream:
@@ -143,7 +152,17 @@ class CanonicalLocalMemorySegmentProducer:
 
     def _payload(self, stream: CanonicalSegmentStream, local_frame: int) -> Any:
         item = self.frame_source._build_item(self._flat_index(stream, local_frame))
-        return self.wrapped_dataset._transform(item, self.wrapped_dataset._resolution)
+        payload = self.wrapped_dataset._transform(item, self.wrapped_dataset._resolution)
+        if not isinstance(payload, dict):
+            return payload
+        for key in MULTI_ITEM_KEYS:
+            value = payload.get(key)
+            # Mirror ``_get_next_sample``: an existing list is kept as-is, a bare
+            # value is wrapped.  ``None`` stays ``None`` so ``custom_collate_fn``'s
+            # sparse-key path, which keys off a per-sample ``None``, still sees it.
+            if value is not None and not isinstance(value, list):
+                payload[key] = [value]
+        return payload
 
     # ---- production --------------------------------------------------------
 

@@ -232,6 +232,17 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             raise RuntimeError("active Local-Memory launch requires a bound trainer")
         if self.driver is not None:
             raise RuntimeError("active Local-Memory launch ran twice")
+        # ``CallBackGroup`` builds callbacks with ``cosmos_framework.utils.lazy_config
+        # .instantiate``, whose recursion descends only through nodes carrying their own
+        # ``_target_``.  A nested mapping such as ``suite_datasets`` carries none, so it
+        # is returned verbatim and its leaves reach us still lazy.  Resolve them here.
+        # ``instantiate`` returns an already-materialized dataset unchanged, so this is a
+        # no-op on a path that resolved them upstream and never double-builds.
+        from cosmos_framework.utils.lazy_config import instantiate
+
+        self.suite_datasets = {
+            category: instantiate(dataset) for category, dataset in self.suite_datasets.items()
+        }
         window_members = int(trainer.config.trainer.grad_accum_iter)
         adapter = canonical_segment_adapter_from_model(model)
         wiring = CanonicalSegmentWiring(adapter, canonical_slow_parameters_from_model(model))

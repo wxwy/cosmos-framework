@@ -293,6 +293,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         if hasattr(self, "local_history_runtime"):
             self.local_history_runtime.reset_parameters()
 
+        if hasattr(self, "local_memory_runtime"):
+            self.local_memory_runtime.reset_parameters()
+
         self.language_model.init_weights(buffer_device=buffer_device)
 
     def generate_reasoner_text(

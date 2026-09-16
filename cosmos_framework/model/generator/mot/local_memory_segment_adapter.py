@@ -82,9 +82,18 @@ class CanonicalLocalMemorySegmentAdapter:
             raise ValueError("segment scan requires an admitted identity in its transaction plan.")
         segment.validate(self.core.ttt_tbptt_steps)
         state_in = self.sidecar.read(identity)
+        # Evidence is built dataset-side on CPU while the live encoder sits wherever the
+        # model was placed, and the core derives its state device from these tensors.
+        # Align them here, not inside the encoder: `encode_segment` is also reached by the
+        # baseline path, whose evidence already matches the model.  A no-op on CPU, so the
+        # offline smoke keeps exercising the same code.
+        device = next(self.encoder.parameters()).device
+        if state_in is not None:
+            state_in = ContinualTTTFastState(*(value.to(device) for value in state_in))
         tokens, state_out, present = self.core.scan_segment_masked_encoded_many(
-            self.encoder, segment.evidence_visual_summary_prev, segment.evidence_executed_action_prev,
-            segment.evidence_valid, state_in, create_graph=True,
+            self.encoder, segment.evidence_visual_summary_prev.to(device),
+            segment.evidence_executed_action_prev.to(device), segment.evidence_valid.to(device),
+            state_in, create_graph=True,
         )
         payloads, locals_, identities = segment.gather_consumers(tokens, present)
         result = SegmentScanResult(tokens, present, state_out, tuple(payloads), tuple(locals_), tuple(identities))

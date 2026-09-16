@@ -2298,6 +2298,7 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
         position_ids: torch.Tensor,
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
+        memory_prefix_context: MemoryPrefixContext | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
         """Training forward pass — delegates to the dense text model."""
         outputs = self.model(
@@ -2306,6 +2307,7 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
             position_ids=position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            memory_prefix_context=memory_prefix_context,
         )
         return outputs
 
@@ -2464,6 +2466,7 @@ class Qwen3VLMoeTextForCausalLM(Qwen3VLMoePreTrainedModel):
         position_ids: torch.Tensor,
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
+        memory_prefix_context: MemoryPrefixContext | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
         """Training forward pass — delegates to the MoE text model."""
 
@@ -2473,6 +2476,7 @@ class Qwen3VLMoeTextForCausalLM(Qwen3VLMoePreTrainedModel):
             position_ids=position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            memory_prefix_context=memory_prefix_context,
         )
 
         return outputs
@@ -2634,6 +2638,7 @@ class Nemotron3DenseVLTextForCausalLM(Nemotron3DenseVLPreTrainedModel):
         position_ids: torch.Tensor,
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
+        memory_prefix_context: MemoryPrefixContext | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
         return self.model(
             pack=pack,
@@ -2641,6 +2646,7 @@ class Nemotron3DenseVLTextForCausalLM(Nemotron3DenseVLPreTrainedModel):
             position_ids=position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            memory_prefix_context=memory_prefix_context,
         )
 
     def generate_reasoner_text(

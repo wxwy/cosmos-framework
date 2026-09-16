@@ -54,6 +54,21 @@ def _strict_bool_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+def _local_history_horizon(*, active: bool) -> int:
+    """Causal-history horizon; forced to zero on the canonical segment route.
+
+    That route owns its Local payload end to end: ``CanonicalLocalMemorySegmentProducer``
+    builds each consumer's evidence straight from the cached latents, so the dataset must
+    emit no causal-history fields.  ``OmniMoTModel._inject_local_history`` keys off
+    ``horizon == 0`` to take its documented producer-owned-payload early return; leaving it
+    at the R08 default of 16 would instead drive the baseline R09-B TTT branch, which
+    requires a ``local_history_runtime`` owner this route deliberately does not register.
+    """
+    if active:
+        return 0
+    return int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", "16"))
+
+
 def _action_policy_libero_edge_model_config() -> dict:
     """Edge model config (identical to edge_warmstart): capped packed tokens,
     selective AC, compile off, fresh diffusion-expert init, local Edge tokenizer."""
@@ -103,7 +118,9 @@ def _action_policy_libero_edge_model_config() -> dict:
     # identical to baseline unless PSM_R09_B_TTT_ENABLED=1; the four TTT
     # hyperparameters keep their frozen defaults (16 / 0.1 / 1 / 1).
     cfg["local_ttt_enabled"] = r09_b_ttt_enabled
-    cfg["local_history_horizon"] = int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", "16"))
+    cfg["local_history_horizon"] = _local_history_horizon(
+        active=_strict_bool_env("PSM_R09_B_TTT_ACTIVE")
+    )
     if cfg["local_history_horizon"] < 0:
         raise ValueError("PSM_R08_LOCAL_HISTORY_HORIZON must be non-negative")
     cfg["local_memory_dim"] = int(os.environ.get("PSM_LOCAL_DUMMY_DIM", "32")) if cfg["local_memory_enabled"] else None
@@ -138,7 +155,11 @@ def _action_policy_libero_edge_dataloader():
     local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
     b2_manifest_root = os.environ.get("PSM_R09_B2_STREAM_MANIFEST_ROOT")
 
-    def _suite_dataset(_suite):
+    def _suite_dataset(_suite, *, iterable_shuffle=None):
+        # Default = the baseline route's infinite shuffled stream.  The active route
+        # passes False explicitly; see `active_datasets` below for why.
+        if iterable_shuffle is None:
+            iterable_shuffle = not bool(b2_manifest_root)
         latent_cache_root = os.environ.get("LIBERO_LATENT_CACHE_ROOT")
         cache_kwargs = (
             {
@@ -169,7 +190,7 @@ def _action_policy_libero_edge_dataloader():
             pose_coordinate_frame="native",
             action_normalization="quantile_rot",
             val_ratio=0.01,
-            iterable_shuffle=not bool(b2_manifest_root),
+            iterable_shuffle=iterable_shuffle,
             episode_shuffle_seed=42,
             resolution=None,
             max_action_dim="${model.config.max_action_dim}",
@@ -180,7 +201,9 @@ def _action_policy_libero_edge_dataloader():
             local_dummy_tokens=int(os.environ.get("PSM_LOCAL_DUMMY_TOKENS", "1")),
             local_dummy_dim="${model.config.local_memory_dim}",
             local_dummy_mode=os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal"),
-            local_history_horizon=int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", "16"))
+            local_history_horizon=_local_history_horizon(
+                active=_strict_bool_env("PSM_R09_B_TTT_ACTIVE")
+            )
             if local_history_enabled
             else 0,
             **cache_kwargs,
@@ -208,7 +231,15 @@ def _action_policy_libero_edge_dataloader():
     # The route's own dataset handles, built as separate LazyDicts so they never
     # share an OmegaConf node with the loader.  They cannot be reached through the
     # trainer: `dataloader_train` is a local of `ImaginaireTrainer.train`.
-    active_datasets = {_suite: _suite_dataset(_suite) for _suite in _SUITES} if _active else {}
+    #
+    # Map-style on purpose: `CanonicalLocalMemorySegmentProducer` accepts exactly
+    # this shape -- `_transform`/`_resolution` off the wrapper, `_load_cached_latent`
+    # off `wrapped._dataset`.  The loader's `ActionIterableShuffleDataset` view nests
+    # one level too deep and the producer rejects it at construction, so these
+    # handles must not be the loader's own dataset object.
+    active_datasets = (
+        {_suite: _suite_dataset(_suite, iterable_shuffle=False) for _suite in _SUITES} if _active else {}
+    )
 
     return L(IterativeJointDataLoader)(
         tokenizer_spatial_compression_factor=16,
