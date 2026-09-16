@@ -35,6 +35,7 @@ from cosmos_framework.configs.base.experiment.action.posttrain_config.action_pol
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
 from cosmos_framework.data.generator.action.datasets.action_sft_dataset import get_action_libero_sft_dataset
 from cosmos_framework.data.generator.joint_dataloader import IterativeJointDataLoader
+from cosmos_framework.model.generator.mot.active_local_memory_launch import ActiveLocalMemoryLaunchCallback
 from cosmos_framework.model.generator.mot.config_checkpoint_contract import SELECTORS as TTT_SLOW_GROUP_SELECTORS
 from cosmos_framework.model.generator.mot.ttt_lifecycle import TTTLifecycleCallback
 from cosmos_framework.model.generator.vision_vae import (
@@ -192,7 +193,15 @@ def _action_policy_libero_edge_dataloader():
     # `psm_local_memory_*` markers), so this loader's batch content is never
     # consumed.  Fetch one sample per iteration purely to satisfy the existing
     # fetch/device path instead of decoding 128 unused samples per member.
-    max_samples_per_batch = 1 if _strict_bool_env("PSM_R09_B_TTT_ACTIVE") else 128
+    _active = _strict_bool_env("PSM_R09_B_TTT_ACTIVE")
+    if _active:
+        # Twelve forked workers would each hold an unused copy of a suite index.
+        _num_workers = 0
+    max_samples_per_batch = 1 if _active else 128
+    # The route's own dataset handles, built as separate LazyDicts so they never
+    # share an OmegaConf node with the loader.  They cannot be reached through the
+    # trainer: `dataloader_train` is a local of `ImaginaireTrainer.train`.
+    active_datasets = {_suite: _suite_dataset(_suite) for _suite in _SUITES} if _active else {}
 
     return L(IterativeJointDataLoader)(
         tokenizer_spatial_compression_factor=16,
@@ -220,7 +229,7 @@ def _action_policy_libero_edge_dataloader():
             )
             for _suite in _SUITES
         },
-    )
+    ), active_datasets
 
 
 action_policy_libero_edge_all = copy.deepcopy(action_policy_libero_all_nano)
@@ -259,7 +268,7 @@ if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
 
 # 单卡多 suite：替换 RankPartitionedDataLoader（world_size>=4 断言不满足）为
 # IterativeJointDataLoader 轮询等权混合（每 grad-accum 窗口 16 批 = 4 套 × 4 次）。
-action_policy_libero_edge_all["dataloader_train"] = _action_policy_libero_edge_dataloader()
+action_policy_libero_edge_all["dataloader_train"], _libero_active_datasets = _action_policy_libero_edge_dataloader()
 
 if _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
     # One window is one optimizer update, and the driver arms exactly
@@ -271,6 +280,21 @@ if _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
     if _active_ga <= 0:
         raise ValueError(f"PSM_R09_B_TTT_ACTIVE_GA must be a positive integer, got {_active_ga}")
     action_policy_libero_edge_all["trainer"]["grad_accum_iter"] = 8 * _active_ga
+    # Launch-time assembly: the canonical owner, the segment adapter over the model's
+    # own registered modules, the slot catalog, and the window driver.  The driver
+    # reads its window size from the `grad_accum_iter` set just above, so the two
+    # cannot drift.  The digests below identify the evidence source rather than
+    # attesting to it; provenance was deferred by the 2026-09-16 route decision.
+    action_policy_libero_edge_all["trainer"]["callbacks"]["r09_b_active_wiring"] = L(
+        ActiveLocalMemoryLaunchCallback
+    )(
+        suite_datasets=_libero_active_datasets,
+        b_stream=8,  # v0.3.5-frozen B_stream
+        ttt_tbptt_steps=int(os.environ.get("PSM_R09_B_TTT_TBPTT_STEPS", "16")),
+        manifest_digest=os.environ.get("PSM_R09_B2_STREAM_MANIFEST_ROOT") or "libero4in1-4suite-manifest",
+        config_digest=os.environ.get("PSM_R09_B_TTT_ACTIVE_CONFIG_DIGEST") or "v035-frozen-local-ttt",
+        source_digest=os.environ.get("LIBERO_LATENT_CACHE_ROOT") or "libero4in1-latent-cache",
+    )
 
 # Admission smoke is fully offline. Keep the safety/monitor callbacks, but do
 # not instantiate the basic group because it unconditionally initializes W&B.
