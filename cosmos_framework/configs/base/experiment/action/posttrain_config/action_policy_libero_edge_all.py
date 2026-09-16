@@ -126,6 +126,13 @@ def _action_policy_libero_edge_dataloader():
     step sees each suite exactly 4 times. Each suite keeps its own DataLoader;
     the datasets default to ``shard_world_size=1``/``shard_rank=0`` so its
     workers shard episodes disjointly within the suite.
+
+    Under ``PSM_R09_B_TTT_ACTIVE`` the argument above no longer applies: the
+    driver reads only the two ``psm_local_memory_*`` markers, so these round-robin
+    cycles are never consumed and the loader degenerates to a pure clock.  Suite
+    balance there is carried by ``RankLocalSegmentScheduler.target_distribution``
+    plus the driver's own deficit rule over the frozen window, so ``grad_accum_iter``
+    must *not* be read as "4 cycles" on that route.
     """
 
     local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
