@@ -191,6 +191,30 @@ def test_launch_assembles_the_driver_at_the_accumulation_boundary(monkeypatch) -
         callback.on_train_start(model, iteration=0)
 
 
+def test_launch_refuses_to_resume_an_interrupted_active_run() -> None:
+    """Resuming would rebuild the data frontier and replay the catalogue.
+
+    Nothing about the driver's slot frontier or the scheduler's exposure/guard
+    state reaches the checkpoint, so a resumed run would silently re-train on
+    episodes it has already consumed while model/optim/LR-schedule continue.
+    """
+    model, _, _, _ = _model()
+    trainer = _trainer(grad_accum_iter=24)
+    callback = ActiveLocalMemoryLaunchCallback(
+        {"libero_spatial": _FakeDataset({0: 32})},
+        manifest_digest="manifest",
+        config_digest="config",
+        source_digest="latent-cache-root",
+    )
+    callback.trainer = trainer
+
+    with pytest.raises(RuntimeError, match="cannot resume"):
+        callback.on_train_start(model, iteration=7)
+
+    assert callback.driver is None
+    assert trainer.callbacks._callbacks == []
+
+
 def test_launch_requires_a_bound_trainer() -> None:
     model, _, _, _ = _model()
     callback = ActiveLocalMemoryLaunchCallback(

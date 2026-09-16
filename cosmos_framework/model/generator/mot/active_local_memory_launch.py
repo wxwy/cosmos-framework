@@ -222,7 +222,22 @@ class ActiveLocalMemoryLaunchCallback(Callback):
 
     def on_train_start(self, model: Any, iteration: int = 0) -> None:
         """Assemble the owner over the live model and attach the window driver."""
-        del iteration
+        # The driver's data-progress state is not checkpointed: ``_stream_index`` /
+        # ``_active_stream`` / ``_active_cursor`` / ``_window_index`` and the
+        # scheduler's ``cumulative_valid_consumer_exposure`` plus its
+        # ``stable_slots`` / ``terminal_slots`` / ``admission_order`` /
+        # ``committed_identities`` guards are all rebuilt from scratch here.  A
+        # resumed run would therefore replay the episode catalogue from its first
+        # episode while model/optim/LR-schedule continue from the checkpoint.
+        # Fail closed instead: an interrupted active run must be restarted, not
+        # silently re-trained on data it has already consumed.
+        if iteration > 0:
+            raise RuntimeError(
+                "active Local-Memory cannot resume: the window driver's slot frontier and the "
+                "segment scheduler's exposure/guard state are not checkpointed, so resuming at "
+                f"iteration {iteration} would silently replay the episode catalogue from the "
+                "beginning. Restart the run from scratch."
+            )
         from cosmos_framework.data.generator.action.datasets.canonical_local_memory_producer import (
             CanonicalLocalMemorySegmentProducer,
         )
