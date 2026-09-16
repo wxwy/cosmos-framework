@@ -314,7 +314,19 @@ if _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
     # size `B_stream * GA` with the v0.3.5-frozen `B_stream = 8`.  A driver
     # constructed over a different slot pool must be given the same count.
     # GA=16 reproduces the baseline 2048 samples/update (128 members x 16 consumers).
-    _active_ga = int(os.environ.get("PSM_R09_B_TTT_ACTIVE_GA", "1"))
+    # Required rather than defaulted: the former default of 1 silently trains a 16x
+    # smaller effective batch (grad_accum_iter=8 -> 128 samples/update instead of the
+    # baseline 2048), and nothing downstream reports it, because the driver reads its
+    # window size from the grad_accum_iter set below and therefore stays internally
+    # consistent while running the wrong recipe.
+    _active_ga_env = os.environ.get("PSM_R09_B_TTT_ACTIVE_GA")
+    if _active_ga_env is None:
+        raise ValueError(
+            "PSM_R09_B_TTT_ACTIVE=1 requires PSM_R09_B_TTT_ACTIVE_GA to be set explicitly "
+            "(16 reproduces the baseline 2048 samples/update); see "
+            "examples/toml/sft_config/action_policy_libero_edge_all_localmem_active.toml"
+        )
+    _active_ga = int(_active_ga_env)
     if _active_ga <= 0:
         raise ValueError(f"PSM_R09_B_TTT_ACTIVE_GA must be a positive integer, got {_active_ga}")
     action_policy_libero_edge_all["trainer"]["grad_accum_iter"] = 8 * _active_ga
