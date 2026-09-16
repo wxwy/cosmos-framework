@@ -95,10 +95,84 @@ class CanonicalLocalMemorySegmentAdapter:
             segment.evidence_executed_action_prev.to(device), segment.evidence_valid.to(device),
             state_in, create_graph=True,
         )
+        self._psm_diag_probe(segment, state_in, tokens, present)
         payloads, locals_, identities = segment.gather_consumers(tokens, present)
         result = SegmentScanResult(tokens, present, state_out, tuple(payloads), tuple(locals_), tuple(identities))
         self._pending_scan = (identity, transaction, result)
         return result
+
+    def _psm_diag_probe(self, segment, state_in, tokens, present) -> None:
+        """TEMP DIAGNOSTIC (enabled by ``PSM_DIAG_EVIDENCE=1``): one-shot numeric probe.
+
+        Reports the first segment's evidence values, validity mask, fast-state graph
+        status and parameter magnitudes, and registers a hook that prints the gradient
+        the real loss delivers to the Local tokens.  ``None`` for the hook means the
+        tokens never received a gradient; a non-zero value means the graph is intact up
+        to the tokens, so any all-zero slow gradient is produced inside this scan.
+        """
+        import os
+
+        if os.environ.get("PSM_DIAG_EVIDENCE") != "1":
+            return
+        if getattr(self, "_psm_diag_done", False):
+            # Keep reporting only the loss-side token gradient: on the first optimizer step
+            # `local_memory2llm.weight` is exactly zero, so ``dL/dtoken = grad_out * W`` is
+            # identically zero and every runtime parameter is starved.  Watching this value
+            # across members shows the step at which W leaves zero and the Local runtime
+            # starts receiving gradient.
+            if tokens.requires_grad:
+                self._psm_diag_hook(tokens)
+            return
+        self._psm_diag_done = True
+        with torch.no_grad():
+            visual = segment.evidence_visual_summary_prev
+            action = segment.evidence_executed_action_prev
+            valid = segment.evidence_valid
+            print(
+                f"[DIAG-EV] visual max={visual.abs().max().item():.3e} "
+                f"nonzero={int((visual != 0).sum())}/{visual.numel()}",
+                flush=True,
+            )
+            print(
+                f"[DIAG-EV] action max={action.abs().max().item():.3e} "
+                f"nonzero={int((action != 0).sum())}/{action.numel()}",
+                flush=True,
+            )
+            print(f"[DIAG-EV] valid true={int(valid.sum())}/{valid.numel()} present={int(present.sum())}", flush=True)
+            state_repr = "None" if state_in is None else [bool(value.requires_grad) for value in state_in]
+            print(
+                f"[DIAG-EV] tokens requires_grad={tokens.requires_grad} "
+                f"max={tokens.abs().max().item():.3e} state_in.requires_grad={state_repr}",
+                flush=True,
+            )
+            for name, parameter in list(self.encoder.named_parameters()) + list(self.core.named_parameters()):
+                print(
+                    f"[DIAG-EV] param {name}: max={parameter.abs().max().item():.3e} "
+                    f"rg={parameter.requires_grad} dtype={parameter.dtype}",
+                    flush=True,
+                )
+        if tokens.requires_grad:
+            self._psm_diag_hook(tokens)
+        else:
+            print("[DIAG-EV] tokens.requires_grad=False: graph already severed at scan exit", flush=True)
+
+    def _psm_diag_hook(self, tokens: torch.Tensor) -> None:
+        """Print the gradient the real loss delivers to the Local tokens of one segment."""
+        count = getattr(self, "_psm_diag_count", 0) + 1
+        self._psm_diag_count = count
+        if count > 4 and count % 32:
+            tokens.register_hook(lambda grad: None)
+            return
+
+        def _report(grad: torch.Tensor) -> None:
+            print(
+                f"[DIAG-EV] scan#{count} dL/dtoken max={grad.abs().max().item():.3e} "
+                f"nonzero={int((grad != 0).sum())}/{grad.numel()}",
+                flush=True,
+            )
+            return None
+
+        tokens.register_hook(_report)
 
     def commit(self, identity: SegmentIdentity, result: SegmentScanResult, *, transaction: LocalMemoryTransaction) -> None:
         """Persist detached fast state only after the trainer transaction succeeds."""
