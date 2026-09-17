@@ -470,6 +470,31 @@ def test_runtime_round_trip_preserves_committed_identity_objects() -> None:
     other.state_dict()  # re-snapshot must not raise (is-checks hold)
 
 
+def _live_identity(driver: ActiveLocalMemoryWindowDriver) -> dict[str, object]:
+    """Capture the live objects whose identity must survive a rejected load."""
+    owner = driver.registry.owner
+    return {
+        "scheduler": owner.scheduler,
+        "stream_index": dict(driver._stream_index),
+        "active_stream": dict(driver._active_stream),
+        "active_cursor": dict(driver._active_cursor),
+        "window_index": driver._window_index,
+        "sidecar_keys": set(owner.adapter.sidecar._records.keys()),
+        "phase": owner.phase,
+    }
+
+
+def _reject_without_live_mutation(state: dict, *, match: str) -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    before = _live_identity(other)
+    with pytest.raises(RuntimeError, match=match):
+        other.load_state_dict(state)
+    assert _live_identity(other) == before
+
+
 def test_load_state_dict_rejects_misaligned_stream_index() -> None:
     producer = _FakeProducer()
     producer.blocks[(0, 1)] = 4
@@ -478,10 +503,7 @@ def test_load_state_dict_rejects_misaligned_stream_index() -> None:
     driver.freeze_window()
     state = driver.state_dict()
     state["stream_index"][0] = 999
-
-    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
-    with pytest.raises(RuntimeError, match="stream_index"):
-        other.load_state_dict(state)
+    _reject_without_live_mutation(state, match="stream_index")
 
 
 def test_load_state_dict_rejects_out_of_range_cursor() -> None:
@@ -492,7 +514,55 @@ def test_load_state_dict_rejects_out_of_range_cursor() -> None:
     driver.freeze_window()
     state = driver.state_dict()
     state["active_cursor"][0] = 99
+    _reject_without_live_mutation(state, match="cursor")
+
+
+def test_load_state_dict_rejects_bad_active_stream_key_set() -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    driver = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    driver.freeze_window()
+    state = driver.state_dict()
+    state["active_stream"][7] = (7, 1, 1, "suite")  # key not in the catalog
+    _reject_without_live_mutation(state, match="key")
+
+
+def test_load_state_dict_rejects_runtime_without_scheduler_counterpart() -> None:
+    from cosmos_framework.model.generator.mot.canonical_segment_runtime import CanonicalRuntimeSnapshot
+
+    registry = _registry({"suite": 1.0})
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    driver = _driver(registry, producer, (stream,), window_members=2)
+    trainer, model = _trainer(registry, grad_accum_iter=2), _model()
+    driver.attach(trainer, model)
+
+    transaction = None
+    for index in range(2):
+        driver.arm_next_member(trainer, model)
+        prepared = trainer._psm_active_armed_prepared
+        registry.consume_prepared_for_model(prepared)
+        published = registry.publish_active_forward(prepared, NativeBatchResult(torch.ones(()), torch.zeros(())))
+        registry.consume_active_forward(published)
+        transaction = registry.owner.transaction
+        transaction.successful_backward(index, prepared.identity, prepared.actual_n_valid)
+        registry.owner.commit(transaction, prepared.forward)
+        trainer._psm_active_armed_prepared = None
+    registry.owner.resolve_local_memory_slow_window(registry.owner.finish_window(transaction), scaler_skipped=False)
+
+    state = driver.state_dict()
+    runtime = state["runtime"]
+    stripped = dict(runtime.scheduler)
+    stripped["admission_order"] = ()
+    stripped["committed_identities"] = ()
+    stripped["stable_slots"] = {}
+    state["runtime"] = CanonicalRuntimeSnapshot(runtime.generation, stripped, runtime.committed)
 
     other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
-    with pytest.raises(RuntimeError, match="cursor"):
+    before = _live_identity(other)
+    with pytest.raises(RuntimeError, match="counterpart"):
         other.load_state_dict(state)
+    assert _live_identity(other) == before
+

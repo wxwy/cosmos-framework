@@ -315,8 +315,10 @@ class ActiveLocalMemoryWindowDriver(Callback):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore driver/runtime state with the §4.3 fail-closed checks.
 
-        A half-right restore is worse than refusing to resume, so every check
-        below raises instead of guessing.
+        Two-phase restore (project atomicity rule): every fallible check runs on
+        staged/off-to-the-side state first; only after all checks pass does a
+        single atomic apply mutate the live owner/sidecar/driver.  Any rejection
+        therefore leaves the live runtime untouched.
         """
         # 4. 版本/身份一致性：catalog/config 变更后不得静默误 load。
         if state_dict.get("source_digest") != getattr(self.producer, "source_digest", None):
@@ -335,9 +337,25 @@ class ActiveLocalMemoryWindowDriver(Callback):
         max_iter = getattr(getattr(getattr(self._trainer, "config", None), "trainer", None), "max_iter", None)
         if max_iter is not None and window_index >= max_iter:
             raise RuntimeError("active Local-Memory cannot resume: window_index exceeds max_iter")
+        # ---- 阶段 1：staging/validation（不 mutate live）----
         # 1. _by_slot 重建确定性：active_stream 按值匹配，且恰好命中一个对象。
+        active_stream = self._stage_active_stream(state_dict["active_stream"])
+        # 6. frontier 跨字段一致性（ChatGPT MEDIUM-1）。
+        stream_index, active_cursor = self._stage_frontier(state_dict, active_stream)
+        # 5. runtime：旁路 rebuild scheduler + stage sidecar records + 全量校验。
+        scheduler, sidecar_records = self._stage_runtime(state_dict["runtime"])
+        # ---- 阶段 2：atomic apply（此后无 fallible 检查）----
+        self._apply_runtime(scheduler, sidecar_records)
+        self._window_index = window_index
+        self._stream_index = stream_index
+        self._active_stream = active_stream
+        self._active_cursor = active_cursor
+
+    def _stage_active_stream(self, serialized: dict[Any, Any]) -> dict[int, Any]:
         active_stream: dict[int, Any] = {}
-        for slot, fields in state_dict["active_stream"].items():
+        for slot, fields in serialized.items():
+            if slot not in self._by_slot:
+                raise RuntimeError("active Local-Memory cannot resume: frontier keys are not valid for the catalog geometry")
             slot_id, episode_index, episode_position, category = fields
             matches = [
                 s
@@ -348,9 +366,9 @@ class ActiveLocalMemoryWindowDriver(Callback):
             if len(matches) != 1:
                 raise RuntimeError("active Local-Memory cannot resume: slot-to-episode binding is ambiguous")
             active_stream[slot] = matches[0]
-        # 5. CanonicalRuntimeSnapshot 重建：scheduler rebuild + owner 重绑 + sidecar 回填。
-        self._restore_runtime(state_dict["runtime"])
-        # 6. 应用游标状态，含跨字段一致性校验（ChatGPT MEDIUM-1）。
+        return active_stream
+
+    def _stage_frontier(self, state_dict: dict[str, Any], active_stream: dict[int, Any]) -> tuple[dict[int, Any], dict[int, int]]:
         stream_index = dict(state_dict["stream_index"])
         active_cursor = dict(state_dict["active_cursor"])
         if set(active_cursor) != set(active_stream):
@@ -370,26 +388,22 @@ class ActiveLocalMemoryWindowDriver(Callback):
                     raise RuntimeError("active Local-Memory cannot resume: cursor out of block range")
             elif not (isinstance(stream_index[slot], int) and 0 <= stream_index[slot] <= len(self._by_slot[slot])):
                 raise RuntimeError("active Local-Memory cannot resume: invalid frontier for idle slot")
-        self._window_index = window_index
-        self._stream_index = stream_index
-        self._active_stream = active_stream
-        self._active_cursor = active_cursor
+        return stream_index, active_cursor
 
-    def _restore_runtime(self, runtime: Any) -> None:
-        """Rebuild scheduler/owner/sidecar from ``owner.snapshot()``.
+    def _stage_runtime(self, runtime: Any) -> tuple[Any, dict[int, tuple[Any, Any]]]:
+        """Rebuild scheduler and stage sidecar records off to the side (no live mutation).
 
-        The sidecar frontier must reuse the *same* ``SegmentIdentity`` objects
-        that ``scheduler.rebuild`` materializes (not the deserialized ones from
-        ``runtime.committed``), otherwise ``canonical_segment_runtime.py:184-186``
-        ``is``-checks fail on the next snapshot.
+        Mirrors ``owner.snapshot()``'s consistency checks (``canonical_segment_runtime.py:181-188``)
+        against the *candidate* scheduler, so a malformed runtime fails before any
+        live owner/sidecar state is touched.  The sidecar frontier must reuse the
+        same ``SegmentIdentity`` objects that ``scheduler.rebuild`` materializes,
+        otherwise the ``is``-checks fail on the next snapshot.
         """
         scheduler = RankLocalSegmentScheduler.rebuild(dict(runtime.scheduler))
-        owner = self.registry.owner
-        owner.scheduler = scheduler
-        scheduler._canonical_runtime_owner = owner
-        sidecar = owner.adapter.sidecar
-        sidecar._records.clear()
+        if any(i not in scheduler.committed_identities for i in scheduler.admission_order):
+            raise RuntimeError("active Local-Memory cannot resume: snapshot has admitted-but-uncommitted authority")
         by_slot = {identity.slot_id: identity for identity in scheduler.committed_identities}
+        records: dict[int, tuple[Any, Any]] = {}
         for identity, fast_state in runtime.committed:
             canonical = by_slot.get(identity.slot_id)
             if canonical is None:
@@ -397,5 +411,17 @@ class ActiveLocalMemoryWindowDriver(Callback):
                     "active Local-Memory cannot resume: committed sidecar identity has no "
                     f"scheduler counterpart for slot {identity.slot_id}"
                 )
-            sidecar._records[identity.slot_id] = (canonical, fast_state)
-        owner.snapshot()  # consistency self-check: must not raise
+            if scheduler.stable_slots.get(identity.slot_id) is not canonical:
+                raise RuntimeError("active Local-Memory cannot resume: snapshot committed frontier mismatch")
+            records[identity.slot_id] = (canonical, fast_state)
+        if any(slot in by_slot for slot in scheduler.terminal_slots):
+            raise RuntimeError("active Local-Memory cannot resume: snapshot terminal slot retains sidecar state")
+        return scheduler, records
+
+    def _apply_runtime(self, scheduler: Any, sidecar_records: dict[int, tuple[Any, Any]]) -> None:
+        owner = self.registry.owner
+        owner.scheduler = scheduler
+        scheduler._canonical_runtime_owner = owner
+        sidecar = owner.adapter.sidecar
+        sidecar._records.clear()
+        sidecar._records.update(sidecar_records)
