@@ -468,3 +468,31 @@ def test_runtime_round_trip_preserves_committed_identity_objects() -> None:
     for slot, identity in committed_by_slot.items():
         assert identity is owner.scheduler.stable_slots[slot]
     other.state_dict()  # re-snapshot must not raise (is-checks hold)
+
+
+def test_load_state_dict_rejects_misaligned_stream_index() -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    driver = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    driver.freeze_window()
+    state = driver.state_dict()
+    state["stream_index"][0] = 999
+
+    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    with pytest.raises(RuntimeError, match="stream_index"):
+        other.load_state_dict(state)
+
+
+def test_load_state_dict_rejects_out_of_range_cursor() -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    driver = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    driver.freeze_window()
+    state = driver.state_dict()
+    state["active_cursor"][0] = 99
+
+    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    with pytest.raises(RuntimeError, match="cursor"):
+        other.load_state_dict(state)

@@ -350,11 +350,30 @@ class ActiveLocalMemoryWindowDriver(Callback):
             active_stream[slot] = matches[0]
         # 5. CanonicalRuntimeSnapshot 重建：scheduler rebuild + owner 重绑 + sidecar 回填。
         self._restore_runtime(state_dict["runtime"])
-        # 6. 应用游标状态。
+        # 6. 应用游标状态，含跨字段一致性校验（ChatGPT MEDIUM-1）。
+        stream_index = dict(state_dict["stream_index"])
+        active_cursor = dict(state_dict["active_cursor"])
+        if set(active_cursor) != set(active_stream):
+            raise RuntimeError("active Local-Memory cannot resume: active_stream/active_cursor key sets disagree")
+        if not set(active_stream) <= set(stream_index) or not set(stream_index) <= set(self._by_slot):
+            raise RuntimeError("active Local-Memory cannot resume: frontier keys are not valid for the catalog geometry")
+        for slot in stream_index:
+            if slot not in self._by_slot:
+                raise RuntimeError("active Local-Memory cannot resume: slot missing from catalog")
+            if slot in active_stream:
+                positions = [i for i, s in enumerate(self._by_slot[slot]) if s is active_stream[slot]]
+                if len(positions) != 1 or positions[0] != stream_index[slot]:
+                    raise RuntimeError("active Local-Memory cannot resume: stream_index not aligned with active_stream position")
+                blocks = int(self.producer.block_count(active_stream[slot]))
+                cursor = active_cursor[slot]
+                if not isinstance(cursor, int) or not (0 <= cursor < blocks):
+                    raise RuntimeError("active Local-Memory cannot resume: cursor out of block range")
+            elif not (isinstance(stream_index[slot], int) and 0 <= stream_index[slot] <= len(self._by_slot[slot])):
+                raise RuntimeError("active Local-Memory cannot resume: invalid frontier for idle slot")
         self._window_index = window_index
-        self._stream_index = dict(state_dict["stream_index"])
+        self._stream_index = stream_index
         self._active_stream = active_stream
-        self._active_cursor = dict(state_dict["active_cursor"])
+        self._active_cursor = active_cursor
 
     def _restore_runtime(self, runtime: Any) -> None:
         """Rebuild scheduler/owner/sidecar from ``owner.snapshot()``.
