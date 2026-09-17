@@ -42,6 +42,7 @@ class _FakeStream:
     def __init__(self, slot_id: int, episode_index: int, category: str) -> None:
         self.slot_id = slot_id
         self.episode_index = episode_index
+        self.episode_position = episode_index
         self.category = category
 
 
@@ -369,3 +370,36 @@ def test_continuation_rebinds_a_finished_episode_before_admitting_its_successor(
     assert second.identity.episode_id == "2" and second.identity.cursor == 0
     assert 0 not in registry.owner.scheduler.terminal_slots
     assert producer.produced == [(0, 1, 0), (0, 2, 0)]
+
+
+def test_load_state_dict_rejects_source_digest_mismatch() -> None:
+    producer = _FakeProducer(source_digest="source-a")
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    driver = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    driver.freeze_window()
+    state = driver.state_dict()
+
+    state["source_digest"] = "source-b"
+    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    with pytest.raises(RuntimeError):
+        other.load_state_dict(state)
+
+
+def test_state_dict_round_trips_cursor_state() -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    driver = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    driver.freeze_window()
+    state = driver.state_dict()
+
+    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    other.load_state_dict(state)
+
+    assert other._stream_index == driver._stream_index
+    assert other._active_cursor == driver._active_cursor
+    assert other._window_index == driver._window_index
+    assert [
+        (s.slot_id, s.episode_index, s.category) for s in other._active_stream.values()
+    ] == [(s.slot_id, s.episode_index, s.category) for s in driver._active_stream.values()]

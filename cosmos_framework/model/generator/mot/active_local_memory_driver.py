@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 from cosmos_framework.utils.callback import Callback
 
 from .canonical_segment_runtime import RuntimePhase
-from .local_memory_segment import GAWindowPlan, SegmentIdentity
+from .local_memory_segment import GAWindowPlan, RankLocalSegmentScheduler, SegmentIdentity
 from .production_active_wiring import ProductionActiveWiringRegistry
 
 if TYPE_CHECKING:
@@ -84,6 +84,7 @@ class ActiveLocalMemoryWindowDriver(Callback):
         streams: tuple[Any, ...],
         window_members: int,
         plan_chain_id: str = "active-local-window",
+        catalog_digest: str | None = None,
     ) -> None:
         super().__init__()
         if window_members <= 0:
@@ -103,6 +104,7 @@ class ActiveLocalMemoryWindowDriver(Callback):
         self.producer = producer
         self.window_members = window_members
         self.plan_chain_id = plan_chain_id
+        self.catalog_digest = catalog_digest or getattr(producer, "source_digest", None)
         self._by_slot = {slot: tuple(items) for slot, items in sorted(by_slot.items())}
         self._stream_index = {slot: 0 for slot in self._by_slot}
         self._active_stream: dict[int, Any] = {}
@@ -283,3 +285,88 @@ class ActiveLocalMemoryWindowDriver(Callback):
         self._stream_index[slot_id] = position
         self._active_stream[slot_id] = stream
         self._active_cursor[slot_id] = cursor
+
+    # ---- checkpoint surface (resume wiring design v0.4) ---------------------
+
+    def state_dict(self) -> dict[str, Any]:
+        """Persist the driver's data-progress state plus the runtime snapshot.
+
+        ``active_stream`` is serialized by value (the four scalar stream fields)
+        so the checkpoint never references a live producer object.
+        """
+        return {
+            "source_digest": getattr(self.producer, "source_digest", None),
+            "catalog_digest": self.catalog_digest,
+            "plan_chain_id": self.plan_chain_id,
+            "window_index": self._window_index,
+            "stream_index": dict(self._stream_index),
+            "active_stream": {
+                slot: (s.slot_id, s.episode_index, s.episode_position, s.category)
+                for slot, s in self._active_stream.items()
+            },
+            "active_cursor": dict(self._active_cursor),
+            "runtime": self.registry.owner.snapshot(),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore driver/runtime state with the §4.3 fail-closed checks.
+
+        A half-right restore is worse than refusing to resume, so every check
+        below raises instead of guessing.
+        """
+        # 4. 版本/身份一致性：catalog/config 变更后不得静默误 load。
+        if state_dict.get("source_digest") != getattr(self.producer, "source_digest", None):
+            raise RuntimeError("active Local-Memory cannot resume: source_digest differs")
+        if state_dict.get("catalog_digest") != self.catalog_digest:
+            raise RuntimeError("active Local-Memory cannot resume: catalog_digest differs")
+        if state_dict.get("plan_chain_id") != self.plan_chain_id:
+            raise RuntimeError("active Local-Memory cannot resume: plan_chain_id differs")
+        # 2. 恢复点必须是窗口边界。
+        if self._window is not None or self.registry.owner.phase is not RuntimePhase.IDLE:
+            raise RuntimeError("active Local-Memory cannot resume: not at a window boundary")
+        # 3. window_index 单调且合法。
+        window_index = state_dict.get("window_index")
+        if not isinstance(window_index, int) or window_index < 0:
+            raise RuntimeError("active Local-Memory cannot resume: invalid window_index")
+        # 1. _by_slot 重建确定性：active_stream 按值匹配，且恰好命中一个对象。
+        active_stream: dict[int, Any] = {}
+        for slot, fields in state_dict["active_stream"].items():
+            slot_id, episode_index, episode_position, category = fields
+            matches = [
+                s
+                for s in self._by_slot[slot]
+                if (s.slot_id, s.episode_index, s.episode_position, s.category)
+                == (slot_id, episode_index, episode_position, category)
+            ]
+            if len(matches) != 1:
+                raise RuntimeError("active Local-Memory cannot resume: slot-to-episode binding is ambiguous")
+            if str(matches[0].episode_index) != str(episode_index):
+                raise RuntimeError("active Local-Memory cannot resume: episode_id string semantics differ")
+            active_stream[slot] = matches[0]
+        # 5. CanonicalRuntimeSnapshot 重建：scheduler rebuild + owner 重绑 + sidecar 回填。
+        self._restore_runtime(state_dict["runtime"])
+        # 6. 应用游标状态。
+        self._window_index = window_index
+        self._stream_index = dict(state_dict["stream_index"])
+        self._active_stream = active_stream
+        self._active_cursor = dict(state_dict["active_cursor"])
+
+    def _restore_runtime(self, runtime: Any) -> None:
+        """Rebuild scheduler/owner/sidecar from ``owner.snapshot()``.
+
+        The sidecar frontier must reuse the *same* ``SegmentIdentity`` objects
+        that ``scheduler.rebuild`` materializes (not the deserialized ones from
+        ``runtime.committed``), otherwise ``canonical_segment_runtime.py:184-186``
+        ``is``-checks fail on the next snapshot.
+        """
+        scheduler = RankLocalSegmentScheduler.rebuild(dict(runtime.scheduler))
+        owner = self.registry.owner
+        owner.scheduler = scheduler
+        scheduler._canonical_runtime_owner = owner
+        sidecar = owner.adapter.sidecar
+        sidecar._records.clear()
+        by_slot = {identity.slot_id: identity for identity in scheduler.committed_identities}
+        for identity, fast_state in runtime.committed:
+            canonical = by_slot[identity.slot_id]
+            sidecar._records[identity.slot_id] = (canonical, fast_state)
+        owner.snapshot()  # consistency self-check: must not raise

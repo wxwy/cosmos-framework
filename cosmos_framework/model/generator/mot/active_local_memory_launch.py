@@ -195,6 +195,12 @@ class ActiveLocalMemoryLaunchCallback(Callback):
     on both ends.
     """
 
+    # Resume wiring design v0.4: surface the driver's data-progress state on the
+    # DCP ``"dataloader"`` slot.  The interface lives here (not on the driver)
+    # because ``_DataloaderWrapper`` walks ``callbacks._callbacks``; the driver is
+    # not a group member.
+    checkpoint_component: str = "dataloader"
+
     def __init__(
         self,
         suite_datasets: Mapping[str, Any],
@@ -219,6 +225,25 @@ class ActiveLocalMemoryLaunchCallback(Callback):
         self.source_digest = source_digest
         self.plan_chain_id = plan_chain_id
         self.driver: ActiveLocalMemoryWindowDriver | None = None
+        self._pending_resume_state: dict[str, Any] | None = None
+
+    # ---- checkpoint surface (resume wiring design v0.4) ---------------------
+
+    def has_checkpoint_state(self) -> bool:
+        return True
+
+    def state_dict(self) -> dict[str, Any]:
+        if self.driver is None:
+            raise RuntimeError("active Local-Memory cannot save: driver not attached")
+        return self.driver.state_dict()
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # ``checkpointer.load`` runs before ``on_train_start``, so the driver may
+        # not exist yet; buffer the state and apply it once the driver is built.
+        if self.driver is None:
+            self._pending_resume_state = state_dict
+        else:
+            self.driver.load_state_dict(state_dict)
 
     def on_train_start(self, model: Any, iteration: int = 0) -> None:
         """Assemble the owner over the live model and attach the window driver."""
@@ -227,11 +252,11 @@ class ActiveLocalMemoryLaunchCallback(Callback):
         # scheduler's ``cumulative_valid_consumer_exposure`` plus its
         # ``stable_slots`` / ``terminal_slots`` / ``admission_order`` /
         # ``committed_identities`` guards are all rebuilt from scratch here.  A
-        # resumed run would therefore replay the episode catalogue from its first
-        # episode while model/optim/LR-schedule continue from the checkpoint.
-        # Fail closed instead: an interrupted active run must be restarted, not
-        # silently re-trained on data it has already consumed.
-        if iteration > 0:
+        # Fail closed unless the dataloader slot already delivered a pending
+        # resume state: resuming without it would silently replay the episode
+        # catalogue from its first episode while model/optim/LR-schedule continue
+        # from the checkpoint.
+        if iteration > 0 and self._pending_resume_state is None:
             raise RuntimeError(
                 "active Local-Memory cannot resume: the window driver's slot frontier and the "
                 "segment scheduler's exposure/guard state are not checkpointed, so resuming at "
@@ -284,6 +309,22 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             streams=canonical_segment_streams(producers, b_stream=self.b_stream),
             window_members=window_members,
             plan_chain_id=self.plan_chain_id,
+            catalog_digest=self._catalog_digest(),
         )
         driver.attach(trainer, model)
         self.driver = driver
+        if self._pending_resume_state is not None:
+            driver.load_state_dict(self._pending_resume_state)
+            self._pending_resume_state = None
+
+    def _catalog_digest(self) -> str:
+        """Catalog-order identity derived from the three frozen digests.
+
+        Mirrors the epoch-reuse ``queue_seed`` derivation (candidate (b)): the
+        same catalog reproduces the same value across runs/resumes, while a
+        changed manifest/config/source yields a different one.
+        """
+        import hashlib
+
+        preimage = f"{self.manifest_digest}|{self.config_digest}|{self.source_digest}"
+        return hashlib.sha256(preimage.encode("utf-8")).hexdigest()

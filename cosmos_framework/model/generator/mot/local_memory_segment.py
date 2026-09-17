@@ -366,13 +366,18 @@ class RankLocalSegmentScheduler:
         return scheduler
 
     def snapshot(self) -> dict[str, object]:
+        # The resume path only ever consults the latest committed identity per
+        # slot (`canonical_segment_runtime.py:181-186` derives `committed_by_slot`
+        # via last-write-wins), so the two unbounded audit lists are persisted as
+        # one entry per slot.  Runtime lists stay unpruned; only this snapshot is
+        # trimmed (resume wiring design v0.4 §4.2).
         return {
             "rank": self.rank,
             "num_workers": self.num_workers,
             "target_distribution": dict(self.target_distribution),
             "cumulative_valid_consumer_exposure": dict(self.cumulative_valid_consumer_exposure),
-            "admission_order": tuple(self.admission_order),
-            "committed_identities": tuple(self.committed_identities),
+            "admission_order": tuple(_last_per_slot(self.admission_order)),
+            "committed_identities": tuple(_last_per_slot(self.committed_identities)),
             "stable_slots": dict(self.stable_slots),
             "terminal_slots": dict(self.terminal_slots),
             "queue_seed": self.queue_seed,
@@ -380,3 +385,13 @@ class RankLocalSegmentScheduler:
             "queue_permutation": self.queue_permutation,
             "segment_provenance": self.segment_provenance,
         }
+
+
+def _last_per_slot(items: Iterable[SegmentIdentity]) -> tuple[SegmentIdentity, ...]:
+    """Collapse an identity list to one entry per slot (last-write-wins).
+
+    Mirrors ``canonical_segment_runtime.py:181``'s ``committed_by_slot``
+    derivation, so a trimmed snapshot round-trips to the same per-slot frontier
+    the resume path actually reads.
+    """
+    return tuple({identity.slot_id: identity for identity in items}.values())
