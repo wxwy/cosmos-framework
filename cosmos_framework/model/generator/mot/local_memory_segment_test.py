@@ -198,3 +198,29 @@ def test_ga_window_full_valid_objective_matches_unpartitioned_consumer_loss() ->
     actual = sum(plan.objective(index, consumer[index], auxiliary[index], plan.planned_n_valid[index]) for index in range(2))
     expected = (2 / 5) * consumer[0] + (3 / 5) * consumer[1] + auxiliary[0]
     torch.testing.assert_close(actual, expected)
+
+
+def test_snapshot_trims_unbounded_lists_to_one_entry_per_slot() -> None:
+    scheduler = RankLocalSegmentScheduler(rank=0, target_distribution={"a": 1.0, "b": 1.0})
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    scheduler.configure_queue(seed=7, epoch=0, permutation=(0, 1), provenance=provenance)
+    first = SegmentIdentity(0, "episode", "a", 0, 0, "source")
+    second = SegmentIdentity(0, "episode", "a", 1, 1, "source", training_stream_end=True)
+    other = SegmentIdentity(1, "other", "b", 0, 1, "source")
+    scheduler.admit((first,))
+    scheduler.commit(first, 1)
+    scheduler.admit((second,))
+    scheduler.commit(second, 1)
+    scheduler.admit((other,))
+    scheduler.commit(other, 1)
+
+    snapshot = scheduler.snapshot()
+    # One entry per slot (last-write-wins), not the raw append order.
+    assert len(snapshot["admission_order"]) == 2
+    assert len(snapshot["committed_identities"]) == 2
+    by_slot = {identity.slot_id: identity for identity in scheduler.committed_identities}
+    trimmed = {identity.slot_id: identity for identity in snapshot["committed_identities"]}
+    assert trimmed == {slot: by_slot[slot] for slot in (0, 1)}
+
+    rebuilt = RankLocalSegmentScheduler.rebuild(snapshot)
+    assert rebuilt.snapshot() == snapshot

@@ -403,3 +403,68 @@ def test_state_dict_round_trips_cursor_state() -> None:
     assert [
         (s.slot_id, s.episode_index, s.category) for s in other._active_stream.values()
     ] == [(s.slot_id, s.episode_index, s.category) for s in driver._active_stream.values()]
+
+
+def test_load_state_dict_rejects_unrebuildable_slot_binding() -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    driver = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    driver.freeze_window()
+    state = driver.state_dict()
+    slot = next(iter(state["active_stream"]))
+    slot_id, _, episode_position, category = state["active_stream"][slot]
+    state["active_stream"][slot] = (slot_id, 999, episode_position, category)
+
+    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        other.load_state_dict(state)
+
+
+def test_load_state_dict_rejects_ambiguous_slot_binding() -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    twin = (_FakeStream(0, 1, "suite"), _FakeStream(0, 1, "suite"))
+    driver = _driver(_registry({"suite": 1.0}), producer, twin, window_members=2)
+    driver.freeze_window()
+    state = driver.state_dict()
+
+    other = _driver(_registry({"suite": 1.0}), producer, twin, window_members=2)
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        other.load_state_dict(state)
+
+
+def test_runtime_round_trip_preserves_committed_identity_objects() -> None:
+    registry = _registry({"suite": 1.0})
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    driver = _driver(registry, producer, (stream,), window_members=2)
+    trainer, model = _trainer(registry, grad_accum_iter=2), _model()
+    driver.attach(trainer, model)
+
+    transaction = None
+    for index in range(2):
+        driver.arm_next_member(trainer, model)
+        prepared = trainer._psm_active_armed_prepared
+        registry.consume_prepared_for_model(prepared)
+        published = registry.publish_active_forward(prepared, NativeBatchResult(torch.ones(()), torch.zeros(())))
+        registry.consume_active_forward(published)
+        transaction = registry.owner.transaction
+        transaction.successful_backward(index, prepared.identity, prepared.actual_n_valid)
+        registry.owner.commit(transaction, prepared.forward)
+        trainer._psm_active_armed_prepared = None
+    registry.owner.resolve_local_memory_slow_window(registry.owner.finish_window(transaction), scaler_skipped=False)
+    assert registry.owner.phase.name == "IDLE"
+
+    state = driver.state_dict()
+
+    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    other.load_state_dict(state)
+
+    owner = other.registry.owner
+    committed_by_slot = {i.slot_id: i for i in owner.scheduler.committed_identities}
+    assert committed_by_slot
+    for slot, identity in committed_by_slot.items():
+        assert identity is owner.scheduler.stable_slots[slot]
+    other.state_dict()  # re-snapshot must not raise (is-checks hold)

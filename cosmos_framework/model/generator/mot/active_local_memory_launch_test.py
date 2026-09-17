@@ -20,8 +20,8 @@ from cosmos_framework.model.generator.mot.active_local_memory_launch import (
 )
 from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
-    ContinualTTTLocalMemoryCore,
     LEGACY_EVIDENCE_FEATURE_CONFIG,
+    ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
 )
 
@@ -225,3 +225,22 @@ def test_launch_requires_a_bound_trainer() -> None:
     )
     with pytest.raises(RuntimeError, match="requires a bound trainer"):
         callback.on_train_start(model, iteration=0)
+
+
+def test_checkpoint_surface_buffers_state_before_driver_builds() -> None:
+    """Load runs before ``on_train_start``; the callback must buffer, not drop."""
+    callback = ActiveLocalMemoryLaunchCallback(
+        {"libero_spatial": _FakeDataset({0: 32})},
+        manifest_digest="manifest",
+        config_digest="config",
+        source_digest="latent-cache-root",
+    )
+    assert callback.checkpoint_component == "dataloader"
+    assert callback.has_checkpoint_state() is True
+
+    state = {"window_index": 0}
+    callback.load_state_dict(state)
+    assert callback._pending_resume_state is state
+
+    with pytest.raises(RuntimeError, match="not attached"):
+        callback.state_dict()

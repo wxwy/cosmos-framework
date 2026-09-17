@@ -104,7 +104,11 @@ class ActiveLocalMemoryWindowDriver(Callback):
         self.producer = producer
         self.window_members = window_members
         self.plan_chain_id = plan_chain_id
-        self.catalog_digest = catalog_digest or getattr(producer, "source_digest", None)
+        # catalog_digest must be supplied explicitly (the launch callback derives it
+        # from manifest|config|source); fall back to source_digest only for legacy
+        # callers that never persist catalog identity, and keep the distinction
+        # explicit so a missing catalog digest is never silently masked.
+        self.catalog_digest = catalog_digest if catalog_digest is not None else getattr(producer, "source_digest", None)
         self._by_slot = {slot: tuple(items) for slot, items in sorted(by_slot.items())}
         self._stream_index = {slot: 0 for slot in self._by_slot}
         self._active_stream: dict[int, Any] = {}
@@ -324,10 +328,13 @@ class ActiveLocalMemoryWindowDriver(Callback):
         # 2. 恢复点必须是窗口边界。
         if self._window is not None or self.registry.owner.phase is not RuntimePhase.IDLE:
             raise RuntimeError("active Local-Memory cannot resume: not at a window boundary")
-        # 3. window_index 单调且合法。
+        # 3. window_index 单调且合法（≥0 且 < max_iter）。
         window_index = state_dict.get("window_index")
         if not isinstance(window_index, int) or window_index < 0:
             raise RuntimeError("active Local-Memory cannot resume: invalid window_index")
+        max_iter = getattr(getattr(getattr(self._trainer, "config", None), "trainer", None), "max_iter", None)
+        if max_iter is not None and window_index >= max_iter:
+            raise RuntimeError("active Local-Memory cannot resume: window_index exceeds max_iter")
         # 1. _by_slot 重建确定性：active_stream 按值匹配，且恰好命中一个对象。
         active_stream: dict[int, Any] = {}
         for slot, fields in state_dict["active_stream"].items():
@@ -340,8 +347,6 @@ class ActiveLocalMemoryWindowDriver(Callback):
             ]
             if len(matches) != 1:
                 raise RuntimeError("active Local-Memory cannot resume: slot-to-episode binding is ambiguous")
-            if str(matches[0].episode_index) != str(episode_index):
-                raise RuntimeError("active Local-Memory cannot resume: episode_id string semantics differ")
             active_stream[slot] = matches[0]
         # 5. CanonicalRuntimeSnapshot 重建：scheduler rebuild + owner 重绑 + sidecar 回填。
         self._restore_runtime(state_dict["runtime"])
@@ -367,6 +372,11 @@ class ActiveLocalMemoryWindowDriver(Callback):
         sidecar._records.clear()
         by_slot = {identity.slot_id: identity for identity in scheduler.committed_identities}
         for identity, fast_state in runtime.committed:
-            canonical = by_slot[identity.slot_id]
+            canonical = by_slot.get(identity.slot_id)
+            if canonical is None:
+                raise RuntimeError(
+                    "active Local-Memory cannot resume: committed sidecar identity has no "
+                    f"scheduler counterpart for slot {identity.slot_id}"
+                )
             sidecar._records[identity.slot_id] = (canonical, fast_state)
         owner.snapshot()  # consistency self-check: must not raise
