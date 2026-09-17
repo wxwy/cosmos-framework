@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from cosmos_framework.utils.callback import Callback
 
+from .canonical_segment_adapter_scheduler import queue_permutation
 from .canonical_segment_runtime import RuntimePhase
 from .local_memory_segment import GAWindowPlan, RankLocalSegmentScheduler, SegmentIdentity
 from .production_active_wiring import ProductionActiveWiringRegistry
@@ -85,6 +86,7 @@ class ActiveLocalMemoryWindowDriver(Callback):
         window_members: int,
         plan_chain_id: str = "active-local-window",
         catalog_digest: str | None = None,
+        queue_seed: int | None = None,
     ) -> None:
         super().__init__()
         if window_members <= 0:
@@ -109,7 +111,12 @@ class ActiveLocalMemoryWindowDriver(Callback):
         # callers that never persist catalog identity, and keep the distinction
         # explicit so a missing catalog digest is never silently masked.
         self.catalog_digest = catalog_digest if catalog_digest is not None else getattr(producer, "source_digest", None)
+        if queue_seed is not None and queue_seed < 0:
+            raise ValueError("active Local window requires a non-negative queue seed")
+        self._queue_seed = queue_seed
         self._by_slot = {slot: tuple(items) for slot, items in sorted(by_slot.items())}
+        self._slot_category = {int(stream.slot_id): stream.category for stream in streams}
+        self._slot_epoch = {slot: 0 for slot in self._by_slot}
         self._stream_index = {slot: 0 for slot in self._by_slot}
         self._active_stream: dict[int, Any] = {}
         self._active_cursor: dict[int, int] = {}
@@ -164,6 +171,7 @@ class ActiveLocalMemoryWindowDriver(Callback):
         configured = int(trainer.config.trainer.grad_accum_iter)
         if self.window_members != configured:
             raise RuntimeError("active Local window member count differs from the accumulation boundary")
+        self._maybe_rollover()
         freeze = self.freeze_window()
         self._window = freeze
         segment = self._produce(freeze, 0)
@@ -290,6 +298,87 @@ class ActiveLocalMemoryWindowDriver(Callback):
         self._active_stream[slot_id] = stream
         self._active_cursor[slot_id] = cursor
 
+    # ---- epoch reuse (catalog epoch-reuse design v0.8) ----------------------
+
+    def _remaining_blocks(self, slot_id: int) -> int:
+        """Pure count of whole blocks a slot can still serve.
+
+        The inverse of ``_peek_block``'s advance rule, so the boundary probe and
+        ``freeze_window`` share one remaining-block definition (criterion 3).
+        """
+        stream = self._active_stream.get(slot_id)
+        position = self._stream_index[slot_id]
+        total = 0
+        if stream is not None:
+            blocks = int(self.producer.block_count(stream))
+            total += max(blocks - 1 - self._active_cursor[slot_id], 0)
+            position += 1
+        while position < len(self._by_slot[slot_id]):
+            total += max(int(self.producer.block_count(self._by_slot[slot_id][position])), 0)
+            position += 1
+        return total
+
+    def _maybe_rollover(self) -> None:
+        """At a window boundary, trigger per-slot reuse when the next window cannot fill.
+
+        Design §3.2: ``Σ_slot remaining_blocks(slot) < window_members``.  Each slot
+        then independently either continues its non-terminal episode or reuses as a
+        terminal slot (design §4.3).
+        """
+        if sum(self._remaining_blocks(slot) for slot in self._by_slot) >= self.window_members:
+            return
+        for slot in self._by_slot:
+            self._rollover_slot(slot)
+
+    def _rollover_slot(self, slot_id: int) -> None:
+        """Per-slot boundary action: non-terminal continues, terminal reuses.
+
+        A terminal slot (``_active_stream`` empty or ``_active_cursor == blocks - 1``)
+        re-orders its episode subsequence for its next reuse pass, resets its
+        frontier to the fresh episode at ``step0``, prunes its scheduler guards, and
+        drops its sidecar carry (design §4.3).  A non-terminal slot is left untouched.
+        """
+        stream = self._active_stream.get(slot_id)
+        cursor = self._active_cursor.get(slot_id)
+        blocks = int(self.producer.block_count(stream)) if stream is not None else 0
+        terminal = stream is None or (cursor is not None and blocks > 0 and cursor >= blocks - 1)
+        if not terminal:
+            return
+        self._slot_epoch[slot_id] += 1
+        self._by_slot[slot_id] = self._reordered_by_slot(slot_id, self._slot_epoch[slot_id])
+        self._stream_index[slot_id] = 0
+        self._active_stream.pop(slot_id, None)
+        self._active_cursor.pop(slot_id, None)
+        scheduler = self.registry.owner.scheduler
+        scheduler.admission_order[:] = [i for i in scheduler.admission_order if i.slot_id != slot_id]
+        scheduler.committed_identities[:] = [i for i in scheduler.committed_identities if i.slot_id != slot_id]
+        scheduler.stable_slots.pop(slot_id, None)
+        scheduler.terminal_slots.pop(slot_id, None)
+        self.registry.owner.discard_committed_carry(slot_id)
+
+    def _reordered_by_slot(self, slot_id: int, epoch: int) -> tuple[Any, ...]:
+        """The slot's episode subsequence under its category-level permutation.
+
+        Design §4.4: sort the whole category's episodes by ``(source_digest,
+        episode_id)`` (string comparison), apply ``queue_permutation(queue_seed,
+        epoch, category, catalog_size)``, and keep this slot's episodes in that
+        order.  Pure: returns a new tuple and mutates nothing.
+        """
+        if self._queue_seed is None:
+            raise RuntimeError("active Local window requires a queue seed for catalog reuse")
+        category = self._slot_category[slot_id]
+        category_slots = [slot for slot in self._by_slot if self._slot_category[slot] == category]
+        reference = sorted(
+            (stream for other in category_slots for stream in self._by_slot[other]),
+            key=lambda stream: (self.producer.source_digest, str(stream.episode_index)),
+        )
+        permutation = queue_permutation(
+            queue_seed=self._queue_seed, epoch=epoch, category=category, catalog_size=len(reference)
+        )
+        ordered = [reference[index] for index in permutation]
+        own = {(int(stream.slot_id), int(stream.episode_index)) for stream in self._by_slot[slot_id]}
+        return tuple(stream for stream in ordered if (int(stream.slot_id), int(stream.episode_index)) in own)
+
     # ---- checkpoint surface (resume wiring design v0.4) ---------------------
 
     def state_dict(self) -> dict[str, Any]:
@@ -303,6 +392,7 @@ class ActiveLocalMemoryWindowDriver(Callback):
             "catalog_digest": self.catalog_digest,
             "plan_chain_id": self.plan_chain_id,
             "window_index": self._window_index,
+            "slot_epoch": dict(self._slot_epoch),
             "stream_index": dict(self._stream_index),
             "active_stream": {
                 slot: (s.slot_id, s.episode_index, s.episode_position, s.category)
@@ -338,28 +428,58 @@ class ActiveLocalMemoryWindowDriver(Callback):
         if max_iter is not None and window_index >= max_iter:
             raise RuntimeError("active Local-Memory cannot resume: window_index exceeds max_iter")
         # ---- 阶段 1：staging/validation（不 mutate live）----
+        # 8. 逐 slot 复用遍数（catalog epoch-reuse design v0.8）：校验并暂存。
+        slot_epoch = self._stage_slot_epoch(state_dict.get("slot_epoch"))
+        # 重排 _by_slot 到存盘时的复用顺序（判据 10 的重放 witness）。
+        by_slot = self._stage_by_slot(slot_epoch)
         # 1. _by_slot 重建确定性：active_stream 按值匹配，且恰好命中一个对象。
-        active_stream = self._stage_active_stream(state_dict["active_stream"])
+        active_stream = self._stage_active_stream(state_dict["active_stream"], by_slot)
         # 6. frontier 跨字段一致性（ChatGPT MEDIUM-1）。
-        stream_index, active_cursor = self._stage_frontier(state_dict, active_stream)
+        stream_index, active_cursor = self._stage_frontier(state_dict, active_stream, by_slot)
         # 5. runtime：旁路 rebuild scheduler + stage sidecar records + 全量校验。
         scheduler, sidecar_records = self._stage_runtime(state_dict["runtime"])
         # ---- 阶段 2：atomic apply（此后无 fallible 检查）----
         self._apply_runtime(scheduler, sidecar_records)
+        self._slot_epoch = slot_epoch
+        self._by_slot = by_slot
         self._window_index = window_index
         self._stream_index = stream_index
         self._active_stream = active_stream
         self._active_cursor = active_cursor
 
-    def _stage_active_stream(self, serialized: dict[Any, Any]) -> dict[int, Any]:
+    def _stage_slot_epoch(self, serialized: Any) -> dict[int, int]:
+        if serialized is None:
+            # Gate 3 之前的 checkpoint 尚无数遍字段；复用尚未发生，全为 0。
+            return {slot: 0 for slot in self._by_slot}
+        if not isinstance(serialized, dict):
+            raise RuntimeError("active Local-Memory cannot resume: slot_epoch is not a mapping")
+        result: dict[int, int] = {}
+        for slot, epoch in serialized.items():
+            if slot not in self._by_slot:
+                raise RuntimeError("active Local-Memory cannot resume: slot_epoch key is not valid for the catalog geometry")
+            if not isinstance(epoch, int) or epoch < 0:
+                raise RuntimeError("active Local-Memory cannot resume: slot_epoch value is invalid")
+            result[slot] = epoch
+        for slot in self._by_slot:
+            result.setdefault(slot, 0)
+        return result
+
+    def _stage_by_slot(self, slot_epoch: dict[int, int]) -> dict[int, tuple[Any, ...]]:
+        by_slot = {slot: tuple(items) for slot, items in self._by_slot.items()}
+        for slot, epoch in slot_epoch.items():
+            if epoch > 0:
+                by_slot[slot] = self._reordered_by_slot(slot, epoch)
+        return by_slot
+
+    def _stage_active_stream(self, serialized: dict[Any, Any], by_slot: dict[int, tuple[Any, ...]]) -> dict[int, Any]:
         active_stream: dict[int, Any] = {}
         for slot, fields in serialized.items():
-            if slot not in self._by_slot:
+            if slot not in by_slot:
                 raise RuntimeError("active Local-Memory cannot resume: frontier keys are not valid for the catalog geometry")
             slot_id, episode_index, episode_position, category = fields
             matches = [
                 s
-                for s in self._by_slot[slot]
+                for s in by_slot[slot]
                 if (s.slot_id, s.episode_index, s.episode_position, s.category)
                 == (slot_id, episode_index, episode_position, category)
             ]
@@ -368,25 +488,25 @@ class ActiveLocalMemoryWindowDriver(Callback):
             active_stream[slot] = matches[0]
         return active_stream
 
-    def _stage_frontier(self, state_dict: dict[str, Any], active_stream: dict[int, Any]) -> tuple[dict[int, Any], dict[int, int]]:
+    def _stage_frontier(self, state_dict: dict[str, Any], active_stream: dict[int, Any], by_slot: dict[int, tuple[Any, ...]]) -> tuple[dict[int, Any], dict[int, int]]:
         stream_index = dict(state_dict["stream_index"])
         active_cursor = dict(state_dict["active_cursor"])
         if set(active_cursor) != set(active_stream):
             raise RuntimeError("active Local-Memory cannot resume: active_stream/active_cursor key sets disagree")
-        if not set(active_stream) <= set(stream_index) or not set(stream_index) <= set(self._by_slot):
+        if not set(active_stream) <= set(stream_index) or not set(stream_index) <= set(by_slot):
             raise RuntimeError("active Local-Memory cannot resume: frontier keys are not valid for the catalog geometry")
         for slot in stream_index:
-            if slot not in self._by_slot:
+            if slot not in by_slot:
                 raise RuntimeError("active Local-Memory cannot resume: slot missing from catalog")
             if slot in active_stream:
-                positions = [i for i, s in enumerate(self._by_slot[slot]) if s is active_stream[slot]]
+                positions = [i for i, s in enumerate(by_slot[slot]) if s is active_stream[slot]]
                 if len(positions) != 1 or positions[0] != stream_index[slot]:
                     raise RuntimeError("active Local-Memory cannot resume: stream_index not aligned with active_stream position")
                 blocks = int(self.producer.block_count(active_stream[slot]))
                 cursor = active_cursor[slot]
                 if not isinstance(cursor, int) or not (0 <= cursor < blocks):
                     raise RuntimeError("active Local-Memory cannot resume: cursor out of block range")
-            elif not (isinstance(stream_index[slot], int) and 0 <= stream_index[slot] <= len(self._by_slot[slot])):
+            elif not (isinstance(stream_index[slot], int) and 0 <= stream_index[slot] <= len(by_slot[slot])):
                 raise RuntimeError("active Local-Memory cannot resume: invalid frontier for idle slot")
         return stream_index, active_cursor
 

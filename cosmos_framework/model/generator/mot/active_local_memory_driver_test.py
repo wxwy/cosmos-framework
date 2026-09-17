@@ -14,6 +14,7 @@ import torch
 from cosmos_framework.model.generator.mot.active_local_memory_driver import (
     ActiveLocalMemoryWindowDriver,
 )
+from cosmos_framework.model.generator.mot.canonical_segment_adapter_scheduler import queue_permutation
 from cosmos_framework.model.generator.mot.canonical_segment_runtime import CanonicalSegmentRuntimeOwner
 from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
@@ -112,12 +113,14 @@ def _driver(
     streams: tuple[_FakeStream, ...],
     *,
     window_members: int,
+    queue_seed: int = 0,
 ) -> ActiveLocalMemoryWindowDriver:
     return ActiveLocalMemoryWindowDriver(
         registry=registry,
         producer=producer,
         streams=streams,
         window_members=window_members,
+        queue_seed=queue_seed,
     )
 
 
@@ -624,4 +627,165 @@ def test_load_state_dict_rejects_sidecar_identity_value_mismatch() -> None:
     with pytest.raises(RuntimeError, match="differs"):
         other.load_state_dict(state)
     assert _live_identity(other) == before
+
+
+# ---- epoch reuse (catalog epoch-reuse design v0.8) ---------------------------
+
+
+def _run_windows(
+    registry: ProductionActiveWiringRegistry,
+    producer: _FakeProducer,
+    streams: tuple[_FakeStream, ...],
+    *,
+    window_members: int,
+    num_windows: int,
+) -> ActiveLocalMemoryWindowDriver:
+    """Run ``num_windows`` complete windows through the trainer seam.
+
+    Every window boundary re-enters ``_arm_initial`` (owner phase back to IDLE),
+    which is exactly where the epoch-reuse boundary probe runs.
+    """
+    driver = _driver(registry, producer, streams, window_members=window_members)
+    trainer, model = _trainer(registry, grad_accum_iter=window_members), _model()
+    driver.attach(trainer, model)
+    for _ in range(num_windows):
+        transaction = None
+        for index in range(window_members):
+            driver.arm_next_member(trainer, model)
+            prepared = trainer._psm_active_armed_prepared
+            registry.consume_prepared_for_model(prepared)
+            published = registry.publish_active_forward(prepared, NativeBatchResult(torch.ones(()), torch.zeros(())))
+            registry.consume_active_forward(published)
+            transaction = registry.owner.transaction
+            transaction.successful_backward(index, prepared.identity, prepared.actual_n_valid)
+            registry.owner.commit(transaction, prepared.forward)
+            trainer._psm_active_armed_prepared = None
+        registry.owner.resolve_local_memory_slow_window(registry.owner.finish_window(transaction), scaler_skipped=False)
+    return driver
+
+
+def test_remaining_blocks_probe_is_pure() -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    driver = _driver(_registry({"suite": 1.0}), producer, (_FakeStream(0, 1, "suite"),), window_members=2)
+    driver.freeze_window()
+
+    before = (dict(driver._stream_index), dict(driver._active_stream), dict(driver._active_cursor))
+    assert driver._remaining_blocks(0) == 2
+    after = (dict(driver._stream_index), dict(driver._active_stream), dict(driver._active_cursor))
+    assert before == after
+
+
+def test_rollover_triggers_only_below_window_members() -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    driver = _driver(_registry({"suite": 1.0}), producer, (_FakeStream(0, 1, "suite"),), window_members=2)
+
+    driver._maybe_rollover()
+    assert driver._slot_epoch == {0: 0}
+
+    driver.freeze_window()  # cursor 0,1 -> remaining 2, still fillable
+    driver._maybe_rollover()
+    assert driver._slot_epoch == {0: 0}
+
+    driver.freeze_window()  # cursor 2,3 -> terminal, remaining 0 < 2
+    driver._maybe_rollover()
+    assert driver._slot_epoch == {0: 1}
+    assert driver._active_stream == {} and driver._active_cursor == {}
+
+
+def test_reordered_by_slot_matches_category_permutation() -> None:
+    producer = _FakeProducer()
+    for episode in (1, 2, 10):
+        producer.blocks[(0, episode)] = 2
+    streams = (_FakeStream(0, 1, "suite"), _FakeStream(0, 2, "suite"), _FakeStream(0, 10, "suite"))
+    driver = _driver(_registry({"suite": 1.0}), producer, streams, window_members=2)
+
+    reference = sorted(streams, key=lambda s: (producer.source_digest, str(s.episode_index)))
+    # string comparison: "1" < "10" < "2"
+    assert [s.episode_index for s in reference] == [1, 10, 2]
+    permutation = queue_permutation(queue_seed=0, epoch=1, category="suite", catalog_size=len(reference))
+    assert driver._reordered_by_slot(0, 1) == tuple(reference[i] for i in permutation)
+
+
+def test_non_terminal_slot_is_not_reset_by_rollover() -> None:
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    producer.blocks[(1, 2)] = 4
+    streams = (_FakeStream(0, 1, "suite"), _FakeStream(1, 2, "suite"))
+    driver = _driver(_registry({"suite": 1.0}), producer, streams, window_members=2)
+
+    driver._active_stream[0] = streams[0]
+    driver._active_cursor[0] = 1  # blocks - 1 == 3, so non-terminal
+    driver._stream_index[0] = 0
+    driver._slot_epoch[0] = 2
+
+    driver._rollover_slot(0)
+
+    assert driver._active_stream[0] is streams[0]
+    assert driver._active_cursor[0] == 1
+    assert driver._slot_epoch[0] == 2
+
+
+def test_terminal_slot_reuse_prunes_guards_and_replays_fresh_episode() -> None:
+    registry = _registry({"suite": 1.0})
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4  # cursor 0..3, terminal at 3
+    producer.blocks[(1, 2)] = 1  # single block, terminal at 0
+    streams = (_FakeStream(0, 1, "suite"), _FakeStream(1, 2, "suite"))
+    driver = _run_windows(registry, producer, streams, window_members=2, num_windows=3)
+
+    # slot 0 stayed non-terminal across the first boundary (cursor 2 < 3); slot 1
+    # terminal-reused once.  The three windows only succeed if the reused slot's
+    # stale guard entries were pruned (criterion 9).
+    assert driver._slot_epoch[1] == 1
+    slot1_admissions = [i for i in registry.owner.scheduler.admission_order if i.slot_id == 1]
+    assert len(slot1_admissions) == 1
+    assert slot1_admissions[0].episode_id == "2" and slot1_admissions[0].cursor == 0
+
+
+def test_slot_epoch_round_trips_through_state_dict() -> None:
+    registry = _registry({"suite": 1.0})
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    producer.blocks[(1, 2)] = 1
+    streams = (_FakeStream(0, 1, "suite"), _FakeStream(1, 2, "suite"))
+    driver = _run_windows(registry, producer, streams, window_members=2, num_windows=3)
+    assert driver._slot_epoch[1] == 1
+
+    state = driver.state_dict()
+    other = _driver(_registry({"suite": 1.0}), producer, streams, window_members=2)
+    other.load_state_dict(state)
+
+    assert other._slot_epoch == driver._slot_epoch
+    assert other._by_slot == driver._by_slot
+    assert other._stream_index == driver._stream_index
+    assert other._active_cursor == driver._active_cursor
+
+
+def test_rollover_discards_sidecar_carry_only_for_terminal_slot() -> None:
+    registry = _registry({"suite": 1.0})
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    producer.blocks[(1, 2)] = 4
+    streams = (_FakeStream(0, 1, "suite"), _FakeStream(1, 2, "suite"))
+    driver = _driver(registry, producer, streams, window_members=2)
+
+    # slot 0 non-terminal (cursor 1 < blocks-1 == 3), slot 1 terminal (cursor 3).
+    driver._active_stream[0] = streams[0]
+    driver._active_cursor[0] = 1
+    driver._stream_index[0] = 0
+    driver._active_stream[1] = streams[1]
+    driver._active_cursor[1] = 3
+    driver._stream_index[1] = 0
+
+    sidecar = registry.owner.adapter.sidecar
+    sidecar._records[0] = ("slot0", "carry0")
+    sidecar._records[1] = ("slot1", "carry1")
+
+    driver._rollover_slot(0)  # non-terminal: keep the detached carry
+    driver._rollover_slot(1)  # terminal: drop the detached carry
+
+    assert sidecar._records[0] == ("slot0", "carry0")
+    assert 1 not in sidecar._records
 

@@ -310,6 +310,7 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             window_members=window_members,
             plan_chain_id=self.plan_chain_id,
             catalog_digest=self._catalog_digest(),
+            queue_seed=self._queue_seed(),
         )
         driver.attach(trainer, model)
         self.driver = driver
@@ -328,3 +329,12 @@ class ActiveLocalMemoryLaunchCallback(Callback):
 
         preimage = f"{self.manifest_digest}|{self.config_digest}|{self.source_digest}"
         return hashlib.sha256(preimage.encode("utf-8")).hexdigest()
+
+    def _queue_seed(self) -> int:
+        """Per-slot reuse permutation seed derived from the catalog identity (§4.6 b).
+
+        ``queue_seed = int(sha256(manifest|config|source).hexdigest()[:16], 16)``: the
+        same catalog reproduces the same permutation stream across runs/resumes, and a
+        changed catalog no longer inherits the previous ordering.
+        """
+        return int(self._catalog_digest()[:16], 16)

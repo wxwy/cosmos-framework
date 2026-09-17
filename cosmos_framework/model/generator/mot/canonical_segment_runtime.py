@@ -170,6 +170,15 @@ class CanonicalSegmentRuntimeOwner:
         self.transaction = None
         self.phase = RuntimePhase.IDLE
 
+    def discard_committed_carry(self, slot_id: int) -> None:
+        """Drop a terminal slot's detached fast-state carry (rollover entry, §4.7).
+
+        A terminal slot's sidecar record is normally already popped by its terminal
+        ``commit``; this defensive drop guarantees a reused slot re-enters from
+        ``step0`` with an initial state.  The scheduler identities remain authoritative.
+        """
+        self.adapter.sidecar._records.pop(int(slot_id), None)
+
     def snapshot(self) -> CanonicalRuntimeSnapshot:
         if (self.phase is not RuntimePhase.IDLE or self.adapter.pending() is not None or self.identity is not None
                 or self.transaction is not None or self.forward is not None or self._skipped_plan is not None
