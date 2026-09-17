@@ -566,3 +566,62 @@ def test_load_state_dict_rejects_runtime_without_scheduler_counterpart() -> None
         other.load_state_dict(state)
     assert _live_identity(other) == before
 
+
+def _run_full_window(registry, producer, stream, *, window_members: int = 2):
+    driver = _driver(registry, producer, (stream,), window_members=window_members)
+    trainer, model = _trainer(registry, grad_accum_iter=window_members), _model()
+    driver.attach(trainer, model)
+    transaction = None
+    for index in range(window_members):
+        driver.arm_next_member(trainer, model)
+        prepared = trainer._psm_active_armed_prepared
+        registry.consume_prepared_for_model(prepared)
+        published = registry.publish_active_forward(prepared, NativeBatchResult(torch.ones(()), torch.zeros(())))
+        registry.consume_active_forward(published)
+        transaction = registry.owner.transaction
+        transaction.successful_backward(index, prepared.identity, prepared.actual_n_valid)
+        registry.owner.commit(transaction, prepared.forward)
+        trainer._psm_active_armed_prepared = None
+    registry.owner.resolve_local_memory_slow_window(registry.owner.finish_window(transaction), scaler_skipped=False)
+    return driver
+
+
+def test_load_state_dict_accepts_terminal_frontier_without_sidecar_carry() -> None:
+    """A slot may terminalize (sidecar popped) while still in committed_identities."""
+    registry = _registry({"suite": 1.0})
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 2  # cursor 1 == blocks-1 is terminal
+    stream = _FakeStream(0, 1, "suite")
+    driver = _run_full_window(registry, producer, stream)
+
+    assert registry.owner.scheduler.terminal_slots
+    assert registry.owner.adapter.sidecar._records == {}
+    state = driver.state_dict()
+
+    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    other.load_state_dict(state)  # must be accepted, not mis-rejected
+    other.state_dict()  # re-snapshot must succeed
+
+
+def test_load_state_dict_rejects_sidecar_identity_value_mismatch() -> None:
+    from cosmos_framework.model.generator.mot.canonical_segment_runtime import CanonicalRuntimeSnapshot
+    from cosmos_framework.model.generator.mot.local_memory_segment import SegmentIdentity
+
+    registry = _registry({"suite": 1.0})
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+    driver = _run_full_window(registry, producer, stream)
+
+    state = driver.state_dict()
+    runtime = state["runtime"]
+    identity, fast_state = runtime.committed[0]
+    bogus = SegmentIdentity(identity.slot_id, "bogus", identity.category, 99, 99, identity.source_digest)
+    state["runtime"] = CanonicalRuntimeSnapshot(runtime.generation, runtime.scheduler, ((bogus, fast_state),))
+
+    other = _driver(_registry({"suite": 1.0}), producer, (stream,), window_members=2)
+    before = _live_identity(other)
+    with pytest.raises(RuntimeError, match="differs"):
+        other.load_state_dict(state)
+    assert _live_identity(other) == before
+

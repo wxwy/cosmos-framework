@@ -411,10 +411,20 @@ class ActiveLocalMemoryWindowDriver(Callback):
                     "active Local-Memory cannot resume: committed sidecar identity has no "
                     f"scheduler counterpart for slot {identity.slot_id}"
                 )
+            # The serialized sidecar identity must be value-equal to the scheduler's
+            # canonical identity before it is re-tagged; otherwise a malformed
+            # checkpoint could silently attach another episode's fast state.
+            if identity != canonical:
+                raise RuntimeError(
+                    "active Local-Memory cannot resume: sidecar identity differs from scheduler identity"
+                )
             if scheduler.stable_slots.get(identity.slot_id) is not canonical:
                 raise RuntimeError("active Local-Memory cannot resume: snapshot committed frontier mismatch")
             records[identity.slot_id] = (canonical, fast_state)
-        if any(slot in by_slot for slot in scheduler.terminal_slots):
+        # Owner invariant: a terminal slot may still be in committed_identities until
+        # terminal rebind, but its sidecar record must already be gone.  Check against
+        # the staged record slots, not the whole committed list.
+        if any(slot in records for slot in scheduler.terminal_slots):
             raise RuntimeError("active Local-Memory cannot resume: snapshot terminal slot retains sidecar state")
         return scheduler, records
 
