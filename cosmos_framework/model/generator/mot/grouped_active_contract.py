@@ -36,6 +36,9 @@ class GroupedPlanMember:
             raise ValueError("group provenance must be explicit")
         if any(i.source_digest != self.source_digest for i in self.row_identities):
             raise ValueError("group source differs from row source")
+        slots = tuple(i.slot_id for i in self.row_identities)
+        if len(set(slots)) != len(slots):
+            raise ValueError("A2 synchronized group requires one row per stable slot")
 
     @property
     def planned_n_valid(self) -> int:

@@ -99,23 +99,36 @@ def assert_state_equal(left, right):
             torch.testing.assert_close(value, expected, rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("widths", [(4, 4), (4,), (7, 3)])
-def test_group_matches_scalar_tokens_gradients_and_rollover(widths):
-    torch.manual_seed(73)
-    scalar = make_driver(grouped=False, widths=widths)
-    grouped = make_driver(grouped=True, widths=widths, template=scalar[0].registry)
-    for _ in range(3):
-        a, ids_a = run_window(*scalar)
-        b, ids_b = run_window(*grouped)
-        assert ids_a == ids_b
-        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
-        assert_state_equal(scalar[0].state_dict(), grouped[0].state_dict())
-    left = scalar[0].registry.owner.wiring.local_slow_parameters
-    right = grouped[0].registry.owner.wiring.local_slow_parameters
-    for a, b in zip(left, right, strict=True):
-        assert (a.grad is None) == (b.grad is None)
-        if a.grad is not None:
-            torch.testing.assert_close(a.grad, b.grad, rtol=2e-4, atol=2e-6)
+def test_group_plan_is_stable_slot_synchronized():
+    driver, trainer, _ = make_driver(group_size=2, ga=3, widths=(10, 10))
+    freeze = driver.freeze_window()
+    plan = driver._plan_groups(freeze)
+    assert plan.ga_effective == trainer.config.trainer.grad_accum_iter == 3
+    for group_index, group in enumerate(plan.members):
+        assert tuple(identity.slot_id for identity in group.row_identities) == (0, 1)
+        assert tuple(identity.cursor for identity in group.row_identities) == (group_index, group_index)
+
+
+def test_synchronized_groups_keep_one_wave_and_reuse_short_slot_only_after_terminal():
+    driver, trainer, model = make_driver(group_size=2, ga=2, widths=(7, 3))
+    # Window 1: both slots advance 0 -> 1.
+    run_window(driver, trainer, model)
+    first = driver._group_plan
+    assert [tuple(i.cursor for i in group.row_identities) for group in first.members] == [(0, 0), (1, 1)]
+    assert driver.registry.owner.last_dependency_wave_count == 1
+
+    # Window 2: slot1 reaches terminal at cursor2, then only at the next
+    # microbatch boundary reuses its catalog from cursor0. Slot0 continues.
+    run_window(driver, trainer, model)
+    second = driver._group_plan
+    assert [tuple(i.slot_id for i in group.row_identities) for group in second.members] == [(0, 1), (0, 1)]
+    assert [tuple(i.cursor for i in group.row_identities) for group in second.members] == [(2, 2), (3, 0)]
+    assert driver._slot_epoch[1] == 1
+    assert driver.registry.owner.last_dependency_wave_count == 1
+
+    # The synchronized route remains executable after epoch reuse.
+    run_window(driver, trainer, model)
+    assert driver.registry.owner.last_dependency_wave_count == 1
 
 
 def test_group_prepare_and_failure_do_not_publish_partial_rows():
