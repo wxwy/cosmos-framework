@@ -387,13 +387,13 @@ def test_a2_and_scalar_window_objective_have_identical_consumer_mean_scale():
     # One window has the same 2048 consumers in both layouts.  Let each scalar
     # 16-consumer segment have an arbitrary native mean.  Each A2 128-consumer
     # group is the equal-size mean of eight consecutive scalar segments.
-    scalar_means = [torch.tensor(1.0 + index / 100.0) for index in range(128)]
+    scalar_means = [torch.tensor(1.0 + index / 100.0, dtype=torch.float64) for index in range(128)]
     scalar_plan = GAWindowPlan(
         members=tuple((index % 8, f"e{index % 8}", index // 8) for index in range(128)),
         planned_n_valid=(16,) * 128,
     )
     scalar_total = sum(
-        scalar_plan.objective(index, mean, torch.tensor(0.0), 16)
+        scalar_plan.objective(index, mean, torch.tensor(0.0, dtype=torch.float64), 16)
         for index, mean in enumerate(scalar_means)
     )
 
@@ -412,8 +412,8 @@ def test_a2_and_scalar_window_objective_have_identical_consumer_mean_scale():
     )
     grouped_means = [torch.stack(scalar_means[start : start + 8]).mean() for start in range(0, 128, 8)]
     grouped_total = sum(
-        grouped_plan.objective(index, mean, torch.tensor(0.0), 128)
+        grouped_plan.objective(index, mean, torch.tensor(0.0, dtype=torch.float64), 128)
         for index, mean in enumerate(grouped_means)
     )
-    torch.testing.assert_close(grouped_total, scalar_total, rtol=0, atol=1e-7)
-    torch.testing.assert_close(grouped_total, torch.stack(scalar_means).mean(), rtol=0, atol=1e-7)
+    torch.testing.assert_close(grouped_total, scalar_total, rtol=0, atol=1e-12)
+    torch.testing.assert_close(grouped_total, torch.stack(scalar_means).mean(), rtol=0, atol=1e-12)
