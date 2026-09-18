@@ -24,10 +24,12 @@ class ActiveDeliveryMetrics(Callback):
         self.wave_counts = []
         self.gradients = {}
         self.losses = []
+        self.starting_state_sha = None
 
     def on_training_step_batch_start(self, model, data, iteration=0):
         if self.started is None:
             self.started = time.monotonic()
+            self.starting_state_sha = self._fast_state_sha()
         prepared = getattr(self.trainer, "_psm_active_armed_prepared", None)
         if prepared is not None:
             self.member_counts.append(prepared.actual_n_valid)
@@ -57,11 +59,8 @@ class ActiveDeliveryMetrics(Callback):
         if owner.phase.name != "IDLE":
             raise RuntimeError("delivery metrics requires resolved window")
         native = getattr(model, "_psm_native_forward_calls", 0)
-        state_hash = hashlib.sha256()
-        for slot, (identity, state) in sorted(owner.adapter.sidecar._records.items()):
-            state_hash.update(repr((slot, identity)).encode())
-            for tensor in state:
-                state_hash.update(tensor.detach().float().cpu().contiguous().numpy().tobytes())
+        optimizers = getattr(optimizer, "optimizers", (optimizer,))
+        param_groups = [group for opt in optimizers for group in opt.param_groups]
         record = {
             "iteration_callback": int(iteration),
             "window_index": self.driver._window_index,
@@ -77,13 +76,15 @@ class ActiveDeliveryMetrics(Callback):
             "identities": [
                 (i.slot_id, i.episode_id, i.cursor, i.training_stream_end) for i in self.driver._window.identities
             ],
-            "fast_state_sha256": state_hash.hexdigest(),
+            "fast_state_sha256": self._fast_state_sha(),
+            "fast_state_before_first_group_sha256": self.starting_state_sha,
+            "fast_state_records": len(owner.adapter.sidecar._records),
             "local_gradients": self.gradients,
             "losses": self.losses,
             "wall_seconds": time.monotonic() - self.started,
             "cuda_peak_allocated": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
-            "optimizer_group_sizes": [len(group["params"]) for group in optimizer.param_groups],
-            "optimizer_lrs": [group["lr"] for group in optimizer.param_groups],
+            "optimizer_group_sizes": [len(group["params"]) for group in param_groups],
+            "optimizer_lrs": [group["lr"] for group in param_groups],
         }
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
@@ -95,3 +96,11 @@ class ActiveDeliveryMetrics(Callback):
         self.last_native_calls = native
         self.member_counts, self.wave_counts, self.losses = [], [], []
         self.started = None
+
+    def _fast_state_sha(self):
+        digest = hashlib.sha256()
+        for slot, (identity, state) in sorted(self.driver.registry.owner.adapter.sidecar._records.items()):
+            digest.update(repr((slot, identity)).encode())
+            for tensor in state:
+                digest.update(tensor.detach().float().cpu().contiguous().numpy().tobytes())
+        return digest.hexdigest()

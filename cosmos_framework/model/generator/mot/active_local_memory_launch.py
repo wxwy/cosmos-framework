@@ -308,7 +308,7 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             from .grouped_active_runtime import GroupedActiveWiringRegistry, GroupedSegmentRuntimeOwner
             # Abort must clear ALL partial gradients, including the newly trained
             # baseline heads, not only the four Local groups.
-            wiring.local_slow_parameters = tuple(p for p in model.net.parameters() if p.requires_grad)
+            wiring = CanonicalSegmentWiring(adapter, tuple(p for p in model.net.parameters() if p.requires_grad))
             registry = GroupedActiveWiringRegistry(GroupedSegmentRuntimeOwner(scheduler, wiring))
             driver_type = GroupedActiveLocalMemoryWindowDriver
             driver_extra = dict(group_size=self.group_size, manifest_digest=self.manifest_digest,
@@ -345,6 +345,12 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             trainer.callbacks._callbacks.append(
                 ActiveDeliveryMetrics(trainer=trainer, driver=driver, path=metrics_path)
             )
+        validation_path = os.environ.get("PSM_A2_POSTTRAIN_VALIDATION_PATH")
+        if validation_path:
+            if self.member_layout != "a2":
+                raise ValueError("native A2 validation requires the A2 route")
+            from .a2_native_validation import A2NativeValidation
+            trainer.callbacks._callbacks.append(A2NativeValidation(driver=driver, path=validation_path))
         if self._pending_resume_state is not None:
             driver.load_state_dict(self._pending_resume_state)
             self._pending_resume_state = None

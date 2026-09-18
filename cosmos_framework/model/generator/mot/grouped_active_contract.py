@@ -28,6 +28,8 @@ class GroupedPlanMember:
     def __post_init__(self) -> None:
         if not self.row_identities or len(self.row_identities) != len(self.row_planned_n_valid):
             raise ValueError("group identities/counts are empty or unaligned")
+        # CanonicalLocalMemorySegmentProducer.block_count is valid_start_count // T.
+        # This active-route contract intentionally refuses partial rows rather than silently dropping/padding them.
         if self.tbptt_steps <= 0 or any(n != self.tbptt_steps for n in self.row_planned_n_valid):
             raise ValueError("active A2 currently requires whole TBPTT segments")
         if not all((self.manifest_digest, self.config_digest, self.source_digest)):

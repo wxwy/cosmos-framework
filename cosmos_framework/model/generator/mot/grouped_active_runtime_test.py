@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -291,8 +292,37 @@ def test_live_delivery_metrics_records_actual_geometry(tmp_path):
     metrics.wave_counts = [1, 1]
     metrics.losses = [1.0, 2.0]
     model._psm_native_forward_calls = 2
-    optimizer = SimpleNamespace(param_groups=[{"params": [], "lr": 1e-4}])
+    optimizer = SimpleNamespace(optimizers=[SimpleNamespace(param_groups=[{"params": [], "lr": 1e-4}])])
     metrics.on_before_zero_grad(model, optimizer, None)
     record = json.loads((tmp_path / "metrics.jsonl").read_text())
     assert record["consumers"] == 8 and record["native_forward_calls"] == 2
     assert record["window_index"] == 1 and len(record["identities"]) == 4
+
+
+def test_active_group_explicitly_rejects_partial_tbptt_row():
+    driver, _, _ = make_driver()
+    freeze = driver.freeze_window()
+    plan = driver._plan_groups(freeze)
+    group = plan.members[0]
+    with pytest.raises(ValueError, match="whole TBPTT"):
+        replace(group, row_planned_n_valid=(1, 2))
+
+
+def test_speculative_rebind_does_not_modify_live_scheduler():
+    driver, trainer, model = make_driver(widths=(2, 2))
+    run_window(driver, trainer, model)
+    before = driver.registry.owner.scheduler.snapshot()
+    terminal_slots = dict(driver.registry.owner.scheduler.terminal_slots)
+    assert terminal_slots
+    for slot in terminal_slots:
+        driver._rebind_terminal(slot)
+    assert driver.registry.owner.scheduler.snapshot() == before
+
+
+def test_prepare_error_preserves_original_exception_and_no_row_commit():
+    driver, trainer, model = make_driver()
+    with patch.object(driver.registry.owner, "_scan_group", side_effect=TypeError("original payload failure")):
+        with pytest.raises(TypeError, match="original payload failure"):
+            driver.arm_next_member(trainer, model)
+    assert driver.registry.owner.adapter.sidecar._records == {}
+    assert driver.registry.owner.scheduler.committed_identities == []
