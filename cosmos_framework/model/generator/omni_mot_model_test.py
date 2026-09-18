@@ -185,3 +185,34 @@ def test_build_net_registers_only_active_ttt_owner(monkeypatch: pytest.MonkeyPat
     assert tuple(net.local_memory_runtime._modules) == ("evidence_encoder", "ttt_core")
     assert not hasattr(net, "local_history_runtime")
     assert not hasattr(net, "readout")
+
+
+def test_inference_text_kv_reuse_is_disabled_only_for_memory_prefix_requests() -> None:
+    from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
+
+    model = SimpleNamespace(
+        parallel_dims=None,
+        config=SimpleNamespace(
+            joint_attn_implementation="two_way",
+            video_temporal_causal=False,
+            sound_gen=False,
+        ),
+    )
+    data = SimpleNamespace(batch_size=1, num_vision_items_per_sample=None)
+    plain = [SimpleNamespace(has_sound=False, has_local_memory=False)]
+    local = [SimpleNamespace(has_sound=False, has_local_memory=True)]
+
+    assert OmniMoTModel._can_reuse_inference_text_kv(
+        model,
+        plain,
+        data,
+        reuse_pack_templates=True,
+        has_velocity_postprocess=False,
+    )
+    assert not OmniMoTModel._can_reuse_inference_text_kv(
+        model,
+        local,
+        data,
+        reuse_pack_templates=True,
+        has_velocity_postprocess=False,
+    )

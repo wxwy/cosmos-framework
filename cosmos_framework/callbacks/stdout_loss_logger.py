@@ -41,6 +41,31 @@ class StdoutLossLogger(Callback):
         super().__init__()
         self.every_n = every_n
         self.sub_loss_keys = sub_loss_keys
+        self._active_window_objectives: list[float] = []
+        self._active_raw_losses: list[float] = []
+
+
+
+    def on_training_step_batch_end(
+        self,
+        model: ImaginaireModel,
+        data_batch: dict[str, torch.Tensor],
+        output_batch: dict[str, torch.Tensor],
+        loss: torch.Tensor,
+        iteration: int = 0,
+    ) -> None:
+        active = output_batch.get("psm_local_memory_active_forward")
+        if active is None:
+            return
+        prepared = active.prepared
+        objective = prepared.transaction.plan.objective(
+            prepared.member_index,
+            active.result.primary_consumer_mean,
+            active.result.auxiliary_loss,
+            prepared.actual_n_valid,
+        )
+        self._active_window_objectives.append(float(objective.detach()))
+        self._active_raw_losses.append(float(loss.detach()))
 
     def on_training_step_end(
         self,
@@ -53,8 +78,16 @@ class StdoutLossLogger(Callback):
         if iteration % self.every_n != 0:
             return
 
+        active_window = bool(self._active_window_objectives)
         sample_size = torch.tensor(get_data_batch_size(data_batch), device="cuda")
-        loss_sum = loss.detach().float() * sample_size
+        if active_window:
+            # Active Local Memory already owns exact GA/window normalization through
+            # GAWindowPlan.objective().  The final microbatch's raw forward loss is not
+            # an optimizer-step loss and varies with grouped member size.
+            loss_sum = torch.tensor(sum(self._active_window_objectives), device="cuda", dtype=torch.float32)
+            sample_size = torch.tensor(1.0, device="cuda")
+        else:
+            loss_sum = loss.detach().float() * sample_size
 
         sub_losses: dict[str, torch.Tensor] = {}
         for key in self.sub_loss_keys:
@@ -78,6 +111,9 @@ class StdoutLossLogger(Callback):
 
         avg_loss = loss_sum.item() / sample_size.item() if sample_size.item() > 0 else float("nan")
         parts = [f"iteration={iteration}", f"train/loss={avg_loss:.6f}"]
+        if active_window:
+            parts.append(f"raw_last_group_loss={self._active_raw_losses[-1]:.6f}")
+            parts.append(f"active_groups={len(self._active_window_objectives)}")
         for key in self.sub_loss_keys:
             if key not in sub_losses:
                 continue
@@ -101,3 +137,6 @@ class StdoutLossLogger(Callback):
             )
 
         log.info(" | ".join(parts))
+        if active_window:
+            self._active_window_objectives.clear()
+            self._active_raw_losses.clear()
