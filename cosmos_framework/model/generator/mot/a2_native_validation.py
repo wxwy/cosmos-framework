@@ -147,10 +147,19 @@ def rgb_visual_summary_parity(model, producer, stream):
         item = source._build_item(producer._flat_index(stream, 0))
     finally:
         source._latent_cache_verify_ratio = old_ratio
-    raw = item.get("video")
-    cached = item.get("video_latent")
+    payload = producer.wrapped_dataset._transform(item, producer.wrapped_dataset._resolution)
+    raw = payload.get("video")
+    cached = payload.get("video_latent", item.get("video_latent"))
+    if isinstance(raw, (list, tuple)):
+        if len(raw) != 1:
+            raise RuntimeError("RGB parity requires exactly one transformed video item")
+        raw = raw[0]
+    if isinstance(cached, (list, tuple)):
+        if len(cached) != 1:
+            raise RuntimeError("RGB parity requires exactly one cached latent item")
+        cached = cached[0]
     if not isinstance(raw, torch.Tensor) or raw.dtype is not torch.uint8:
-        raise RuntimeError("RGB parity requires the real uint8 dataset window")
+        raise RuntimeError("RGB parity requires the transformed uint8 training window")
     if not isinstance(cached, torch.Tensor) or cached.ndim != 4:
         raise RuntimeError("RGB parity requires the exact-window cached latent")
     device = next(model.net.parameters()).device

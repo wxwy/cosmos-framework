@@ -289,6 +289,7 @@ def test_live_delivery_metrics_records_actual_geometry(tmp_path):
     metrics._window_started = 0.0
     metrics._starting_state_sha = metrics._fast_state_sha()
     metrics._losses = [1.0, 2.0]
+    metrics._backward_objectives = [0.5, 1.0]
     metrics._waves = [1, 1]
     metrics._identities = [(0, "test", i) for i in range(driver._group_plan.n_window)]
     model._psm_native_forward_calls = 2
@@ -298,6 +299,8 @@ def test_live_delivery_metrics_records_actual_geometry(tmp_path):
     assert record["window_index"] == 1 and len(record["actual_consumer_identities"]) == 8
     assert record["fast_state_sha256"] == metrics._fast_state_sha()
     assert record["fast_state_before_first_group_sha256"] is not None
+    assert record["raw_native_loss_mean"] == 1.5
+    assert record["backward_objective_sum"] == 1.5
 
 
 def test_active_group_explicitly_rejects_partial_tbptt_row():
@@ -375,3 +378,42 @@ def test_cuda_vectorized_fast_state_and_outer_gradients_match_scalar():
                 torch.testing.assert_close(a.grad, b.grad, rtol=3e-4, atol=3e-6)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
+def test_a2_and_scalar_window_objective_have_identical_consumer_mean_scale():
+    from .grouped_active_contract import GroupedGAWindowPlan, GroupedPlanMember
+    from .local_memory_segment import GAWindowPlan, SegmentIdentity
+
+    # One window has the same 2048 consumers in both layouts.  Let each scalar
+    # 16-consumer segment have an arbitrary native mean.  Each A2 128-consumer
+    # group is the equal-size mean of eight consecutive scalar segments.
+    scalar_means = [torch.tensor(1.0 + index / 100.0) for index in range(128)]
+    scalar_plan = GAWindowPlan(
+        members=tuple((index % 8, f"e{index % 8}", index // 8) for index in range(128)),
+        planned_n_valid=(16,) * 128,
+    )
+    scalar_total = sum(
+        scalar_plan.objective(index, mean, torch.tensor(0.0), 16)
+        for index, mean in enumerate(scalar_means)
+    )
+
+    identities = tuple(
+        SegmentIdentity(index % 8, f"e{index % 8}", "suite", index // 8, index, "source")
+        for index in range(128)
+    )
+    groups = tuple(
+        GroupedPlanMember(
+            identities[start : start + 8], (16,) * 8, 16, "manifest", "config", "source"
+        )
+        for start in range(0, 128, 8)
+    )
+    grouped_plan = GroupedGAWindowPlan(
+        members=groups, planned_n_valid=(128,) * 16, plan_chain_id="scale-parity"
+    )
+    grouped_means = [torch.stack(scalar_means[start : start + 8]).mean() for start in range(0, 128, 8)]
+    grouped_total = sum(
+        grouped_plan.objective(index, mean, torch.tensor(0.0), 128)
+        for index, mean in enumerate(grouped_means)
+    )
+    torch.testing.assert_close(grouped_total, scalar_total, rtol=0, atol=1e-7)
+    torch.testing.assert_close(grouped_total, torch.stack(scalar_means).mean(), rtol=0, atol=1e-7)

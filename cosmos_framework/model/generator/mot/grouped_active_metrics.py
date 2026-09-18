@@ -43,6 +43,7 @@ class ActiveDeliveryMetrics(Callback):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._previous_calls = 0
         self._losses: list[float] = []
+        self._backward_objectives: list[float] = []
         self._waves: list[int] = []
         self._identities: list[tuple[int, str, int]] = []
         self._gradients: dict[str, dict] = {}
@@ -59,8 +60,16 @@ class ActiveDeliveryMetrics(Callback):
 
     def on_training_step_batch_end(self, model, data_batch, output_batch, loss, iteration=0):
         self._losses.append(float(loss.detach()))
+        active = output_batch["psm_local_memory_active_forward"]
+        prepared = active.prepared
+        detached_objective = prepared.transaction.plan.objective(
+            prepared.member_index,
+            active.result.primary_consumer_mean.detach(),
+            active.result.auxiliary_loss.detach(),
+            prepared.actual_n_valid,
+        )
+        self._backward_objectives.append(float(detached_objective))
         self._waves.append(getattr(self.driver.registry.owner, "last_dependency_wave_count", 1))
-        prepared = output_batch["psm_local_memory_active_forward"].prepared
         self._identities.extend(prepared.inputs.identities)
 
     def on_before_optimizer_step(self, model, optimizer, scheduler, grad_scaler, iteration=0):
@@ -116,9 +125,11 @@ class ActiveDeliveryMetrics(Callback):
             "actual_consumer_identities": list(self._identities),
             "actual_consumer_identity_sha256": hashlib.sha256(identity_bytes).hexdigest(),
             "objective_version": "native_weighted_total_separate_aux_v1",
-            "loss_mean": sum(self._losses) / len(self._losses),
-            "loss_min": min(self._losses),
-            "loss_max": max(self._losses),
+            "raw_native_loss_mean": sum(self._losses) / len(self._losses),
+            "raw_native_loss_min": min(self._losses),
+            "raw_native_loss_max": max(self._losses),
+            "backward_objective_sum": sum(self._backward_objectives),
+            "backward_objective_members": list(self._backward_objectives),
             "dependency_waves": list(self._waves),
             "gradients": self._gradients,
             "timing": getattr(self.trainer, "last_optimizer_step_timing", None),
@@ -140,10 +151,13 @@ class ActiveDeliveryMetrics(Callback):
             handle.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
         print(
             f"[A2-EVIDENCE] iter={iteration} native={calls} consumers={plan.n_window} "
-            f"loss_mean={record['loss_mean']:.6f} peak_GiB={record['peak_allocated_bytes'] / 2**30:.2f}",
+            f"raw_loss={record['raw_native_loss_mean']:.6f} "
+            f"backward_objective={record['backward_objective_sum']:.6f} "
+            f"peak_GiB={record['peak_allocated_bytes'] / 2**30:.2f}",
             flush=True,
         )
         self._losses.clear()
+        self._backward_objectives.clear()
         self._waves.clear()
         self._identities.clear()
         self._gradients.clear()
