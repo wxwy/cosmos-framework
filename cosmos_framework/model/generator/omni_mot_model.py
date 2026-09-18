@@ -1456,8 +1456,10 @@ class OmniMoTModel(ImaginaireModel):
         # would otherwise reach `training_step` on CPU.  Device comes from the model so
         # a CPU-only run stays valid.
         collated = misc.to(collated, device=next(self.net.parameters()).device)
-        output_batch, _ = self.training_step(collated, iteration, _psm_local_override=inputs.locals)
-        primary = self._psm_reduced_loss(output_batch, self._PSM_CONSUMER_LOSS_KEYS)
+        output_batch, native_total = self.training_step(collated, iteration, _psm_local_override=inputs.locals)
+        # The native objective owns modality weights (e.g. vision/action = 10).
+        # Diagnostic flow_matching_loss_* scalars are deliberately UNWEIGHTED.
+        primary = native_total
         auxiliary = self._psm_reduced_loss(output_batch, self._PSM_AUXILIARY_LOSS_KEYS, allow_empty=True)
         if auxiliary is None:
             # The auxiliary slot carries the load-balancing term, which ``_compute_losses``
@@ -1466,6 +1468,8 @@ class OmniMoTModel(ImaginaireModel):
             # objective adds it as ``auxiliary_loss / ga_effective``, making an absent term
             # an exact zero contribution instead of a contract failure.
             auxiliary = torch.zeros((), device=primary.device, dtype=primary.dtype)
+        primary = primary - auxiliary
+        self._psm_native_forward_calls = getattr(self, "_psm_native_forward_calls", 0) + 1
         return NativeBatchResult(primary_consumer_mean=primary, auxiliary_loss=auxiliary)
 
     def _active_local_memory_forward(

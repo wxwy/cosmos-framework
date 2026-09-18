@@ -17,7 +17,7 @@
 #      `config.trainer.grad_accum_iter`（`arm_active_local_memory_initial` 与
 #      `_preflight_active_optimizer_boundary` 两端夹逼，无其它可能取值），而该值由
 #      `action_policy_libero_edge_all.py` 在 `PSM_R09_B_TTT_ACTIVE=1` 下算作
-#      `8 * PSM_R09_B_TTT_ACTIVE_GA`（8 = v0.3.5 冻结的 `B_stream`）。
+#      A2 为 `PSM_R09_B_TTT_ACTIVE_GA`；single 对照为 `B_stream * GA`。
 #      所以 window 大小只经环境变量调节，本文件对它保持透明。
 #   3. 同一开关下 config 把 `max_samples_per_batch` 降为 1：active 路线上外层 batch 的
 #      内容**完全不被消费**（`omni_mot_model._active_local_memory_forward` 只读
@@ -29,7 +29,9 @@
 #   PSM_R09_B_TTT_ACTIVE=1        # 本路线总开关
 #   PSM_R09_B_TTT_ENABLED=1       # 前置：TTT 基础设施
 #   PSM_R08_LOCAL_HISTORY_ENABLED=1
-#   PSM_R09_B_TTT_ACTIVE_GA=<n>   # 正整数；window members = 8*n
+#   PSM_R09_B_TTT_ACTIVE_GA=<n>   # 正整数；A2 native members = n
+#   PSM_R09_B_TTT_MEMBER_LAYOUT=a2 # 默认a2；single用于显式旧路径对照
+#   PSM_R09_B_TTT_B_STREAM=8      # 可配置，至少suite数；consumers/update=B_stream*T*GA
 #
 # 其余训练参数与基线逐字一致（lr / cycle / warmup / selective AC + fmha / FusedAdamW /
 # max_num_tokens_after_packing / cudnn.benchmark=false / 单卡 HSDP 设定），

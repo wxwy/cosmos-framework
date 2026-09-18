@@ -536,42 +536,79 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             raise ValueError("state and K/Q/V must share a device.")
         queries = self.project_queries(query_base_t)
 
-        valid = valid.bool()
-        state_rows: list[list[torch.Tensor]] = [[], [], [], []]
-        token_rows: list[torch.Tensor] = []
-        for row in range(batch):
-            if not valid[row]:
-                for output, member in zip(state_rows, state_in, strict=True):
-                    output.append(member[row])
-                token_rows.append(torch.zeros(self.k_local, self.local_dim, device=key_t.device, dtype=torch.float32))
-                continue
+        # Preserve the frozen singleton arithmetic (including replay bitwise behavior).
+        # A2 uses the vectorized independent-row path below for B > 1.
+        if batch == 1:
+            valid = valid.bool()
+            state_rows: list[list[torch.Tensor]] = [[], [], [], []]
+            token_rows: list[torch.Tensor] = []
+            for row in range(batch):
+                if not valid[row]:
+                    for output, member in zip(state_rows, state_in, strict=True):
+                        output.append(member[row])
+                    token_rows.append(torch.zeros(self.k_local, self.local_dim, device=key_t.device, dtype=torch.float32))
+                    continue
 
-            work = []
-            for member in state_in:
-                member_row = member[row].float()
-                if not member_row.requires_grad:
-                    member_row = member_row.detach().requires_grad_(True)
-                work.append(member_row)
-            work_state = ContinualTTTFastState(*work)
-            prediction = self._fast_mlp(key_t[row], work_state)
-            inner_loss = (prediction - value_t[row]).square().mean()
-            gradients = torch.autograd.grad(inner_loss, work_state, create_graph=create_graph)
-            updated = ContinualTTTFastState(
-                *(member - self.inner_lr * gradient for member, gradient in zip(work_state, gradients, strict=True))
-            )
-            if emit_prewrite_tokens:
-                # Pre-write witness token: read the state BEFORE this row's write,
-                # i.e. read(S_{t-1}); the post-write candidate S_t is still returned
-                # separately as state_out. Same values as ``read_many`` on state_in.
-                token_rows.append(
-                    self._fast_mlp(queries[row], ContinualTTTFastState(*(member[row].float() for member in state_in)))
+                work = []
+                for member in state_in:
+                    member_row = member[row].float()
+                    if not member_row.requires_grad:
+                        member_row = member_row.detach().requires_grad_(True)
+                    work.append(member_row)
+                work_state = ContinualTTTFastState(*work)
+                prediction = self._fast_mlp(key_t[row], work_state)
+                inner_loss = (prediction - value_t[row]).square().mean()
+                gradients = torch.autograd.grad(inner_loss, work_state, create_graph=create_graph)
+                updated = ContinualTTTFastState(
+                    *(member - self.inner_lr * gradient for member, gradient in zip(work_state, gradients, strict=True))
                 )
-            else:
-                token_rows.append(self._fast_mlp(queries[row], updated))
-            for output, member, reference in zip(state_rows, updated, state_in, strict=True):
-                output.append(member.to(dtype=reference.dtype))
-        state_out = ContinualTTTFastState(*(torch.stack(rows) for rows in state_rows))
-        return torch.stack(token_rows), state_out, valid
+                if emit_prewrite_tokens:
+                    # Pre-write witness token: read the state BEFORE this row's write,
+                    # i.e. read(S_{t-1}); the post-write candidate S_t is still returned
+                    # separately as state_out. Same values as ``read_many`` on state_in.
+                    token_rows.append(
+                        self._fast_mlp(queries[row], ContinualTTTFastState(*(member[row].float() for member in state_in)))
+                    )
+                else:
+                    token_rows.append(self._fast_mlp(queries[row], updated))
+                for output, member, reference in zip(state_rows, updated, state_in, strict=True):
+                    output.append(member.to(dtype=reference.dtype))
+            state_out = ContinualTTTFastState(*(torch.stack(rows) for rows in state_rows))
+            return torch.stack(token_rows), state_out, valid
+
+        rows = valid.bool().nonzero(as_tuple=False).flatten()
+        tokens = torch.zeros(batch, self.k_local, self.local_dim, device=key_t.device, dtype=torch.float32)
+        if not rows.numel():
+            return tokens, state_in, valid.bool()
+        selected = self._select_rows(state_in, rows)
+        work = ContinualTTTFastState(*(
+            member.float() if member.requires_grad else member.float().detach().requires_grad_(True)
+            for member in selected
+        ))
+        prediction = self._fast_mlp_batched(key_t.index_select(0, rows).unsqueeze(1), work).squeeze(1)
+        # Sum independent ROW means, never average over B: each fast learner must
+        # receive exactly its original per-row inner learning rate.
+        inner_loss = (prediction - value_t.index_select(0, rows)).square().mean(dim=-1).sum()
+        gradients = torch.autograd.grad(inner_loss, work, create_graph=create_graph)
+        updated = ContinualTTTFastState(*(
+            member - self.inner_lr * gradient
+            for member, gradient in zip(work, gradients, strict=True)
+        ))
+        read_state = selected if emit_prewrite_tokens else updated
+        compact_tokens = self._fast_mlp_batched(queries.index_select(0, rows), read_state)
+        updated = ContinualTTTFastState(*(
+            value.to(dtype=reference.dtype) for value, reference in zip(updated, selected, strict=True)
+        ))
+        state_out = self._scatter_rows(state_in, rows, updated)
+        return tokens.index_copy(0, rows, compact_tokens), state_out, valid.bool()
+
+    @staticmethod
+    def _fast_mlp_batched(value: torch.Tensor, state: ContinualTTTFastState) -> torch.Tensor:
+        """[B,N,D] MLP with one independent fast parameter set per row."""
+        hidden = F.silu(torch.bmm(value.float(), state.fast_in_weight.float().transpose(1, 2))
+                        + state.fast_in_bias.float().unsqueeze(1))
+        return (torch.bmm(hidden, state.fast_out_weight.float().transpose(1, 2))
+                + state.fast_out_bias.float().unsqueeze(1))
 
     def step_projected(
         self,

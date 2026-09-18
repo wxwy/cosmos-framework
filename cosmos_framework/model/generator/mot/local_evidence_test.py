@@ -699,7 +699,8 @@ def test_continual_ttt_multi_slot_one_write_per_valid_sample_and_legacy_boundary
         valid=torch.tensor([True, False, True]),
         create_graph=True,
     )
-    assert calls == 2
+    # A2 performs one vectorized gradient of the SUM of per-row means.
+    assert calls == 1
     with pytest.raises(ValueError, match="step_projected_many"):
         core.step_projected(
             key_t=key,
@@ -782,14 +783,14 @@ def test_continual_ttt_multi_slot_invalid_rows_skip_fast_read_even_when_finite_v
     for member in state:
         member[1].fill_(1e20)
     original = tuple(member.clone() for member in state)
-    original_fast_mlp = core._fast_mlp
+    original_fast_mlp = core._fast_mlp_batched
     call_shapes: list[tuple[int, ...]] = []
 
     def counted_fast_mlp(value: torch.Tensor, fast_state: ContinualTTTFastState) -> torch.Tensor:
         call_shapes.append(tuple(value.shape))
         return original_fast_mlp(value, fast_state)
 
-    monkeypatch.setattr(core, "_fast_mlp", counted_fast_mlp)
+    monkeypatch.setattr(core, "_fast_mlp_batched", counted_fast_mlp)
     token, state_out, present = core.step_projected_many(
         key_t=torch.randn(2, 4),
         query_base_t=torch.tensor([[0.0, 0.0, 0.0, 0.0], [1e20, 1e20, 1e20, 1e20]]),
@@ -798,7 +799,7 @@ def test_continual_ttt_multi_slot_invalid_rows_skip_fast_read_even_when_finite_v
         valid=torch.tensor([True, False]),
         create_graph=True,
     )
-    assert call_shapes == [(4,), (4, 4)]
+    assert call_shapes == [(1, 1, 4), (1, 4, 4)]
     assert present.tolist() == [True, False]
     assert torch.isfinite(token[1]).all() and torch.equal(token[1], torch.zeros_like(token[1]))
     assert all(torch.equal(output[1], source[1]) for output, source in zip(state_out, original, strict=True))

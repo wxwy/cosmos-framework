@@ -305,7 +305,7 @@ if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
     # inherited baseline allowlist (generation + action heads).  It must append,
     # not overwrite: the intended training scope is baseline heads + local-memory
     # branch together, so the generation/action heads keep receiving gradient.
-    _baseline_slow_selectors = list(action_policy_libero_edge_all["optimizer"]["keys_to_select"])
+    _baseline_slow_selectors = list(action_policy_libero_all_nano["optimizer"]["keys_to_select"])
     action_policy_libero_edge_all["optimizer"]["keys_to_select"] = (
         _baseline_slow_selectors + list(TTT_SLOW_GROUP_SELECTORS)
     )
@@ -315,16 +315,14 @@ if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
 action_policy_libero_edge_all["dataloader_train"], _libero_active_datasets = _action_policy_libero_edge_dataloader()
 
 if _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
-    # One window is one optimizer update, and the driver arms exactly
-    # `config.trainer.grad_accum_iter` members, so this boundary *is* the window
-    # size `B_stream * GA` with the v0.3.5-frozen `B_stream = 8`.  A driver
-    # constructed over a different slot pool must be given the same count.
-    # GA=16 reproduces the baseline 2048 samples/update (128 members x 16 consumers).
-    # Required rather than defaulted: the former default of 1 silently trains a 16x
-    # smaller effective batch (grad_accum_iter=8 -> 128 samples/update instead of the
-    # baseline 2048), and nothing downstream reports it, because the driver reads its
-    # window size from the grad_accum_iter set below and therefore stays internally
-    # consistent while running the wrong recipe.
+    # A2: GA grouped forwards, B_stream*T consumers each. Legacy single-row
+    # mode remains explicit for matched controls and old-checkpoint workflows.
+    _active_b_stream = int(os.environ.get("PSM_R09_B_TTT_B_STREAM", "8"))
+    _active_layout = os.environ.get("PSM_R09_B_TTT_MEMBER_LAYOUT", "a2")
+    if _active_b_stream < len(_SUITES):
+        raise ValueError("PSM_R09_B_TTT_B_STREAM must provide at least one slot per suite")
+    if _active_layout not in {"single", "a2"}:
+        raise ValueError("PSM_R09_B_TTT_MEMBER_LAYOUT must be single or a2")
     _active_ga_env = os.environ.get("PSM_R09_B_TTT_ACTIVE_GA")
     if _active_ga_env is None:
         raise ValueError(
@@ -335,7 +333,9 @@ if _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
     _active_ga = int(_active_ga_env)
     if _active_ga <= 0:
         raise ValueError(f"PSM_R09_B_TTT_ACTIVE_GA must be a positive integer, got {_active_ga}")
-    action_policy_libero_edge_all["trainer"]["grad_accum_iter"] = 8 * _active_ga
+    action_policy_libero_edge_all["trainer"]["grad_accum_iter"] = (
+        _active_ga if _active_layout == "a2" else _active_b_stream * _active_ga
+    )
     # Launch-time assembly: the canonical owner, the segment adapter over the model's
     # own registered modules, the slot catalog, and the window driver.  The driver
     # reads its window size from the `grad_accum_iter` set just above, so the two
@@ -345,7 +345,9 @@ if _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
         ActiveLocalMemoryLaunchCallback
     )(
         suite_datasets=_libero_active_datasets,
-        b_stream=8,  # v0.3.5-frozen B_stream
+        b_stream=_active_b_stream,
+        member_layout=_active_layout,
+        group_size=_active_b_stream if _active_layout == "a2" else 1,
         ttt_tbptt_steps=int(os.environ.get("PSM_R09_B_TTT_TBPTT_STEPS", "16")),
         manifest_digest=os.environ.get("PSM_R09_B2_STREAM_MANIFEST_ROOT") or "libero4in1-4suite-manifest",
         config_digest=os.environ.get("PSM_R09_B_TTT_ACTIVE_CONFIG_DIGEST") or "v035-frozen-local-ttt",

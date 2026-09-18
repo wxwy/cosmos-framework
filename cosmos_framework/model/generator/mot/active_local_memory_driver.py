@@ -448,6 +448,8 @@ class ActiveLocalMemoryWindowDriver(Callback):
         single atomic apply mutate the live owner/sidecar/driver.  Any rejection
         therefore leaves the live runtime untouched.
         """
+        if state_dict.get("member_layout", "single") != getattr(self, "member_layout", "single"):
+            raise RuntimeError("active Local-Memory cannot resume: member layout differs")
         # 4. 版本/身份一致性：catalog/config 变更后不得静默误 load。
         if state_dict.get("source_digest") != getattr(self.producer, "source_digest", None):
             raise RuntimeError("active Local-Memory cannot resume: source_digest differs")
@@ -593,3 +595,16 @@ class ActiveLocalMemoryWindowDriver(Callback):
         sidecar = owner.adapter.sidecar
         sidecar._records.clear()
         sidecar._records.update(sidecar_records)
+
+
+    def close(self) -> None:
+        """Drain/cancel bounded source prefetch at an explicit training exit."""
+        for future in self._prefetch_futures.values():
+            future.cancel()
+        self._prefetch_futures.clear()
+        if self._prefetch_executor is not None:
+            self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+            self._prefetch_executor = None
+
+    def on_train_end(self, *args, **kwargs) -> None:
+        self.close()

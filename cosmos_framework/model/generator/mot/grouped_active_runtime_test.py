@@ -1,0 +1,298 @@
+"""A2 regression: source order, gradients, repeated-slot dependencies and resume."""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import replace
+
+import pytest
+import torch
+
+from .active_local_memory_driver import ActiveLocalMemoryWindowDriver
+from .active_local_memory_driver_test import _FakeProducer, _FakeStream, _model, _registry, _trainer
+from .grouped_active_driver import GroupedActiveLocalMemoryWindowDriver
+from .grouped_active_runtime import GroupedActiveWiringRegistry, GroupedSegmentRuntimeOwner
+from .local_memory_segment import RankLocalSegmentScheduler
+from .production_segment_bridge import NativeBatchResult
+from .production_segment_wiring import CanonicalSegmentWiring
+
+
+class Producer(_FakeProducer):
+    def produce(self, stream, *, cursor):
+        segment = super().produce(stream, cursor=cursor)
+        rng = torch.Generator().manual_seed(stream.slot_id * 10007 + stream.episode_index * 101 + cursor)
+        return replace(
+            segment,
+            evidence_visual_summary_prev=torch.randn(1, self.ttt_tbptt_steps, 96, generator=rng),
+            evidence_executed_action_prev=torch.randn(1, self.ttt_tbptt_steps, 10, generator=rng),
+        )
+
+
+def make_driver(*, grouped=True, group_size=2, ga=2, widths=(4, 4), template=None):
+    producer = Producer()
+    streams = tuple(_FakeStream(slot, slot + 10, "suite") for slot in range(len(widths)))
+    for stream, width in zip(streams, widths, strict=True):
+        producer.blocks[(stream.slot_id, stream.episode_index)] = width
+    registry = _registry({"suite": 1.0})
+    adapter = registry.owner.adapter
+    if template is not None:
+        adapter.encoder.load_state_dict(template.owner.adapter.encoder.state_dict())
+        adapter.core.load_state_dict(template.owner.adapter.core.state_dict())
+    parameters = tuple(adapter.encoder.parameters()) + tuple(adapter.core.parameters())
+    registry.owner.wiring.local_slow_parameters = parameters
+    if grouped:
+        wiring = CanonicalSegmentWiring(adapter, parameters)
+        registry = GroupedActiveWiringRegistry(
+            GroupedSegmentRuntimeOwner(RankLocalSegmentScheduler(rank=0, target_distribution={"suite": 1.0}), wiring)
+        )
+    kwargs = dict(
+        registry=registry,
+        producer=producer,
+        streams=streams,
+        window_members=ga if grouped else ga * group_size,
+        queue_seed=19,
+    )
+    if grouped:
+        driver = GroupedActiveLocalMemoryWindowDriver(
+            group_size=group_size, manifest_digest="manifest", config_digest="config", **kwargs
+        )
+    else:
+        driver = ActiveLocalMemoryWindowDriver(**kwargs)
+    trainer = _trainer(registry, grad_accum_iter=ga if grouped else ga * group_size)
+    model = _model()
+    driver.attach(trainer, model)
+    return driver, trainer, model
+
+
+def run_window(driver, trainer, model):
+    collected, identities = [], []
+    registry = driver.registry
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    for index in range(trainer.config.trainer.grad_accum_iter):
+        driver.arm_next_member(trainer, model)
+        prepared = trainer._psm_active_armed_prepared
+        registry.consume_prepared_for_model(prepared)
+        local = prepared.forward.result.local_tokens
+        collected.append(local.detach().flatten(0, 1))
+        identities.extend(prepared.inputs.identities)
+        primary = local.square().sum() / prepared.actual_n_valid
+        active = registry.publish_active_forward(prepared, NativeBatchResult(primary, primary * 0))
+        trainer._run_active_local_memory_backward(model, {"psm_local_memory_active_forward": active}, scaler, index)
+        trainer._psm_active_armed_prepared = None
+    registry.owner.resolve_local_memory_slow_window(trainer._psm_active_completed_window, scaler_skipped=False)
+    registry.retire_resolved_window(registry.owner)
+    trainer._psm_active_completed_window = trainer._psm_active_registry = None
+    return torch.cat(collected), tuple(identities)
+
+
+def assert_state_equal(left, right):
+    assert left["window_index"] == right["window_index"]
+    for key in ("slot_epoch", "stream_index", "active_stream", "active_cursor"):
+        assert left[key] == right[key]
+    assert left["runtime"].scheduler == right["runtime"].scheduler
+    a, b = left["runtime"].committed, right["runtime"].committed
+    assert len(a) == len(b)
+    for (i, state), (j, other) in zip(a, b, strict=True):
+        assert i == j
+        for value, expected in zip(state, other, strict=True):
+            torch.testing.assert_close(value, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("widths", [(4, 4), (4,), (7, 3)])
+def test_group_matches_scalar_tokens_gradients_and_rollover(widths):
+    torch.manual_seed(73)
+    scalar = make_driver(grouped=False, widths=widths)
+    grouped = make_driver(grouped=True, widths=widths, template=scalar[0].registry)
+    for _ in range(3):
+        a, ids_a = run_window(*scalar)
+        b, ids_b = run_window(*grouped)
+        assert ids_a == ids_b
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+        assert_state_equal(scalar[0].state_dict(), grouped[0].state_dict())
+    left = scalar[0].registry.owner.wiring.local_slow_parameters
+    right = grouped[0].registry.owner.wiring.local_slow_parameters
+    for a, b in zip(left, right, strict=True):
+        assert (a.grad is None) == (b.grad is None)
+        if a.grad is not None:
+            torch.testing.assert_close(a.grad, b.grad, rtol=2e-4, atol=2e-6)
+
+
+def test_group_prepare_and_failure_do_not_publish_partial_rows():
+    driver, trainer, model = make_driver()
+    before = driver.registry.owner.snapshot()
+    driver.arm_next_member(trainer, model)
+    prepared = trainer._psm_active_armed_prepared
+    owner = driver.registry.owner
+    assert owner.scheduler.snapshot() == before.scheduler
+    assert owner.adapter.sidecar._records == {}
+    for parameter in owner.wiring.local_slow_parameters:
+        parameter.grad = torch.ones_like(parameter)
+    owner.abort_terminal(prepared.transaction, prepared.forward, "injected")
+    assert owner.scheduler.snapshot() == before.scheduler
+    assert owner.adapter.sidecar._records == {}
+    assert all(p.grad is None for p in owner.wiring.local_slow_parameters)
+    with pytest.raises(RuntimeError):
+        owner.commit(prepared.transaction, prepared.forward)
+
+
+def test_group_resume_matches_uninterrupted_next_window():
+    original = make_driver(widths=(7, 3))
+    run_window(*original)
+    run_window(*original)
+    saved = copy.deepcopy(original[0].state_dict())
+    resumed = make_driver(widths=(7, 3), template=original[0].registry)
+    resumed[0].load_state_dict(saved)
+    a, ids_a = run_window(*original)
+    b, ids_b = run_window(*resumed)
+    assert ids_a == ids_b
+    torch.testing.assert_close(a, b)
+    assert_state_equal(original[0].state_dict(), resumed[0].state_dict())
+
+
+@pytest.mark.parametrize("key,value", [("group_size", 99), ("native_members", 99), ("member_layout", "single")])
+def test_invalid_resume_geometry_rejects_without_mutation(key, value):
+    original = make_driver()
+    run_window(*original)
+    saved = original[0].state_dict()
+    saved[key] = value
+    other = make_driver()
+    before = other[0].state_dict()
+    with pytest.raises(RuntimeError, match="geometry"):
+        other[0].load_state_dict(saved)
+    assert_state_equal(before, other[0].state_dict())
+
+
+def test_new_layout_cannot_load_in_legacy_driver():
+    original = make_driver()
+    run_window(*original)
+    legacy = make_driver(grouped=False)
+    with pytest.raises(RuntimeError, match="layout"):
+        legacy[0].load_state_dict(original[0].state_dict())
+
+
+def test_a2_default_geometry_is_16_forwards_2048_consumers():
+    driver, trainer, _ = make_driver(group_size=8, ga=16, widths=(20,) * 8)
+    driver.producer.ttt_tbptt_steps = 16
+    freeze = driver.freeze_window()
+    plan = driver._plan_groups(freeze)
+    assert plan.ga_effective == trainer.config.trainer.grad_accum_iter == 16
+    assert plan.planned_n_valid == (128,) * 16
+    assert plan.n_window == 2048
+    assert tuple(i for group in plan.members for i in group.row_identities) == freeze.identities
+
+
+def _original_row_update(core, evidence, state, valid, *, prewrite=False):
+    """Independent pre-A2 algorithm: per-row F.linear and per-row autograd.grad."""
+    key, query_base, value = core.project_evidence(evidence)
+    queries = core.project_queries(query_base)
+    outputs, states = [], []
+    from .local_evidence import ContinualTTTFastState
+
+    for row in range(len(valid)):
+        original = ContinualTTTFastState(*(v[row] for v in state))
+        if not valid[row]:
+            outputs.append(torch.zeros(core.k_local, core.local_dim))
+            states.append(original)
+            continue
+        work = ContinualTTTFastState(*(v if v.requires_grad else v.detach().requires_grad_(True) for v in original))
+        prediction = core._fast_mlp(key[row], work)
+        inner = (prediction - value[row]).square().mean()
+        gradients = torch.autograd.grad(inner, work, create_graph=True)
+        updated = ContinualTTTFastState(*(v - core.inner_lr * g for v, g in zip(work, gradients, strict=True)))
+        outputs.append(core._fast_mlp(queries[row], original if prewrite else updated))
+        states.append(updated)
+    return torch.stack(outputs), ContinualTTTFastState(*(torch.stack([s[i] for s in states]) for i in range(4)))
+
+
+@pytest.mark.parametrize("batch", [1, 2, 8])
+@pytest.mark.parametrize("prewrite", [False, True])
+def test_vectorized_inner_update_matches_original_per_row_algorithm(batch, prewrite):
+    from .local_evidence import ContinualTTTLocalMemoryCore
+
+    torch.manual_seed(47)
+    reference = ContinualTTTLocalMemoryCore(evidence_dim=8, local_dim=4, ttt_dim=6, fast_hidden_dim=10, k_local=2)
+    vectorized = copy.deepcopy(reference)
+    evidence = torch.randn(batch, 8)
+    valid = torch.ones(batch, dtype=torch.bool)
+    if batch > 1:
+        valid[0] = False
+    expected, expected_state = _original_row_update(
+        reference, evidence, reference.initial_state(batch), valid, prewrite=prewrite
+    )
+    key, query_base, value = vectorized.project_evidence(evidence)
+    actual, actual_state, _ = vectorized.step_projected_many(
+        key_t=key,
+        query_base_t=query_base,
+        value_t=value,
+        state_in=vectorized.initial_state(batch),
+        valid=valid,
+        create_graph=True,
+        emit_prewrite_tokens=prewrite,
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    for a, b in zip(actual_state, expected_state, strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    for a, b in zip(vectorized.parameters(), reference.parameters(), strict=True):
+        assert (a.grad is None) == (b.grad is None)
+        if a.grad is not None:
+            torch.testing.assert_close(a.grad, b.grad, rtol=2e-4, atol=2e-6)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_first_group_retry_is_content_bound_and_commits_nothing_before_backward(changed):
+    driver, trainer, model = make_driver()
+    driver.arm_next_member(trainer, model)
+    first = trainer._psm_active_armed_prepared
+    registry = driver.registry
+    expected = first.forward.result.local_tokens.detach().clone()
+    before = registry.owner.scheduler.snapshot()
+    plan = registry.abort_source_transient(first)
+    assert registry.owner.scheduler.snapshot() == before
+    assert registry.owner.adapter.sidecar._records == {}
+    if changed:
+        first.segment.evidence_visual_summary_prev[0, 1, 0] += 1
+        with pytest.raises(RuntimeError, match="SOURCE_CHANGED"):
+            registry.prepare_retry(first.segment, plan, trainer_grad_accum_iter=0)
+        assert registry.owner.scheduler.snapshot() == before
+        assert registry.owner.adapter.sidecar._records == {}
+    else:
+        retry = registry.prepare_retry(first.segment, plan, trainer_grad_accum_iter=0)
+        torch.testing.assert_close(retry.forward.result.local_tokens, expected)
+        assert registry.owner.scheduler.snapshot() == before
+        with pytest.raises(RuntimeError, match="EXHAUSTED"):
+            registry.abort_source_transient(retry)
+        assert registry.owner.adapter.sidecar._records == {}
+
+
+def test_resume_rejects_changed_episode_catalog_before_mutation():
+    original = make_driver(widths=(4, 4))
+    run_window(*original)
+    changed = make_driver(widths=(5, 4))
+    before = changed[0].state_dict()
+    with pytest.raises(RuntimeError, match="geometry"):
+        changed[0].load_state_dict(original[0].state_dict())
+    assert_state_equal(before, changed[0].state_dict())
+
+
+def test_live_delivery_metrics_records_actual_geometry(tmp_path):
+    import json
+    import time
+    from types import SimpleNamespace
+
+    from .grouped_active_metrics import ActiveDeliveryMetrics
+
+    driver, trainer, model = make_driver()
+    run_window(driver, trainer, model)
+    metrics = ActiveDeliveryMetrics(trainer=trainer, driver=driver, path=str(tmp_path / "metrics.jsonl"))
+    metrics.started = time.monotonic()
+    metrics.member_counts = [4, 4]
+    metrics.wave_counts = [1, 1]
+    metrics.losses = [1.0, 2.0]
+    model._psm_native_forward_calls = 2
+    optimizer = SimpleNamespace(param_groups=[{"params": [], "lr": 1e-4}])
+    metrics.on_before_zero_grad(model, optimizer, None)
+    record = json.loads((tmp_path / "metrics.jsonl").read_text())
+    assert record["consumers"] == 8 and record["native_forward_calls"] == 2
+    assert record["window_index"] == 1 and len(record["identities"]) == 4
