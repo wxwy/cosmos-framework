@@ -1,4 +1,17 @@
-"""CPU/static contract for Local Memory config, selectors and slow checkpoints."""
+"""CPU/static contract for Local Memory config, selectors and slow checkpoints.
+
+Scope boundary (D025, 2026-09-18): ``SELECTORS`` and everything built on it
+(``_validate_selector_cover``, ``validate_optimizer_membership``, and the optimizer
+identity used by ``strict_restore_into``) describe the **Local-Memory slow inventory**
+-- exactly the four local groups below.  They are **not** the definition of the
+production optimizer allowlist.  The active route's full optimizer scope is the config's
+``optimizer.keys_to_select`` (the inherited baseline generation/action heads **plus** the
+local groups, per MEMORY/DECISIONS.md D025).  The production training path only calls
+``validate_slow_inventory``/``canonical_slow_inventory`` (they validate the registered
+Local owner), so widening the config allowlist does not change this contract.  The exact
+opt-in scope is intentionally left to the config; this module bounds only the Local
+inventory.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -65,6 +78,9 @@ _OPTIMIZER_IDENTITY_SCHEMA = "canonical_native_local_ttt_optimizer_v1"
 _SCHEDULER_IDENTITY_SCHEMA = "canonical_native_local_ttt_scheduler_v1"
 _RUNTIME_KEY_FRAGMENTS = ("continualtttfaststate", "fast_state", "frontier", "pending", "scan", "native_forward", "commit", "retry", "suffix", "transaction", "receipt", "cursor", "queue", "rng", "grad")
 
+# Local-Memory slow inventory selectors -- the four groups owned by this contract.
+# This is NOT the production optimizer allowlist (see module docstring / D025); the
+# active route selects these on top of the baseline heads via config.keys_to_select.
 SELECTORS = (
     "local_memory_runtime.evidence_encoder.",
     "local_memory_runtime.ttt_core.",
