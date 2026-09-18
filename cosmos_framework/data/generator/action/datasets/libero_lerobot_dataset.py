@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
@@ -143,6 +144,12 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
             raise ValueError(f"latent_cache_verify_ratio must be in [0,1], got {latent_cache_verify_ratio}.")
         self._latent_cache_verify_ratio = latent_cache_verify_ratio
         self._latent_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._latent_cache_lock = threading.Lock()
+        # Per-sample augmentation seed.  Every sample derives its own
+        # ``random.Random(f"{seed}:{idx}")`` so mode/caption choices depend only on
+        # the sample identity, never on call order or thread scheduling — required
+        # because the segment prefetch workers build samples concurrently.
+        self._aug_seed = int(seed)
         if max_episodes is not None and max_episodes <= 0:
             raise ValueError(f"max_episodes must be a positive integer, got {max_episodes}")
         self._max_episodes = max_episodes
@@ -351,7 +358,10 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         if self._latent_cache_root is None:
             return None
 
-        cache_item = self._latent_cache.get(episode_index)
+        with self._latent_cache_lock:
+            cache_item = self._latent_cache.get(episode_index)
+            if cache_item is not None:
+                self._latent_cache.move_to_end(episode_index)
         if cache_item is None:
             path = self._latent_cache_root / "episodes" / f"episode_{episode_index:06d}.pt"
             if not path.is_file():
@@ -361,11 +371,23 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
                 raise ValueError(f"Unsupported latent cache format in {path}: {cache_item.get('format')!r}")
             if int(cache_item.get("episode_index", -1)) != episode_index:
                 raise ValueError(f"Latent cache episode mismatch in {path}")
-            self._latent_cache[episode_index] = cache_item
-            if len(self._latent_cache) > 8:
-                self._latent_cache.popitem(last=False)
-        else:
-            self._latent_cache.move_to_end(episode_index)
+            # Validated contiguous windows for this episode.  A window's latent is
+            # read on nearly every access (its own frame, up to `horizon` history
+            # frames, and repeated by adjacent members), so the dtype/shape/index
+            # and finiteness validation must run once per window, not once per
+            # access.  The cache dies with the episode entry, so it cannot outlive
+            # the raw `windows` dict it derives from.  The structural cache mutation
+            # is lock-guarded so segment prefetch workers may load concurrently.
+            cache_item["_validated_windows"] = {}
+            with self._latent_cache_lock:
+                self._latent_cache[episode_index] = cache_item
+                if len(self._latent_cache) > 8:
+                    self._latent_cache.popitem(last=False)
+
+        validated = cache_item["_validated_windows"]
+        cached = validated.get(start_frame)
+        if cached is not None:
+            return cached.clone()
 
         window = cache_item.get("windows", {}).get(str(start_frame))
         if not isinstance(window, dict) or not isinstance(window.get("latent"), torch.Tensor):
@@ -393,7 +415,8 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
             raise ValueError(f"Invalid latent_source_frame_indices for episode={episode_index} start_frame={start_frame}")
         if not torch.isfinite(latent).all():
             raise FloatingPointError(f"Non-finite cached latent episode={episode_index} start_frame={start_frame}")
-        return latent
+        validated[start_frame] = latent
+        return latent.clone()
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         # Resample a different valid window if a frame fails to decode (bounded retries).
@@ -410,8 +433,10 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         raise RuntimeError(f"LIBERO: failed to load a sample after 8 resamples; last error: {last_err}")
 
     def _build_item(self, idx: int) -> dict[str, Any]:
-        mode = self._choose_mode()
         idx = int(idx)
+        # Deterministic per-sample RNG: independent of call order / thread.
+        rng = random.Random(f"{self._aug_seed}:{idx}")
+        mode = self._choose_mode(rng)
         ep = int(np.searchsorted(self._valid_cum, idx, side="right"))
         prev = int(self._valid_cum[ep - 1]) if ep > 0 else 0
         start = int(self._ep_starts[ep]) + (idx - prev)
@@ -420,7 +445,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
 
         stop = start + self._chunk_length + 1
         video_latent = self._load_cached_latent(episode_index, start - int(self._ep_starts[ep]))
-        verify_cached_latent = video_latent is not None and random.random() < self._latent_cache_verify_ratio
+        verify_cached_latent = video_latent is not None and rng.random() < self._latent_cache_verify_ratio
         if video_latent is None or verify_cached_latent:
             timestamps = [float(self._row_timestamp[j]) for j in range(start, stop)]
             video = self._load_video(episode, timestamps)
@@ -435,7 +460,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         action = self._build_frame_wise_action(raw)
 
         task = self._tasks[int(self._row_task[start])]
-        ai_caption = random.choice([p.strip() for p in task.split(" | ") if p.strip()] or [task])
+        ai_caption = rng.choice([p.strip() for p in task.split(" | ") if p.strip()] or [task])
 
         local_start_frame = start - int(self._ep_starts[ep])
         extras: dict[str, Any] = {

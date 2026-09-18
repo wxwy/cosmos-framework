@@ -26,6 +26,7 @@ markers), so the datasets here exist purely to feed the canonical producer.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Mapping
 
 import torch
@@ -311,6 +312,7 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             plan_chain_id=self.plan_chain_id,
             catalog_digest=self._catalog_digest(),
             queue_seed=self._queue_seed(),
+            prefetch_depth=int(os.environ.get("PSM_ACTIVE_PREFETCH_DEPTH", "4")),
         )
         driver.attach(trainer, model)
         self.driver = driver

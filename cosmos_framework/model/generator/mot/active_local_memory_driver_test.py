@@ -114,6 +114,7 @@ def _driver(
     *,
     window_members: int,
     queue_seed: int = 0,
+    prefetch_depth: int = 0,
 ) -> ActiveLocalMemoryWindowDriver:
     return ActiveLocalMemoryWindowDriver(
         registry=registry,
@@ -121,6 +122,7 @@ def _driver(
         streams=streams,
         window_members=window_members,
         queue_seed=queue_seed,
+        prefetch_depth=prefetch_depth,
     )
 
 
@@ -570,8 +572,8 @@ def test_load_state_dict_rejects_runtime_without_scheduler_counterpart() -> None
     assert _live_identity(other) == before
 
 
-def _run_full_window(registry, producer, stream, *, window_members: int = 2):
-    driver = _driver(registry, producer, (stream,), window_members=window_members)
+def _run_full_window(registry, producer, stream, *, window_members: int = 2, prefetch_depth: int = 0):
+    driver = _driver(registry, producer, (stream,), window_members=window_members, prefetch_depth=prefetch_depth)
     trainer, model = _trainer(registry, grad_accum_iter=window_members), _model()
     driver.attach(trainer, model)
     transaction = None
@@ -789,3 +791,21 @@ def test_rollover_discards_sidecar_carry_only_for_terminal_slot() -> None:
     assert sidecar._records[0] == ("slot0", "carry0")
     assert 1 not in sidecar._records
 
+
+
+def test_prefetch_builds_the_same_window_members_as_sequential() -> None:
+    """A window armed with prefetch workers commits exactly the frozen members.
+
+    Per-sample data determinism is covered separately; this pins that the
+    background workers neither reorder nor drop a member.
+    """
+    registry = _registry({"suite": 1.0})
+    producer = _FakeProducer()
+    producer.blocks[(0, 1)] = 4
+    stream = _FakeStream(0, 1, "suite")
+
+    driver = _run_full_window(registry, producer, stream, window_members=2, prefetch_depth=2)
+
+    assert registry.owner.phase.name == "IDLE"
+    assert [identity.cursor for identity in registry.owner.scheduler.committed_identities] == [0, 1]
+    assert driver._prefetch_futures == {}

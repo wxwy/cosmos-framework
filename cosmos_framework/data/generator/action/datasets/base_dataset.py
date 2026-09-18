@@ -152,9 +152,9 @@ class ActionBaseDataset(ABC, Dataset):
             min_streak=3,
         )
 
-    def _choose_mode(self) -> str:
+    def _choose_mode(self, rng: random.Random | None = None) -> str:
         if self._mode == "joint":
-            return random.choice(_MODE_CHOICES)
+            return (rng or random).choice(_MODE_CHOICES)
         return self._mode
 
     def _video_path(self, episode: dict[str, Any], video_key: str) -> Path:

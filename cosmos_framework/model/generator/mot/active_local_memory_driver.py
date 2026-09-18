@@ -22,6 +22,7 @@ froze; ``attach`` only binds the registry and registers the batch-start hook.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -87,6 +88,7 @@ class ActiveLocalMemoryWindowDriver(Callback):
         plan_chain_id: str = "active-local-window",
         catalog_digest: str | None = None,
         queue_seed: int | None = None,
+        prefetch_depth: int = 0,
     ) -> None:
         super().__init__()
         if window_members <= 0:
@@ -123,6 +125,15 @@ class ActiveLocalMemoryWindowDriver(Callback):
         self._window: ActiveWindowFreeze | None = None
         self._window_index = 0
         self._trainer: Any = None
+        # Per-window segment prefetch: build the frozen window's SegmentBatches on
+        # background workers, overlapping the CPU-bound producer with the GPU
+        # forward/backward.  The frozen plan fixes each member's (stream, cursor),
+        # so `producer.produce` is independent of the scheduler state advanced by
+        # `_rebind_terminal`.  `prefetch_depth=0` (the default) disables it; the
+        # production launch callback enables it.
+        self._prefetch_depth = int(prefetch_depth)
+        self._prefetch_executor: ThreadPoolExecutor | None = None
+        self._prefetch_futures: dict[int, Any] = {}
 
     # ---- attachment --------------------------------------------------------
 
@@ -174,6 +185,7 @@ class ActiveLocalMemoryWindowDriver(Callback):
         self._maybe_rollover()
         freeze = self.freeze_window()
         self._window = freeze
+        self._start_prefetch(freeze)
         segment = self._produce(freeze, 0)
         trainer.arm_active_local_memory_initial(
             model, freeze.identities[0], segment, freeze.plan, grad_accum_iter=0
@@ -191,11 +203,37 @@ class ActiveLocalMemoryWindowDriver(Callback):
             model, freeze.identities[index], segment, transaction, grad_accum_iter=index
         )
 
+    # ---- per-window segment prefetch ---------------------------------------
+
+    def _start_prefetch(self, freeze: ActiveWindowFreeze) -> None:
+        self._prefetch_futures.clear()
+        if self._prefetch_depth <= 0:
+            return
+        if self._prefetch_executor is None:
+            self._prefetch_executor = ThreadPoolExecutor(max_workers=self._prefetch_depth)
+        for index in range(min(self._prefetch_depth, len(freeze.members))):
+            self._submit_prefetch(freeze, index)
+
+    def _submit_prefetch(self, freeze: ActiveWindowFreeze, index: int) -> None:
+        if self._prefetch_executor is None or not 0 <= index < len(freeze.members):
+            return
+        member = freeze.members[index]
+        self._prefetch_futures[index] = self._prefetch_executor.submit(
+            self.producer.produce, member.stream, cursor=member.cursor
+        )
+
     def _produce(self, freeze: ActiveWindowFreeze, index: int) -> "SegmentBatch":
         member = freeze.members[index]
         if member.rebind_before_admit:
             self._rebind_terminal(int(member.stream.slot_id))
-        segment = self.producer.produce(member.stream, cursor=member.cursor)
+        future = self._prefetch_futures.pop(index, None)
+        if future is not None:
+            # The worker already built this member's SegmentBatch; block only if it
+            # is not done yet, then keep the pipeline `_prefetch_depth` members ahead.
+            segment = future.result()
+            self._submit_prefetch(freeze, index + self._prefetch_depth)
+        else:
+            segment = self.producer.produce(member.stream, cursor=member.cursor)
         planned = int(freeze.plan.planned_n_valid[index])
         if int(segment.consumer_valid.sum()) != planned:
             raise RuntimeError("active Local segment valid count differs from the frozen plan")
