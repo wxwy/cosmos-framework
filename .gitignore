@@ -224,3 +224,11 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local closed-loop eval outputs + ad-hoc eval launch scripts (not framework
+# content; left in place, only kept out of git status).
+/results/libero_closed_loop_4in1/
+/results/libero_closed_loop_4in1_*/
+/examples/eval_libero_cfg_4090.sh
+/examples/eval_libero_spatial_cfg_4090.sh
+/examples/goal_task0_water_check.sh
