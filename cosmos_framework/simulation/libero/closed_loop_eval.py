@@ -42,7 +42,6 @@ import random
 import sys
 import time
 from dataclasses import dataclass, field
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +56,7 @@ from cosmos_framework.data.generator.action.libero_pose_utils import (
 )
 from cosmos_framework.data.generator.action.utils.pose_utils import convert_rotation
 from cosmos_framework.data.generator.action.utils.viewpoint_utils import DEFAULT_VIEWPOINT_TEMPLATES
+from cosmos_framework.simulation.libero.local_memory_client import ClientLocalMemory
 
 benchmark: Any
 get_libero_path: Any
@@ -150,6 +150,8 @@ class ActionEnvironmentClient:
         self.prompt = prompt
         self.image_size = image_size
         self.timeout = timeout
+        self.memory = ClientLocalMemory()
+        self._memory_info_loaded = False
 
     def check_health(self) -> bool:
         """Check if the model server is healthy."""
@@ -163,7 +165,30 @@ class ActionEnvironmentClient:
         """Get model server info."""
         resp = requests.get(f"{self.server_url}/info", timeout=5.0)
         resp.raise_for_status()
-        return resp.json()
+        info = resp.json()
+        self.memory.enabled = bool((info.get("local_memory") or {}).get("enabled", False))
+        self._memory_info_loaded = True
+        return info
+
+    def begin_memory_episode(self, slot=0):
+        if not self._memory_info_loaded:
+            self.get_info()
+        self.end_memory_episode(slot)
+        self.memory.begin(slot)
+
+    def end_memory_episode(self, slot=0):
+        session = self.memory.end(slot)
+        if session is not None:
+            response = requests.post(f"{self.server_url}/reset",
+                json={"session_id": session}, timeout=5.0)
+            response.raise_for_status()
+
+    def record_memory_step(self, slot, observation, executed_action, *, gripper_mode):
+        if self.memory.enabled:
+            image = self.concatenate_images(observation) if isinstance(observation, list) else self.resize_image(observation)
+            self.memory.record_executed(
+                slot, self.encode_image_raw(image), executed_action, gripper_mode=gripper_mode
+            )
 
     def notify_next_episode(self) -> None:
         """Notify server to advance to next episode (used with dataset action server)."""
@@ -254,6 +279,10 @@ class ActionEnvironmentClient:
             "image_size": self.image_size,
         }
 
+        local = self.memory.payload(0)
+        if local is not None:
+            payload["local_memory"] = local
+
         resp = requests.post(
             f"{self.server_url}/predict",
             json=payload,
@@ -265,13 +294,21 @@ class ActionEnvironmentClient:
         result = resp.json()
         if "error" in result and result["error"]:
             raise RuntimeError(f"Model server error: {result['error']}")
+        if self.memory.enabled:
+            statuses = result.get("local_memory")
+            if not isinstance(statuses, list) or len(statuses) != 1:
+                raise ValueError("TTT server did not acknowledge the memory request")
+            self.memory.acknowledge(0, statuses[0])
         return result
 
-    def predict_batch(self, observations: list[list[np.ndarray]]) -> list[list[list[float]]]:
+    def predict_batch(self, observations: list[list[np.ndarray]], *, slot_ids=None) -> list[list[list[float]]]:
         """Batched inference: a list of per-env multi-view observations -> ONE
         POST /predict_batch -> a list of action chunks (one per env). Used by the
         vectorized eval so N parallel envs share a single diffusion forward."""
         items = []
+        slots = list(range(len(observations))) if slot_ids is None else list(slot_ids)
+        if len(slots) != len(observations) or len(set(slots)) != len(slots):
+            raise ValueError("predict_batch requires one unique slot identity per observation")
         for obs_imgs in observations:
             concat = self.concatenate_images(obs_imgs) if len(obs_imgs) > 1 else self.resize_image(obs_imgs[0])
             items.append(
@@ -282,6 +319,10 @@ class ActionEnvironmentClient:
                     "image_size": self.image_size,
                 }
             )
+        for slot, item in zip(slots, items, strict=True):
+            local = self.memory.payload(slot)
+            if local is not None:
+                item["local_memory"] = local
         resp = requests.post(
             f"{self.server_url}/predict_batch",
             json={"items": items},
@@ -292,6 +333,12 @@ class ActionEnvironmentClient:
         result = resp.json()
         if "error" in result and result["error"]:
             raise RuntimeError(f"Model server error: {result['error']}")
+        if self.memory.enabled:
+            statuses = result.get("local_memory")
+            if not isinstance(statuses, list) or len(statuses) != len(slots):
+                raise ValueError("TTT server did not acknowledge the batched memory requests")
+            for slot, status in zip(slots, statuses, strict=True):
+                self.memory.acknowledge(slot, status)
         return result["actions"]
 
 
@@ -436,7 +483,7 @@ def _annotate_frame_number(
     instruction: 任务语言指令，置于左上角；多行/超长会截断到 80 字符换行。
     border_color: 非 None 时在帧四周画 3px 细边框（输入帧绿 / 预测帧红）。
     """
-    from PIL import ImageDraw, ImageFont
+    from PIL import ImageDraw
 
     annotated = frame.copy()
     draw = ImageDraw.Draw(annotated)
@@ -791,168 +838,178 @@ def _run_episode(
     pred_video_fps: int = 20,
     task_description: str = "",
 ) -> EpisodeResult:
-    env.reset()
-    if initial_state is not None:
-        obs = env.set_init_state(initial_state)
-    else:
-        obs = env.get_observation()
-
-    action_queue: list[list[float]] = []
-    base_pose: tuple[np.ndarray, np.ndarray] | None = None
-    step = 0
-    success = False
-    gif_frames: list[Image.Image] = []
-    action_log: list[list[float]] = []
-    predict_log: list[dict] = []
-    prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]] = []
-    is_multi_view = len(cameras) > 1
-    resolved_rotation_space = _infer_rotation_space(action_dim, rotation_space)
-
-    comparison_windows: list[tuple[list[Image.Image], list[Image.Image]]] = []
-
-    def record_frame(current_obs: dict[str, Any]) -> None:
-        if gif_path is None and mp4_path is None:
-            return
-        if is_multi_view:
-            imgs = _get_libero_images(
-                current_obs,
-                cameras,
-                flip_images=flip_images,
-                rotate_180=rotate_180,
-            )
-            image = client.concatenate_images(imgs)
+    client.begin_memory_episode(0)
+    try:
+        env.reset()
+        if initial_state is not None:
+            obs = env.set_init_state(initial_state)
         else:
-            image = _get_libero_image(
-                current_obs,
-                cameras[0],
-                flip_images=flip_images,
-                rotate_180=rotate_180,
-            )
-        image = _ensure_uint8_image(image)
-        frame = Image.fromarray(image).convert("RGB")
-        gif_frames.append(_annotate_frame_number(frame, step, instruction=task_description))
+            obs = env.get_observation()
 
-    def capture_comparison_frame(current_obs: dict[str, Any]) -> Image.Image:
-        """Capture an env frame matching Action's input view (multi-view concatenated if applicable)."""
-        if is_multi_view:
-            imgs = _get_libero_images(current_obs, cameras, flip_images=flip_images, rotate_180=rotate_180)
-            concat = client.concatenate_images(imgs)
-            return Image.fromarray(_ensure_uint8_image(concat)).convert("RGB")
-        img = _get_libero_image(current_obs, cameras[0], flip_images=flip_images, rotate_180=rotate_180)
-        return Image.fromarray(_ensure_uint8_image(img)).convert("RGB")
+        action_queue: list[list[float]] = []
+        base_pose: tuple[np.ndarray, np.ndarray] | None = None
+        step = 0
+        success = False
+        gif_frames: list[Image.Image] = []
+        action_log: list[list[float]] = []
+        predict_log: list[dict] = []
+        prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]] = []
+        is_multi_view = len(cameras) > 1
+        resolved_rotation_space = _infer_rotation_space(action_dim, rotation_space)
 
-    record_frame(obs)
+        comparison_windows: list[tuple[list[Image.Image], list[Image.Image]]] = []
 
-    while step < max_steps:
-        if step < warmup_steps:
-            dummy = _get_libero_dummy_action()
-            obs, _, _, _ = env.step(dummy)
-            action_log.append(dummy)
-            step += 1
-            record_frame(obs)
-            continue
-
-        if not action_queue:
+        def record_frame(current_obs: dict[str, Any]) -> None:
+            if gif_path is None and mp4_path is None:
+                return
             if is_multi_view:
-                observation_imgs = _get_libero_images(
-                    obs,
+                imgs = _get_libero_images(
+                    current_obs,
                     cameras,
                     flip_images=flip_images,
                     rotate_180=rotate_180,
                 )
-                result = client.predict(observation_imgs)
+                image = client.concatenate_images(imgs)
             else:
-                observation_img = _get_libero_image(
-                    obs,
+                image = _get_libero_image(
+                    current_obs,
                     cameras[0],
                     flip_images=flip_images,
                     rotate_180=rotate_180,
                 )
-                result = client.predict(observation_img)
-            actions = result.get("action", [])
-            if not actions:
-                return EpisodeResult(False, step, "Empty action chunk from server", action_log, predict_log)
-            action_queue = _select_action_chunk(actions, action_horizon)
+            image = _ensure_uint8_image(image)
+            frame = Image.fromarray(image).convert("RGB")
+            gif_frames.append(_annotate_frame_number(frame, step, instruction=task_description))
 
-            # Save the full prediction result for this request: the denormalized
-            # action chunk the server returned, plus the slice that will actually
-            # be executed (bounded by --action-horizon), keyed by env step.
-            predict_log.append(
-                {
-                    "step": step,
-                    "chunk_size": len(actions),
-                    "action_chunk": actions,
-                    "executed": list(action_queue),
-                    "n_execute": len(action_queue),
-                    "video_frames": len(result.get("video", [])),
-                }
-            )
+        def capture_comparison_frame(current_obs: dict[str, Any]) -> Image.Image:
+            """Capture an env frame matching Action's input view (multi-view concatenated if applicable)."""
+            if is_multi_view:
+                imgs = _get_libero_images(current_obs, cameras, flip_images=flip_images, rotate_180=rotate_180)
+                concat = client.concatenate_images(imgs)
+                return Image.fromarray(_ensure_uint8_image(concat)).convert("RGB")
+            img = _get_libero_image(current_obs, cameras[0], flip_images=flip_images, rotate_180=rotate_180)
+            return Image.fromarray(_ensure_uint8_image(img)).convert("RGB")
 
-            action_video_b64 = result.get("video", [])
-            if action_video_b64 and (pred_video_dir is not None or comparison_path is not None):
-                action_frames = _decode_b64_frames(action_video_b64)
-                input_frame = capture_comparison_frame(obs)
-                if pred_video_dir is not None:
-                    prediction_videos.append((step, input_frame, action_frames, task_description))
-                if comparison_path is not None:
-                    comparison_windows.append((action_frames, [input_frame]))
-
-            if action_space == "relative":
-                base_pose = _obs_to_pose(obs)
-
-        raw_action = _format_action(action_queue.pop(0), action_dim)
-        if action_space == "relative":
-            if base_pose is None:
-                raise RuntimeError("Missing base pose for relative action conversion")
-            current_pose = _obs_to_pose(obs)
-            action = _anchored_action_to_delta(
-                np.asarray(raw_action, dtype=np.float32),
-                base_pose,
-                current_pose,
-                resolved_rotation_space,
-            )
-            action_list = action.tolist()
-        else:
-            action = _framewise_action_to_delta(
-                np.asarray(raw_action, dtype=np.float32),
-                resolved_rotation_space,
-            )
-            action_list = action.tolist()
-
-        # Map the model's gripper command to the env's [-1, 1] per the dataset convention.
-        action_list = _remap_gripper(action_list, gripper_mode)
-
-        action_log.append(action_list)
-        obs, _, done, info = env.step(action_list)
-        step += 1
         record_frame(obs)
 
+        while step < max_steps:
+            if step < warmup_steps:
+                dummy = _get_libero_dummy_action()
+                obs, _, _, _ = env.step(dummy)
+                action_log.append(dummy)
+                step += 1
+                record_frame(obs)
+                continue
+
+            if not action_queue:
+                if is_multi_view:
+                    observation_imgs = _get_libero_images(
+                        obs,
+                        cameras,
+                        flip_images=flip_images,
+                        rotate_180=rotate_180,
+                    )
+                    result = client.predict(observation_imgs)
+                else:
+                    observation_img = _get_libero_image(
+                        obs,
+                        cameras[0],
+                        flip_images=flip_images,
+                        rotate_180=rotate_180,
+                    )
+                    result = client.predict(observation_img)
+                actions = result.get("action", [])
+                if not actions:
+                    return EpisodeResult(False, step, "Empty action chunk from server", action_log, predict_log)
+                action_queue = _select_action_chunk(actions, action_horizon)
+
+                # Save the full prediction result for this request: the denormalized
+                # action chunk the server returned, plus the slice that will actually
+                # be executed (bounded by --action-horizon), keyed by env step.
+                predict_log.append(
+                    {
+                        "step": step,
+                        "chunk_size": len(actions),
+                        "action_chunk": actions,
+                        "executed": list(action_queue),
+                        "n_execute": len(action_queue),
+                        "video_frames": len(result.get("video", [])),
+                    }
+                )
+
+                action_video_b64 = result.get("video", [])
+                if action_video_b64 and (pred_video_dir is not None or comparison_path is not None):
+                    action_frames = _decode_b64_frames(action_video_b64)
+                    input_frame = capture_comparison_frame(obs)
+                    if pred_video_dir is not None:
+                        prediction_videos.append((step, input_frame, action_frames, task_description))
+                    if comparison_path is not None:
+                        comparison_windows.append((action_frames, [input_frame]))
+
+                if action_space == "relative":
+                    base_pose = _obs_to_pose(obs)
+
+            raw_action = _format_action(action_queue.pop(0), action_dim)
+            if action_space == "relative":
+                if base_pose is None:
+                    raise RuntimeError("Missing base pose for relative action conversion")
+                current_pose = _obs_to_pose(obs)
+                action = _anchored_action_to_delta(
+                    np.asarray(raw_action, dtype=np.float32),
+                    base_pose,
+                    current_pose,
+                    resolved_rotation_space,
+                )
+                action_list = action.tolist()
+            else:
+                action = _framewise_action_to_delta(
+                    np.asarray(raw_action, dtype=np.float32),
+                    resolved_rotation_space,
+                )
+                action_list = action.tolist()
+
+            # Map the model's gripper command to the env's [-1, 1] per the dataset convention.
+            action_list = _remap_gripper(action_list, gripper_mode)
+
+            action_log.append(action_list)
+            completed_observation = (
+                _get_libero_images(obs, cameras, flip_images=flip_images, rotate_180=rotate_180)
+                if client.memory.enabled else None
+            )
+            obs, _, done, info = env.step(action_list)
+            if completed_observation is not None:
+                client.record_memory_step(0, completed_observation, action_list, gripper_mode=gripper_mode)
+            step += 1
+            record_frame(obs)
+
+            if comparison_path is not None and comparison_windows:
+                comparison_windows[-1][1].append(capture_comparison_frame(obs))
+
+            if isinstance(info, dict) and info.get("success"):
+                success = True
+                break
+            if done:
+                success = True if not isinstance(info, dict) else bool(info.get("success", True))
+                break
+
+        if gif_path is not None:
+            _save_gif(gif_frames, gif_path, gif_fps)
+        if mp4_path is not None:
+            _save_mp4(gif_frames, mp4_path, mp4_fps)
+        if pred_video_dir is not None and prediction_videos:
+            _save_prediction_videos(prediction_videos, pred_video_dir, pred_video_fps)
         if comparison_path is not None and comparison_windows:
-            comparison_windows[-1][1].append(capture_comparison_frame(obs))
-
-        if isinstance(info, dict) and info.get("success"):
-            success = True
-            break
-        if done:
-            success = True if not isinstance(info, dict) else bool(info.get("success", True))
-            break
-
-    if gif_path is not None:
-        _save_gif(gif_frames, gif_path, gif_fps)
-    if mp4_path is not None:
-        _save_mp4(gif_frames, mp4_path, mp4_fps)
-    if pred_video_dir is not None and prediction_videos:
-        _save_prediction_videos(prediction_videos, pred_video_dir, pred_video_fps)
-    if comparison_path is not None and comparison_windows:
-        _save_comparison_gif(comparison_windows, comparison_path, gif_fps)
-    # Annotate per-episode media with success/fail so users can filter at a
-    # glance. The helper no-ops when the source path was never written (empty
-    # frame list, --save_* disabled), so it composes cleanly with the
-    # conditional save branches above.
-    for media_path in (gif_path, mp4_path, pred_video_dir, comparison_path):
-        if media_path is not None and media_path.exists():
-            _rename_with_outcome(media_path, success)
-    return EpisodeResult(success, step, None, action_log, predict_log)
+            _save_comparison_gif(comparison_windows, comparison_path, gif_fps)
+        # Annotate per-episode media with success/fail so users can filter at a
+        # glance. The helper no-ops when the source path was never written (empty
+        # frame list, --save_* disabled), so it composes cleanly with the
+        # conditional save branches above.
+        for media_path in (gif_path, mp4_path, pred_video_dir, comparison_path):
+            if media_path is not None and media_path.exists():
+                _rename_with_outcome(media_path, success)
+        return EpisodeResult(success, step, None, action_log, predict_log)
+    finally:
+        client.end_memory_episode(0)
 
 
 def _load_initial_states(
@@ -1200,6 +1257,8 @@ def _run_task_vectorized(
             states = np.stack([np.asarray(init_states[t], dtype=np.float64) for t in wave])
             obs_arr = venv.set_init_state(states, id=slots)
             obs_by_slot = {s: obs_arr[i] for i, s in enumerate(slots)}
+            for slot in slots:
+                client.begin_memory_episode(slot)
             done = {s: False for s in slots}
             succ = {s: False for s in slots}
             err: dict[int, str | None] = {s: None for s in slots}
@@ -1222,7 +1281,7 @@ def _run_task_vectorized(
                     for s in active
                 ]
                 try:
-                    chunks = client.predict_batch(obs_batch)
+                    chunks = client.predict_batch(obs_batch, slot_ids=active)
                 except Exception as e:  # noqa: BLE001
                     for s in active:
                         done[s] = True
@@ -1246,9 +1305,13 @@ def _run_task_vectorized(
                         raw = _format_action(chunk_by_slot[s][h], action_dim)
                         a = _framewise_action_to_delta(np.asarray(raw, dtype=np.float32), resolved_rotation_space)
                         env_actions.append(_remap_gripper(a.tolist(), gripper_mode))
+                    completed = {s: _get_libero_images(obs_by_slot[s], cameras,
+                        flip_images=flip_images, rotate_180=rotate_180) for s in cur} if client.memory.enabled else {}
                     obs_arr, _, d, info = venv.step(np.stack(env_actions), id=cur)
                     step += 1
                     for i, s in enumerate(cur):
+                        if completed:
+                            client.record_memory_step(s, completed[s], env_actions[i], gripper_mode=gripper_mode)
                         obs_by_slot[s] = obs_arr[i]
                         di = bool(d[i])
                         ii = info[i] if isinstance(info, (list, np.ndarray)) else info
@@ -1262,6 +1325,7 @@ def _run_task_vectorized(
                             nsteps[s] = step
             per_ep_elapsed = round((time.perf_counter() - t_wave0) / max(1, len(wave)), 3)
             for s, t in zip(slots, wave):
+                client.end_memory_episode(s)
                 results[t] = {
                     "episode": t,
                     "success": bool(succ[s]),
@@ -1270,6 +1334,8 @@ def _run_task_vectorized(
                     "elapsed_s": per_ep_elapsed,
                 }
     finally:
+        for slot in range(n):
+            client.end_memory_episode(slot)
         try:
             venv.close()
         except Exception:  # noqa: BLE001

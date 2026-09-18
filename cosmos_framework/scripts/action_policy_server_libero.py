@@ -80,6 +80,7 @@ from cosmos_framework.inference.common.args import CheckpointOverrides, ConfigFi
 from cosmos_framework.inference.common.config import deserialize_config_dict
 from cosmos_framework.inference.common.init import init_output_dir
 from cosmos_framework.inference.inference import OmniInference
+from cosmos_framework.inference.local_memory_policy import PolicyLocalMemoryAdapter
 from cosmos_framework.scripts.action_policy_server_utils import (
     DEFAULT_FALLBACK_OUTPUT_DIR,
     disable_runtime_ema_for_frozen_config,
@@ -87,8 +88,8 @@ from cosmos_framework.scripts.action_policy_server_utils import (
     maybe_init_distributed,
 )
 from cosmos_framework.utils import log
-from cosmos_framework.utils.lazy_config import instantiate
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
+from cosmos_framework.utils.lazy_config import instantiate
 
 _DEFAULT_ACTION_CHUNK_SIZE = 16
 ActionNormalization = Literal["auto", "meanstd", "minmax", "quantile", "quantile_rot"]
@@ -448,6 +449,11 @@ class ActionServerArgs(pydantic.BaseModel):
     """Output directory for ``OmniInference`` (saved config.yaml, benchmarks).
     Defaults to ``--dump-dir`` if set, else ``/tmp/cosmos3_action_server``."""
 
+    local_memory_mode: Literal["auto", "off", "required"] = "auto"
+    """Auto enables causal session memory for TTT checkpoints; off is explicit ablation."""
+    local_memory_max_sessions: int = 64
+    """Bounded active episode states; completed sessions must be reset explicitly."""
+
     # ----- single-rank parallelism / sampler ----------------------------------
     sampler: Literal["unipc", "edm"] = "unipc"
     """Diffusion sampler used by ``OmniInference``."""
@@ -689,6 +695,9 @@ class ActionModelService:
         if self.raw_action_dim is None:
             self.raw_action_dim = 7
 
+        self.local_memory_adapter = PolicyLocalMemoryAdapter(
+            self, mode=args.local_memory_mode, max_sessions=args.local_memory_max_sessions
+        )
         if args.run_validation:
             self._run_developer_validation()
 
@@ -829,6 +838,7 @@ class ActionModelService:
             "max_action_dim": self.cfg.max_action_dim,
             "raw_action_dim": self.cfg.raw_action_dim,
             "action_stats_path": str(self.cfg.action_stats_path) if self.cfg.action_stats_path else None,
+            "local_memory": self.local_memory_adapter.info(),
         }
 
     # ------------------------------------------------------------------
@@ -957,12 +967,11 @@ class ActionModelService:
         t_inf0 = time.monotonic()
         with self._lock:
             with torch.inference_mode():
-                samples = self.model.generate_samples_from_batch(
-                    batch,
-                    guidance=self.cfg.guidance,
-                    seed=[self.cfg.seed] * n,
-                    num_steps=self.cfg.num_steps,
-                    has_negative_prompt=False,
+                samples = self.local_memory_adapter.generate(
+                    reqs, batch, lambda: self.model.generate_samples_from_batch(
+                        batch, guidance=self.cfg.guidance, seed=[self.cfg.seed] * n,
+                        num_steps=self.cfg.num_steps, has_negative_prompt=False,
+                    )
                 )
         t_inf1 = time.monotonic()
         actions: list[list[list[float]]] = []
@@ -974,7 +983,7 @@ class ActionModelService:
             f"[action-server] predict_batch n={n} steps={self.cfg.num_steps} "
             f"ms_total={(time.monotonic() - t0) * 1000.0:.1f} ms_infer={(t_inf1 - t_inf0) * 1000.0:.1f}"
         )
-        return {"actions": actions}
+        return {"actions": actions, "local_memory": samples.get("_local_memory_status")}
 
     def predict_policy(self, req: dict[str, Any]) -> dict[str, Any]:
         """
@@ -1059,12 +1068,11 @@ class ActionModelService:
         t_inf0 = time.monotonic()
         with self._lock:
             with torch.inference_mode():
-                samples = self.model.generate_samples_from_batch(
-                    batch,
-                    guidance=self.cfg.guidance,
-                    seed=[self.cfg.seed],
-                    num_steps=self.cfg.num_steps,
-                    has_negative_prompt=False,
+                samples = self.local_memory_adapter.generate(
+                    [req], batch, lambda: self.model.generate_samples_from_batch(
+                        batch, guidance=self.cfg.guidance, seed=[self.cfg.seed],
+                        num_steps=self.cfg.num_steps, has_negative_prompt=False,
+                    )
                 )
                 pred_action = samples["action"][0]  # [T,D] or [1,T,D]
 
@@ -1118,7 +1126,8 @@ class ActionModelService:
             f"video_frames={len(pred_video_b64)} "
             f"ms_total={dt_total_ms:.1f} ms_decode={dt_decode_ms:.1f} ms_infer={dt_inf_ms:.1f}"
         )
-        return {"action": pred_action_list, "video": pred_video_b64}
+        return {"action": pred_action_list, "video": pred_video_b64,
+                "local_memory": samples.get("_local_memory_status")}
 
     # ------------------------------------------------------------------
     # Developer validation (optional, --run-validation)
@@ -1227,7 +1236,7 @@ class _ActionHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "Not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in ("/", "/predict", "/predict_batch"):
+        if self.path not in ("/", "/predict", "/predict_batch", "/reset"):
             self._send_json(404, {"error": "Not found"})
             return
 
@@ -1273,6 +1282,11 @@ class _ActionHandler(BaseHTTPRequestHandler):
 
         is_batch = self.path == "/predict_batch"
         try:
+            if self.path == "/reset":
+                with service._lock:
+                    service.local_memory_adapter.reset(req.get("session_id"))
+                self._send_json(200, {"status": "reset"})
+                return
             if is_batch:
                 out = service.predict_policy_batch(req.get("items", []))
             else:
