@@ -301,8 +301,14 @@ if _strict_bool_env("PSM_R09_B1_TTT_ENABLED"):
     ]
 
 if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
-    # R09-B TTT active wiring trains exactly the four frozen slow groups.
-    action_policy_libero_edge_all["optimizer"]["keys_to_select"] = list(TTT_SLOW_GROUP_SELECTORS)
+    # R09-B TTT active wiring adds the four frozen slow groups ON TOP OF the
+    # inherited baseline allowlist (generation + action heads).  It must append,
+    # not overwrite: the intended training scope is baseline heads + local-memory
+    # branch together, so the generation/action heads keep receiving gradient.
+    _baseline_slow_selectors = list(action_policy_libero_edge_all["optimizer"]["keys_to_select"])
+    action_policy_libero_edge_all["optimizer"]["keys_to_select"] = (
+        _baseline_slow_selectors + list(TTT_SLOW_GROUP_SELECTORS)
+    )
 
 # 单卡多 suite：替换 RankPartitionedDataLoader（world_size>=4 断言不满足）为
 # IterativeJointDataLoader 轮询等权混合（每 grad-accum 窗口 16 批 = 4 套 × 4 次）。
