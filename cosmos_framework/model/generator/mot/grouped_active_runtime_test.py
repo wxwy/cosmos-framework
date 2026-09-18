@@ -279,24 +279,25 @@ def test_resume_rejects_changed_episode_catalog_before_mutation():
 
 def test_live_delivery_metrics_records_actual_geometry(tmp_path):
     import json
-    import time
-    from types import SimpleNamespace
 
     from .grouped_active_metrics import ActiveDeliveryMetrics
 
     driver, trainer, model = make_driver()
     run_window(driver, trainer, model)
+    trainer.last_optimizer_step_timing = {"step_wall_s": 1.0}
     metrics = ActiveDeliveryMetrics(trainer=trainer, driver=driver, path=str(tmp_path / "metrics.jsonl"))
-    metrics.started = time.monotonic()
-    metrics.member_counts = [4, 4]
-    metrics.wave_counts = [1, 1]
-    metrics.losses = [1.0, 2.0]
+    metrics._window_started = 0.0
+    metrics._starting_state_sha = metrics._fast_state_sha()
+    metrics._losses = [1.0, 2.0]
+    metrics._waves = [1, 1]
+    metrics._identities = [(0, "test", i) for i in range(driver._group_plan.n_window)]
     model._psm_native_forward_calls = 2
-    optimizer = SimpleNamespace(optimizers=[SimpleNamespace(param_groups=[{"params": [], "lr": 1e-4}])])
-    metrics.on_before_zero_grad(model, optimizer, None)
+    metrics.on_training_step_end(model, {}, {}, torch.tensor(1.0), iteration=1)
     record = json.loads((tmp_path / "metrics.jsonl").read_text())
-    assert record["consumers"] == 8 and record["native_forward_calls"] == 2
-    assert record["window_index"] == 1 and len(record["identities"]) == 4
+    assert record["valid_consumers"] == 8 and record["native_forwards"] == 2
+    assert record["window_index"] == 1 and len(record["actual_consumer_identities"]) == 8
+    assert record["fast_state_sha256"] == metrics._fast_state_sha()
+    assert record["fast_state_before_first_group_sha256"] is not None
 
 
 def test_active_group_explicitly_rejects_partial_tbptt_row():
@@ -326,3 +327,51 @@ def test_prepare_error_preserves_original_exception_and_no_row_commit():
             driver.arm_next_member(trainer, model)
     assert driver.registry.owner.adapter.sidecar._records == {}
     assert driver.registry.owner.scheduler.committed_identities == []
+
+
+@pytest.mark.parametrize("slots", [4, 8, 12])
+def test_configurable_slot_count_preserves_consumer_accounting(slots):
+    driver, trainer, _ = make_driver(group_size=slots, ga=3, widths=(20,) * slots)
+    plan = driver._plan_groups(driver.freeze_window())
+    assert plan.ga_effective == trainer.config.trainer.grad_accum_iter == 3
+    assert plan.n_window == slots * driver.producer.ttt_tbptt_steps * 3
+    assert all(len(member.row_identities) == slots for member in plan.members)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires authorized CUDA")
+def test_cuda_vectorized_fast_state_and_outer_gradients_match_scalar():
+    from .local_evidence import ContinualTTTLocalMemoryCore
+
+    torch.manual_seed(59)
+    reference = ContinualTTTLocalMemoryCore(
+        evidence_dim=8, local_dim=4, ttt_dim=6, fast_hidden_dim=10, k_local=2
+    ).cuda()
+    vectorized = copy.deepcopy(reference)
+    evidence = torch.randn(8, 8, device="cuda")
+    valid = torch.ones(8, dtype=torch.bool, device="cuda")
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        expected, state = _original_row_update(
+            reference, evidence, reference.initial_state(8, device="cuda"), valid
+        )
+        key, query, value = vectorized.project_evidence(evidence)
+        actual, got, _ = vectorized.step_projected_many(
+            key_t=key,
+            query_base_t=query,
+            value_t=value,
+            state_in=vectorized.initial_state(8, device="cuda"),
+            valid=valid,
+            create_graph=True,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+        for a, b in zip(got, state, strict=True):
+            torch.testing.assert_close(a, b, rtol=2e-5, atol=2e-6)
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        for a, b in zip(vectorized.parameters(), reference.parameters(), strict=True):
+            assert (a.grad is None) == (b.grad is None)
+            if a.grad is not None:
+                torch.testing.assert_close(a.grad, b.grad, rtol=3e-4, atol=3e-6)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32

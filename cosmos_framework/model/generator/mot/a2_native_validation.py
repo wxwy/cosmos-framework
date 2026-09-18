@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
 from cosmos_framework.utils import misc
@@ -130,6 +131,58 @@ def native_group_parity(model, segments):
         model._psm_native_forward_calls = old_calls
 
 
+
+def rgb_visual_summary_parity(model, producer, stream):
+    """Real raw-RGB witness for the causal visual96 evidence used online.
+
+    The exact-window cache is [T_latent,C_latent,H,W].  We decode the same
+    17-frame dataset item, encode it through the loaded model VAE, and also
+    encode only its first causal frame (the online-server route).  Causality
+    requires that the first latent / pooled visual96 agree.
+    """
+    source = producer.frame_source
+    old_ratio = source._latent_cache_verify_ratio
+    try:
+        source._latent_cache_verify_ratio = 1.0
+        item = source._build_item(producer._flat_index(stream, 0))
+    finally:
+        source._latent_cache_verify_ratio = old_ratio
+    raw = item.get("video")
+    cached = item.get("video_latent")
+    if not isinstance(raw, torch.Tensor) or raw.dtype is not torch.uint8:
+        raise RuntimeError("RGB parity requires the real uint8 dataset window")
+    if not isinstance(cached, torch.Tensor) or cached.ndim != 4:
+        raise RuntimeError("RGB parity requires the exact-window cached latent")
+    device = next(model.net.parameters()).device
+    with torch.inference_mode():
+        full = model._encode_uint8_vision_item(raw.unsqueeze(0).to(device)).float()
+        first = model._encode_uint8_vision_item(raw[:, :1].unsqueeze(0).to(device)).float()
+    expected = cached.permute(1, 0, 2, 3).unsqueeze(0).to(device=device, dtype=torch.float32)
+    if tuple(full.shape) != tuple(expected.shape) or first.shape[2] != 1:
+        raise RuntimeError(
+            f"RGB parity latent shape mismatch: full={tuple(full.shape)} cache={tuple(expected.shape)} first={tuple(first.shape)}"
+        )
+    full_max = float((full - expected).abs().max())
+    first_max = float((first[:, :, 0] - expected[:, :, 0]).abs().max())
+    cached96 = F.adaptive_avg_pool2d(expected[0, :, 0].unsqueeze(0), (1, 2)).flatten()
+    online96 = F.adaptive_avg_pool2d(first[0, :, 0].unsqueeze(0), (1, 2)).flatten()
+    visual96_max = float((online96 - cached96).abs().max())
+    # Existing exact-window parity is normally near numerical roundoff.  Keep a
+    # strict but non-bitwise tolerance because VAE kernels may use different
+    # legal batch/temporal launch geometry.
+    tolerance = 2e-4
+    return {
+        "result": "PASS" if full_max <= tolerance and first_max <= tolerance and visual96_max <= tolerance else "FAIL",
+        "episode_id": str(stream.episode_index),
+        "raw_shape": list(raw.shape),
+        "cache_shape": list(cached.shape),
+        "full_latent_max_abs": full_max,
+        "first_causal_latent_max_abs": first_max,
+        "visual96_max_abs": visual96_max,
+        "tolerance": tolerance,
+        "scope": "same real raw 17-frame LIBERO window: cache vs full VAE and first-frame causal online visual96",
+    }
+
 def native_online_probe(model, segment):
     """Recorded observations exercise real generation, not an environment rollout."""
     runtime = model.net.local_memory_runtime
@@ -199,9 +252,14 @@ class A2NativeValidation(Callback):
         try:
             report["native_group_parity"] = native_group_parity(model, segments)
             report["online_generation"] = native_online_probe(model, segments[0])
+            producer = self.driver.producer._route(streams[0])
+            report["rgb_visual96_parity"] = rgb_visual_summary_parity(model, producer, streams[0])
             report["result"] = (
                 "PASS"
-                if all(report[key]["result"] == "PASS" for key in ("native_group_parity", "online_generation"))
+                if all(
+                    report[key]["result"] == "PASS"
+                    for key in ("native_group_parity", "online_generation", "rgb_visual96_parity")
+                )
                 else "FAIL"
             )
         except Exception as error:
