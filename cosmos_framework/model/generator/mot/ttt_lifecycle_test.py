@@ -599,14 +599,12 @@ def test_recipe_r09_b_ttt_selects_four_slow_groups_and_callback(monkeypatch: pyt
     cfg = recipe._action_policy_libero_edge_model_config()
     assert cfg["local_ttt_enabled"] is True
     assert cfg["local_history_backend"] == "ttt_fast_weight"
-    # Exact replacement with the contract selectors (four frozen slow groups).
-    assert list(SELECTORS) == [
-        "local_history_runtime.encoder",
-        "local_history_runtime.recurrent_backend",
-        "local_memory2llm",
-        "local_memory_modality_embed",
-    ]
-    assert recipe.action_policy_libero_edge_all["optimizer"]["keys_to_select"] == list(SELECTORS)
+    # D025: canonical Local inventory plus the pristine baseline allowlist.
+    expected = list(recipe.action_policy_libero_all_nano["optimizer"]["keys_to_select"]) + list(SELECTORS)
+    actual = recipe.action_policy_libero_edge_all["optimizer"]["keys_to_select"]
+    assert actual == expected
+    assert len(actual) == len(set(actual)) == 11
+    assert "local_history_runtime" not in actual
     callbacks = recipe.action_policy_libero_edge_all["trainer"]["callbacks"]
     assert "r09_b_ttt_lifecycle" in callbacks
     target = callbacks["r09_b_ttt_lifecycle"]["_target_"]
@@ -619,11 +617,15 @@ def test_recipe_r09_b_ttt_selector_covers_continual_core_not_readout(monkeypatch
     torch.manual_seed(0)
     model = nn.Module()
     model.net = nn.Module()
-    model.net.local_history_runtime = LocalHistoryRuntime(
-        LocalEvidenceEncoder(evidence_dim=8, visual_dim=4, action_dim=3, max_age_steps=8),
-        StatelessLocalReplayReadout(evidence_dim=8, local_dim=4, hidden_dim=8),
-        ContinualTTTLocalMemoryCore(evidence_dim=8, local_dim=4, ttt_dim=6, fast_hidden_dim=10),
+    from cosmos_framework.model.generator.mot.local_evidence import (
+        CANONICAL_EVIDENCE_FEATURE_CONFIG, LocalMemoryRuntime,
     )
+    model.net.local_memory_runtime = LocalMemoryRuntime(
+        LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        ContinualTTTLocalMemoryCore(),
+    )
+    model.net.local_history_runtime = nn.Module()
+    model.net.local_history_runtime.readout = nn.Linear(3, 3)
     model.net.local_memory2llm = nn.Linear(4, 5)
     model.net.local_memory_modality_embed = nn.Parameter(torch.zeros(5))
     model.unrelated_outer_module = nn.Linear(3, 3)
@@ -635,13 +637,12 @@ def test_recipe_r09_b_ttt_selector_covers_continual_core_not_readout(monkeypatch
         disable_weight_decay_for_1d_params=False,
     )
     selected_ids = {id(param) for param, _ in selected_params}
-    runtime = model.net.local_history_runtime
-    expected_ids = {id(param) for param in runtime.encoder.parameters()}
-    expected_ids |= {id(param) for param in runtime.recurrent_backend.parameters()}
+    runtime = model.net.local_memory_runtime
+    expected_ids = {id(param) for param in runtime.parameters()}
     expected_ids |= {id(param) for param in model.net.local_memory2llm.parameters()}
     expected_ids.add(id(model.net.local_memory_modality_embed))
-    assert expected_ids.issubset(selected_ids)
-    assert not any(id(param) in selected_ids for param in runtime.readout.parameters())
+    assert selected_ids == expected_ids
+    assert not any(id(param) in selected_ids for param in model.net.local_history_runtime.parameters())
     assert id(model.unrelated_outer_module.weight) not in selected_ids
 
 
@@ -719,8 +720,8 @@ def test_model_config_ttt_field_defaults() -> None:
         "ttt_tbptt_steps": 16,
         "ttt_inner_lr": 0.1,
         "k_local": 1,
-        "runtime_evidence_steps": 1,
     }
+    assert "runtime_evidence_steps" not in fields
     for name, default in expected.items():
         assert name in fields
         assert fields[name].default == default
@@ -746,8 +747,7 @@ def test_model_config_ttt_validators() -> None:
     for bad in (0, 2, True):
         with pytest.raises(ValueError):
             _require_ttt_k_local(None, _attr("k_local"), bad)
-    _require_ttt_runtime_evidence_steps(None, _attr("runtime_evidence_steps"), 1)
-    for bad in (0, 2, True):
+    for bad in (0, 1, 2, True):
         with pytest.raises(ValueError):
             _require_ttt_runtime_evidence_steps(None, _attr("runtime_evidence_steps"), bad)
 
@@ -759,6 +759,7 @@ def test_model_config_ttt_post_init_mutual_exclusion() -> None:
     with pytest.raises(ValueError, match="local_ttt_enabled requires"):
         OmniMoTModelConfig(local_ttt_enabled=True, local_history_enabled=True)
     config = OmniMoTModelConfig(
-        local_ttt_enabled=True, local_history_enabled=True, local_history_backend="ttt_fast_weight"
+        local_ttt_enabled=True, local_history_enabled=True, local_history_backend="ttt_fast_weight",
+        local_memory_enabled=True, local_memory_dim=32,
     )
     assert config.local_ttt_enabled is True

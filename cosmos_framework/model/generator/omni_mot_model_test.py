@@ -185,3 +185,26 @@ def test_build_net_registers_only_active_ttt_owner(monkeypatch: pytest.MonkeyPat
     assert tuple(net.local_memory_runtime._modules) == ("evidence_encoder", "ttt_core")
     assert not hasattr(net, "local_history_runtime")
     assert not hasattr(net, "readout")
+
+
+def test_active_native_loss_uses_weighted_total_without_double_auxiliary(monkeypatch):
+    import torch
+    from cosmos_framework.data.generator import joint_dataloader
+    from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
+
+    monkeypatch.setattr(joint_dataloader, "custom_collate_fn", lambda rows: {"x": torch.ones(1)})
+    primary = torch.tensor(52.0, requires_grad=True)
+    auxiliary = torch.tensor(0.25, requires_grad=True)
+    outputs = {"flow_matching_loss_vision": torch.tensor(2.0),
+               "flow_matching_loss_action": torch.tensor(3.0), "aux_loss_gen": auxiliary}
+    model = SimpleNamespace(config=SimpleNamespace(), net=torch.nn.Linear(1, 1),
+        training_step=lambda *args, **kwargs: (outputs, primary + auxiliary),
+        _psm_reduced_loss=OmniMoTModel._psm_reduced_loss,
+        _PSM_AUXILIARY_LOSS_KEYS=OmniMoTModel._PSM_AUXILIARY_LOSS_KEYS)
+    inputs = SimpleNamespace(payloads=({"x": torch.ones(1)},), locals=(None,))
+    result = OmniMoTModel._run_active_local_memory_native_forward(model, inputs, 0)
+    torch.testing.assert_close(result.primary_consumer_mean, primary)
+    torch.testing.assert_close(result.auxiliary_loss, auxiliary)
+    assert model._psm_native_forward_calls == 1
+    (result.primary_consumer_mean + result.auxiliary_loss).backward()
+    assert primary.grad == 1 and auxiliary.grad == 1

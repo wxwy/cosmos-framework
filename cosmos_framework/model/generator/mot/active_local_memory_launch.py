@@ -212,6 +212,8 @@ class ActiveLocalMemoryLaunchCallback(Callback):
         config_digest: str,
         source_digest: str,
         plan_chain_id: str = "active-local-window",
+        member_layout: str = "single",
+        group_size: int = 1,
     ) -> None:
         super().__init__()
         if not suite_datasets:
@@ -224,6 +226,11 @@ class ActiveLocalMemoryLaunchCallback(Callback):
         self.manifest_digest = manifest_digest
         self.config_digest = config_digest
         self.source_digest = source_digest
+        if member_layout not in {"single", "a2"} or group_size <= 0:
+            raise ValueError("invalid active member layout/group size")
+        if (member_layout == "single" and group_size != 1) or (member_layout == "a2" and group_size != b_stream):
+            raise ValueError("active group size must match the configured layout/slot count")
+        self.member_layout, self.group_size = member_layout, group_size
         self.plan_chain_id = plan_chain_id
         self.driver: ActiveLocalMemoryWindowDriver | None = None
         self._pending_resume_state: dict[str, Any] | None = None
@@ -292,7 +299,20 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             rank=dist.get_rank() if dist.is_initialized() else 0,
             target_distribution={category: 1.0 / len(categories) for category in categories},
         )
-        registry = ProductionActiveWiringRegistry(CanonicalSegmentRuntimeOwner(scheduler, wiring))
+        driver_type = ActiveLocalMemoryWindowDriver
+        driver_extra = {}
+        if self.member_layout == "a2":
+            from .grouped_active_driver import GroupedActiveLocalMemoryWindowDriver
+            from .grouped_active_runtime import GroupedActiveWiringRegistry, GroupedSegmentRuntimeOwner
+            # Abort must clear ALL partial gradients, including the newly trained
+            # baseline heads, not only the four Local groups.
+            wiring.local_slow_parameters = tuple(p for p in model.net.parameters() if p.requires_grad)
+            registry = GroupedActiveWiringRegistry(GroupedSegmentRuntimeOwner(scheduler, wiring))
+            driver_type = GroupedActiveLocalMemoryWindowDriver
+            driver_extra = dict(group_size=self.group_size, manifest_digest=self.manifest_digest,
+                                config_digest=self.config_digest)
+        else:
+            registry = ProductionActiveWiringRegistry(CanonicalSegmentRuntimeOwner(scheduler, wiring))
         producers = {
             category: CanonicalLocalMemorySegmentProducer(
                 self.suite_datasets[category],
@@ -304,7 +324,8 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             )
             for category in categories
         }
-        driver = ActiveLocalMemoryWindowDriver(
+        driver = driver_type(
+            **driver_extra,
             registry=registry,
             producer=SuiteRoutedSegmentProducer(producers, source_digest=self.source_digest),
             streams=canonical_segment_streams(producers, b_stream=self.b_stream),
@@ -316,6 +337,12 @@ class ActiveLocalMemoryLaunchCallback(Callback):
         )
         driver.attach(trainer, model)
         self.driver = driver
+        metrics_path = os.environ.get("PSM_ACTIVE_METRICS_PATH")
+        if metrics_path:
+            from .grouped_active_metrics import ActiveDeliveryMetrics
+            trainer.callbacks._callbacks.append(
+                ActiveDeliveryMetrics(trainer=trainer, driver=driver, path=metrics_path)
+            )
         if self._pending_resume_state is not None:
             driver.load_state_dict(self._pending_resume_state)
             self._pending_resume_state = None
