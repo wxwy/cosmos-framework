@@ -71,6 +71,15 @@ TASK_MAX_STEPS: dict[str, int] = {
     "libero_90": 400,
 }
 
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    """Write JSON via a same-directory temporary file, then atomically replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+
 
 _CAMERA_PROMPT_NAMES: dict[str, str] = {
     "agentview": "third-person view",
@@ -1199,6 +1208,8 @@ def _run_task_vectorized(
     max_steps: int,
     warmup_steps: int,
     init_states: list[np.ndarray | None],
+    output_dir: Path | None = None,
+    task_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """Run all `num_trials` of one task across `num_envs` parallel LIBERO envs
     (SubprocVectorEnv), in waves. Each control step gathers obs from the ACTIVE
@@ -1263,6 +1274,8 @@ def _run_task_vectorized(
             succ = {s: False for s in slots}
             err: dict[int, str | None] = {s: None for s in slots}
             nsteps = {s: max_steps for s in slots}
+            action_logs: dict[int, list[list[float]]] = {s: [] for s in slots}
+            prediction_logs: dict[int, list[dict[str, Any]]] = {s: [] for s in slots}
             step = 0
 
             for _ in range(warmup_steps):
@@ -1296,6 +1309,18 @@ def _run_task_vectorized(
                     break
                 chunk_by_slot = {s: chunks[k] for k, s in enumerate(active)}
                 horizon = action_horizon if action_horizon > 0 else len(chunks[0])
+                for s in active:
+                    chunk = chunk_by_slot[s]
+                    prediction_logs[s].append(
+                        {
+                            "step": step,
+                            "chunk_size": len(chunk),
+                            "action_chunk": chunk,
+                            "executed": list(chunk[:horizon]),
+                            "n_execute": min(horizon, len(chunk)),
+                            "video_frames": 0,
+                        }
+                    )
                 for h in range(horizon):
                     cur = [s for s in slots if not done[s]]
                     if not cur or step >= max_steps:
@@ -1310,6 +1335,7 @@ def _run_task_vectorized(
                     obs_arr, _, d, info = venv.step(np.stack(env_actions), id=cur)
                     step += 1
                     for i, s in enumerate(cur):
+                        action_logs[s].append([float(v) for v in env_actions[i]])
                         if completed:
                             client.record_memory_step(s, completed[s], env_actions[i], gripper_mode=gripper_mode)
                         obs_by_slot[s] = obs_arr[i]
@@ -1333,6 +1359,32 @@ def _run_task_vectorized(
                     "error": err[s],
                     "elapsed_s": per_ep_elapsed,
                 }
+
+            # Persist each completed wave immediately. A long vectorized suite can
+            # therefore be inspected or resumed after interruption without waiting
+            # for every task/trial to finish.
+            if output_dir is not None and task_id is not None:
+                for s, t in zip(slots, wave):
+                    _write_json_atomic(
+                        output_dir / "actions" / f"task_{task_id:03d}" / f"episode_{t:03d}.json",
+                        action_logs[s],
+                    )
+                    _write_json_atomic(
+                        output_dir / "predictions" / f"task_{task_id:03d}" / f"episode_{t:03d}.json",
+                        prediction_logs[s],
+                    )
+                completed = [item for item in results if item is not None]
+                _write_json_atomic(
+                    output_dir / "partial_summary" / f"task_{task_id:03d}.json",
+                    {
+                        "task_id": task_id,
+                        "task_description": task_description,
+                        "completed_episodes": len(completed),
+                        "target_episodes": num_trials,
+                        "successes": sum(1 for item in completed if item["success"]),
+                        "episode_results": completed,
+                    },
+                )
     finally:
         for slot in range(n):
             client.end_memory_episode(slot)
@@ -1437,6 +1489,8 @@ def main() -> None:
                 max_steps=max_steps,
                 warmup_steps=args.warmup_steps,
                 init_states=init_states,
+                output_dir=output_dir,
+                task_id=task_id,
             )
             task_episodes = 0
             task_successes = 0

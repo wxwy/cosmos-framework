@@ -9,7 +9,7 @@
 #
 # Model:  a saved SFT checkpoint under edge_libero_4in1/checkpoints/iter_* (CHECKPOINT_PATH)
 # Config: experiment module action_policy_libero_edge_all (DCP+MODULE branch)
-# Port:   8000
+# Port:   SERVER_PORT (default 8000)
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -19,6 +19,8 @@ export WAN_VAE_PATH="${WAN_VAE_PATH:-$PWD/examples/checkpoints/wan22_vae/Wan2.2_
 export CHECKPOINT_PATH="${CHECKPOINT_PATH:-$PWD/outputs/train/cosmos3_action_libero/action_sft/edge_libero_4in1/checkpoints/iter_000000050}"
 # 视觉(视频)生成的去噪步数：默认 50（同 task0 server）。环境变量 NUM_STEPS 可临时覆盖。
 export NUM_STEPS="${NUM_STEPS:-50}"
+export SERVER_PORT="${SERVER_PORT:-8000}"
+export SERVER_OUTPUT_DIR="${SERVER_OUTPUT_DIR:-/tmp/cosmos3_action_server_${SERVER_PORT}}"
 # edge_all 继承 action_policy_libero_all_nano，数据 root 用 ${oc.env:LIBERO_ROOT}；
 # 服务端不加载训练数据，但 OmegaConf 急切解析插值（含 4 个 suite 子路径），缺了会崩。
 # 与 4in1 训练同一路径：LIBERO_LeRobot_v3 PARENT 目录。
@@ -39,5 +41,6 @@ exec .venv/bin/python -m cosmos_framework.scripts.action_policy_server_libero \
   --no-use-ema-weights \
   --action-normalization quantile_rot \
   --action-stats-path cosmos_framework/data/generator/action/normalizer_stats/libero_native_frame_wise_relative_rot6d.json \
-  --raw-action-dim 10 --fps 20 --port 8000 --num-steps "$NUM_STEPS" \
+  --raw-action-dim 10 --fps 20 --port "$SERVER_PORT" --num-steps "$NUM_STEPS" \
+  --output-dir "$SERVER_OUTPUT_DIR" \
   --guidance "${GUIDANCE:-1.0}"
