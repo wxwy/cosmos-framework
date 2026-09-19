@@ -10,6 +10,21 @@ from cosmos_framework.model.generator.mot.parallelize_unified_mot import paralle
 from cosmos_framework.utils.generator.parallelism import ParallelDims, fsdp_mesh
 
 
+def _local_memory_fsdp_ignored_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
+    """Return Local slow parameters that must remain replicated for active TTT."""
+
+    ignored: set[torch.nn.Parameter] = set()
+    local_runtime = getattr(model, "local_memory_runtime", None)
+    if isinstance(local_runtime, torch.nn.Module):
+        ignored.update(local_runtime.parameters())
+    local_projector = getattr(model, "local_memory2llm", None)
+    if isinstance(local_projector, torch.nn.Module):
+        ignored.update(local_projector.parameters())
+    local_modality = getattr(model, "local_memory_modality_embed", None)
+    if isinstance(local_modality, torch.nn.Parameter):
+        ignored.add(local_modality)
+    return ignored
+
 def apply_compile(model: torch.nn.Module, config: CompileConfig):
     """Apply torch.compile to the VFM encode/decode heads.
 
@@ -81,8 +96,10 @@ def parallelize_vfm_network(
         model = apply_compile(model, compile_config)
 
     if parallel_dims is not None and parallel_dims.dp_enabled:
-        # Collect parameters to ignore during FSDP wrapping
-        ignored_params = set()
+        # Active Local evidence/TTT runs before the normal FSDP forward, so its
+        # four slow groups must remain replicated. Their gradients are averaged
+        # explicitly by the trainer at the active optimizer boundary.
+        ignored_params = _local_memory_fsdp_ignored_parameters(model)
 
         # Same mesh as the per-block wrapping in ``parallelize_unified_mot.apply_fsdp`` (see
         # ``fsdp_mesh``): the root and the blocks must agree, or one model ends up with a

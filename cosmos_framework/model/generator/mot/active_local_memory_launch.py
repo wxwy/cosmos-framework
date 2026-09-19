@@ -144,48 +144,71 @@ class SuiteRoutedSegmentProducer:
         return self._route(stream).produce(stream, cursor=cursor)
 
 
-def canonical_segment_streams(producers: Mapping[str, Any], *, b_stream: int) -> tuple[Any, ...]:
-    """Enumerate every whole-block episode of every suite into one slot catalog.
+def canonical_segment_streams(
+    producers: Mapping[str, Any],
+    *,
+    b_stream: int,
+    rank: int = 0,
+    world_size: int = 1,
+) -> tuple[Any, ...]:
+    """Shard one global per-suite episode catalog across ranks, then assign stable slots.
 
-    Entries sharing a ``slot_id`` are consumed by the driver in catalog order, so
-    each suite's episodes are spread round-robin over that suite's slots.  An
-    episode with fewer frames than one TBPTT block is skipped rather than
-    admitted, because the frozen plan only ever covers whole blocks.
+    The dataset episode order is global and deterministic. After filtering episodes
+    that cannot provide one whole TBPTT block, each suite is sharded by eligible
+    ordinal using rank::world_size. Ranks therefore consume disjoint subsets whose
+    union is exactly the global suite catalog. Each rank then round-robins only its
+    own shard over its own b_stream stable slots.
+
+    world_size=1 preserves the historical single-rank ordering.
     """
     from cosmos_framework.data.generator.action.datasets.canonical_local_memory_producer import (
         CanonicalSegmentStream,
     )
+
+    if isinstance(world_size, bool) or not isinstance(world_size, int) or world_size <= 0:
+        raise ValueError("active Local-Memory world_size must be a positive integer")
+    if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < world_size:
+        raise ValueError("active Local-Memory rank must be in [0, world_size)")
 
     categories = tuple(sorted(producers))
     if not categories:
         raise ValueError("active Local-Memory requires at least one suite producer")
     if b_stream < len(categories):
         raise ValueError("active Local-Memory needs at least one slot per suite")
+
     by_slot: dict[int, list[Any]] = {slot: [] for slot in range(b_stream)}
     for index, category in enumerate(categories):
         producer = producers[category]
         slots = tuple(slot for slot in range(b_stream) if slot % len(categories) == index)
         ep_vals = producer.frame_source._ep_vals
-        admitted = 0
+
+        eligible: list[tuple[int, int]] = []
         for position in range(len(ep_vals)):
             episode_index = int(ep_vals[position])
             probe = CanonicalSegmentStream(
                 slot_id=slots[0], episode_index=episode_index, episode_position=position, category=category
             )
-            if producer.block_count(probe) <= 0:
-                continue
+            if producer.block_count(probe) > 0:
+                eligible.append((position, episode_index))
+
+        rank_episodes = eligible[rank::world_size]
+        if not rank_episodes:
+            raise RuntimeError(
+                f"active Local-Memory rank {rank}/{world_size} has no eligible episodes for suite {category!r}"
+            )
+
+        for admitted, (position, episode_index) in enumerate(rank_episodes):
             slot = slots[admitted % len(slots)]
-            admitted += 1
             by_slot[slot].append(
                 CanonicalSegmentStream(
                     slot_id=slot, episode_index=episode_index, episode_position=position, category=category
                 )
             )
+
     streams = tuple(stream for slot in range(b_stream) for stream in by_slot[slot])
     if not streams:
         raise RuntimeError("active Local-Memory found no episode holding a whole TBPTT block")
     return streams
-
 
 class ActiveLocalMemoryLaunchCallback(Callback):
     """Build the canonical segment owner and attach the window driver at train start.
@@ -292,18 +315,34 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             category: instantiate(dataset) for category, dataset in self.suite_datasets.items()
         }
         window_members = int(trainer.config.trainer.grad_accum_iter)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
         adapter = canonical_segment_adapter_from_model(model)
-        wiring = CanonicalSegmentWiring(adapter, canonical_slow_parameters_from_model(model))
+        local_slow_parameters = canonical_slow_parameters_from_model(model)
+
+        # Active Local evidence/TTT executes before the normal model forward.
+        # Keep these four Local slow groups replicated outside root FSDP and
+        # synchronize them explicitly across ranks. Broadcast after checkpoint
+        # load so newly introduced Local parameters start identically.
+        if world_size > 1:
+            from torch.distributed.tensor import DTensor
+
+            if any(isinstance(parameter, DTensor) for parameter in local_slow_parameters):
+                raise RuntimeError(
+                    "active Local-Memory slow parameters must stay replicated outside FSDP in multi-rank training"
+                )
+            for parameter in local_slow_parameters:
+                dist.broadcast(parameter.data, src=0)
+
+        wiring = CanonicalSegmentWiring(adapter, local_slow_parameters)
         categories = tuple(sorted(self.suite_datasets))
         scheduler = RankLocalSegmentScheduler(
-            rank=dist.get_rank() if dist.is_initialized() else 0,
+            rank=rank,
             target_distribution={category: 1.0 / len(categories) for category in categories},
         )
         driver_type = ActiveLocalMemoryWindowDriver
         driver_extra = {}
         if self.member_layout == "a2":
-            if dist.is_initialized() and dist.get_world_size() != 1:
-                raise RuntimeError("A2 delivery currently validates single-rank training only")
             from .grouped_active_driver import GroupedActiveLocalMemoryWindowDriver
             from .grouped_active_runtime import GroupedActiveWiringRegistry, GroupedSegmentRuntimeOwner
             # Abort must clear ALL partial gradients, including the newly trained
@@ -330,7 +369,9 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             **driver_extra,
             registry=registry,
             producer=SuiteRoutedSegmentProducer(producers, source_digest=self.source_digest),
-            streams=canonical_segment_streams(producers, b_stream=self.b_stream),
+            streams=canonical_segment_streams(
+                producers, b_stream=self.b_stream, rank=rank, world_size=world_size
+            ),
             window_members=window_members,
             plan_chain_id=self.plan_chain_id,
             catalog_digest=self._catalog_digest(),

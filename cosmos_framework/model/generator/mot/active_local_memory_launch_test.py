@@ -165,6 +165,42 @@ def test_streams_spread_episodes_over_slots_and_skip_short_ones() -> None:
     )
 
 
+def test_streams_partition_each_suite_across_rank_shards_without_overlap() -> None:
+    spatial = _FakeProducer(_FakeDataset({index: 32 for index in range(16)}), category="libero_spatial")
+    goal = _FakeProducer(_FakeDataset({100 + index: 32 for index in range(16)}), category="libero_goal")
+    producers = {"libero_spatial": spatial, "libero_goal": goal}
+
+    global_streams = canonical_segment_streams(producers, b_stream=8)
+    global_by_category = {
+        category: {stream.episode_index for stream in global_streams if stream.category == category}
+        for category in producers
+    }
+    shards = []
+    for rank in range(4):
+        streams = canonical_segment_streams(producers, b_stream=8, rank=rank, world_size=4)
+        by_category = {
+            category: {stream.episode_index for stream in streams if stream.category == category}
+            for category in producers
+        }
+        assert all(by_category[category] for category in producers)
+        shards.append(by_category)
+
+    for category in producers:
+        union: set[int] = set()
+        for left_rank, left in enumerate(shards):
+            for right in shards[left_rank + 1 :]:
+                assert left[category].isdisjoint(right[category])
+            union |= left[category]
+        assert union == global_by_category[category]
+
+
+def test_stream_rank_geometry_fails_closed() -> None:
+    producer = _FakeProducer(_FakeDataset({0: 32}), category="libero_spatial")
+    with pytest.raises(ValueError, match="world_size"):
+        canonical_segment_streams({"libero_spatial": producer}, b_stream=1, world_size=0)
+    with pytest.raises(ValueError, match="rank"):
+        canonical_segment_streams({"libero_spatial": producer}, b_stream=1, rank=2, world_size=2)
+
 def test_launch_assembles_the_driver_at_the_accumulation_boundary(monkeypatch) -> None:
     from cosmos_framework.data.generator.action.datasets import canonical_local_memory_producer as producer_module
 

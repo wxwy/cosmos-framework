@@ -186,6 +186,58 @@ class OptimizerStepTiming:
         return timing
 
 
+def _active_local_replicated_parameters(model: torch.nn.Module) -> tuple[torch.nn.Parameter, ...]:
+    """Return replicated Local slow parameters owned by the active route."""
+
+    net = getattr(model, "net", None)
+    if net is None:
+        return ()
+    parameters: list[torch.nn.Parameter] = []
+    runtime = getattr(net, "local_memory_runtime", None)
+    if isinstance(runtime, torch.nn.Module):
+        parameters.extend(runtime.parameters())
+    projector = getattr(net, "local_memory2llm", None)
+    if isinstance(projector, torch.nn.Module):
+        parameters.extend(projector.parameters())
+    modality = getattr(net, "local_memory_modality_embed", None)
+    if isinstance(modality, torch.nn.Parameter):
+        parameters.append(modality)
+
+    unique: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for parameter in parameters:
+        if id(parameter) not in seen:
+            seen.add(id(parameter))
+            unique.append(parameter)
+    return tuple(unique)
+
+
+@torch.no_grad()
+def _sync_active_local_replicated_gradients(model: torch.nn.Module) -> None:
+    """Average replicated Local gradients across ranks before grad clipping."""
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return
+    from torch.distributed.tensor import DTensor
+
+    world_size = dist.get_world_size()
+    for parameter in _active_local_replicated_parameters(model):
+        if isinstance(parameter, DTensor):
+            raise RuntimeError(
+                "active Local-Memory replicated gradient sync received an FSDP/DTensor parameter"
+            )
+        present = torch.tensor(
+            [1 if parameter.grad is not None else 0], device=parameter.device, dtype=torch.int32
+        )
+        dist.all_reduce(present, op=dist.ReduceOp.SUM)
+        if int(present.item()) == 0:
+            continue
+        gradient = parameter.grad if parameter.grad is not None else torch.zeros_like(parameter)
+        dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
+        gradient.div_(world_size)
+        if parameter.grad is None:
+            parameter.grad = gradient
+
 class ImaginaireTrainer:
     """The base trainer class of Imaginaire.
 
@@ -625,6 +677,8 @@ class ImaginaireTrainer:
         grad_accum_iter += 1
         if grad_accum_iter == self.config.trainer.grad_accum_iter:
             active_seal = self._preflight_active_optimizer_boundary(grad_accum_iter)
+            if active_seal is not None:
+                _sync_active_local_replicated_gradients(model)
             with self.training_timer("optimizer_step"):
                 with self.straggler_detector.profile_section(
                     "opt", self.config.trainer.straggler_detection.analyze_optimizer
