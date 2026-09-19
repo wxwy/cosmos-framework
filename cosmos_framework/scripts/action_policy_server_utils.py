@@ -93,3 +93,41 @@ def disable_runtime_ema_for_frozen_config(setup_args: OmniSetupArgs) -> OmniSetu
 
     log.info("[action-server] disabled runtime EMA for frozen config model load")
     return _ActionPolicyServerSetupArgs.model_validate(setup_args.model_dump())
+
+def apply_model_compile_setting(setup_args: OmniSetupArgs, experiment_config: object) -> bool | None:
+    """Mirror model.config.compile.enabled into the flat inference setup knob.
+
+    OmniSetupOverrides.use_torch_compile defaults to True for inference, while
+    the model CompileConfig.enabled defaults to False and can be explicitly
+    disabled by an experiment. The inference stack rebuilds a CompileConfig
+    from the flat setup args, so failing to copy this value silently re-enables
+    torch.compile.
+
+    Returns the resolved boolean when the experiment declares the setting, or
+    None when the field is absent or malformed, leaving the inference default
+    unchanged.
+    """
+    value: object = experiment_config
+    for field in ("model", "config", "compile", "enabled"):
+        if isinstance(value, dict):
+            if field not in value:
+                return None
+            value = value[field]
+        else:
+            value = getattr(value, field, None)
+            if value is None:
+                return None
+
+    if not isinstance(value, bool):
+        log.warning(
+            "[action-server] ignored non-boolean model.config.compile.enabled; "
+            f"keeping use_torch_compile={setup_args.use_torch_compile}"
+        )
+        return None
+
+    setup_args.use_torch_compile = value
+    log.info(
+        "[action-server] resolved use_torch_compile="
+        f"{setup_args.use_torch_compile} from model.config.compile.enabled"
+    )
+    return value

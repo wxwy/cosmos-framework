@@ -83,6 +83,7 @@ from cosmos_framework.inference.inference import OmniInference
 from cosmos_framework.inference.local_memory_policy import PolicyLocalMemoryAdapter
 from cosmos_framework.scripts.action_policy_server_utils import (
     DEFAULT_FALLBACK_OUTPUT_DIR,
+    apply_model_compile_setting,
     disable_runtime_ema_for_frozen_config,
     get_local_ip,
     maybe_init_distributed,
@@ -584,6 +585,14 @@ class ActionModelService:
                 *setup_args.experiment_overrides,
                 f"model.config.max_action_dim={int(args.max_action_dim)}",
             ]
+
+        # Omni inference exposes torch.compile through the flat
+        # setup_args.use_torch_compile switch. Do not let its inference default
+        # silently override the experiment's model.config.compile.enabled value:
+        # Local-Memory checkpoints intentionally run eager while the Memory
+        # Prefix validator contains data-dependent tensor reads.
+        preflight_experiment_config = _load_introspection_config_dict(setup_args)
+        apply_model_compile_setting(setup_args, preflight_experiment_config)
 
         log.info(
             f"[action-server] loading model: config_file='{setup_args.config_file}' "
