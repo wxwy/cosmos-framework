@@ -94,6 +94,7 @@ def disable_runtime_ema_for_frozen_config(setup_args: OmniSetupArgs) -> OmniSetu
     log.info("[action-server] disabled runtime EMA for frozen config model load")
     return _ActionPolicyServerSetupArgs.model_validate(setup_args.model_dump())
 
+
 def apply_model_compile_setting(setup_args: OmniSetupArgs, experiment_config: object) -> bool | None:
     """Mirror model.config.compile.enabled into the flat inference setup knob.
 
