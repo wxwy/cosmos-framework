@@ -79,8 +79,6 @@ def _write_json_atomic(path: Path, payload: Any) -> None:
     tmp_path.replace(path)
 
 
-
-
 _CAMERA_PROMPT_NAMES: dict[str, str] = {
     "agentview": "third-person view",
     "wrist": "wrist-mounted camera",
