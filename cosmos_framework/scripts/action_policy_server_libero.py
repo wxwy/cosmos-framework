@@ -949,8 +949,8 @@ class ActionModelService:
 
     def predict_policy_batch(self, reqs: list[dict[str, Any]]) -> dict[str, Any]:
         """Batched policy inference: N requests -> ONE diffusion forward (batch_size=N)
-        -> N denormalized action chunks. Skips vision decode (the vectorized eval client
-        only needs actions), so it is ~N x faster than N serial /predict calls."""
+        -> N denormalized action chunks. Vision decode remains opt-in per item via
+        return_video so normal vectorized evaluation keeps the fast action-only path."""
         t0 = time.monotonic()
         if not isinstance(reqs, list) or not reqs:
             raise ValueError("'items' must be a non-empty list of policy requests")
@@ -973,6 +973,8 @@ class ActionModelService:
             "domain_id": [torch.tensor(get_domain_id(p["domain_name"]), dtype=torch.long) for p in preps],
             "sequence_plan": [p["sequence_plan"] for p in preps],
         }
+        return_video = [bool(req.get("return_video", False)) for req in reqs]
+        decoded_video_tensors: dict[int, torch.Tensor] = {}
         t_inf0 = time.monotonic()
         with self._lock:
             with torch.inference_mode():
@@ -982,17 +984,40 @@ class ActionModelService:
                         num_steps=self.cfg.num_steps, has_negative_prompt=False,
                     )
                 )
+                # Keep expensive vision decode opt-in. Only sampled evaluation
+                # episodes request it; action-only items pay no decode/PNG/HTTP cost.
+                for i, requested in enumerate(return_video):
+                    if not requested:
+                        continue
+                    video = self.model.decode(samples["vision"][i]).squeeze(0)
+                    decoded_video_tensors[i] = remove_reflection_padding(
+                        video, preps[i]["padded_image_size"]
+                    ).detach().cpu()
         t_inf1 = time.monotonic()
         actions: list[list[list[float]]] = []
         for i in range(n):
             pred = samples["action"][i].float().squeeze(0)  # [T,D]
             pred = self._denormalize_action(pred)
             actions.append(pred.detach().cpu().numpy().tolist())
+        videos: list[list[str]] = [[] for _ in range(n)]
+        for i, video_tensor in decoded_video_tensors.items():
+            encoded_frames: list[str] = []
+            for frame in _video_tensor_to_pil_images(video_tensor):
+                buf = io.BytesIO()
+                frame.save(buf, format="PNG")
+                encoded_frames.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+            videos[i] = encoded_frames
+        decoded_count = sum(1 for frames in videos if frames)
         log.info(
             f"[action-server] predict_batch n={n} steps={self.cfg.num_steps} "
+            f"video_items={decoded_count} "
             f"ms_total={(time.monotonic() - t0) * 1000.0:.1f} ms_infer={(t_inf1 - t_inf0) * 1000.0:.1f}"
         )
-        return {"actions": actions, "local_memory": samples.get("_local_memory_status")}
+        return {
+            "actions": actions,
+            "videos": videos,
+            "local_memory": samples.get("_local_memory_status"),
+        }
 
     def predict_policy(self, req: dict[str, Any]) -> dict[str, Any]:
         """
