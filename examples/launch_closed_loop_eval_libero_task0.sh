@@ -37,6 +37,7 @@ exec /disk/rl/RLinf/.venv/bin/python examples/_eval_client_launcher.py \
   --action_horizon "${ACTION_HORIZON:-8}" \
   ${SAVE_GIFS:+--save_gifs --gif_fps 20} \
   --save_mp4 --mp4_fps 20 \
-  ${SAVE_PRED_MP4:+--save_pred_mp4} \
+  --save_pred_mp4 \
+  --video_samples_per_task "${VIDEO_SAMPLES_PER_TASK:-1}" \
   --output_dir "${OUTPUT_DIR:-results/libero_closed_loop_task0}" \
   "$@"
