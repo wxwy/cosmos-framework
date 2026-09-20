@@ -1513,6 +1513,8 @@ def main() -> None:
         raise ValueError("--save_mp4 requires --output_dir to be set")
     if args.save_pred_mp4 and not args.output_dir:
         raise ValueError("--save_pred_mp4 requires --output_dir to be set")
+    if args.video_samples_per_task < 0:
+        raise ValueError("--video_samples_per_task must be >= 0")
 
     # Parse cameras from comma-separated string
     cameras = [c.strip() for c in args.camera.split(",") if c.strip()]
@@ -1596,6 +1598,10 @@ def main() -> None:
                 init_states=init_states,
                 output_dir=output_dir,
                 task_id=task_id,
+                mp4_root=mp4_root,
+                mp4_pred_root=mp4_pred_root,
+                mp4_fps=args.mp4_fps,
+                video_samples_per_task=args.video_samples_per_task,
             )
             task_episodes = 0
             task_successes = 0
@@ -1640,6 +1646,7 @@ def main() -> None:
         task_episodes = 0
         task_successes = 0
         episode_results: list[dict[str, Any]] = []
+        video_samples_used = 0
 
         for episode_idx in range(args.num_trials_per_task):
             episode_t0 = time.perf_counter()
@@ -1671,6 +1678,10 @@ def main() -> None:
                 )
                 continue
 
+            capture_sampled_video = video_samples_used < args.video_samples_per_task
+            if capture_sampled_video and (mp4_root is not None or mp4_pred_root is not None):
+                video_samples_used += 1
+
             gif_path = (
                 gif_root / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}.gif" if gif_root is not None else None
             )
@@ -1680,11 +1691,13 @@ def main() -> None:
                 else None
             )
             mp4_path = (
-                mp4_root / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}.mp4" if mp4_root is not None else None
+                mp4_root / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}.mp4"
+                if mp4_root is not None and capture_sampled_video
+                else None
             )
             pred_video_dir = (
                 mp4_pred_root / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}"
-                if mp4_pred_root is not None
+                if mp4_pred_root is not None and capture_sampled_video
                 else None
             )
             try:
