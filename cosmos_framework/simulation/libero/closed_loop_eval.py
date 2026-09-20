@@ -1309,7 +1309,35 @@ def _run_task_vectorized(
             nsteps = {s: max_steps for s in slots}
             action_logs: dict[int, list[list[float]]] = {s: [] for s in slots}
             prediction_logs: dict[int, list[dict[str, Any]]] = {s: [] for s in slots}
+            trial_by_slot = dict(zip(slots, wave, strict=True))
+            video_slots = {s for s, t in trial_by_slot.items() if t in video_trials}
+            env_video_frames: dict[int, list[Image.Image]] = {s: [] for s in video_slots}
+            prediction_videos: dict[int, list[tuple[int, Image.Image, list[Image.Image], str]]] = {
+                s: [] for s in video_slots
+            }
             step = 0
+
+            def capture_env_frame(slot: int) -> None:
+                if slot not in env_video_frames:
+                    return
+                imgs = _get_libero_images(
+                    obs_by_slot[slot], cameras, flip_images=flip_images, rotate_180=rotate_180
+                )
+                image = client.concatenate_images(imgs) if len(imgs) > 1 else imgs[0]
+                frame = Image.fromarray(_ensure_uint8_image(image)).convert("RGB")
+                env_video_frames[slot].append(
+                    _annotate_frame_number(frame, step, instruction=task_description)
+                )
+
+            def capture_prediction_input(slot: int) -> Image.Image:
+                imgs = _get_libero_images(
+                    obs_by_slot[slot], cameras, flip_images=flip_images, rotate_180=rotate_180
+                )
+                image = client.concatenate_images(imgs) if len(imgs) > 1 else imgs[0]
+                return Image.fromarray(_ensure_uint8_image(image)).convert("RGB")
+
+            for slot in video_slots:
+                capture_env_frame(slot)
 
             for _ in range(warmup_steps):
                 act = np.stack([_get_libero_dummy_action() for _ in slots])
@@ -1317,6 +1345,8 @@ def _run_task_vectorized(
                 for i, s in enumerate(slots):
                     obs_by_slot[s] = obs_arr[i]
                 step += 1
+                for slot in video_slots:
+                    capture_env_frame(slot)
 
             while step < max_steps:
                 active = [s for s in slots if not done[s]]
@@ -1326,8 +1356,15 @@ def _run_task_vectorized(
                     _get_libero_images(obs_by_slot[s], cameras, flip_images=flip_images, rotate_180=rotate_180)
                     for s in active
                 ]
+                requested_video_slots = video_slots.intersection(active) if mp4_pred_root is not None else set()
                 try:
-                    chunks = client.predict_batch(obs_batch, slot_ids=active)
+                    batch_result = client.predict_batch_detailed(
+                        obs_batch,
+                        slot_ids=active,
+                        return_video_slots=requested_video_slots,
+                    )
+                    chunks = batch_result["actions"]
+                    batch_videos = batch_result["videos"]
                 except Exception as e:  # noqa: BLE001
                     for s in active:
                         done[s] = True
@@ -1342,8 +1379,10 @@ def _run_task_vectorized(
                     break
                 chunk_by_slot = {s: chunks[k] for k, s in enumerate(active)}
                 horizon = action_horizon if action_horizon > 0 else len(chunks[0])
+                videos_by_slot = {s: batch_videos[k] for k, s in enumerate(active)}
                 for s in active:
                     chunk = chunk_by_slot[s]
+                    video_b64 = videos_by_slot.get(s, [])
                     prediction_logs[s].append(
                         {
                             "step": step,
@@ -1351,9 +1390,26 @@ def _run_task_vectorized(
                             "action_chunk": chunk,
                             "executed": list(chunk[:horizon]),
                             "n_execute": min(horizon, len(chunk)),
-                            "video_frames": 0,
+                            "video_frames": len(video_b64),
                         }
                     )
+                    if output_dir is not None and task_id is not None:
+                        _write_json_atomic(
+                            output_dir
+                            / "predictions"
+                            / f"task_{task_id:03d}"
+                            / f"episode_{trial_by_slot[s]:03d}.json",
+                            prediction_logs[s],
+                        )
+                    if s in requested_video_slots and video_b64:
+                        prediction_videos[s].append(
+                            (
+                                step,
+                                capture_prediction_input(s),
+                                _decode_b64_frames(video_b64),
+                                task_description,
+                            )
+                        )
                 for h in range(horizon):
                     cur = [s for s in slots if not done[s]]
                     if not cur or step >= max_steps:
@@ -1382,6 +1438,8 @@ def _run_task_vectorized(
                             done[s] = True
                             succ[s] = ii.get("success", True) if isinstance(ii, dict) else True
                             nsteps[s] = step
+                        if s in video_slots:
+                            capture_env_frame(s)
             per_ep_elapsed = round((time.perf_counter() - t_wave0) / max(1, len(wave)), 3)
             for s, t in zip(slots, wave):
                 client.end_memory_episode(s)
@@ -1392,6 +1450,20 @@ def _run_task_vectorized(
                     "error": err[s],
                     "elapsed_s": per_ep_elapsed,
                 }
+
+            # Save only the deterministic sampled episode(s) for this task.
+            for s in video_slots:
+                trial_idx = trial_by_slot[s]
+                if mp4_root is not None and env_video_frames[s]:
+                    mp4_path = mp4_root / f"task_{task_id:03d}" / f"episode_{trial_idx:03d}.mp4"
+                    _save_mp4(env_video_frames[s], mp4_path, mp4_fps)
+                    if mp4_path.exists():
+                        _rename_with_outcome(mp4_path, bool(succ[s]))
+                if mp4_pred_root is not None and prediction_videos[s]:
+                    pred_dir = mp4_pred_root / f"task_{task_id:03d}" / f"episode_{trial_idx:03d}"
+                    _save_prediction_videos(prediction_videos[s], pred_dir, mp4_fps)
+                    if pred_dir.exists():
+                        _rename_with_outcome(pred_dir, bool(succ[s]))
 
             # Persist each completed wave immediately. A long vectorized suite can
             # therefore be inspected or resumed after interruption without waiting
