@@ -308,15 +308,27 @@ class ActionEnvironmentClient:
             self.memory.acknowledge(0, statuses[0])
         return result
 
-    def predict_batch(self, observations: list[list[np.ndarray]], *, slot_ids=None) -> list[list[list[float]]]:
-        """Batched inference: a list of per-env multi-view observations -> ONE
-        POST /predict_batch -> a list of action chunks (one per env). Used by the
-        vectorized eval so N parallel envs share a single diffusion forward."""
+    def predict_batch_detailed(
+        self,
+        observations: list[list[np.ndarray]],
+        *,
+        slot_ids=None,
+        return_video_slots: set[int] | None = None,
+    ) -> dict[str, Any]:
+        """Batched inference with optional per-slot predicted rollout videos.
+
+        return_video_slots contains environment slot identities, not batch
+        positions. Only those items ask the server to decode vision.
+        """
         items = []
         slots = list(range(len(observations))) if slot_ids is None else list(slot_ids)
         if len(slots) != len(observations) or len(set(slots)) != len(slots):
             raise ValueError("predict_batch requires one unique slot identity per observation")
-        for obs_imgs in observations:
+        video_slots = set() if return_video_slots is None else set(return_video_slots)
+        unknown_video_slots = video_slots.difference(slots)
+        if unknown_video_slots:
+            raise ValueError(f"return_video_slots are not active batch slots: {sorted(unknown_video_slots)}")
+        for slot, obs_imgs in zip(slots, observations, strict=True):
             concat = self.concatenate_images(obs_imgs) if len(obs_imgs) > 1 else self.resize_image(obs_imgs[0])
             items.append(
                 {
@@ -324,6 +336,7 @@ class ActionEnvironmentClient:
                     "prompt": self.prompt,
                     "domain_name": self.domain_name,
                     "image_size": self.image_size,
+                    "return_video": slot in video_slots,
                 }
             )
         for slot, item in zip(slots, items, strict=True):
@@ -340,13 +353,23 @@ class ActionEnvironmentClient:
         result = resp.json()
         if "error" in result and result["error"]:
             raise RuntimeError(f"Model server error: {result['error']}")
+        actions = result.get("actions")
+        if not isinstance(actions, list) or len(actions) != len(slots):
+            raise ValueError("Model server returned malformed batched actions")
+        videos = result.get("videos", [[] for _ in slots])
+        if not isinstance(videos, list) or len(videos) != len(slots):
+            raise ValueError("Model server returned malformed batched videos")
         if self.memory.enabled:
             statuses = result.get("local_memory")
             if not isinstance(statuses, list) or len(statuses) != len(slots):
                 raise ValueError("TTT server did not acknowledge the batched memory requests")
             for slot, status in zip(slots, statuses, strict=True):
                 self.memory.acknowledge(slot, status)
-        return result["actions"]
+        return {"actions": actions, "videos": videos}
+
+    def predict_batch(self, observations: list[list[np.ndarray]], *, slot_ids=None) -> list[list[list[float]]]:
+        """Compatibility wrapper returning only action chunks."""
+        return self.predict_batch_detailed(observations, slot_ids=slot_ids)["actions"]
 
 
 def _find_accessible_dri_nodes() -> list[Path]:
@@ -1111,6 +1134,12 @@ def _parse_args() -> argparse.Namespace:
         help="Save each prediction's model-generated video as MP4 (per-predict + combined)",
     )
     parser.add_argument(
+        "--video_samples_per_task",
+        type=int,
+        default=1,
+        help="Number of valid episodes per task that save environment MP4 + model prediction rollout video (default: 1).",
+    )
+    parser.add_argument(
         "--mujoco_gl",
         type=str,
         default="auto",
@@ -1208,6 +1237,10 @@ def _run_task_vectorized(
     init_states: list[np.ndarray | None],
     output_dir: Path | None = None,
     task_id: int | None = None,
+    mp4_root: Path | None = None,
+    mp4_pred_root: Path | None = None,
+    mp4_fps: int = 20,
+    video_samples_per_task: int = 1,
 ) -> list[dict[str, Any]]:
     """Run all `num_trials` of one task across `num_envs` parallel LIBERO envs
     (SubprocVectorEnv), in waves. Each control step gathers obs from the ACTIVE
@@ -1245,6 +1278,8 @@ def _run_task_vectorized(
     if not runnable:
         return results
 
+    video_trial_count = min(max(0, video_samples_per_task), len(runnable))
+    video_trials = set(runnable[:video_trial_count]) if (mp4_root is not None or mp4_pred_root is not None) else set()
     n = min(num_envs, len(runnable))
 
     mujoco_gl = os.environ.get("MUJOCO_GL", "egl")
