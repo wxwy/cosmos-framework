@@ -3,6 +3,7 @@
 # 对 4in1 SFT 的 200 倍数 checkpoint 做全量闭环评测：
 #   4 suite × 独立 server/client 并行；每 suite 内 num_envs 向量 batch。
 #   默认 denoise num_steps=30，保持正式 baseline 推理语义不变。
+#   默认 --resume：按 task partial_summary 复用已完成 episode，只补缺失/瞬态失败 episode。
 # 输出：results/libero_closed_loop_4in1_acceptance/iter_XXXXXXXXX/<suite>/summary.json
 #
 # 与训练并发共享 GPU/内存（训练不动）。内存水位准入：cgroup memory.current
@@ -132,7 +133,7 @@ run_ckpt() {
       TASK_IDS="0,1,2,3,4,5,6,7,8,9" NUM_TRIALS="$NUM_TRIALS" \
       OUTPUT_DIR="$out_root/$suite" \
       bash examples/launch_closed_loop_eval_libero_task0.sh \
-        --max_steps "$MAX_STEPS" --num_envs "$NUM_ENVS" \
+        --max_steps "$MAX_STEPS" --num_envs "$NUM_ENVS" --resume \
         > "$out_root/$suite/eval.log" 2>&1 &
     client_pids[$idx]=$!
     if (( idx + 1 < ${#SUITES[@]} )); then sleep "$CLIENT_STAGGER_S"; fi

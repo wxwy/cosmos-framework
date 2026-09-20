@@ -1065,6 +1065,121 @@ def _load_initial_states(
     return np.array(all_initial_states[task_key][episode_key]["initial_state"])
 
 
+_INTENTIONAL_SKIP_ERROR = "Skipped due to failed expert demo"
+
+
+def _resume_result_is_terminal(result: Any) -> bool:
+    """Return whether an episode result is safe to reuse across eval restarts.
+
+    Infrastructure/runtime failures are intentionally *not* terminal: they must be
+    retried on resume. A policy success/failure with no runtime error is terminal,
+    as is the explicit deterministic "failed expert demo" skip.
+    """
+    if not isinstance(result, dict):
+        return False
+    episode = result.get("episode")
+    success = result.get("success")
+    steps = result.get("steps")
+    error = result.get("error")
+    if type(episode) is not int or type(success) is not bool or type(steps) is not int or steps < 0:
+        return False
+    return error is None or error == _INTENTIONAL_SKIP_ERROR
+
+
+def _load_resume_task_results(
+    output_dir: Path | None,
+    *,
+    task_id: int,
+    task_description: str,
+    num_trials: int,
+) -> dict[int, dict[str, Any]]:
+    """Load reusable episode-boundary results from one task partial summary.
+
+    partial_summary/task_XXX.json is the sole resume authority. Residual
+    actions/predictions without this receipt are not sufficient because they may
+    come from an interrupted episode.
+    """
+    if output_dir is None:
+        return {}
+    path = output_dir / "partial_summary" / f"task_{task_id:03d}.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Cannot resume from malformed partial summary {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Cannot resume from non-object partial summary {path}")
+    if payload.get("task_id") != task_id:
+        raise ValueError(
+            f"Resume task mismatch in {path}: expected task_id={task_id}, got {payload.get('task_id')!r}"
+        )
+    if payload.get("task_description") != task_description:
+        raise ValueError(f"Resume task description mismatch in {path}")
+    if payload.get("target_episodes") != num_trials:
+        raise ValueError(
+            f"Resume trial-count mismatch in {path}: expected {num_trials}, "
+            f"got {payload.get('target_episodes')!r}"
+        )
+    rows = payload.get("episode_results")
+    if not isinstance(rows, list):
+        raise ValueError(f"Resume partial summary has no episode_results list: {path}")
+    declared_completed = payload.get("completed_episodes")
+    if declared_completed is not None and declared_completed != len(rows):
+        raise ValueError(
+            f"Resume completed_episodes mismatch in {path}: "
+            f"declared={declared_completed!r} rows={len(rows)}"
+        )
+
+    reusable: dict[int, dict[str, Any]] = {}
+    seen: set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"Resume partial summary contains a non-object episode result: {path}")
+        episode = row.get("episode")
+        if type(episode) is not int or not 0 <= episode < num_trials:
+            raise ValueError(f"Resume partial summary has invalid episode={episode!r}: {path}")
+        if episode in seen:
+            raise ValueError(f"Resume partial summary has duplicate episode={episode}: {path}")
+        seen.add(episode)
+        if _resume_result_is_terminal(row):
+            reusable[episode] = dict(row)
+        else:
+            print(
+                f"Resume: task {task_id} episode {episode} has non-terminal result "
+                f"error={row.get('error')!r}; rerunning it.",
+                flush=True,
+            )
+    return reusable
+
+
+def _write_task_partial_summary(
+    output_dir: Path | None,
+    *,
+    task_id: int,
+    task_description: str,
+    num_trials: int,
+    results: list[dict[str, Any] | None],
+) -> None:
+    if output_dir is None:
+        return
+    completed = sorted(
+        (dict(item) for item in results if item is not None),
+        key=lambda item: int(item["episode"]),
+    )
+    _write_json_atomic(
+        output_dir / "partial_summary" / f"task_{task_id:03d}.json",
+        {
+            "task_id": task_id,
+            "task_description": task_description,
+            "completed_episodes": len(completed),
+            "target_episodes": num_trials,
+            "successes": sum(1 for item in completed if item["success"]),
+            "episode_results": completed,
+        },
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LIBERO closed-loop evaluation via Action HTTP server")
     parser.add_argument(
@@ -1165,6 +1280,15 @@ def _parse_args() -> argparse.Namespace:
         help="Number of parallel LIBERO envs (SubprocVectorEnv). >1 runs trials in waves "
         "with ONE batched /predict_batch per control step (~num_envs x faster). 1 = serial.",
     )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Resume completed episodes from output_dir/partial_summary/task_XXX.json. "
+            "Only episode-boundary terminal results are reused; runtime/server errors are rerun."
+        ),
+    )
     parser.add_argument("--output_dir", type=str, default="", help="Directory to save evaluation summary JSON")
     return parser.parse_args()
 
@@ -1241,6 +1365,7 @@ def _run_task_vectorized(
     mp4_pred_root: Path | None = None,
     mp4_fps: int = 20,
     video_samples_per_task: int = 1,
+    resume_results: dict[int, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Run all `num_trials` of one task across `num_envs` parallel LIBERO envs
     (SubprocVectorEnv), in waves. Each control step gathers obs from the ACTIVE
@@ -1264,22 +1389,35 @@ def _run_task_vectorized(
     resolved_rotation_space = _infer_rotation_space(action_dim, rotation_space)
     bddl = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
 
-    results: list[dict[str, Any]] = [None] * num_trials  # type: ignore[list-item]
+    results: list[dict[str, Any] | None] = [None] * num_trials
     for t in range(num_trials):
         if init_states[t] is None:
             results[t] = {
                 "episode": t,
                 "success": False,
                 "steps": 0,
-                "error": "Skipped due to failed expert demo",
+                "error": _INTENTIONAL_SKIP_ERROR,
                 "elapsed_s": 0.0,
             }
-    runnable = [t for t in range(num_trials) if init_states[t] is not None]
-    if not runnable:
-        return results
+    for episode, result in (resume_results or {}).items():
+        if not 0 <= episode < num_trials:
+            raise ValueError(f"resume episode {episode} is outside [0, {num_trials})")
+        results[episode] = dict(result)
 
-    video_trial_count = min(max(0, video_samples_per_task), len(runnable))
-    video_trials = set(runnable[:video_trial_count]) if (mp4_root is not None or mp4_pred_root is not None) else set()
+    eligible_trials = [t for t in range(num_trials) if init_states[t] is not None]
+    runnable = [t for t in eligible_trials if results[t] is None]
+    if not runnable:
+        return [item for item in results if item is not None]
+
+    # Video sampling is defined against the original episode ordering, not the
+    # post-resume pending subset. Resuming after episode 0 therefore does not
+    # silently turn a later episode into a new sampled-video episode.
+    video_trial_count = min(max(0, video_samples_per_task), len(eligible_trials))
+    video_trials = (
+        set(eligible_trials[:video_trial_count])
+        if (mp4_root is not None or mp4_pred_root is not None)
+        else set()
+    )
     n = min(num_envs, len(runnable))
 
     mujoco_gl = os.environ.get("MUJOCO_GL", "egl")
@@ -1478,17 +1616,12 @@ def _run_task_vectorized(
                         output_dir / "predictions" / f"task_{task_id:03d}" / f"episode_{t:03d}.json",
                         prediction_logs[s],
                     )
-                completed = [item for item in results if item is not None]
-                _write_json_atomic(
-                    output_dir / "partial_summary" / f"task_{task_id:03d}.json",
-                    {
-                        "task_id": task_id,
-                        "task_description": task_description,
-                        "completed_episodes": len(completed),
-                        "target_episodes": num_trials,
-                        "successes": sum(1 for item in completed if item["success"]),
-                        "episode_results": completed,
-                    },
+                _write_task_partial_summary(
+                    output_dir,
+                    task_id=task_id,
+                    task_description=task_description,
+                    num_trials=num_trials,
+                    results=results,
                 )
     finally:
         for slot in range(n):
@@ -1497,7 +1630,10 @@ def _run_task_vectorized(
             venv.close()
         except Exception:  # noqa: BLE001
             pass
-    return results
+    if any(item is None for item in results):
+        missing = [i for i, item in enumerate(results) if item is None]
+        raise RuntimeError(f"vectorized evaluation finished with missing episode results: {missing}")
+    return [item for item in results if item is not None]
 
 
 def main() -> None:
@@ -1562,10 +1698,26 @@ def main() -> None:
 
     for task_id in selected_task_ids:
         task = task_suite.get_task(task_id)
+        task_description = str(task.language)
+        resume_results = (
+            _load_resume_task_results(
+                output_dir,
+                task_id=task_id,
+                task_description=task_description,
+                num_trials=args.num_trials_per_task,
+            )
+            if args.resume
+            else {}
+        )
+        if resume_results:
+            print(
+                f"Resume: task {task_id} reusing {len(resume_results)}/"
+                f"{args.num_trials_per_task} completed episodes: {sorted(resume_results)}",
+                flush=True,
+            )
 
         # ---- Vectorized path: N parallel envs + one batched /predict_batch per step ----
         if args.num_envs > 1:
-            task_description = str(task.language)
             client.prompt = _augment_task_prompt_with_viewpoint(task_description, cameras)
             init_states = [
                 _load_initial_states(
@@ -1602,6 +1754,7 @@ def main() -> None:
                 mp4_pred_root=mp4_pred_root,
                 mp4_fps=args.mp4_fps,
                 video_samples_per_task=args.video_samples_per_task,
+                resume_results=resume_results,
             )
             task_episodes = 0
             task_successes = 0
@@ -1649,6 +1802,25 @@ def main() -> None:
         video_samples_used = 0
 
         for episode_idx in range(args.num_trials_per_task):
+            if episode_idx in resume_results:
+                resumed = resume_results[episode_idx]
+                episode_results.append(dict(resumed))
+                task_episodes += 1
+                total_episodes += 1
+                if resumed["success"]:
+                    task_successes += 1
+                    total_successes += 1
+                print(
+                    f"Task {task_id} | Episode {episode_idx + 1}/{args.num_trials_per_task} | "
+                    f"resume=True success={resumed['success']} steps={resumed['steps']} | "
+                    f"task SR {task_successes}/{task_episodes} "
+                    f"({100.0 * task_successes / max(1, task_episodes):.1f}%) | "
+                    f"overall SR {total_successes}/{total_episodes} "
+                    f"({100.0 * total_successes / max(1, total_episodes):.1f}%)",
+                    flush=True,
+                )
+                continue
+
             episode_t0 = time.perf_counter()
             client.prompt = _augment_task_prompt_with_viewpoint(task_description, cameras)
             initial_state = _load_initial_states(
@@ -1665,15 +1837,24 @@ def main() -> None:
                         "episode": episode_idx,
                         "success": False,
                         "steps": 0,
-                        "error": "Skipped due to failed expert demo",
+                        "error": _INTENTIONAL_SKIP_ERROR,
                         "elapsed_s": round(episode_elapsed_s, 3),
                     }
+                )
+                task_episodes += 1
+                total_episodes += 1
+                _write_task_partial_summary(
+                    output_dir,
+                    task_id=task_id,
+                    task_description=task_description,
+                    num_trials=args.num_trials_per_task,
+                    results=episode_results,
                 )
                 print(
                     f"Task {task_id} | Episode {episode_idx + 1}/{args.num_trials_per_task} | "
                     "success=False steps=0 "
                     f"elapsed_s={episode_elapsed_s:.1f} "
-                    "error='Skipped due to failed expert demo'",
+                    f"error={_INTENTIONAL_SKIP_ERROR!r}",
                     flush=True,
                 )
                 continue
@@ -1764,6 +1945,14 @@ def main() -> None:
                     json.dumps(result.predictions, indent=2),
                     encoding="utf-8",
                 )
+
+            _write_task_partial_summary(
+                output_dir,
+                task_id=task_id,
+                task_description=task_description,
+                num_trials=args.num_trials_per_task,
+                results=episode_results,
+            )
 
             client.notify_next_episode()
 
