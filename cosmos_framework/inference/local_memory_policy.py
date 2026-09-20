@@ -187,8 +187,12 @@ class PolicyLocalMemoryAdapter:
             "sessions": data.get("sessions", 0),
             "max_sessions": data.get("max_sessions", 0),
             "cold_start": (
-                "step0 required; inference fast state is not restored from a training checkpoint"
-                if self.memory_kind == "ttt_fast_weight"
-                else "step0 required; bounded recent-history buffer starts empty and stores no recurrent hidden state"
+                "disabled"
+                if not self.enabled
+                else (
+                    "step0 required; inference fast state is not restored from a training checkpoint"
+                    if self.memory_kind == "ttt_fast_weight"
+                    else "step0 required; bounded recent-history buffer starts empty and stores no recurrent hidden state"
+                )
             ),
         }

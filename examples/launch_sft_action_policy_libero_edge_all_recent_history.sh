@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # E003 bounded recent-history matched control.
-# H=64 is formal; override PSM_R08_LOCAL_HISTORY_HORIZON=16 for smoke only.
+# This formal launcher is pinned to H=64 so smoke runs cannot contaminate the
+# auto-resume namespace with a different history horizon.
 export PSM_R08_LOCAL_HISTORY_ENABLED=1
 export PSM_E003_RECENT_HISTORY_CONTROL=1
-export PSM_R08_LOCAL_HISTORY_HORIZON="${PSM_R08_LOCAL_HISTORY_HORIZON:-64}"
+export PSM_R08_LOCAL_HISTORY_HORIZON=64
 export PSM_R08_HISTORY_MODE=normal
 export PSM_LOCAL_DUMMY_ENABLED=0
 export PSM_R09_A1_ENABLED=0
