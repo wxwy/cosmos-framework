@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 # E003 matched bounded recent-history control.
-# Wrapper enables canonical visual96 + executed_action10 evidence, H=64 by default,
+# Wrapper enables canonical visual96 + executed_action10 evidence, H=16 for the formal matched control,
 # finite-window GRU replay from zero, and disables all persistent recurrent/TTT routes.
 # Output remains one 32-D Local token. Formal comparison checkpoint: iter_000002800.
 
@@ -11,7 +11,7 @@ task       = "vfm"
 experiment = "action_policy_libero_edge_all"
 project    = "cosmos3_action_libero"
 group      = "action_sft"
-name       = "edge_libero_4in1_recent_history_h64"
+name       = "edge_libero_4in1_recent_history_h16"
 wandb_mode = "disabled"
 
 [model]

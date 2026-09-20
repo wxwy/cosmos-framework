@@ -66,7 +66,7 @@ def _local_history_horizon(*, active: bool) -> int:
     """
     if active:
         return 0
-    default_horizon = "64" if _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL") else "16"
+    default_horizon = "16"
     return int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", default_horizon))
 
 

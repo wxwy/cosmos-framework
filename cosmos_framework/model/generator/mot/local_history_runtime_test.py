@@ -271,7 +271,7 @@ def test_canonical_recent_history_runtime_ignores_age_dt_and_replays_from_zero()
     assert torch.equal(present, expected_present)
 
 
-def test_e003_recent_history_config_is_h64_canonical_and_ttt_exclusive(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_e003_recent_history_config_is_h16_canonical_and_ttt_exclusive(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PSM_R08_LOCAL_HISTORY_ENABLED", "1")
     monkeypatch.setenv("PSM_E003_RECENT_HISTORY_CONTROL", "1")
     monkeypatch.delenv("PSM_R08_LOCAL_HISTORY_HORIZON", raising=False)
@@ -283,7 +283,7 @@ def test_e003_recent_history_config_is_h64_canonical_and_ttt_exclusive(monkeypat
 
     recipe = importlib.reload(recipe)
     cfg = recipe._action_policy_libero_edge_model_config()
-    assert cfg["local_history_horizon"] == 64
+    assert cfg["local_history_horizon"] == 16
     assert cfg["local_history_backend"] == "recurrent"
     assert cfg["local_history_canonical_evidence"] is True
     selected = recipe.action_policy_libero_edge_all["optimizer"]["keys_to_select"]
