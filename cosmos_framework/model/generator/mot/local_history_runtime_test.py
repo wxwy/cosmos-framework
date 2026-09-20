@@ -8,8 +8,10 @@ import cosmos_framework.model.generator.omni_mot_model as omni_mot_model
 from cosmos_framework.data.generator.sequence_packing.sequence import SequencePlan
 from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
 from cosmos_framework.model.generator.mot.local_evidence import (
+    CANONICAL_EVIDENCE_FEATURE_CONFIG,
     LocalEvidenceEncoder,
     LocalHistoryRuntime,
+    RecurrentLocalMemoryBackend,
     StatelessLocalReplayReadout,
 )
 from cosmos_framework.utils.generator.optimizer import _build_params_with_metadata
@@ -237,5 +239,60 @@ def test_r09_b1_config_selects_ttt_and_excludes_a1(monkeypatch: pytest.MonkeyPat
         "local_memory_modality_embed",
     ]
     monkeypatch.setenv("PSM_R09_A1_ENABLED", "1")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        recipe._action_policy_libero_edge_model_config()
+
+
+def test_canonical_recent_history_runtime_ignores_age_dt_and_replays_from_zero() -> None:
+    encoder = LocalEvidenceEncoder(
+        evidence_dim=8,
+        visual_dim=4,
+        action_dim=3,
+        feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG,
+    )
+    backend = RecurrentLocalMemoryBackend(evidence_dim=8, local_dim=5)
+    runtime = LocalHistoryRuntime(
+        encoder,
+        StatelessLocalReplayReadout(evidence_dim=8, local_dim=5),
+        backend,
+    )
+    inputs = _inputs(batch=2, horizon=4)
+    first, present, evidence = runtime(**inputs)
+    inputs["history_age_steps"] = torch.full_like(inputs["history_age_steps"], 999)
+    inputs["history_dt_s"] = torch.full_like(inputs["history_dt_s"], 999.0)
+    second, present2, evidence2 = runtime(**inputs)
+    assert tuple(first.shape) == (2, 1, 5)
+    assert torch.equal(present, present2)
+    torch.testing.assert_close(evidence, evidence2, rtol=0, atol=0)
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+    expected, _, expected_present = backend.replay(evidence, inputs["history_mask"], state=None)
+    torch.testing.assert_close(first, expected, rtol=0, atol=0)
+    assert torch.equal(present, expected_present)
+
+
+def test_e003_recent_history_config_is_h64_canonical_and_ttt_exclusive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PSM_R08_LOCAL_HISTORY_ENABLED", "1")
+    monkeypatch.setenv("PSM_E003_RECENT_HISTORY_CONTROL", "1")
+    monkeypatch.delenv("PSM_R08_LOCAL_HISTORY_HORIZON", raising=False)
+    monkeypatch.delenv("PSM_R09_A1_ENABLED", raising=False)
+    monkeypatch.delenv("PSM_R09_B1_TTT_ENABLED", raising=False)
+    monkeypatch.delenv("PSM_R09_B_TTT_ENABLED", raising=False)
+    monkeypatch.delenv("PSM_R09_B_TTT_ACTIVE", raising=False)
+    from cosmos_framework.configs.base.experiment.action.posttrain_config import action_policy_libero_edge_all as recipe
+
+    recipe = importlib.reload(recipe)
+    cfg = recipe._action_policy_libero_edge_model_config()
+    assert cfg["local_history_horizon"] == 64
+    assert cfg["local_history_backend"] == "recurrent"
+    assert cfg["local_history_canonical_evidence"] is True
+    selected = recipe.action_policy_libero_edge_all["optimizer"]["keys_to_select"]
+    assert "local_history_runtime" not in selected
+    assert "local_history_runtime.encoder" in selected
+    assert "local_history_runtime.recurrent_backend" in selected
+    assert "local_memory2llm" in selected
+    assert "local_memory_modality_embed" in selected
+
+    monkeypatch.setenv("PSM_R09_B_TTT_ENABLED", "1")
     with pytest.raises(ValueError, match="mutually exclusive"):
         recipe._action_policy_libero_edge_model_config()

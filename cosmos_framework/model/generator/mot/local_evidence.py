@@ -92,16 +92,20 @@ class LocalEvidenceEncoder(nn.Module):
         *,
         history_visual_summary: torch.Tensor,
         local_history_action: torch.Tensor,
-        history_age_steps: torch.Tensor,
-        history_dt_s: torch.Tensor,
+        history_age_steps: torch.Tensor | None,
+        history_dt_s: torch.Tensor | None,
         history_mask: torch.Tensor,
         history_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return ``[B,H,D_e]`` with every masked position exactly zero."""
         if not self.feature_config.state and history_state is not None:
             raise ValueError("history_state is disabled by feature_config.")
+        if self.feature_config.dt and history_dt_s is None:
+            raise ValueError("history_dt_s is required by feature_config.")
         if not self.feature_config.dt and history_dt_s is not None:
             raise ValueError("history_dt_s is disabled by feature_config.")
+        if self.feature_config.age and history_age_steps is None:
+            raise ValueError("history_age_steps is required by feature_config.")
         if not self.feature_config.age and history_age_steps is not None:
             raise ValueError("history_age_steps is disabled by feature_config.")
         if history_visual_summary.ndim != 3:
@@ -112,8 +116,10 @@ class LocalEvidenceEncoder(nn.Module):
         )
         self._check_shape(local_history_action, (batch, horizon, self.action_proj.in_features), "local_history_action")
         if self.feature_config.age:
+            assert history_age_steps is not None
             self._check_shape(history_age_steps, (batch, horizon), "history_age_steps")
         if self.feature_config.dt:
+            assert history_dt_s is not None
             self._check_shape(history_dt_s, (batch, horizon, 1), "history_dt_s")
         self._check_shape(history_mask, (batch, horizon), "history_mask")
         if not torch.isfinite(history_visual_summary).all() or not torch.isfinite(local_history_action).all():
@@ -122,8 +128,10 @@ class LocalEvidenceEncoder(nn.Module):
         encoded = self.visual_proj(history_visual_summary.to(dtype=self.visual_proj.weight.dtype))
         encoded = encoded + self.action_proj(local_history_action.to(dtype=self.action_proj.weight.dtype))
         if self.feature_config.age:
+            assert history_age_steps is not None
             encoded = encoded + self.age_embedding(history_age_steps.long().clamp(0, self.max_age_steps))
         if self.feature_config.dt:
+            assert history_dt_s is not None
             encoded = encoded + self.dt_proj(history_dt_s.to(dtype=encoded.dtype))
 
         if self.feature_config.state and history_state is not None:
@@ -940,15 +948,15 @@ class LocalHistoryRuntime(nn.Module):
         A sample with no valid history is marked absent; callers must not pack its
         zero readout token because downstream R07 projections may have bias.
         """
-        if not torch.isfinite(history_dt_s).all():
+        if self.encoder.feature_config.dt and not torch.isfinite(history_dt_s).all():
             raise ValueError("history_dt_s must be finite before Local runtime wiring.")
         evidence = self.encoder(
             history_visual_summary=history_visual_summary,
             local_history_action=local_history_action,
-            history_age_steps=history_age_steps,
-            history_dt_s=history_dt_s,
+            history_age_steps=history_age_steps if self.encoder.feature_config.age else None,
+            history_dt_s=history_dt_s if self.encoder.feature_config.dt else None,
             history_mask=history_mask,
-            history_state=history_state,
+            history_state=history_state if self.encoder.feature_config.state else None,
         )
         if self.recurrent_backend is None:
             tokens = self.readout(evidence, history_mask)

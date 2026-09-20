@@ -434,7 +434,7 @@ class OmniMoTModel(ImaginaireModel):
                     visual_dim=96,
                     feature_config=(
                         CANONICAL_EVIDENCE_FEATURE_CONFIG
-                        if self.config.local_ttt_enabled
+                        if self.config.local_ttt_enabled or self.config.local_history_canonical_evidence
                         else LEGACY_EVIDENCE_FEATURE_CONFIG
                     ),
                 )

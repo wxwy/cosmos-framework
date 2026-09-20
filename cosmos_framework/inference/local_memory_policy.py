@@ -11,6 +11,7 @@ from cosmos_framework.inference.local_memory_online import (
     EVIDENCE_VERSION,
     OnlineLocalMemory,
     OnlineMemoryRequest,
+    OnlineRecentHistoryMemory,
 )
 
 
@@ -19,14 +20,37 @@ class PolicyLocalMemoryAdapter:
         if mode not in {"auto", "off", "required"}:
             raise ValueError("local memory mode must be auto, off, or required")
         self.service, self.mode = service, mode
-        available = bool(getattr(service.model.config, "local_ttt_enabled", False))
+        config = service.model.config
+        ttt_available = bool(getattr(config, "local_ttt_enabled", False))
+        recent_available = bool(
+            getattr(config, "local_history_enabled", False)
+            and getattr(config, "local_history_backend", "recurrent") == "recurrent"
+            and getattr(config, "local_history_canonical_evidence", False)
+            and int(getattr(config, "local_history_horizon", 0)) > 0
+        )
+        available = ttt_available or recent_available
         self.enabled = mode == "required" or (mode == "auto" and available)
         self.memory = None
-        if self.enabled:
+        self.memory_kind = None
+        if self.enabled and ttt_available:
             runtime = getattr(service.model.net, "local_memory_runtime", None)
             if runtime is None:
-                raise ValueError("required Local Memory is absent from this checkpoint model")
+                raise ValueError("required TTT Local Memory is absent from this checkpoint model")
             self.memory = OnlineLocalMemory(runtime.evidence_encoder, runtime.ttt_core, max_sessions=max_sessions)
+            self.memory_kind = "ttt_fast_weight"
+        elif self.enabled and recent_available:
+            runtime = getattr(service.model.net, "local_history_runtime", None)
+            if runtime is None or runtime.recurrent_backend is None:
+                raise ValueError("required bounded recent-history runtime is absent from this checkpoint model")
+            self.memory = OnlineRecentHistoryMemory(
+                runtime.encoder,
+                runtime.recurrent_backend,
+                history_horizon=int(config.local_history_horizon),
+                max_sessions=max_sessions,
+            )
+            self.memory_kind = "bounded_recent_history"
+        elif self.enabled:
+            raise ValueError("required Local Memory is absent from this checkpoint model")
 
     def _visual_summary(self, req, image):
         prep = self.service._prep_policy_item({**req, "image": image})
@@ -71,7 +95,7 @@ class PolicyLocalMemoryAdapter:
     def _request(self, req):
         memory = req.get("local_memory")
         if not isinstance(memory, dict):
-            raise ValueError("TTT checkpoint requires a local_memory session/episode/consumer_step/evidence request")
+            raise ValueError("Local Memory checkpoint requires a local_memory session/episode/consumer_step/evidence request")
         if memory.get("evidence_version", EVIDENCE_VERSION) != EVIDENCE_VERSION:
             raise ValueError("unsupported local evidence version")
         rows = memory.get("evidence", [])
@@ -137,6 +161,7 @@ class PolicyLocalMemoryAdapter:
                     "consumer_step": update.replacement.consumer_step,
                     "prefix_present": update.replacement.token is not None,
                     "replay": update.replay,
+                    "memory_kind": self.memory_kind,
                 }
                 for update in updates
             ]
@@ -157,7 +182,13 @@ class PolicyLocalMemoryAdapter:
             "enabled": self.enabled,
             "mode": self.mode,
             "evidence_version": EVIDENCE_VERSION,
+            "memory_kind": data.get("memory_kind", self.memory_kind),
+            "history_horizon": data.get("history_horizon"),
             "sessions": data.get("sessions", 0),
             "max_sessions": data.get("max_sessions", 0),
-            "cold_start": "step0 required; inference fast state is not restored from a training checkpoint",
+            "cold_start": (
+                "step0 required; inference fast state is not restored from a training checkpoint"
+                if self.memory_kind == "ttt_fast_weight"
+                else "step0 required; bounded recent-history buffer starts empty and stores no recurrent hidden state"
+            ),
         }

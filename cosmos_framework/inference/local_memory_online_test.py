@@ -8,6 +8,7 @@ from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
     ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
+    RecurrentLocalMemoryBackend,
 )
 
 
@@ -126,3 +127,58 @@ def test_session_limits_and_reset_pending_guard():
     memory.commit(pending)
     memory.reset_session("s")
     memory.commit(memory.prepare(request(session="other")))
+
+
+def make_recent_memory(history_horizon=2, **kwargs):
+    torch.manual_seed(53)
+    encoder = LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG)
+    backend = RecurrentLocalMemoryBackend()
+    return online.OnlineRecentHistoryMemory(
+        encoder,
+        backend,
+        history_horizon=history_horizon,
+        **kwargs,
+    )
+
+
+def test_recent_history_keeps_only_last_h_and_replays_from_zero():
+    memory = make_recent_memory(history_horizon=2)
+    memory.commit(memory.prepare(request()))
+    memory.commit(memory.prepare(request(3)))
+    record = memory._records["s"]
+    assert record.source_steps == (1, 2)
+    assert not hasattr(record, "state")
+
+    with torch.no_grad():
+        evidence = memory.encoder.encode_segment(
+            record.visual_summary.unsqueeze(0),
+            record.executed_action.unsqueeze(0),
+        )
+        expected, _, present = memory.recurrent_backend.replay(
+            evidence,
+            torch.ones(1, 2, dtype=torch.bool),
+            state=None,
+        )
+    assert bool(present[0])
+    torch.testing.assert_close(record.token, expected[0], rtol=0, atol=0)
+
+    memory.commit(memory.prepare(request(5, start=3)))
+    record = memory._records["s"]
+    assert record.source_steps == (3, 4)
+    assert record.visual_summary.shape == (2, 96)
+    assert record.executed_action.shape == (2, 10)
+
+
+def test_recent_history_abort_and_reset_clear_only_evidence_buffer():
+    memory = make_recent_memory(history_horizon=4)
+    memory.commit(memory.prepare(request()))
+    pending = memory.prepare(request(3))
+    memory.abort_many((pending,))
+    assert memory._records["s"].source_steps == ()
+    memory.commit(memory.prepare(request(3)))
+    assert memory._records["s"].source_steps == (0, 1, 2)
+    memory.commit(memory.prepare(request(0, episode="other", reset=True)))
+    record = memory._records["s"]
+    assert record.episode_id == "other"
+    assert record.source_steps == ()
+    assert record.token is None

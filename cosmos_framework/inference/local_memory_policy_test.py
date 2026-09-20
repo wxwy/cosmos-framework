@@ -10,6 +10,7 @@ from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
     ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
+    RecurrentLocalMemoryBackend,
 )
 
 
@@ -118,3 +119,44 @@ def test_batched_sessions_can_commit_atomically_and_reset_independently():
     policy.reset("a")
     assert policy.memory.metadata()["steps"] == {"b": 0}
     assert policy.info()["enabled"] and policy.info()["sessions"] == 1
+
+
+def recent_adapter(mode="auto", history_horizon=2):
+    runtime = SimpleNamespace(
+        encoder=LocalEvidenceEncoder(feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG),
+        recurrent_backend=RecurrentLocalMemoryBackend(),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            local_ttt_enabled=False,
+            local_history_enabled=True,
+            local_history_backend="recurrent",
+            local_history_canonical_evidence=True,
+            local_history_horizon=history_horizon,
+        ),
+        net=SimpleNamespace(local_history_runtime=runtime),
+    )
+    service = SimpleNamespace(
+        model=model,
+        action_normalization="quantile",
+        action_min=torch.full((10,), -1.0),
+        action_range=torch.full((10,), 2.0),
+    )
+    return PolicyLocalMemoryAdapter(service, mode=mode)
+
+
+def test_recent_history_checkpoint_uses_bounded_online_control():
+    policy = recent_adapter(history_horizon=2)
+    assert policy.info()["memory_kind"] == "bounded_recent_history"
+    assert policy.info()["history_horizon"] == 2
+    policy.generate([req()], batch(), lambda: {"action": [torch.zeros(16, 10)]})
+
+    observed = batch()
+    result = policy.generate(
+        [req(3)],
+        observed,
+        lambda: {"action": [observed["local_memory"][0].sum().expand(16, 10)]},
+    )
+    assert tuple(observed["local_memory"][0].shape) == (1, 32)
+    assert result["_local_memory_status"][0]["memory_kind"] == "bounded_recent_history"
+    assert policy.memory.metadata()["retained_source_steps"]["s"] == [1, 2]

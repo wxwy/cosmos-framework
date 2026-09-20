@@ -66,7 +66,8 @@ def _local_history_horizon(*, active: bool) -> int:
     """
     if active:
         return 0
-    return int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", "16"))
+    default_horizon = "64" if _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL") else "16"
+    return int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", default_horizon))
 
 
 def _action_policy_libero_edge_model_config() -> dict:
@@ -86,6 +87,7 @@ def _action_policy_libero_edge_model_config() -> dict:
     r09_b1_ttt_enabled = _strict_bool_env("PSM_R09_B1_TTT_ENABLED")
     r09_a1_enabled = _strict_bool_env("PSM_R09_A1_ENABLED")
     r09_b_ttt_enabled = _strict_bool_env("PSM_R09_B_TTT_ENABLED")
+    e003_recent_history = _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL")
     if local_dummy_enabled and local_history_enabled:
         raise ValueError("PSM_LOCAL_DUMMY_ENABLED and PSM_R08_LOCAL_HISTORY_ENABLED are mutually exclusive")
     if r09_b1_ttt_enabled and not local_history_enabled:
@@ -108,12 +110,22 @@ def _action_policy_libero_edge_model_config() -> dict:
         raise ValueError("PSM_R09_B_TTT_ACTIVE requires PSM_R09_B_TTT_ENABLED=1")
     if _strict_bool_env("PSM_R09_B_TTT_ACTIVE") and not local_history_enabled:
         raise ValueError("PSM_R09_B_TTT_ACTIVE requires PSM_R08_LOCAL_HISTORY_ENABLED=1")
+    if e003_recent_history and not local_history_enabled:
+        raise ValueError("PSM_E003_RECENT_HISTORY_CONTROL requires PSM_R08_LOCAL_HISTORY_ENABLED=1")
+    if e003_recent_history and (
+        r09_a1_enabled
+        or r09_b1_ttt_enabled
+        or r09_b_ttt_enabled
+        or _strict_bool_env("PSM_R09_B_TTT_ACTIVE")
+    ):
+        raise ValueError("PSM_E003_RECENT_HISTORY_CONTROL is mutually exclusive with recurrent-state/TTT routes")
     local_dummy_mode = os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal")
     if local_dummy_mode not in {"normal", "zero", "shuffle"}:
         raise ValueError(f"unsupported PSM_LOCAL_DUMMY_MODE: {local_dummy_mode}")
     cfg["local_memory_enabled"] = local_dummy_enabled or local_history_enabled
     cfg["local_history_enabled"] = local_history_enabled
     cfg["local_history_backend"] = "ttt_fast_weight" if (r09_b1_ttt_enabled or r09_b_ttt_enabled) else "recurrent"
+    cfg["local_history_canonical_evidence"] = e003_recent_history
     # R09-B TTT active wiring: default stays False, so the composed config is
     # identical to baseline unless PSM_R09_B_TTT_ENABLED=1; the four TTT
     # hyperparameters keep their frozen defaults (16 / 0.1 / 1 / 1).
@@ -123,6 +135,8 @@ def _action_policy_libero_edge_model_config() -> dict:
     )
     if cfg["local_history_horizon"] < 0:
         raise ValueError("PSM_R08_LOCAL_HISTORY_HORIZON must be non-negative")
+    if e003_recent_history and cfg["local_history_horizon"] <= 0:
+        raise ValueError("E003 bounded recent-history control requires a positive history horizon")
     cfg["local_memory_dim"] = int(os.environ.get("PSM_LOCAL_DUMMY_DIM", "32")) if cfg["local_memory_enabled"] else None
     cfg["vlm_config"]["tokenizer"].update(
         repository=None,
@@ -287,6 +301,15 @@ if action_policy_libero_edge_all["model"]["config"]["local_history_enabled"]:
 
 if os.environ.get("PSM_R09_A1_ENABLED", "0") == "1":
     action_policy_libero_edge_all["optimizer"]["keys_to_select"] = [
+        "local_history_runtime.encoder",
+        "local_history_runtime.recurrent_backend",
+        "local_memory2llm",
+        "local_memory_modality_embed",
+    ]
+
+if _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL"):
+    _baseline_slow_selectors = list(action_policy_libero_all_nano["optimizer"]["keys_to_select"])
+    action_policy_libero_edge_all["optimizer"]["keys_to_select"] = _baseline_slow_selectors + [
         "local_history_runtime.encoder",
         "local_history_runtime.recurrent_backend",
         "local_memory2llm",

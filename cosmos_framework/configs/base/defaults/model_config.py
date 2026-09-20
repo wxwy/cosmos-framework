@@ -351,6 +351,10 @@ class OmniMoTModelConfig:
     local_history_horizon: int = 16
     local_history_evidence_dim: int = 256
     local_history_state_enabled: bool = False
+    # E003 bounded recent-history control: use the same canonical
+    # visual96 + executed_action10 evidence inventory as Local TTT while keeping
+    # the recurrent replay stateless across policy queries.
+    local_history_canonical_evidence: bool = False
 
     # R09-B TTT active training wiring. Disabled by default so No-Memory and
     # R08/B1 checkpoints and runtime behavior remain unchanged. Validation

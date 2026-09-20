@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# E003 matched bounded recent-history control.
+# Wrapper enables canonical visual96 + executed_action10 evidence, H=64 by default,
+# finite-window GRU replay from zero, and disables all persistent recurrent/TTT routes.
+# Output remains one 32-D Local token. Formal comparison checkpoint: iter_000002800.
+
+[job]
+task       = "vfm"
+experiment = "action_policy_libero_edge_all"
+project    = "cosmos3_action_libero"
+group      = "action_sft"
+name       = "edge_libero_4in1_recent_history_h64"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 74000
+
+[model.parallelism]
+data_parallel_shard_degree     = -1
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [16000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter        = 2800
+logging_iter    = 1
+grad_accum_iter = 16
+
+[trainer.cudnn]
+benchmark = false
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 50
