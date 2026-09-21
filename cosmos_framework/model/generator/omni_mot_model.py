@@ -1891,6 +1891,7 @@ class OmniMoTModel(ImaginaireModel):
         rectified_flow: RectifiedFlow,
         raw_action_dim: list[torch.Tensor] | None = None,
         normalize_by_active: bool = False,
+        exclude_fully_conditioned_items: bool = False,
     ) -> torch.Tensor:
         """Compute flow matching loss for a modality.
 
@@ -1927,6 +1928,7 @@ class OmniMoTModel(ImaginaireModel):
             tensor_kwargs_fp32=self.tensor_kwargs_fp32,
             raw_action_dim=raw_action_dim,
             normalize_by_active=normalize_by_active,
+            exclude_fully_conditioned_items=exclude_fully_conditioned_items,
         )
 
     def _get_load_balancing_loss_meshes(self) -> tuple[DeviceMesh | None, DeviceMesh | None]:
@@ -2042,6 +2044,7 @@ class OmniMoTModel(ImaginaireModel):
                 has_valid_tokens=has_noisy_tokens(data_batch_packed.vision),
                 rectified_flow=rectified_flow_vision,
                 normalize_by_active=normalize_by_active,
+                exclude_fully_conditioned_items=self.config.history_mode == "window",
             )
             loss_scale = (
                 rf_cfg.image_loss_scale if is_image_batch and rf_cfg.image_loss_scale is not None else rf_cfg.loss_scale
