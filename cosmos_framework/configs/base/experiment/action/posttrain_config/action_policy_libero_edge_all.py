@@ -289,7 +289,11 @@ def _action_policy_libero_edge_dataloader():
     if _active:
         # Twelve forked workers would each hold an unused copy of a suite index.
         _num_workers = 0
-    max_samples_per_batch = 1 if _active else 128
+    # Native WINDOW-H16 carries H full-spatial clean vision items, so its
+    # per-sample token count is several times the baseline. Keep a conservative
+    # 16 samples/native-forward; the formal window TOML uses GA=128 so the
+    # optimizer still sees exactly 2048 consumers/update, matching GRU/baseline.
+    max_samples_per_batch = 1 if _active else (16 if history_mode == "window" else 128)
     # The route's own dataset handles, built as separate LazyDicts so they never
     # share an OmegaConf node with the loader.  They cannot be reached through the
     # trainer: `dataloader_train` is a local of `ImaginaireTrainer.train`.
