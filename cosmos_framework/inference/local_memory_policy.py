@@ -357,7 +357,16 @@ class PolicyLocalMemoryAdapter:
             for req, profile in zip(reqs, profiles, strict=True):
                 request, request_timing = self._request(req, profile=profile)
                 request_timings.append(request_timing)
-                updates.append(self.memory.prepare(request, profile=profile))
+                if self.memory_kind == "ttt_fast_weight":
+                    updates.append(
+                        self.memory.prepare(
+                            request,
+                            profile=profile,
+                            update_fast_state=self.mode != "init",
+                        )
+                    )
+                else:
+                    updates.append(self.memory.prepare(request, profile=profile))
             inject_t0 = _profile_start(any(profiles))
             tokens = [update.token for update in updates]
             plans = batch["sequence_plan"]

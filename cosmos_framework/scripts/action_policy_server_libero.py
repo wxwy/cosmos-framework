@@ -462,8 +462,8 @@ class ActionServerArgs(pydantic.BaseModel):
     """Output directory for ``OmniInference`` (saved config.yaml, benchmarks).
     Defaults to ``--dump-dir`` if set, else ``/tmp/cosmos3_action_server``."""
 
-    local_memory_mode: Literal["auto", "off", "required"] = "auto"
-    """Auto enables causal session memory for TTT checkpoints; off is explicit ablation."""
+    local_memory_mode: Literal["auto", "off", "required", "zero", "init"] = "auto"
+    """Local-memory mode. zero keeps online TTT updates but zeroes the injected token; init reads checkpoint W0 without online fast-weight updates."""
     local_memory_max_sessions: int = 64
     """Bounded active episode states; completed sessions must be reset explicitly."""
 

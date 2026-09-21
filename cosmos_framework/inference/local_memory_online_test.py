@@ -182,3 +182,49 @@ def test_recent_history_abort_and_reset_clear_only_evidence_buffer():
     assert record.episode_id == "other"
     assert record.source_steps == ()
     assert record.token is None
+
+
+def test_frozen_fast_intervention_reads_real_evidence_without_updating_w0():
+    memory = make_memory()
+    first = memory.prepare(request(), update_fast_state=False)
+    initial_state = tuple(value.clone() for value in first.replacement.state)
+    memory.commit(first)
+
+    req = request(3)
+    update = memory.prepare(req, update_fast_state=False)
+
+    # Frozen-fast means the session state stays exactly at checkpoint-learned W0.
+    for actual, expected in zip(update.replacement.state, initial_state, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    # The emitted token is still evidence-conditioned: read the final evidence
+    # query through the unchanged W0 and require exact agreement.
+    device = next(memory.encoder.parameters()).device
+    with torch.no_grad():
+        visual = req.visual_summary[-1:].to(device).unsqueeze(0)
+        action = req.executed_action[-1:].to(device).unsqueeze(0)
+        evidence = memory.encoder.encode_segment(visual, action).squeeze(1)
+        _, query_base, _ = memory.core.project_evidence(evidence)
+        expected_token = memory.core.read_many(
+            memory.core.project_queries(query_base),
+            memory._detach(initial_state),
+        )[0]
+    torch.testing.assert_close(update.token, expected_token, rtol=0, atol=0)
+    assert torch.count_nonzero(update.token).item() > 0
+
+    memory.commit(update)
+    later = memory.prepare(request(5, start=3), update_fast_state=False)
+    for actual, expected in zip(later.replacement.state, initial_state, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_normal_online_memory_still_updates_fast_state():
+    memory = make_memory()
+    first = memory.prepare(request())
+    initial_state = tuple(value.clone() for value in first.replacement.state)
+    memory.commit(first)
+    update = memory.prepare(request(3))
+    assert any(
+        not torch.equal(actual, initial)
+        for actual, initial in zip(update.replacement.state, initial_state, strict=True)
+    )

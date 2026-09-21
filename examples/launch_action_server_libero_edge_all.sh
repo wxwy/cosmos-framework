@@ -43,4 +43,5 @@ exec .venv/bin/python -m cosmos_framework.scripts.action_policy_server_libero \
   --action-stats-path cosmos_framework/data/generator/action/normalizer_stats/libero_native_frame_wise_relative_rot6d.json \
   --raw-action-dim 10 --fps 20 --port "$SERVER_PORT" --num-steps "$NUM_STEPS" \
   --output-dir "$SERVER_OUTPUT_DIR" \
+  --local-memory-mode "${LOCAL_MEMORY_MODE:-auto}" \
   --guidance "${GUIDANCE:-1.0}"

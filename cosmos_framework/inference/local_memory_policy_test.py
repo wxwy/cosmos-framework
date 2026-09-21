@@ -313,3 +313,60 @@ def test_profile_timing_is_exposed_for_every_history_method(kind):
     assert result["_profile_timing"][0]["history_mode"] == "window"
     for key in ("payload_total_ms", "history_preprocess_ms", "action_normalize_ms", "prefix_assembly_ms"):
         assert key in history and history[key] >= 0
+
+
+def test_zero_intervention_keeps_prefix_shape_but_zeros_injected_content_and_commits_real_state():
+    policy = adapter("zero")
+    policy.generate([req()], batch(), lambda: {"action": [torch.zeros(16, 10)]})
+    initial_state = tuple(value.clone() for value in policy.memory._records["s"].state)
+
+    observed = batch()
+
+    def generate():
+        token = observed["local_memory"][0]
+        assert token is not None
+        assert tuple(token.shape) == (1, 32)
+        assert torch.count_nonzero(token).item() == 0
+        assert observed["sequence_plan"][0].has_local_memory
+        return {"action": [torch.zeros(16, 10)]}
+
+    result = policy.generate([req(3)], observed, generate)
+    record = policy.memory._records["s"]
+    assert record.token is not None
+    assert torch.count_nonzero(record.token).item() > 0
+    assert any(
+        not torch.equal(actual, initial)
+        for actual, initial in zip(record.state, initial_state, strict=True)
+    )
+    assert result["_local_memory_status"][0]["intervention"] == "zero"
+    assert result["_local_memory_status"][0]["prefix_present"]
+
+
+def test_init_intervention_reads_real_evidence_but_keeps_fast_state_at_w0():
+    policy = adapter("init")
+    policy.generate([req()], batch(), lambda: {"action": [torch.zeros(16, 10)]})
+    initial_state = tuple(value.clone() for value in policy.memory._records["s"].state)
+
+    observed = batch()
+
+    def generate():
+        token = observed["local_memory"][0]
+        assert token is not None
+        assert tuple(token.shape) == (1, 32)
+        assert torch.count_nonzero(token).item() > 0
+        assert observed["sequence_plan"][0].has_local_memory
+        return {"action": [torch.zeros(16, 10)]}
+
+    result = policy.generate([req(3)], observed, generate)
+    record = policy.memory._records["s"]
+    for actual, expected in zip(record.state, initial_state, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert result["_local_memory_status"][0]["intervention"] == "init"
+    assert result["_local_memory_status"][0]["prefix_present"]
+
+
+def test_zero_and_init_are_ttt_only_interventions():
+    with pytest.raises(ValueError, match="TTT fast-weight checkpoint"):
+        recent_adapter(mode="zero")
+    with pytest.raises(ValueError, match="TTT fast-weight checkpoint"):
+        recent_adapter(mode="init")

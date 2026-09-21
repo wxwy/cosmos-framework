@@ -128,7 +128,23 @@ class OnlineLocalMemory:
         h.update(action.contiguous().numpy().tobytes())
         return visual, action, h.hexdigest()
 
-    def prepare(self, request: OnlineMemoryRequest, *, profile: bool = False) -> OnlineMemoryUpdate:
+    def prepare(
+        self,
+        request: OnlineMemoryRequest,
+        *,
+        profile: bool = False,
+        update_fast_state: bool = True,
+    ) -> OnlineMemoryUpdate:
+        """Prepare one transactional online-memory update.
+
+        update_fast_state=False is the frozen-fast / init intervention: real
+        evidence still flows through the canonical encoder and query projection,
+        but every read uses the checkpoint-learned initial fast weights without
+        applying the inner-loss update. Chronology/replay/transaction semantics
+        remain identical to normal online memory.
+        """
+        if not isinstance(update_fast_state, bool):
+            raise TypeError("update_fast_state must be bool")
         timing: dict[str, float] = {}
         total_t0 = _profile_start(profile)
         with self._lock, torch.inference_mode(False):
@@ -187,29 +203,40 @@ class OnlineLocalMemory:
                     if profile:
                         project_ms += _profile_elapsed_ms(stage_t0, profile)
                     stage_t0 = _profile_start(profile)
-                    with torch.enable_grad():
-                        tokens, candidate, _ = self.core.step_projected_many(
-                            key_t=key,
-                            query_base_t=query,
-                            value_t=value,
-                            state_in=state,
-                            valid=torch.ones(1, dtype=torch.bool, device=device),
-                            create_graph=False,
-                        )
+                    if update_fast_state:
+                        with torch.enable_grad():
+                            tokens, candidate, _ = self.core.step_projected_many(
+                                key_t=key,
+                                query_base_t=query,
+                                value_t=value,
+                                state_in=state,
+                                valid=torch.ones(1, dtype=torch.bool, device=device),
+                                create_graph=False,
+                            )
+                        next_state = self._detach(candidate)
+                    else:
+                        # Init/frozen-fast intervention: current evidence still
+                        # determines the read query, but the fast weights remain
+                        # exactly the checkpoint-learned W0 for the whole episode.
+                        with torch.no_grad():
+                            queries = self.core.project_queries(query)
+                            tokens = self.core.read_many(queries, state)
+                        next_state = state
                     if profile:
                         update_read_ms += _profile_elapsed_ms(stage_t0, profile)
                     stage_t0 = _profile_start(profile)
-                    state, token = self._detach(candidate), tokens[0].detach().clone()
+                    state, token = next_state, tokens[0].detach().clone()
                     if profile:
                         detach_ms += _profile_elapsed_ms(stage_t0, profile)
                     if not torch.isfinite(token).all() or any(not torch.isfinite(v).all() for v in state):
-                        raise FloatingPointError("online fast-state adaptation produced non-finite values")
+                        raise FloatingPointError("online fast-state read/update produced non-finite values")
                 if profile:
                     timing["evidence_encode_ms"] = encode_ms
                     timing["kqv_project_ms"] = project_ms
                     timing["inner_update_read_ms"] = update_read_ms
                     timing["state_detach_ms"] = detach_ms
-                    timing["adapted_steps"] = float(len(expected))
+                    timing["adapted_steps"] = float(len(expected) if update_fast_state else 0)
+                    timing["frozen_read_steps"] = float(0 if update_fast_state else len(expected))
             replacement = _Record(request.episode_id, request.consumer_step, state, token, fingerprint)
             if profile:
                 timing["prepare_total_ms"] = _profile_elapsed_ms(total_t0, profile)
