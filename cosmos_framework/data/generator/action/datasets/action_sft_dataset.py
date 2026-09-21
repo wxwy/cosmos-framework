@@ -299,6 +299,7 @@ def get_action_libero_sft_dataset(
     local_dummy_tokens: int = 1,
     local_dummy_dim: int = 32,
     local_dummy_mode: str = "normal",
+    history_mode: str = "none",
     local_history_horizon: int = 0,
     stream_manifest_path: str | None = None,
     stream_manifest_suite: str | None = None,
@@ -332,6 +333,7 @@ def get_action_libero_sft_dataset(
         latent_cache_root=latent_cache_root,
         latent_cache_verify_ratio=latent_cache_verify_ratio,
         max_episodes=max_episodes,
+        history_mode=history_mode,
         local_history_horizon=local_history_horizon,
     )
     transform = ActionTransformPipeline(
