@@ -39,6 +39,7 @@ import io
 import json
 import os
 import random
+import resource
 import sys
 import time
 from dataclasses import dataclass, field
@@ -61,6 +62,42 @@ from cosmos_framework.simulation.libero.local_memory_client import ClientLocalMe
 benchmark: Any
 get_libero_path: Any
 OffScreenRenderEnv: Any
+
+
+
+
+def _flatten_numeric(prefix: str, value: Any, out: dict[str, float]) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            _flatten_numeric(child_prefix, child, out)
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        out[prefix] = float(value)
+
+
+def _summarize_profile_records(records: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    buckets: dict[str, list[float]] = {}
+    for record in records:
+        flat: dict[str, float] = {}
+        _flatten_numeric("", record, flat)
+        for key, value in flat.items():
+            buckets.setdefault(key, []).append(value)
+    summary: dict[str, dict[str, float]] = {}
+    for key, values in sorted(buckets.items()):
+        arr = np.asarray(values, dtype=np.float64)
+        summary[key] = {
+            "count": float(arr.size),
+            "mean": float(arr.mean()),
+            "p50": float(np.percentile(arr, 50)),
+            "p95": float(np.percentile(arr, 95)),
+            "min": float(arr.min()),
+            "max": float(arr.max()),
+        }
+    return summary
+
+
+def _process_rss_peak_mb() -> float:
+    return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
 
 
 TASK_MAX_STEPS: dict[str, int] = {
@@ -133,6 +170,7 @@ class EpisodeResult:
     error: str | None
     actions: list[list[float]]
     predictions: list[dict] = field(default_factory=list)
+    profile: dict[str, Any] = field(default_factory=dict)
 
 
 class ActionEnvironmentClient:
