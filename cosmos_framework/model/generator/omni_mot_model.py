@@ -3481,6 +3481,24 @@ class OmniMoTModel(ImaginaireModel):
             ValueError: If the seed is a single integer. This is not supported anymore: `seed` must be
                 a list of integers, one for each sample.
         """
+        profile_timing = kwargs.pop("_profile_timing", None)
+        profile_enabled = isinstance(profile_timing, dict)
+
+        def _profile_sync() -> None:
+            if profile_enabled and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        def _profile_start() -> float:
+            _profile_sync()
+            return time.perf_counter()
+
+        def _profile_mark(name: str, started: float) -> None:
+            if profile_enabled:
+                _profile_sync()
+                profile_timing[name] = (time.perf_counter() - started) * 1000.0
+
+        profile_total_t0 = _profile_start()
+
         if isinstance(seed, int):
             raise ValueError(
                 "Single integer seed is not supported anymore: `seed` must be a list of integers, one for each sample."
@@ -3500,6 +3518,7 @@ class OmniMoTModel(ImaginaireModel):
         # fresh ``data_batch`` (caller's dict is never mutated) with
         # ``self.input_caption_key`` overwritten by the upsampled
         # captions; returns the input unchanged when ``upsample_task=None``.
+        profile_stage_t0 = _profile_start()
         data_batch = self._maybe_apply_prompt_upsampling(
             data_batch,
             upsample_task=upsample_task,
@@ -3511,8 +3530,10 @@ class OmniMoTModel(ImaginaireModel):
             upsample_presence_penalty=upsample_presence_penalty,
             upsample_seed=upsample_seed,
         )
+        _profile_mark("prompt_upsample_ms", profile_stage_t0)
 
         # Prepare all data (initial noise as list of flattened tensors per sample)
+        profile_stage_t0 = _profile_start()
         (
             sequence_plans,
             gen_data_clean,
@@ -3523,6 +3544,7 @@ class OmniMoTModel(ImaginaireModel):
             condition_mask,
             has_noisy_actions,
         ) = self._prepare_inference_data(data_batch, seed, has_negative_prompt)
+        _profile_mark("prepare_inference_ms", profile_stage_t0)
 
         if n_sample is not None:
             assert n_sample == len(initial_noise), (
@@ -3533,6 +3555,7 @@ class OmniMoTModel(ImaginaireModel):
 
         assert n_sample == len(seed), f"Number of samples {n_sample} must match number of seeds {len(seed)}"
 
+        profile_stage_t0 = _profile_start()
         reuse_pack_templates = self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
         cond_packed_sequence_template: PackedSequence | None = None
         uncond_packed_sequence_template: PackedSequence | None = None
@@ -3558,6 +3581,7 @@ class OmniMoTModel(ImaginaireModel):
                     skip_text_tokens=skip_text_tokens_for_cfg,
                 )
                 uncond_packed_sequence_template.to_cuda()
+        _profile_mark("pack_template_ms", profile_stage_t0)
 
         # Optional per-step velocity postprocess hook. Built once via a builder
         # that receives the prepared inference state. The returned callable (if
@@ -3774,6 +3798,7 @@ class OmniMoTModel(ImaginaireModel):
                     "condition_mask": condition_mask,
                 }
 
+            profile_stage_t0 = _profile_start()
             if isinstance(sampler, FixedStepSampler) or scheduler_type == "unipc":
                 latents = sampler(
                     velocity_fn,
@@ -3863,8 +3888,10 @@ class OmniMoTModel(ImaginaireModel):
                     for _ in range(_extra_num_steps):
                         _ = x0_fn(latents, _dummy_sigma)
                 latents = list(torch.split(latents, chunk_sizes, dim=0))
+            _profile_mark("diffusion_sampling_ms", profile_stage_t0)
 
             # Split flattened latents back into vision latents, external actions, and sound latents
+            profile_stage_t0 = _profile_start()
             # Mirror the per-sample logic from _prepare_inference_data:
             # Order: [vision | action (if present) | sound (if present)]
             # action/sound lists are dense (only modality-having samples), so use separate indexes.
@@ -3923,6 +3950,10 @@ class OmniMoTModel(ImaginaireModel):
                 result["action"] = result_action
             if self.config.sound_gen and len(result_sound) > 0:
                 result["sound"] = result_sound
+            _profile_mark("output_unpack_ms", profile_stage_t0)
+            if profile_enabled:
+                _profile_sync()
+                profile_timing["generate_total_ms"] = (time.perf_counter() - profile_total_t0) * 1000.0
             return result
         finally:
             if previous_attention_dispatch is not None:
