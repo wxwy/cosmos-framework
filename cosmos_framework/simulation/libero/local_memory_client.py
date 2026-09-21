@@ -22,6 +22,10 @@ class ClientLocalMemory:
     def __init__(self, *, enabled=False, max_evidence_steps=256):
         self.enabled = bool(enabled)
         self.max_evidence_steps = max_evidence_steps
+        # Native sliding-window mode keeps a bounded acknowledged tail on the
+        # client because the server is intentionally stateless. TTT/GRU leave
+        # this at zero and keep the existing consume-and-clear protocol.
+        self.retain_history_horizon = 0
         self.client_id = uuid.uuid4().hex
         self._episodes: dict[int, _Episode] = {}
 
@@ -65,6 +69,9 @@ class ClientLocalMemory:
         if not self.enabled:
             return None
         episode = self._get(slot)
+        rows = episode.evidence
+        if self.retain_history_horizon > 0:
+            rows = rows[-self.retain_history_horizon :]
         return {
             "session_id": episode.session_id,
             "episode_id": episode.episode_id,
@@ -72,7 +79,7 @@ class ClientLocalMemory:
             "reset": episode.first_request,
             "evidence_version": "causal_visual96_executed_action10_v1",
             "evidence_format": "libero_rgb_action7_v1",
-            "evidence": [dict(row) for row in episode.evidence],
+            "evidence": [dict(row) for row in rows],
         }
 
     def acknowledge(self, slot, status):
@@ -86,7 +93,10 @@ class ClientLocalMemory:
             or status.get("consumer_step") != episode.consumer_step
         ):
             raise ValueError("prediction response does not acknowledge this exact memory frontier")
-        episode.evidence.clear()
+        if self.retain_history_horizon > 0:
+            episode.evidence[:] = episode.evidence[-self.retain_history_horizon :]
+        else:
+            episode.evidence.clear()
         episode.first_request = False
 
     def end(self, slot=0):
