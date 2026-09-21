@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 import torch
 
@@ -23,6 +24,22 @@ from cosmos_framework.model.generator.mot.local_evidence import (
 )
 
 EVIDENCE_VERSION = "causal_visual96_executed_action10_v1"
+
+
+
+def _profile_sync(enabled: bool) -> None:
+    if enabled and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _profile_start(enabled: bool) -> float:
+    _profile_sync(enabled)
+    return time.perf_counter()
+
+
+def _profile_elapsed_ms(start: float, enabled: bool) -> float:
+    _profile_sync(enabled)
+    return (time.perf_counter() - start) * 1000.0
 
 
 @dataclass(frozen=True)
@@ -52,6 +69,7 @@ class OnlineMemoryUpdate:
     previous: _Record | None
     replacement: _Record
     replay: bool
+    timing_ms: dict[str, float] = field(default_factory=dict)
 
     @property
     def token(self) -> torch.Tensor | None:
@@ -110,14 +128,21 @@ class OnlineLocalMemory:
         h.update(action.contiguous().numpy().tobytes())
         return visual, action, h.hexdigest()
 
-    def prepare(self, request: OnlineMemoryRequest) -> OnlineMemoryUpdate:
+    def prepare(self, request: OnlineMemoryRequest, *, profile: bool = False) -> OnlineMemoryUpdate:
+        timing: dict[str, float] = {}
+        total_t0 = _profile_start(profile)
         with self._lock, torch.inference_mode(False):
+            stage_t0 = _profile_start(profile)
             visual, action, fingerprint = self._validate(request)
+            if profile:
+                timing["validate_ms"] = _profile_elapsed_ms(stage_t0, profile)
             if request.session_id in self._pending:
                 raise RuntimeError("session already has a pending prediction")
             previous = self._records.get(request.session_id)
             if previous is not None and previous.fingerprint == fingerprint:
-                update = OnlineMemoryUpdate(self, request.session_id, previous, previous, True)
+                if profile:
+                    timing["prepare_total_ms"] = _profile_elapsed_ms(total_t0, profile)
+                update = OnlineMemoryUpdate(self, request.session_id, previous, previous, True, timing)
                 self._pending[request.session_id] = update
                 return update
             fresh = previous is None or request.reset
@@ -127,9 +152,12 @@ class OnlineLocalMemory:
                 new_pending = sum(u.previous is None for u in self._pending.values())
                 if previous is None and len(self._records) + new_pending >= self.max_sessions:
                     raise RuntimeError("session limit reached; explicitly close an episode before admitting another")
+                stage_t0 = _profile_start(profile)
                 with torch.no_grad():
                     device = next(self.encoder.parameters()).device
                     state = self._detach(self.core.initial_state(1, device=device))
+                if profile:
+                    timing["state_init_ms"] = _profile_elapsed_ms(stage_t0, profile)
                 token = None
             else:
                 if previous.episode_id != request.episode_id:
@@ -144,12 +172,21 @@ class OnlineLocalMemory:
                 state, token = previous.state, previous.token
                 device = next(self.encoder.parameters()).device
                 visual, action = visual.to(device), action.to(device)
+                encode_ms = project_ms = update_read_ms = detach_ms = 0.0
                 for index in range(len(expected)):
+                    stage_t0 = _profile_start(profile)
                     with torch.no_grad():
                         evidence = self.encoder.encode_segment(
                             visual[index : index + 1].unsqueeze(1), action[index : index + 1].unsqueeze(1)
                         ).squeeze(1)
+                    if profile:
+                        encode_ms += _profile_elapsed_ms(stage_t0, profile)
+                    stage_t0 = _profile_start(profile)
+                    with torch.no_grad():
                         key, query, value = self.core.project_evidence(evidence)
+                    if profile:
+                        project_ms += _profile_elapsed_ms(stage_t0, profile)
+                    stage_t0 = _profile_start(profile)
                     with torch.enable_grad():
                         tokens, candidate, _ = self.core.step_projected_many(
                             key_t=key,
@@ -159,11 +196,24 @@ class OnlineLocalMemory:
                             valid=torch.ones(1, dtype=torch.bool, device=device),
                             create_graph=False,
                         )
+                    if profile:
+                        update_read_ms += _profile_elapsed_ms(stage_t0, profile)
+                    stage_t0 = _profile_start(profile)
                     state, token = self._detach(candidate), tokens[0].detach().clone()
+                    if profile:
+                        detach_ms += _profile_elapsed_ms(stage_t0, profile)
                     if not torch.isfinite(token).all() or any(not torch.isfinite(v).all() for v in state):
                         raise FloatingPointError("online fast-state adaptation produced non-finite values")
+                if profile:
+                    timing["evidence_encode_ms"] = encode_ms
+                    timing["kqv_project_ms"] = project_ms
+                    timing["inner_update_read_ms"] = update_read_ms
+                    timing["state_detach_ms"] = detach_ms
+                    timing["adapted_steps"] = float(len(expected))
             replacement = _Record(request.episode_id, request.consumer_step, state, token, fingerprint)
-            update = OnlineMemoryUpdate(self, request.session_id, previous, replacement, False)
+            if profile:
+                timing["prepare_total_ms"] = _profile_elapsed_ms(total_t0, profile)
+            update = OnlineMemoryUpdate(self, request.session_id, previous, replacement, False, timing)
             self._pending[request.session_id] = update
             return update
 
@@ -232,6 +282,7 @@ class OnlineRecentHistoryUpdate:
     previous: _RecentHistoryRecord | None
     replacement: _RecentHistoryRecord
     replay: bool
+    timing_ms: dict[str, float] = field(default_factory=dict)
 
     @property
     def token(self) -> torch.Tensor | None:
@@ -302,27 +353,45 @@ class OnlineRecentHistoryMemory:
         h.update(action.contiguous().numpy().tobytes())
         return visual, action, h.hexdigest()
 
-    def _replay_from_zero(self, visual: torch.Tensor, action: torch.Tensor) -> torch.Tensor | None:
+    def _replay_from_zero(
+        self, visual: torch.Tensor, action: torch.Tensor, *, profile: bool = False
+    ) -> tuple[torch.Tensor | None, dict[str, float]]:
+        timing: dict[str, float] = {}
         if visual.shape[0] == 0:
-            return None
+            return None, timing
         device = next(self.encoder.parameters()).device
+        stage_t0 = _profile_start(profile)
         with torch.no_grad():
             evidence = self.encoder.encode_segment(visual.to(device).unsqueeze(0), action.to(device).unsqueeze(0))
-            mask = torch.ones(1, evidence.shape[1], dtype=torch.bool, device=device)
+        if profile:
+            timing["evidence_encode_ms"] = _profile_elapsed_ms(stage_t0, profile)
+        mask = torch.ones(1, evidence.shape[1], dtype=torch.bool, device=device)
+        stage_t0 = _profile_start(profile)
+        with torch.no_grad():
             tokens, _, present = self.recurrent_backend.replay(evidence, mask, state=None)
             token = tokens[0].detach().clone() if bool(present[0]) else None
+        if profile:
+            timing["gru_replay_ms"] = _profile_elapsed_ms(stage_t0, profile)
+            timing["replayed_steps"] = float(evidence.shape[1])
         if token is not None and not torch.isfinite(token).all():
             raise FloatingPointError("recent-history replay produced non-finite Local token")
-        return token
+        return token, timing
 
-    def prepare(self, request: OnlineMemoryRequest) -> OnlineRecentHistoryUpdate:
+    def prepare(self, request: OnlineMemoryRequest, *, profile: bool = False) -> OnlineRecentHistoryUpdate:
+        timing: dict[str, float] = {}
+        total_t0 = _profile_start(profile)
         with self._lock:
+            stage_t0 = _profile_start(profile)
             visual, action, fingerprint = self._validate(request)
+            if profile:
+                timing["validate_ms"] = _profile_elapsed_ms(stage_t0, profile)
             if request.session_id in self._pending:
                 raise RuntimeError("session already has a pending prediction")
             previous = self._records.get(request.session_id)
             if previous is not None and previous.fingerprint == fingerprint:
-                update = OnlineRecentHistoryUpdate(self, request.session_id, previous, previous, True)
+                if profile:
+                    timing["prepare_total_ms"] = _profile_elapsed_ms(total_t0, profile)
+                update = OnlineRecentHistoryUpdate(self, request.session_id, previous, previous, True, timing)
                 self._pending[request.session_id] = update
                 return update
 
@@ -347,6 +416,7 @@ class OnlineRecentHistoryMemory:
                     raise ValueError(
                         "every completed source step must appear exactly once, without gaps or future evidence"
                     )
+                stage_t0 = _profile_start(profile)
                 retained_steps = previous.source_steps + request.source_steps
                 retained_visual = torch.cat((previous.visual_summary, visual), dim=0)
                 retained_action = torch.cat((previous.executed_action, action), dim=0)
@@ -354,7 +424,10 @@ class OnlineRecentHistoryMemory:
                     retained_steps = retained_steps[-self.history_horizon :]
                     retained_visual = retained_visual[-self.history_horizon :]
                     retained_action = retained_action[-self.history_horizon :]
-                token = self._replay_from_zero(retained_visual, retained_action)
+                if profile:
+                    timing["window_merge_ms"] = _profile_elapsed_ms(stage_t0, profile)
+                token, replay_timing = self._replay_from_zero(retained_visual, retained_action, profile=profile)
+                timing.update(replay_timing)
 
             replacement = _RecentHistoryRecord(
                 request.episode_id,
@@ -365,7 +438,9 @@ class OnlineRecentHistoryMemory:
                 token,
                 fingerprint,
             )
-            update = OnlineRecentHistoryUpdate(self, request.session_id, previous, replacement, False)
+            if profile:
+                timing["prepare_total_ms"] = _profile_elapsed_ms(total_t0, profile)
+            update = OnlineRecentHistoryUpdate(self, request.session_id, previous, replacement, False, timing)
             self._pending[request.session_id] = update
             return update
 
