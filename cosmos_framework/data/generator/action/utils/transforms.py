@@ -765,6 +765,7 @@ class ActionTransformPipeline:
         # represented by cached full-spatial single-frame latents; zero-valued pixel
         # placeholders only carry the matching geometry because the cache bypasses VAE.
         window_history_latents = data_dict.pop("window_history_video_latent", None)
+        data_dict.pop("window_history_frame_indices", None)
         if window_history_latents is not None:
             if not isinstance(window_history_latents, (list, tuple)):
                 raise TypeError("window_history_video_latent must be a list of single-frame latents")
