@@ -774,40 +774,43 @@ class ActionTransformPipeline:
                     "native window history requires one clean vision item per history action: "
                     f"vision={len(window_history_latents)} action={num_history_actions}"
                 )
-            if num_history_actions > 0:
-                main_video = data_dict["video"]
-                main_image_size = data_dict["image_size"]
-                main_latent = data_dict.get("video_latent")
-                if not isinstance(main_video, torch.Tensor) or main_video.ndim != 4:
-                    raise ValueError("native window main video must have shape [C,T,H,W]")
-                if not isinstance(main_image_size, torch.Tensor):
-                    raise TypeError("native window main image_size must be a tensor")
-                if not isinstance(main_latent, torch.Tensor):
-                    raise ValueError("native window history requires the exact-window main video_latent cache")
-                for latent in window_history_latents:
-                    if not isinstance(latent, torch.Tensor) or latent.ndim != 4 or latent.shape[0] != 1:
-                        raise ValueError(
-                            "each native window history latent must have shape [1,C,H,W], "
-                            f"got {getattr(latent, 'shape', None)}"
-                        )
-                data_dict["video"] = [
-                    torch.zeros_like(main_video[:, :1]) for _ in range(num_history_actions)
-                ] + [main_video]
-                # Cached multi-vision ABI: each vision item carries exactly one
-                # cached latent inside a singleton container. The model flattens
-                # samples across vision items first, then validates each flattened
-                # cache item as ``[latent]``. Pixel placeholders stay as bare tensors
-                # because the media flatten path calls ``item.unsqueeze(0)``.
-                data_dict["video_latent"] = [[latent] for latent in [*window_history_latents, main_latent]]
-                data_dict["image_size"] = [
-                    main_image_size.clone() for _ in range(num_history_actions)
-                ] + [main_image_size]
-                # With both history vision and history actions prepended, action[0]
-                # remains the transition after history vision item 0. The standard
-                # action-only history builder subtracts H here, so restore the native
-                # start offset used by the aligned vision+action prefix.
-                sequence_plan.action_start_frame_offset = 1
-                sequence_plan.vision_item_source_frame_offsets = list(range(num_history_actions + 1))
+            # Keep every WINDOW sample on the same multi-vision ABI, including
+            # episode start where no completed history exists yet. Mixed batches are
+            # common: if a start sample remains a bare tensor while another sample has
+            # multiple vision items, the model's batch-level multi-vision probe would
+            # read the bare video's channel dimension as its item count.
+            main_video = data_dict["video"]
+            main_image_size = data_dict["image_size"]
+            main_latent = data_dict.get("video_latent")
+            if not isinstance(main_video, torch.Tensor) or main_video.ndim != 4:
+                raise ValueError("native window main video must have shape [C,T,H,W]")
+            if not isinstance(main_image_size, torch.Tensor):
+                raise TypeError("native window main image_size must be a tensor")
+            if not isinstance(main_latent, torch.Tensor):
+                raise ValueError("native window history requires the exact-window main video_latent cache")
+            for latent in window_history_latents:
+                if not isinstance(latent, torch.Tensor) or latent.ndim != 4 or latent.shape[0] != 1:
+                    raise ValueError(
+                        "each native window history latent must have shape [1,C,H,W], "
+                        f"got {getattr(latent, 'shape', None)}"
+                    )
+            data_dict["video"] = [
+                torch.zeros_like(main_video[:, :1]) for _ in range(num_history_actions)
+            ] + [main_video]
+            # Cached multi-vision ABI: each vision item carries exactly one
+            # cached latent inside a singleton container. The model flattens
+            # samples across vision items first, then validates each flattened
+            # cache item as ``[latent]``. Pixel placeholders stay as bare tensors
+            # because the media flatten path calls ``item.unsqueeze(0)``.
+            data_dict["video_latent"] = [[latent] for latent in [*window_history_latents, main_latent]]
+            data_dict["image_size"] = [
+                main_image_size.clone() for _ in range(num_history_actions)
+            ] + [main_image_size]
+            # action_start_frame_offset is 1 by default; keep it explicit for the
+            # native-window route. For H>0 this restores aligned history action
+            # semantics; for H=0 it is identical to the ordinary WAM plan.
+            sequence_plan.action_start_frame_offset = 1
+            sequence_plan.vision_item_source_frame_offsets = list(range(num_history_actions + 1))
 
         data_dict["sequence_plan"] = sequence_plan
         data_dict = self.local_dummy_transform(data_dict, sequence_plan)

@@ -549,3 +549,74 @@ def test_action_transform_pipeline_native_window_h16_matches_cached_multi_vision
     assert result["video_latent"][-1][0].shape[0] == 5
     assert result["sequence_plan"].vision_item_source_frame_offsets == list(range(17))
     assert result["sequence_plan"].action_start_frame_offset == 1
+
+
+@pytest.mark.L0
+def test_action_transform_pipeline_native_window_episode_start_uses_single_item_multi_vision_abi() -> None:
+    pipeline = ActionTransformPipeline(tokenizer_config=None, max_action_dim=12)
+    main_video = torch.zeros(3, 17, 256, 512, dtype=torch.uint8)
+    main_latent = torch.zeros(5, 48, 16, 32)
+    data_dict = {
+        "ai_caption": "Put both objects in the basket.",
+        "video": main_video,
+        "video_latent": main_latent,
+        "window_history_video_latent": [],
+        "window_history_frame_indices": torch.empty(0, dtype=torch.long),
+        "history_action": torch.empty(0, 10),
+        "action": torch.zeros(16, 10),
+        "conditioning_fps": torch.tensor(20),
+        "mode": "wam",
+        "domain_id": torch.tensor(0),
+        "viewpoint": "concat_view",
+        "idle_frames": torch.tensor(0),
+    }
+
+    result = pipeline(data_dict, resolution=None)
+
+    assert isinstance(result["video"], list) and len(result["video"]) == 1
+    torch.testing.assert_close(result["video"][0], main_video)
+    assert isinstance(result["video_latent"], list) and len(result["video_latent"]) == 1
+    assert isinstance(result["video_latent"][0], list) and len(result["video_latent"][0]) == 1
+    torch.testing.assert_close(result["video_latent"][0][0], main_latent)
+    assert isinstance(result["image_size"], list) and len(result["image_size"]) == 1
+    assert result["sequence_plan"].vision_item_source_frame_offsets == [0]
+    assert result["sequence_plan"].action_start_frame_offset == 1
+    assert result["sequence_plan"].condition_frame_indexes_action == []
+
+
+@pytest.mark.L0
+def test_action_transform_pipeline_native_window_mixed_batch_has_uniform_outer_abi() -> None:
+    pipeline = ActionTransformPipeline(tokenizer_config=None, max_action_dim=12)
+
+    def _sample(history: int) -> dict:
+        return {
+            "ai_caption": "Put both objects in the basket.",
+            "video": torch.zeros(3, 17, 256, 512, dtype=torch.uint8),
+            "video_latent": torch.zeros(5, 48, 16, 32),
+            "window_history_video_latent": [
+                torch.full((1, 48, 16, 32), float(i + 1)) for i in range(history)
+            ],
+            "window_history_frame_indices": torch.arange(history, dtype=torch.long),
+            "history_action": torch.zeros(history, 10),
+            "action": torch.zeros(16, 10),
+            "conditioning_fps": torch.tensor(20),
+            "mode": "wam",
+            "domain_id": torch.tensor(0),
+            "viewpoint": "concat_view",
+            "idle_frames": torch.tensor(0),
+        }
+
+    start = pipeline(_sample(0), resolution=None)
+    mid = pipeline(_sample(16), resolution=None)
+
+    sample_vision_list = [start["video"], mid["video"]]
+    assert [len(items) for items in sample_vision_list] == [1, 17]
+    assert all(isinstance(items, list) for items in sample_vision_list)
+
+    sample_latent_list = [start["video_latent"], mid["video_latent"]]
+    assert [len(items) for items in sample_latent_list] == [1, 17]
+    assert all(
+        isinstance(cached_item, list) and len(cached_item) == 1
+        for sample_items in sample_latent_list
+        for cached_item in sample_items
+    )
