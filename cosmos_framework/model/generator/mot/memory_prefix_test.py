@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -226,6 +227,8 @@ def test_memory_prefix_concat_keeps_each_sample_isolated_and_orders_mem_before_n
         native_key,
         native_value,
         torch.tensor([0, 2, 4, 5], dtype=torch.int32),
+        max_native_len=2,
+        max_prefix_len=2,
     )
 
     assert offsets.tolist() == [0, 4, 6, 8]
@@ -233,6 +236,119 @@ def test_memory_prefix_concat_keeps_each_sample_isolated_and_orders_mem_before_n
     torch.testing.assert_close(key[:, 0, 0], torch.tensor([10.0, 11.0, 1.0, 2.0, 3.0, 4.0, 20.0, 5.0]))
     torch.testing.assert_close(value[:, 0, 0], torch.tensor([110.0, 111.0, 1001.0, 1002.0, 1003.0, 1004.0, 120.0, 1005.0]))
 
+
+def _python_offsets(lengths: list[int]) -> list[int]:
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    return offsets
+
+
+def _reference_mem_native_order(
+    prefix: torch.Tensor,
+    native: torch.Tensor,
+    prefix_lengths: list[int],
+    native_lengths: list[int],
+) -> torch.Tensor:
+    prefix_offsets = _python_offsets(prefix_lengths)
+    native_offsets = _python_offsets(native_lengths)
+    pieces = []
+    for index in range(len(prefix_lengths)):
+        pieces.append(prefix[prefix_offsets[index] : prefix_offsets[index + 1]])
+        pieces.append(native[native_offsets[index] : native_offsets[index + 1]])
+    return torch.cat(pieces, dim=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("prefix_lengths", "native_lengths"),
+    [
+        ([1], [3]),
+        ([1, 0, 1, 1], [2, 1, 3, 2]),
+        ([4, 4, 4, 4], [1, 3, 2, 4]),
+        ([4, 0, 4, 0], [2, 5, 1, 3]),
+    ],
+)
+def test_memory_prefix_concat_matches_reference_for_batch_k_and_mixed_presence(
+    prefix_lengths: list[int], native_lengths: list[int]
+) -> None:
+    prefix_count = sum(prefix_lengths)
+    native_count = sum(native_lengths)
+    prefix_key = torch.arange(prefix_count * 2, dtype=torch.float32).reshape(prefix_count, 1, 2)
+    prefix_value = prefix_key + 1000
+    native_key = torch.arange(native_count * 2, dtype=torch.float32).reshape(native_count, 1, 2) + 100
+    native_value = native_key + 2000
+    prefix_offsets = torch.tensor(_python_offsets(prefix_lengths), dtype=torch.long)
+    native_offsets = torch.tensor(_python_offsets(native_lengths), dtype=torch.int32)
+
+    key, value, offsets, max_len = concat_prefix_with_native_kv(
+        prefix_key,
+        prefix_value,
+        prefix_offsets,
+        native_key,
+        native_value,
+        native_offsets,
+        max_native_len=max(native_lengths),
+        max_prefix_len=max(prefix_lengths),
+    )
+
+    torch.testing.assert_close(
+        key, _reference_mem_native_order(prefix_key, native_key, prefix_lengths, native_lengths), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        value, _reference_mem_native_order(prefix_value, native_value, prefix_lengths, native_lengths), rtol=0, atol=0
+    )
+    expected_lengths = [p + n for p, n in zip(prefix_lengths, native_lengths, strict=True)]
+    torch.testing.assert_close(offsets, torch.tensor(_python_offsets(expected_lengths), dtype=torch.int32))
+    assert max_len == max(native_lengths) + max(prefix_lengths)
+
+
+@pytest.mark.L0
+def test_memory_prefix_concat_preserves_prefix_and_native_gradients() -> None:
+    prefix_key = torch.randn(3, 2, 4, requires_grad=True)
+    prefix_value = torch.randn(3, 2, 4, requires_grad=True)
+    native_key = torch.randn(5, 2, 4, requires_grad=True)
+    native_value = torch.randn(5, 2, 4, requires_grad=True)
+    key, value, _, _ = concat_prefix_with_native_kv(
+        prefix_key,
+        prefix_value,
+        torch.tensor([0, 1, 1, 3], dtype=torch.long),
+        native_key,
+        native_value,
+        torch.tensor([0, 2, 4, 5], dtype=torch.int32),
+        max_native_len=2,
+        max_prefix_len=2,
+    )
+    (key.sum() + value.sum()).backward()
+    for tensor in (prefix_key, prefix_value, native_key, native_value):
+        assert tensor.grad is not None
+        torch.testing.assert_close(tensor.grad, torch.ones_like(tensor), rtol=0, atol=0)
+
+
+@pytest.mark.L0
+def test_memory_prefix_hot_path_helpers_do_not_read_tensor_values_on_host() -> None:
+    concat_source = inspect.getsource(concat_prefix_with_native_kv)
+    replace_source = inspect.getsource(MemoryPrefixContext.replace_hidden)
+    build_source = inspect.getsource(build_memory_prefix_context)
+    for source in (concat_source, replace_source, build_source):
+        assert ".item(" not in source
+        assert ".tolist(" not in source
+        assert ".cpu(" not in source
+        assert ".numpy(" not in source
+    assert ".validate(" not in build_source
+
+
+@pytest.mark.L0
+def test_memory_prefix_replace_hidden_preserves_immutable_metadata() -> None:
+    context = build_memory_prefix_context(
+        [torch.ones(1, 3), None, torch.full((1, 3), 2.0)], nn.Identity(), torch.zeros(3), torch.float32
+    )
+    assert context is not None
+    replacement = context.replace_hidden(context.hidden + 1)
+    assert replacement.sample_offsets is context.sample_offsets
+    assert replacement.present is context.present
+    assert replacement.k_local == context.k_local == 1
+    torch.testing.assert_close(replacement.hidden, context.hidden + 1)
 
 @pytest.mark.L0
 def test_memory_prefix_concat_rejects_incompatible_offsets() -> None:

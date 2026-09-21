@@ -108,6 +108,7 @@ def _dispatch_attention_with_optional_memory_prefix(
     memory_prefix_key_states: torch.Tensor | None,
     memory_prefix_value_states: torch.Tensor | None,
     memory_prefix_sample_offsets: torch.Tensor | None,
+    memory_prefix_max_len: int | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
     """Preserve alternate-dispatch signatures unless a Memory Prefix is present."""
     dispatch_kwargs = {
@@ -122,6 +123,7 @@ def _dispatch_attention_with_optional_memory_prefix(
             memory_prefix_key_states=memory_prefix_key_states,
             memory_prefix_value_states=memory_prefix_value_states,
             memory_prefix_sample_offsets=memory_prefix_sample_offsets,
+            memory_prefix_max_len=memory_prefix_max_len,
         )
     return dispatch_attention_fn(
         packed_query_states, packed_key_states, packed_value_states, attention_mask, **dispatch_kwargs
@@ -739,8 +741,8 @@ class PackedAttentionMoT(nn.Module):
         memory_prefix_key_states = None
         memory_prefix_value_states = None
         memory_prefix_offsets = None
+        memory_prefix_max_len = None
         if memory_prefix_context is not None:
-            memory_prefix_context.validate()
             memory_prefix_key_states = self.k_proj_moe_gen(memory_prefix_context.hidden).view(
                 -1, self.num_key_value_heads, self.head_dim
             )
@@ -749,6 +751,7 @@ class PackedAttentionMoT(nn.Module):
                 -1, self.num_key_value_heads, self.head_dim
             )
             memory_prefix_offsets = memory_prefix_context.sample_offsets
+            memory_prefix_max_len = memory_prefix_context.k_local
 
         packed_attn_output, kv_to_store = _dispatch_attention_with_optional_memory_prefix(
             self.dispatch_attention_fn,
@@ -763,6 +766,7 @@ class PackedAttentionMoT(nn.Module):
             memory_prefix_key_states=memory_prefix_key_states,
             memory_prefix_value_states=memory_prefix_value_states,
             memory_prefix_sample_offsets=memory_prefix_offsets,
+            memory_prefix_max_len=memory_prefix_max_len,
         )
 
         # Produce kv_to_store for MemoryState.write_for_layer() when the
@@ -1270,7 +1274,7 @@ class MoTDecoderLayer(nn.Module):
         )  # [N_und+N_gen,hidden_size]
 
         memory_prefix_normed = (
-            memory_prefix_context.with_hidden(self.memory_input_layernorm(memory_prefix_context.hidden))
+            memory_prefix_context.replace_hidden(self.memory_input_layernorm(memory_prefix_context.hidden))
             if memory_prefix_context is not None
             else None
         )

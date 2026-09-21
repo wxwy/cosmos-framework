@@ -187,6 +187,7 @@ def two_way_attention(
     memory_prefix_key_states: torch.Tensor | None = None,
     memory_prefix_value_states: torch.Tensor | None = None,
     memory_prefix_sample_offsets: torch.Tensor | None = None,
+    memory_prefix_max_len: int | None = None,
 ):
     """
     Performs two-way attention with causal and full attention.
@@ -284,6 +285,8 @@ def two_way_attention(
             get_all_seq(packed_key_normalized),
             get_all_seq(packed_value_states),
             sample_offsets,
+            max_native_len=packed_query_states["max_sample_len"],
+            max_prefix_len=memory_prefix_max_len,
         )
         full_varlen_kwargs = _varlen_kwargs(
             sample_offsets,
@@ -686,6 +689,7 @@ def dispatch_attention(
     memory_prefix_key_states: torch.Tensor | None = None,
     memory_prefix_value_states: torch.Tensor | None = None,
     memory_prefix_sample_offsets: torch.Tensor | None = None,
+    memory_prefix_max_len: int | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
     memory_prefix_present = memory_prefix_key_states is not None
     if memory_prefix_present and memory_value is not None:
@@ -694,6 +698,8 @@ def dispatch_attention(
     if memory_prefix_present:
         if memory_prefix_value_states is None or memory_prefix_sample_offsets is None:
             raise ValueError("Memory Prefix requires K, V and sample_offsets together.")
+        if memory_prefix_max_len is not None and memory_prefix_max_len <= 0:
+            raise ValueError("Memory Prefix k_local metadata must be positive when provided.")
         if packed_query_states.get("is_sharded", False):
             raise ValueError("Memory Prefix does not support context parallel/Ulysses.")
     if not _is_split_info_compatible(attention_mask):
@@ -733,6 +739,7 @@ def dispatch_attention(
             memory_prefix_key_states=memory_prefix_key_states,
             memory_prefix_value_states=memory_prefix_value_states,
             memory_prefix_sample_offsets=memory_prefix_sample_offsets,
+            memory_prefix_max_len=memory_prefix_max_len,
         )
     return output, None
 
