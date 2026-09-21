@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.nn.functional as F
 
@@ -14,6 +16,22 @@ from cosmos_framework.inference.local_memory_online import (
     OnlineRecentHistoryMemory,
 )
 
+
+
+
+def _profile_sync(enabled: bool) -> None:
+    if enabled and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _profile_start(enabled: bool) -> float:
+    _profile_sync(enabled)
+    return time.perf_counter()
+
+
+def _profile_elapsed_ms(start: float, enabled: bool) -> float:
+    _profile_sync(enabled)
+    return (time.perf_counter() - start) * 1000.0
 
 class PolicyLocalMemoryAdapter:
     def __init__(self, service, *, mode="auto", max_sessions=64):
@@ -97,7 +115,10 @@ class PolicyLocalMemoryAdapter:
             raise ValueError("executed-action normalization requires the matching 10-D training statistics")
         return 2 * (action - lo.cpu()) / scale.cpu().clamp(min=1e-8) - 1
 
-    def _window_payload(self, req):
+    def _window_payload(self, req, *, profile: bool = False):
+        timing: dict[str, float] = {}
+        total_t0 = _profile_start(profile)
+        validation_t0 = _profile_start(profile)
         memory = req.get("local_memory")
         if not isinstance(memory, dict):
             raise ValueError("native window checkpoint requires a local_memory history request")
@@ -116,10 +137,14 @@ class PolicyLocalMemoryAdapter:
         if not isinstance(rows, list) or len(rows) > self.history_horizon:
             raise ValueError("native window evidence exceeds the configured history horizon")
         expected_steps = list(range(consumer_step - len(rows), consumer_step))
+        if profile:
+            timing["validate_ms"] = _profile_elapsed_ms(validation_t0, profile)
         source_steps = []
         frames = []
         actions = []
         image_sizes = []
+        history_preprocess_ms = 0.0
+        action_normalize_ms = 0.0
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError("each native window evidence row must be an object")
@@ -127,20 +152,30 @@ class PolicyLocalMemoryAdapter:
             image = row.get("image")
             if not isinstance(image, str) or not image:
                 raise ValueError("native window evidence requires the completed pre-action image")
+            stage_t0 = _profile_start(profile)
             prep = self.service._prep_policy_item({**req, "image": image})
+            if profile:
+                history_preprocess_ms += _profile_elapsed_ms(stage_t0, profile)
             frames.append(prep["video_padded"][:, :1])
             image_sizes.append(prep["padded_image_size"])
+            stage_t0 = _profile_start(profile)
             actions.append(
                 self._normalize_executed_action(
                     row.get("executed_action"), gripper_mode=row.get("gripper_mode")
                 )
             )
+            if profile:
+                action_normalize_ms += _profile_elapsed_ms(stage_t0, profile)
         if source_steps != expected_steps:
             raise ValueError(
                 f"native window evidence must be the contiguous causal tail {expected_steps}, got {source_steps}"
             )
         if memory.get("reset", False) and consumer_step != 0:
             raise ValueError("native window reset is only valid at consumer_step=0")
+        if profile:
+            timing["history_preprocess_ms"] = history_preprocess_ms
+            timing["action_normalize_ms"] = action_normalize_ms
+            timing["payload_total_ms"] = _profile_elapsed_ms(total_t0, profile)
         return {
             "session_id": session_id,
             "episode_id": episode_id,
@@ -149,6 +184,7 @@ class PolicyLocalMemoryAdapter:
             "frames": frames,
             "actions": actions,
             "image_sizes": image_sizes,
+            "_timing_ms": timing,
         }
 
     def _generate_native_window(self, reqs, batch, generate_fn):
@@ -156,7 +192,9 @@ class PolicyLocalMemoryAdapter:
         main_image_sizes = batch["image_size"]
         if not isinstance(main_image_sizes, torch.Tensor) or main_image_sizes.ndim != 2:
             raise ValueError("native window expects batched main image_size tensor")
-        histories = [self._window_payload(req) for req in reqs]
+        profiles = [bool(req.get("profile_inference", False)) for req in reqs]
+        histories = [self._window_payload(req, profile=profile) for req, profile in zip(reqs, profiles, strict=True)]
+        prefix_t0 = _profile_start(any(profiles))
         flat_image_sizes = []
         prefix_lengths = []
         for index, history in enumerate(histories):
@@ -190,8 +228,10 @@ class PolicyLocalMemoryAdapter:
             plan.has_local_memory = False
 
         batch["image_size"] = flat_image_sizes
+        prefix_ms = _profile_elapsed_ms(prefix_t0, any(profiles)) if any(profiles) else 0.0
         with torch.inference_mode():
             samples = generate_fn()
+        trim_t0 = _profile_start(any(profiles))
         actions = samples.get("action")
         if actions is None or len(actions) != len(reqs):
             raise FloatingPointError("policy returned missing actions for native window inference")
@@ -207,6 +247,7 @@ class PolicyLocalMemoryAdapter:
                 )
             trimmed_actions.append(trimmed)
         samples["action"] = trimmed_actions
+        trim_ms = _profile_elapsed_ms(trim_t0, any(profiles)) if any(profiles) else 0.0
         samples["_local_memory_status"] = [
             {
                 "session_id": history["session_id"],
@@ -219,9 +260,25 @@ class PolicyLocalMemoryAdapter:
             }
             for history in histories
         ]
+        samples["_profile_timing"] = [
+            {
+                "history_mode": "window",
+                "history_ms": {
+                    **history["_timing_ms"],
+                    "prefix_assembly_ms": prefix_ms / max(1, len(histories)),
+                    "output_trim_ms": trim_ms / max(1, len(histories)),
+                },
+            }
+            if profile
+            else {}
+            for history, profile in zip(histories, profiles, strict=True)
+        ]
         return samples
 
-    def _request(self, req):
+    def _request(self, req, *, profile: bool = False):
+        timing: dict[str, float] = {}
+        total_t0 = _profile_start(profile)
+        validation_t0 = _profile_start(profile)
         memory = req.get("local_memory")
         if not isinstance(memory, dict):
             raise ValueError("Local Memory checkpoint requires a local_memory session/episode/consumer_step/evidence request")
@@ -233,7 +290,10 @@ class PolicyLocalMemoryAdapter:
         fmt = memory.get("evidence_format", "canonical_features_v1")
         if fmt not in {"canonical_features_v1", "libero_rgb_action7_v1"}:
             raise ValueError("unsupported local evidence format")
+        if profile:
+            timing["request_validate_ms"] = _profile_elapsed_ms(validation_t0, profile)
         visuals, actions, steps = [], [], []
+        visual_encode_ms = action_normalize_ms = 0.0
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError("each completed evidence row must be an object")
@@ -242,15 +302,21 @@ class PolicyLocalMemoryAdapter:
                 visuals.append(torch.as_tensor(row["visual_summary"], dtype=torch.float32))
                 actions.append(torch.as_tensor(row["executed_action"], dtype=torch.float32))
             else:
+                stage_t0 = _profile_start(profile)
                 visuals.append(self._visual_summary(req, row["image"]))
+                if profile:
+                    visual_encode_ms += _profile_elapsed_ms(stage_t0, profile)
+                stage_t0 = _profile_start(profile)
                 actions.append(
                     self._normalize_executed_action(
                         row["executed_action"], gripper_mode=row.get("gripper_mode")
                     )
                 )
+                if profile:
+                    action_normalize_ms += _profile_elapsed_ms(stage_t0, profile)
         visual = torch.stack(visuals) if visuals else torch.empty(0, 96)
         action = torch.stack(actions) if actions else torch.empty(0, 10)
-        return OnlineMemoryRequest(
+        request = OnlineMemoryRequest(
             memory.get("session_id"),
             memory.get("episode_id"),
             memory.get("consumer_step"),
@@ -259,19 +325,35 @@ class PolicyLocalMemoryAdapter:
             action,
             memory.get("reset", False),
         )
+        if profile:
+            timing["visual_summary_encode_ms"] = visual_encode_ms
+            timing["action_normalize_ms"] = action_normalize_ms
+            timing["request_build_total_ms"] = _profile_elapsed_ms(total_t0, profile)
+            timing["new_evidence_steps"] = float(len(steps))
+        return request, timing
 
     def generate(self, reqs, batch, generate_fn):
+        profiles = [bool(req.get("profile_inference", False)) for req in reqs]
         if not self.enabled:
             if any(req.get("local_memory") is not None for req in reqs):
                 raise ValueError("Local Memory is disabled; supplied evidence would otherwise be ignored")
             with torch.inference_mode():
-                return generate_fn()
+                samples = generate_fn()
+            samples["_profile_timing"] = [
+                {"history_mode": "none", "history_ms": {}} if profile else {}
+                for profile in profiles
+            ]
+            return samples
         if self.memory_kind == "native_window":
             return self._generate_native_window(reqs, batch, generate_fn)
         updates = []
+        request_timings = []
         try:
-            for req in reqs:
-                updates.append(self.memory.prepare(self._request(req)))
+            for req, profile in zip(reqs, profiles, strict=True):
+                request, request_timing = self._request(req, profile=profile)
+                request_timings.append(request_timing)
+                updates.append(self.memory.prepare(request, profile=profile))
+            inject_t0 = _profile_start(any(profiles))
             tokens = [update.token for update in updates]
             plans = batch["sequence_plan"]
             if len(plans) != len(tokens):
@@ -279,12 +361,15 @@ class PolicyLocalMemoryAdapter:
             batch["local_memory"] = tokens
             for plan, token in zip(plans, tokens, strict=True):
                 plan.has_local_memory = token is not None
+            inject_ms = _profile_elapsed_ms(inject_t0, any(profiles)) if any(profiles) else 0.0
             with torch.inference_mode():
                 samples = generate_fn()
             actions = samples.get("action")
             if actions is None or len(actions) != len(reqs) or any(not torch.isfinite(a).all() for a in actions):
                 raise FloatingPointError("policy returned missing or non-finite actions; memory was not committed")
+            commit_t0 = _profile_start(any(profiles))
             self.memory.commit_many(tuple(updates))
+            commit_ms = _profile_elapsed_ms(commit_t0, any(profiles)) if any(profiles) else 0.0
             samples["_local_memory_status"] = [
                 {
                     "session_id": update.session_id,
@@ -295,6 +380,23 @@ class PolicyLocalMemoryAdapter:
                     "memory_kind": self.memory_kind,
                 }
                 for update in updates
+            ]
+            mode_name = "ttt" if self.memory_kind == "ttt_fast_weight" else "gru"
+            samples["_profile_timing"] = [
+                {
+                    "history_mode": mode_name,
+                    "history_ms": {
+                        **request_timing,
+                        **update.timing_ms,
+                        "local_token_inject_ms": inject_ms / max(1, len(updates)),
+                        "commit_ms": commit_ms / max(1, len(updates)),
+                    },
+                }
+                if profile
+                else {}
+                for request_timing, update, profile in zip(
+                    request_timings, updates, profiles, strict=True
+                )
             ]
             return samples
         except Exception:
