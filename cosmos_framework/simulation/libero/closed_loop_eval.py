@@ -1392,6 +1392,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output_dir", type=str, default="", help="Directory to save evaluation summary JSON")
+    parser.add_argument(
+        "--profile_inference",
+        action="store_true",
+        help=(
+            "Run the strict single-GPU/single-process/single-episode action-only profiling protocol. "
+            "Requires num_envs=1, num_trials_per_task=1 and exactly one task id."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1753,6 +1761,8 @@ def main() -> None:
         raise ValueError("--save_pred_mp4 requires --output_dir to be set")
     if args.video_samples_per_task < 0:
         raise ValueError("--video_samples_per_task must be >= 0")
+    if args.profile_inference and (args.num_envs != 1 or args.num_trials_per_task != 1):
+        raise ValueError("--profile_inference requires --num_envs 1 and --num_trials_per_task 1")
 
     # Parse cameras from comma-separated string
     cameras = [c.strip() for c in args.camera.split(",") if c.strip()]
@@ -1785,6 +1795,8 @@ def main() -> None:
         selected_task_ids = [int(t) for t in args.task_ids.split(",") if t.strip()]
     else:
         selected_task_ids = list(range(num_tasks))
+    if args.profile_inference and len(selected_task_ids) != 1:
+        raise ValueError("--profile_inference requires exactly one task id")
 
     max_steps = args.max_steps if args.max_steps > 0 else TASK_MAX_STEPS[args.task_suite]
 
@@ -2006,6 +2018,7 @@ def main() -> None:
                     pred_video_dir=pred_video_dir,
                     pred_video_fps=args.mp4_fps,
                     task_description=task_description,
+                    profile_inference=args.profile_inference,
                 )
             except Exception as exc:
                 result = EpisodeResult(False, 0, str(exc), [])
@@ -2024,6 +2037,7 @@ def main() -> None:
                     "steps": result.steps,
                     "error": result.error,
                     "elapsed_s": round(episode_elapsed_s, 3),
+                    **({"profile": result.profile} if result.profile else {}),
                 }
             )
 
@@ -2047,6 +2061,9 @@ def main() -> None:
                     json.dumps(result.predictions, indent=2),
                     encoding="utf-8",
                 )
+            if output_dir is not None and result.profile:
+                profile_path = output_dir / "profile" / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}.json"
+                _write_json_atomic(profile_path, result.profile)
 
             _write_task_partial_summary(
                 output_dir,
