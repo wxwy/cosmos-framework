@@ -2945,14 +2945,9 @@ class OmniMoTModel(ImaginaireModel):
             return False
         if self.config.sound_gen and any(plan.has_sound for plan in sequence_plans):
             return False
-        # Memory Prefix owns clean Local K/V outside the native packed sequence.
-        # The request-local InferenceTextKVMemoryState installs an alternate
-        # attention dispatcher that only knows cached text + current GEN K/V and
-        # intentionally cannot represent that prefix.  Text-KV reuse is purely an
-        # inference optimization, so Local-enabled requests must recompute text K/V
-        # on each denoise step while preserving the canonical Memory Prefix route.
-        if any(plan.has_local_memory for plan in sequence_plans):
-            return False
+        # Memory Prefix is compatible with request-local text-KV reuse for the
+        # single-sample two-way inference path. The alternate dispatcher keeps
+        # the canonical GEN-attention order [MEM | cached text | current GEN].
         if gen_data_clean.batch_size != 1 or len(sequence_plans) != 1:
             return False
         if gen_data_clean.num_vision_items_per_sample is not None:

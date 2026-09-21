@@ -100,3 +100,11 @@ class MemoryState(ABC):
         visibility itself return ``False``.
         """
         return True
+
+    def supports_memory_prefix(self) -> bool:
+        """Whether this state can coexist with the out-of-band Memory Prefix route.
+
+        Default is fail-closed. Inference-only states that explicitly preserve
+        Memory Prefix semantics may override this capability.
+        """
+        return False

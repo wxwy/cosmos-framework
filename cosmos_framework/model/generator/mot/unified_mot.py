@@ -19,6 +19,7 @@ from cosmos_framework.model.generator.mot.attention import (
     AttentionMaskType,
     dispatch_attention,
 )
+from cosmos_framework.model.generator.mot.inference_text_kv_memory import dispatch_attention_with_text_kv_memory
 
 # Nemotron 3 Dense VL imports
 from cosmos_framework.model.generator.reasoner.nemotron_3_dense_vl.configuration_nemotron_3_dense_vl import (
@@ -117,8 +118,8 @@ def _dispatch_attention_with_optional_memory_prefix(
         "packed_key_states_normalized": packed_key_states_normalized,
     }
     if memory_prefix_context is not None:
-        if dispatch_attention_fn is not dispatch_attention:
-            raise ValueError("Memory Prefix does not support alternate attention dispatch.")
+        if dispatch_attention_fn not in (dispatch_attention, dispatch_attention_with_text_kv_memory):
+            raise ValueError("Memory Prefix does not support this alternate attention dispatch.")
         dispatch_kwargs.update(
             memory_prefix_key_states=memory_prefix_key_states,
             memory_prefix_value_states=memory_prefix_value_states,

@@ -91,6 +91,9 @@ class InferenceTextKVMemoryState(MemoryState):
     def requires_natten_metadata(self) -> bool:
         return False
 
+    def supports_memory_prefix(self) -> bool:
+        return True
+
 
 def make_inference_text_kv_cache(num_layers: int) -> list[UndKVCache]:
     """Create per-layer request-local text K/V caches for one CFG branch."""
@@ -102,8 +105,13 @@ def _attention_gen_with_cached_text(
     packed_key_states: SequencePack,
     packed_value_states: SequencePack,
     memory_value: InferenceTextKVMemoryValue,
+    *,
+    memory_prefix_key_states: torch.Tensor | None = None,
+    memory_prefix_value_states: torch.Tensor | None = None,
+    memory_prefix_sample_offsets: torch.Tensor | None = None,
+    memory_prefix_max_len: int | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
-    """Gen-only attention attending to cached text K/V plus current gen K/V."""
+    """Gen-only attention over ``[MEM | cached text | current GEN]`` K/V."""
     q_gen = get_gen_seq(packed_query_states)  # [S_curr, H, D]
     k_gen = get_gen_seq(packed_key_states)  # [S_curr, H_kv, D]
     v_gen = get_gen_seq(packed_value_states)  # [S_curr, H_kv, D]
@@ -119,8 +127,20 @@ def _attention_gen_with_cached_text(
         kv_parts_k.insert(0, memory_value.und_k_cached)
         kv_parts_v.insert(0, memory_value.und_v_cached)
 
-    k_full = torch.cat(kv_parts_k, dim=1)  # [1, S_total, H_kv, D]
-    v_full = torch.cat(kv_parts_v, dim=1)  # [1, S_total, H_kv, D]
+    if memory_prefix_key_states is not None:
+        if memory_prefix_value_states is None or memory_prefix_sample_offsets is None:
+            raise ValueError("Memory Prefix requires K, V and sample_offsets together.")
+        if memory_prefix_sample_offsets.shape[0] != 2:
+            raise ValueError("Text-KV reuse with Memory Prefix supports exactly one sample.")
+        if memory_prefix_max_len is not None and memory_prefix_max_len != memory_prefix_key_states.shape[0]:
+            raise ValueError("Memory Prefix k_local metadata must match the prefix tensor length.")
+        if memory_prefix_key_states.shape != memory_prefix_value_states.shape:
+            raise ValueError("Memory Prefix K/V shapes must match.")
+        kv_parts_k.insert(0, memory_prefix_key_states.unsqueeze(0))
+        kv_parts_v.insert(0, memory_prefix_value_states.unsqueeze(0))
+
+    k_full = torch.cat(kv_parts_k, dim=1)  # [1, MEM + cached UND + current GEN, H_kv, D]
+    v_full = torch.cat(kv_parts_v, dim=1)
 
     attn_result = attention(
         query=q_gen.unsqueeze(0),  # [1, S_curr, H, D]
@@ -148,6 +168,10 @@ def dispatch_attention_with_text_kv_memory(
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
     packed_key_states_normalized: SequencePack | None = None,
+    memory_prefix_key_states: torch.Tensor | None = None,
+    memory_prefix_value_states: torch.Tensor | None = None,
+    memory_prefix_sample_offsets: torch.Tensor | None = None,
+    memory_prefix_max_len: int | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
     """Dispatch attention with optional request-local text K/V reuse.
 
@@ -160,6 +184,10 @@ def dispatch_attention_with_text_kv_memory(
             packed_key_states,
             packed_value_states,
             memory_value,
+            memory_prefix_key_states=memory_prefix_key_states,
+            memory_prefix_value_states=memory_prefix_value_states,
+            memory_prefix_sample_offsets=memory_prefix_sample_offsets,
+            memory_prefix_max_len=memory_prefix_max_len,
         )
     return dispatch_attention(
         packed_query_states,
@@ -169,6 +197,10 @@ def dispatch_attention_with_text_kv_memory(
         natten_metadata=natten_metadata,
         memory_value=None,
         packed_key_states_normalized=packed_key_states_normalized,
+        memory_prefix_key_states=memory_prefix_key_states,
+        memory_prefix_value_states=memory_prefix_value_states,
+        memory_prefix_sample_offsets=memory_prefix_sample_offsets,
+        memory_prefix_max_len=memory_prefix_max_len,
     )
 
 

@@ -1063,8 +1063,8 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         memory_prefix_context = self._encode_local_memory(packed_seq, target_dtype)
         if memory_prefix_context is not None and self.pad_for_cuda_graphs:
             raise ValueError("Memory Prefix does not support CUDA graph padding.")
-        if memory_prefix_context is not None and memory is not None:
-            raise ValueError("Memory Prefix does not support native MemoryState KV cache.")
+        if memory_prefix_context is not None and memory is not None and not memory.supports_memory_prefix():
+            raise ValueError("Memory Prefix does not support this MemoryState KV cache.")
 
         assert packed_seq.attn_modes is not None
         assert packed_seq.split_lens is not None
