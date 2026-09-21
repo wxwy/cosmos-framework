@@ -65,7 +65,7 @@ def _history_mode() -> str:
         if mode not in _HISTORY_MODES:
             raise ValueError(f"PSM_HISTORY_MODE must be one of {sorted(_HISTORY_MODES)}, got {explicit!r}")
         return mode
-    if _history_mode() == "gru":
+    if _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL"):
         return "gru"
     if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
         return "ttt"
@@ -355,7 +355,7 @@ if os.environ.get("PSM_R09_A1_ENABLED", "0") == "1":
         "local_memory_modality_embed",
     ]
 
-if _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL"):
+if _history_mode() == "gru":
     _baseline_slow_selectors = list(action_policy_libero_all_nano["optimizer"]["keys_to_select"])
     action_policy_libero_edge_all["optimizer"]["keys_to_select"] = _baseline_slow_selectors + [
         "local_history_runtime.encoder",
