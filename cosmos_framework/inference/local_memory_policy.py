@@ -186,6 +186,7 @@ class PolicyLocalMemoryAdapter:
             plan.condition_frame_indexes_vision = [0]
             plan.condition_frame_indexes_action = list(range(h))
             plan.action_start_frame_offset = 1
+            plan.vision_item_source_frame_offsets = list(range(h + 1)) if h else None
             plan.has_local_memory = False
 
         batch["image_size"] = flat_image_sizes
