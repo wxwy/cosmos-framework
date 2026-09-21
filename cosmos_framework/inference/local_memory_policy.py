@@ -35,8 +35,8 @@ def _profile_elapsed_ms(start: float, enabled: bool) -> float:
 
 class PolicyLocalMemoryAdapter:
     def __init__(self, service, *, mode="auto", max_sessions=64):
-        if mode not in {"auto", "off", "required"}:
-            raise ValueError("local memory mode must be auto, off, or required")
+        if mode not in {"auto", "off", "required", "zero", "init"}:
+            raise ValueError("local memory mode must be auto, off, required, zero, or init")
         self.service, self.mode = service, mode
         config = service.model.config
         self.history_mode = str(getattr(config, "history_mode", "none"))
@@ -50,10 +50,19 @@ class PolicyLocalMemoryAdapter:
         )
         window_available = self.history_mode == "window" and self.history_horizon > 0
         available = ttt_available or recent_available or window_available
-        self.enabled = mode == "required" or (mode == "auto" and available)
+        intervention = mode in {"zero", "init"}
+        if intervention and not ttt_available:
+            raise ValueError(f"{mode} Local Memory intervention requires a TTT fast-weight checkpoint")
+        self.enabled = mode in {"required", "zero", "init"} or (mode == "auto" and available)
         self.memory = None
         self.memory_kind = None
-        if self.enabled and window_available:
+        if self.enabled and intervention:
+            runtime = getattr(service.model.net, "local_memory_runtime", None)
+            if runtime is None:
+                raise ValueError(f"{mode} Local Memory intervention requires the checkpoint TTT runtime")
+            self.memory = OnlineLocalMemory(runtime.evidence_encoder, runtime.ttt_core, max_sessions=max_sessions)
+            self.memory_kind = "ttt_fast_weight"
+        elif self.enabled and window_available:
             self.memory_kind = "native_window"
         elif self.enabled and ttt_available:
             runtime = getattr(service.model.net, "local_memory_runtime", None)
@@ -369,6 +378,8 @@ class PolicyLocalMemoryAdapter:
                     updates.append(self.memory.prepare(request, profile=profile))
             inject_t0 = _profile_start(any(profiles))
             tokens = [update.token for update in updates]
+            if self.mode == "zero":
+                tokens = [None if token is None else torch.zeros_like(token) for token in tokens]
             plans = batch["sequence_plan"]
             if len(plans) != len(tokens):
                 raise ValueError("online prefix count differs from policy request count")
@@ -390,6 +401,7 @@ class PolicyLocalMemoryAdapter:
                     "episode_id": update.replacement.episode_id,
                     "consumer_step": update.replacement.consumer_step,
                     "prefix_present": update.replacement.token is not None,
+                    "intervention": self.mode if self.mode in {"zero", "init"} else None,
                     "replay": update.replay,
                     "memory_kind": self.memory_kind,
                 }
