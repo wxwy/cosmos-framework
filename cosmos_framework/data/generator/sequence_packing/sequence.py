@@ -1152,6 +1152,10 @@ class SequencePlan:
         vision_temporal_position_groups: Optional integer group ID per vision item. Items
             with the same integer group ID share a temporal mRoPE grid; ``None`` items
             remain independent. This supports source-video/reference-image/target-video samples.
+        vision_item_source_frame_offsets: Optional source-frame start offset for each
+            vision item, relative to the first item. The packer converts these offsets
+            to FPS-aware mRoPE units. Used by native sliding-window history so
+            separately encoded single-frame items stay aligned with frame-rate actions.
         has_action: Whether action input is present for robotics/embodied AI tasks.
             Defaults to False.
         condition_frame_indexes_action: Indexes of action steps that are clean/conditioning.
@@ -1178,6 +1182,7 @@ class SequencePlan:
     # image-editing semantics where items represent distinct time states.
     share_vision_temporal_positions: bool = False
     vision_temporal_position_groups: list[int | None] | None = None
+    vision_item_source_frame_offsets: list[int] | None = None
 
     # -- action modality --
     has_action: bool = False
@@ -1203,6 +1208,7 @@ class SequencePlan:
             "condition_frame_indexes_sound": self.condition_frame_indexes_sound,
             "share_vision_temporal_positions": self.share_vision_temporal_positions,
             "vision_temporal_position_groups": self.vision_temporal_position_groups,
+            "vision_item_source_frame_offsets": self.vision_item_source_frame_offsets,
         }
 
 
