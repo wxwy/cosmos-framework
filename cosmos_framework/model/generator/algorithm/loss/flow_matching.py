@@ -37,6 +37,7 @@ def compute_flow_matching_loss(
     tensor_kwargs_fp32: dict,
     raw_action_dim: list[torch.Tensor] | None = None,
     normalize_by_active: bool = False,
+    exclude_fully_conditioned_items: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute flow matching loss for a modality.
 
@@ -75,6 +76,7 @@ def compute_flow_matching_loss(
         tensor_kwargs_fp32=tensor_kwargs_fp32,
         raw_action_dim=raw_action_dim,
         normalize_by_active=normalize_by_active,
+        exclude_fully_conditioned_items=exclude_fully_conditioned_items,
     )
     return terms.weighted_mean, terms.unweighted_per_instance
 
@@ -89,6 +91,7 @@ def compute_flow_matching_loss_terms(
     tensor_kwargs_fp32: dict,
     raw_action_dim: list[torch.Tensor] | None = None,
     normalize_by_active: bool = False,
+    exclude_fully_conditioned_items: bool = False,
 ) -> FlowMatchingLossTerms:
     """Compute the native loss while retaining its weighted per-instance terms."""
     if not has_valid_tokens:
@@ -103,11 +106,13 @@ def compute_flow_matching_loss_terms(
     # tw_i gets the same shape so w(σ_t) broadcasts element-wise over non-T dims.
     per_instance_losses = []
     per_instance_weighted_losses = []
+    has_noisy_items: list[torch.Tensor] = []
 
     for i in range(len(pred)):
         T_i = condition_mask[i].shape[0]
         sqerr_i = (pred[i] - target[i]) ** 2  # vision:[C,T,H,W]  action/sound:[T,D]
         noisy_mask_i = 1.0 - condition_mask[i]  # vision:[T,1,1]  action/sound:[T,1]
+        has_noisy_items.append(torch.any(noisy_mask_i != 0))  # []
         if raw_action_dim is not None and raw_action_dim[i] is not None:
             sqerr_i = sqerr_i[:, : raw_action_dim[i]]
         if normalize_by_active:
@@ -126,6 +131,15 @@ def compute_flow_matching_loss_terms(
 
     per_instance_loss = torch.stack(per_instance_losses)  # [B]
     per_instance_weighted_loss = torch.stack(per_instance_weighted_losses)  # [B]
+    if exclude_fully_conditioned_items:
+        active_item_mask = torch.stack(has_noisy_items).to(
+            device=per_instance_weighted_loss.device,
+            dtype=per_instance_weighted_loss.dtype,
+        )  # [B]
+        active_item_count = active_item_mask.sum().clamp(min=1)  # []
+        weighted_mean = (per_instance_weighted_loss * active_item_mask).sum() / active_item_count
+    else:
+        weighted_mean = per_instance_weighted_loss.mean()
     return FlowMatchingLossTerms(
-        per_instance_weighted_loss.mean(), per_instance_weighted_loss, per_instance_loss, per_instance_weighted_loss
+        weighted_mean, per_instance_weighted_loss, per_instance_loss, per_instance_weighted_loss
     )
