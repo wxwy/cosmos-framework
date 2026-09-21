@@ -263,6 +263,11 @@ class PolicyLocalMemoryAdapter:
         samples["_profile_timing"] = [
             {
                 "history_mode": "window",
+                "history_overhead_total_ms": (
+                    history["_timing_ms"].get("payload_total_ms", 0.0)
+                    + prefix_ms / max(1, len(histories))
+                    + trim_ms / max(1, len(histories))
+                ),
                 "history_ms": {
                     **history["_timing_ms"],
                     "prefix_assembly_ms": prefix_ms / max(1, len(histories)),
@@ -340,7 +345,7 @@ class PolicyLocalMemoryAdapter:
             with torch.inference_mode():
                 samples = generate_fn()
             samples["_profile_timing"] = [
-                {"history_mode": "none", "history_ms": {}} if profile else {}
+                {"history_mode": "none", "history_overhead_total_ms": 0.0, "history_ms": {}} if profile else {}
                 for profile in profiles
             ]
             return samples
@@ -385,6 +390,12 @@ class PolicyLocalMemoryAdapter:
             samples["_profile_timing"] = [
                 {
                     "history_mode": mode_name,
+                    "history_overhead_total_ms": (
+                        request_timing.get("request_build_total_ms", 0.0)
+                        + update.timing_ms.get("prepare_total_ms", 0.0)
+                        + inject_ms / max(1, len(updates))
+                        + commit_ms / max(1, len(updates))
+                    ),
                     "history_ms": {
                         **request_timing,
                         **update.timing_ms,
