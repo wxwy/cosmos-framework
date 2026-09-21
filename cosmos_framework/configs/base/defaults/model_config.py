@@ -344,6 +344,12 @@ class OmniMoTModelConfig:
     local_memory_enabled: bool = False
     local_memory_dim: int | None = None
 
+    # Unified PSM history selector. "window" uses native multi-vision/action
+    # conditioning with no Local token; "gru" reduces a bounded window to one
+    # Local token; "ttt" carries episode-level fast weights. Legacy launch flags
+    # remain supported when this field is left at "none".
+    history_mode: Literal["none", "window", "gru", "ttt"] = "none"
+
     # R08 causal history runtime. Disabled by default; when enabled, the
     # dataset-provided history evidence is reduced to one clean Local token.
     local_history_enabled: bool = False
