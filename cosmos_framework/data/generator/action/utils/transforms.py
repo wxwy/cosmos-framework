@@ -793,7 +793,12 @@ class ActionTransformPipeline:
                 data_dict["video"] = [
                     torch.zeros_like(main_video[:, :1]) for _ in range(num_history_actions)
                 ] + [main_video]
-                data_dict["video_latent"] = [*window_history_latents, main_latent]
+                # Cached multi-vision ABI: each vision item carries exactly one
+                # cached latent inside a singleton container. The model flattens
+                # samples across vision items first, then validates each flattened
+                # cache item as ``[latent]``. Pixel placeholders stay as bare tensors
+                # because the media flatten path calls ``item.unsqueeze(0)``.
+                data_dict["video_latent"] = [[latent] for latent in [*window_history_latents, main_latent]]
                 data_dict["image_size"] = [
                     main_image_size.clone() for _ in range(num_history_actions)
                 ] + [main_image_size]

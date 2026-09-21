@@ -503,7 +503,11 @@ def test_action_transform_pipeline_native_window_uses_clean_multi_vision_and_act
     assert isinstance(result["video"], list) and len(result["video"]) == 3
     assert [item.shape[1] for item in result["video"]] == [1, 1, 17]
     assert isinstance(result["video_latent"], list) and len(result["video_latent"]) == 3
-    assert [item.shape[0] for item in result["video_latent"]] == [1, 1, 5]
+    assert all(isinstance(item, list) and len(item) == 1 for item in result["video_latent"])
+    assert [item[0].shape[0] for item in result["video_latent"]] == [1, 1, 5]
+    # Pixel placeholders intentionally remain bare tensors. The model media
+    # flatten path calls ``unsqueeze(0)`` on each item before cached-latent use.
+    assert all(isinstance(item, torch.Tensor) for item in result["video"])
     assert isinstance(result["image_size"], list) and len(result["image_size"]) == 3
     assert result["action"].shape == (18, 12)
     torch.testing.assert_close(result["action"][:2, :10], history_action)
@@ -513,3 +517,35 @@ def test_action_transform_pipeline_native_window_uses_clean_multi_vision_and_act
     assert plan.action_start_frame_offset == 1
     assert plan.vision_item_source_frame_offsets == [0, 1, 2]
     assert not plan.has_local_memory
+
+
+@pytest.mark.L0
+def test_action_transform_pipeline_native_window_h16_matches_cached_multi_vision_abi() -> None:
+    pipeline = ActionTransformPipeline(tokenizer_config=None, max_action_dim=12)
+    history_latents = [torch.full((1, 48, 16, 32), float(i + 1)) for i in range(16)]
+    data_dict = {
+        "ai_caption": "Put both objects in the basket.",
+        "video": torch.zeros(3, 17, 256, 512, dtype=torch.uint8),
+        "video_latent": torch.zeros(5, 48, 16, 32),
+        "window_history_video_latent": history_latents,
+        "history_action": torch.zeros(16, 10),
+        "action": torch.zeros(16, 10),
+        "conditioning_fps": torch.tensor(20),
+        "mode": "wam",
+        "domain_id": torch.tensor(0),
+        "viewpoint": "concat_view",
+        "idle_frames": torch.tensor(0),
+    }
+
+    result = pipeline(data_dict, resolution=None)
+
+    assert len(result["video"]) == 17
+    assert all(isinstance(item, torch.Tensor) for item in result["video"])
+    assert [item.shape[1] for item in result["video"][:-1]] == [1] * 16
+    assert result["video"][-1].shape[1] == 17
+    assert len(result["video_latent"]) == 17
+    assert all(isinstance(item, list) and len(item) == 1 for item in result["video_latent"])
+    assert [item[0].shape[0] for item in result["video_latent"][:-1]] == [1] * 16
+    assert result["video_latent"][-1][0].shape[0] == 5
+    assert result["sequence_plan"].vision_item_source_frame_offsets == list(range(17))
+    assert result["sequence_plan"].action_start_frame_offset == 1
