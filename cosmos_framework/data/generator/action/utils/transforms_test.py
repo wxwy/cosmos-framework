@@ -511,4 +511,5 @@ def test_action_transform_pipeline_native_window_uses_clean_multi_vision_and_act
     assert plan.condition_frame_indexes_vision == [0]
     assert plan.condition_frame_indexes_action == [0, 1]
     assert plan.action_start_frame_offset == 1
+    assert plan.vision_item_source_frame_offsets == [0, 1, 2]
     assert not plan.has_local_memory
