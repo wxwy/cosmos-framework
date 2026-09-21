@@ -324,6 +324,19 @@ def pack_input_sequence(
                 # downstream EOV / next-modality tokens).
                 shared_grid = sequence_plan.share_vision_temporal_positions and num_vis > 1
                 temporal_groups = sequence_plan.vision_temporal_position_groups
+                source_frame_offsets = sequence_plan.vision_item_source_frame_offsets
+                if source_frame_offsets is not None:
+                    if shared_grid or temporal_groups is not None:
+                        raise ValueError(
+                            "vision_item_source_frame_offsets cannot be combined with shared/grouped vision grids"
+                        )
+                    if len(source_frame_offsets) != num_vis:
+                        raise ValueError(
+                            "vision_item_source_frame_offsets must have one entry per vision item, "
+                            f"got {len(source_frame_offsets)} offsets for {num_vis} items."
+                        )
+                    if any((not isinstance(offset, int) or offset < 0) for offset in source_frame_offsets):
+                        raise ValueError("vision_item_source_frame_offsets must be non-negative integers")
                 if temporal_groups is not None:
                     if shared_grid:
                         raise ValueError(
@@ -356,6 +369,18 @@ def pack_input_sequence(
                 # flat idx_vision counter (which would alias to a neighbor sample's
                 # fps and corrupt RoPE FPS modulation).
                 sample_vision_fps = _get_optional_fps(gen_data_clean.fps_vision, sample_idx)
+                source_frame_mrope_scale: float | None = None
+                if source_frame_offsets is not None:
+                    if not enable_fps_modulation or sample_vision_fps is None or sample_vision_fps <= 0:
+                        raise ValueError(
+                            "vision_item_source_frame_offsets requires positive FPS-aware mRoPE"
+                        )
+                    # One source frame spans 1/fps seconds. Vision mRoPE advances at
+                    # base_fps/temporal_compression_factor positions per second, so
+                    # this is exactly the same clock pack_action_tokens uses.
+                    source_frame_mrope_scale = (
+                        float(base_fps) / (float(sample_vision_fps) * float(temporal_compression_factor))
+                    )
 
                 for item_idx in range(num_vis):
                     flat_vision_idx = idx_vision
@@ -393,6 +418,13 @@ def pack_input_sequence(
                         num_views=num_views,
                         latent_t=latent_t,
                     )
+
+                    if source_frame_offsets is not None:
+                        assert source_frame_mrope_scale is not None
+                        seq_builder.set_mrope_temporal_offset(
+                            items_temporal_offset_snapshot
+                            + source_frame_offsets[item_idx] * source_frame_mrope_scale
+                        )
 
                     item_group = temporal_groups[item_idx] if temporal_groups is not None else None
                     if item_group is not None:
@@ -469,13 +501,13 @@ def pack_input_sequence(
                         temporal_compression_factor=temporal_compression_factor,
                         vision_temporal_positions=vision_temporal_positions,
                     )
-                    if temporal_groups is not None:
+                    if temporal_groups is not None or source_frame_offsets is not None:
                         grouped_end_offset = max(grouped_end_offset, seq_builder.mrope_temporal_offset)
                     vision_split_len += item_split_len
                     if track_item_split_lens:
                         sample_item_split_lens.append(item_split_len)
 
-                if temporal_groups is not None:
+                if temporal_groups is not None or source_frame_offsets is not None:
                     seq_builder.set_mrope_temporal_offset(max(grouped_end_offset, seq_builder.mrope_temporal_offset))
                 if track_item_split_lens:
                     seq_builder.vision_item_split_lens.append(sample_item_split_lens)
