@@ -940,6 +940,7 @@ def _run_episode(
     pred_video_dir: Path | None = None,
     pred_video_fps: int = 20,
     task_description: str = "",
+    profile_inference: bool = False,
 ) -> EpisodeResult:
     client.begin_memory_episode(0)
     try:
@@ -957,6 +958,8 @@ def _run_episode(
         action_log: list[list[float]] = []
         predict_log: list[dict] = []
         prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]] = []
+        profile_records: list[dict[str, Any]] = []
+        env_step_ms: list[float] = []
         is_multi_view = len(cameras) > 1
         resolved_rotation_space = _infer_rotation_space(action_dim, rotation_space)
 
@@ -1012,7 +1015,11 @@ def _run_episode(
                         flip_images=flip_images,
                         rotate_180=rotate_180,
                     )
-                    result = client.predict(observation_imgs)
+                    result = client.predict(
+                        observation_imgs,
+                        profile_inference=profile_inference,
+                        return_video=not profile_inference,
+                    )
                 else:
                     observation_img = _get_libero_image(
                         obs,
@@ -1020,7 +1027,11 @@ def _run_episode(
                         flip_images=flip_images,
                         rotate_180=rotate_180,
                     )
-                    result = client.predict(observation_img)
+                    result = client.predict(
+                        observation_img,
+                        profile_inference=profile_inference,
+                        return_video=not profile_inference,
+                    )
                 actions = result.get("action", [])
                 if not actions:
                     return EpisodeResult(False, step, "Empty action chunk from server", action_log, predict_log)
@@ -1029,16 +1040,21 @@ def _run_episode(
                 # Save the full prediction result for this request: the denormalized
                 # action chunk the server returned, plus the slice that will actually
                 # be executed (bounded by --action-horizon), keyed by env step.
-                predict_log.append(
-                    {
-                        "step": step,
-                        "chunk_size": len(actions),
-                        "action_chunk": actions,
-                        "executed": list(action_queue),
-                        "n_execute": len(action_queue),
-                        "video_frames": len(result.get("video", [])),
-                    }
-                )
+                predict_entry = {
+                    "step": step,
+                    "chunk_size": len(actions),
+                    "action_chunk": actions,
+                    "executed": list(action_queue),
+                    "n_execute": len(action_queue),
+                    "video_frames": len(result.get("video", [])),
+                }
+                if profile_inference:
+                    timing_payload = result.get("timing")
+                    if not isinstance(timing_payload, dict):
+                        raise ValueError("profile inference result is missing timing payload")
+                    predict_entry["timing"] = timing_payload
+                    profile_records.append(timing_payload)
+                predict_log.append(predict_entry)
 
                 action_video_b64 = result.get("video", [])
                 if action_video_b64 and (pred_video_dir is not None or comparison_path is not None):
@@ -1079,7 +1095,11 @@ def _run_episode(
                 _get_libero_images(obs, cameras, flip_images=flip_images, rotate_180=rotate_180)
                 if client.memory.enabled else None
             )
+            env_t0 = time.perf_counter()
             obs, _, done, info = env.step(action_list)
+            env_t1 = time.perf_counter()
+            if profile_inference:
+                env_step_ms.append((env_t1 - env_t0) * 1000.0)
             if completed_observation is not None:
                 client.record_memory_step(0, completed_observation, action_list, gripper_mode=gripper_mode)
             step += 1
@@ -1110,7 +1130,16 @@ def _run_episode(
         for media_path in (gif_path, mp4_path, pred_video_dir, comparison_path):
             if media_path is not None and media_path.exists():
                 _rename_with_outcome(media_path, success)
-        return EpisodeResult(success, step, None, action_log, predict_log)
+        profile_summary: dict[str, Any] = {}
+        if profile_inference:
+            profile_summary = {
+                "policy_query_count": len(profile_records),
+                "timing_summary": _summarize_profile_records(profile_records),
+                "env_step_ms": _summarize_profile_records([{"env_step_ms": value} for value in env_step_ms]),
+                "client_process_rss_peak_mb": _process_rss_peak_mb(),
+                "action_only": True,
+            }
+        return EpisodeResult(success, step, None, action_log, predict_log, profile_summary)
     finally:
         client.end_memory_episode(0)
 
