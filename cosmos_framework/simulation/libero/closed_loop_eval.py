@@ -173,7 +173,15 @@ class ActionEnvironmentClient:
         resp = requests.get(f"{self.server_url}/info", timeout=5.0)
         resp.raise_for_status()
         info = resp.json()
-        self.memory.enabled = bool((info.get("local_memory") or {}).get("enabled", False))
+        local_info = info.get("local_memory") or {}
+        self.memory.enabled = bool(local_info.get("enabled", False))
+        if local_info.get("memory_kind") == "native_window":
+            horizon = int(local_info.get("history_horizon") or 0)
+            if horizon <= 0:
+                raise ValueError("native_window server must report a positive history_horizon")
+            self.memory.retain_history_horizon = horizon
+        else:
+            self.memory.retain_history_horizon = 0
         self._memory_info_loaded = True
         return info
 
