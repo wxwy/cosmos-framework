@@ -1138,7 +1138,9 @@ def _run_episode(
         if profile_inference:
             profile_summary = {
                 "policy_query_count": len(profile_records),
-                "timing_summary": _summarize_profile_records(profile_records),
+                "cold_start_first_query": profile_records[0] if profile_records else {},
+                "timing_summary_all": _summarize_profile_records(profile_records),
+                "timing_summary_steady_state": _summarize_profile_records(profile_records[1:]),
                 "env_step_ms": _summarize_profile_records([{"env_step_ms": value} for value in env_step_ms]),
                 "memory_record_ms": _summarize_profile_records(
                     [{"memory_record_ms": value} for value in memory_record_ms]
