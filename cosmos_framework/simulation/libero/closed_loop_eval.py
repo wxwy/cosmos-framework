@@ -232,8 +232,11 @@ class ActionEnvironmentClient:
     def end_memory_episode(self, slot=0):
         session = self.memory.end(slot)
         if session is not None:
-            response = requests.post(f"{self.server_url}/reset",
-                json={"session_id": session}, timeout=5.0)
+            response = requests.post(
+                f"{self.server_url}/reset",
+                json={"session_id": session},
+                timeout=self.timeout,
+            )
             response.raise_for_status()
 
     def record_memory_step(self, slot, observation, executed_action, *, gripper_mode):

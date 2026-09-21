@@ -28,6 +28,7 @@ def _client():
 def test_http_ack_commits_client_frontier_and_failed_request_keeps_evidence(monkeypatch):
     client = _client()
     reset_sessions = []
+    reset_timeouts = []
     fail_predict = False
 
     def get(url, **kwargs):
@@ -38,6 +39,7 @@ def test_http_ack_commits_client_frontier_and_failed_request_keeps_evidence(monk
         nonlocal fail_predict
         if url.endswith("/reset"):
             reset_sessions.append(json["session_id"])
+            reset_timeouts.append(kwargs.get("timeout"))
             return Response({"status": "reset"})
         if url.endswith("/predict"):
             if fail_predict:
@@ -77,6 +79,7 @@ def test_http_ack_commits_client_frontier_and_failed_request_keeps_evidence(monk
     session = client.memory.payload(0)["session_id"]
     client.end_memory_episode(0)
     assert reset_sessions == [session]
+    assert reset_timeouts == [client.timeout]
 
 
 def test_batch_requires_unique_slots_before_http(monkeypatch):
