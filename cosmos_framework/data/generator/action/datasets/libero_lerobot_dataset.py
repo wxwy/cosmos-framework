@@ -93,6 +93,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         latent_cache_root: str | None = None,
         latent_cache_verify_ratio: float = 0.0,
         max_episodes: int | None = None,
+        history_mode: str = "none",
         local_history_horizon: int = 0,
     ) -> None:
         if action_space != "frame_wise_relative":
@@ -153,11 +154,19 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         if max_episodes is not None and max_episodes <= 0:
             raise ValueError(f"max_episodes must be a positive integer, got {max_episodes}")
         self._max_episodes = max_episodes
+        self._history_mode = str(history_mode).strip().lower()
+        if self._history_mode not in {"none", "window", "gru", "ttt"}:
+            raise ValueError(f"unsupported history_mode={history_mode!r}")
         self._local_history_horizon = int(local_history_horizon)
         if self._local_history_horizon < 0:
             raise ValueError(f"local_history_horizon must be non-negative, got {local_history_horizon}")
+        if self._history_mode == "window" and self._local_history_horizon <= 0:
+            raise ValueError("history_mode='window' requires local_history_horizon > 0")
         if self._local_history_horizon > 0 and self._latent_cache_root is None:
-            raise ValueError("local_history_horizon requires latent_cache_root for causal z0 visual summaries")
+            raise ValueError("local_history_horizon requires latent_cache_root for causal history latents")
+        if self._history_mode == "window" and self._latent_cache_verify_ratio > 0:
+            raise ValueError("history_mode='window' requires latent_cache_verify_ratio=0")
+        self._needs_local_evidence = self._local_history_horizon > 0 and self._history_mode != "window"
         # quantile_rot normalizes against the raw (un-orthonormalized) rotation stats
         # under "global_raw"; everything else uses "global".
         self._stats_key = "global_raw" if action_normalization == "quantile_rot" else "global"
@@ -175,7 +184,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         # frame index, so DataLoader worker forks share them copy-on-write.
         index_parts, episode_parts, task_parts, ts_parts, action_parts, state_parts = [], [], [], [], [], []
         parquet_columns = ["index", "episode_index", "task_index", "timestamp", _ACTION_FEATURE]
-        if self._local_history_horizon > 0:
+        if self._needs_local_evidence:
             parquet_columns.append("observation.state")
         for path in sorted((self._root / "data").glob("chunk-*/file-*.parquet")):
             table = pq.read_table(path, columns=parquet_columns)
@@ -184,7 +193,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
             task_parts.append(table["task_index"].to_numpy())
             ts_parts.append(table["timestamp"].to_numpy())
             action_parts.append(np.asarray(table[_ACTION_FEATURE].to_pylist(), dtype=np.float32))
-            if self._local_history_horizon > 0:
+            if self._needs_local_evidence:
                 state_parts.append(np.asarray(table["observation.state"].to_pylist(), dtype=np.float32))
         if not index_parts:
             raise FileNotFoundError(f"No data parquet found under {self._root / 'data'}.")
@@ -194,7 +203,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         self._row_timestamp = np.concatenate(ts_parts).astype(np.float64)[order]
         self._row_action = np.concatenate(action_parts, axis=0).astype(np.float32)[order]
         self._row_state = (
-            np.concatenate(state_parts, axis=0).astype(np.float32)[order] if self._local_history_horizon > 0 else None
+            np.concatenate(state_parts, axis=0).astype(np.float32)[order] if self._needs_local_evidence else None
         )
         if self._row_state is not None and self._row_state.shape[1:] != (8,):
             raise ValueError(f"Expected observation.state shape [8], got {self._row_state.shape[1:]}")
@@ -473,18 +482,71 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         }
         if video_latent is not None:
             extras["video_latent"] = video_latent
-        extras.update(
-            self._build_local_history(
-                start=start,
-                local_start_frame=local_start_frame,
-                episode_index=episode_index,
+        if self._history_mode == "window":
+            extras.update(
+                self._build_native_window_history(
+                    start=start,
+                    local_start_frame=local_start_frame,
+                    episode_index=episode_index,
+                )
             )
-        )
+        else:
+            extras.update(
+                self._build_local_history(
+                    start=start,
+                    local_start_frame=local_start_frame,
+                    episode_index=episode_index,
+                )
+            )
         if self._camera_mode == "concat_view":
             extras["additional_view_description"] = (
                 "The left half shows the third-person view; the right half shows the wrist-mounted camera."
             )
         return self._build_result(mode=mode, video=video, action=action, ai_caption=ai_caption, **extras)
+
+    def _build_native_window_history(
+        self, *, start: int, local_start_frame: int, episode_index: int
+    ) -> dict[str, Any]:
+        """Return the bounded native history prefix without an extra learned compressor.
+
+        Each previous observation is represented by the first causal latent of its
+        exact-window cache entry, i.e. the same single-frame latent the causal VAE
+        exposes at that source step. The paired executed actions use the same
+        frame-wise 6D conversion and normalization as the current action target.
+        """
+        horizon = self._local_history_horizon
+        available = min(horizon, local_start_frame)
+        if available == 0:
+            return {
+                "window_history_video_latent": [],
+                "window_history_frame_indices": torch.empty(0, dtype=torch.long),
+                "history_action": torch.empty((0, self.action_dim), dtype=torch.float32),
+            }
+
+        source_rows = np.arange(start - available, start, dtype=np.int64)
+        source_frames = np.arange(local_start_frame - available, local_start_frame, dtype=np.int64)
+        raw_action = self._build_frame_wise_action(self._row_action[source_rows])
+        normalized_action = (
+            raw_action
+            if self.action_normalization is None
+            else normalize_action(raw_action, self.action_normalization, self._load_norm_stats())
+        )
+
+        history_latents: list[torch.Tensor] = []
+        for source_frame in source_frames:
+            latent = self._load_cached_latent(episode_index, int(source_frame))
+            if latent is None:
+                raise AssertionError("native window history requires exact-window latent cache")
+            # Cache layout is [T_latent=5,C=48,H,W]. The first causal latent
+            # depends only on this source observation and is kept at full spatial
+            # resolution; no visual96 pooling or GRU compression is applied.
+            history_latents.append(latent[:1].clone())
+
+        return {
+            "window_history_video_latent": history_latents,
+            "window_history_frame_indices": torch.from_numpy(source_frames.copy()),
+            "history_action": normalized_action,
+        }
 
     def _build_local_history(self, *, start: int, local_start_frame: int, episode_index: int) -> dict[str, torch.Tensor]:
         """Build fixed-width, left-padded evidence strictly from same-episode rows ``j < t``."""
