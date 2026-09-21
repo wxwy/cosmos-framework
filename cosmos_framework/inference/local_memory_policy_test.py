@@ -245,3 +245,71 @@ def test_native_window_prefixes_clean_history_and_returns_only_target_actions():
     assert result["action"][0].shape == (16, 10)
     assert result["_local_memory_status"][0]["memory_kind"] == "native_window"
     assert result["_local_memory_status"][0]["retained_source_steps"] == [0, 1]
+
+
+@pytest.mark.parametrize("kind", ["none", "ttt", "gru", "window"])
+def test_profile_timing_is_exposed_for_every_history_method(kind):
+    if kind == "none":
+        policy = adapter("off")
+        request = {"profile_inference": True}
+        result = policy.generate([request], batch(), lambda: {"action": [torch.zeros(16, 10)]})
+        profile = result["_profile_timing"][0]
+        assert profile["history_mode"] == "none"
+        return
+
+    if kind == "ttt":
+        policy = adapter()
+        policy.generate([req()], batch(), lambda: {"action": [torch.zeros(16, 10)]})
+        request = req(2)
+        request["profile_inference"] = True
+        result = policy.generate([request], batch(), lambda: {"action": [torch.zeros(16, 10)]})
+        history = result["_profile_timing"][0]["history_ms"]
+        assert result["_profile_timing"][0]["history_mode"] == "ttt"
+        for key in (
+            "request_build_total_ms",
+            "prepare_total_ms",
+            "evidence_encode_ms",
+            "kqv_project_ms",
+            "inner_update_read_ms",
+            "state_detach_ms",
+            "commit_ms",
+        ):
+            assert key in history and history[key] >= 0
+        return
+
+    if kind == "gru":
+        policy = recent_adapter(history_horizon=2)
+        policy.generate([req()], batch(), lambda: {"action": [torch.zeros(16, 10)]})
+        request = req(2)
+        request["profile_inference"] = True
+        result = policy.generate([request], batch(), lambda: {"action": [torch.zeros(16, 10)]})
+        history = result["_profile_timing"][0]["history_ms"]
+        assert result["_profile_timing"][0]["history_mode"] == "gru"
+        for key in ("request_build_total_ms", "prepare_total_ms", "evidence_encode_ms", "gru_replay_ms"):
+            assert key in history and history[key] >= 0
+        return
+
+    policy = window_adapter(history_horizon=2)
+    request = window_req(2)
+    request["profile_inference"] = True
+    plan = SimpleNamespace(
+        has_local_memory=False,
+        condition_frame_indexes_vision=[0],
+        condition_frame_indexes_action=[],
+        action_start_frame_offset=1,
+    )
+    observed = {
+        "video": [[torch.zeros(3, 17, 8, 8)]],
+        "action": [[torch.zeros(16, 64)]],
+        "image_size": torch.tensor([[8, 8, 8, 8]]),
+        "sequence_plan": [plan],
+    }
+    result = policy.generate(
+        [request],
+        observed,
+        lambda: {"action": [torch.zeros(18, 10)]},
+    )
+    history = result["_profile_timing"][0]["history_ms"]
+    assert result["_profile_timing"][0]["history_mode"] == "window"
+    for key in ("payload_total_ms", "history_preprocess_ms", "action_normalize_ms", "prefix_assembly_ms"):
+        assert key in history and history[key] >= 0
