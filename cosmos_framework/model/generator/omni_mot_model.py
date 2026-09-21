@@ -4438,6 +4438,31 @@ class OmniMoTModel(ImaginaireModel):
             if has_multiple_vision_per_sample:
                 media_key = self.input_video_key if not is_image_batch else self.input_image_key
                 data_batch[media_key] = [item.unsqueeze(0) for sublist in sample_vision_list for item in sublist]
+                cached_video_latents_nested = data_batch.get("video_latent")
+                if cached_video_latents_nested is not None:
+                    if len(cached_video_latents_nested) != len(sample_vision_list):
+                        raise ValueError(
+                            "Multi-vision cached-latent sample count must match media sample count: "
+                            f"latents={len(cached_video_latents_nested)} media={len(sample_vision_list)}"
+                        )
+                    flattened_cached_latents = []
+                    for sample_latents, n_items in zip(
+                        cached_video_latents_nested, num_vision_items_per_sample, strict=True
+                    ):
+                        if isinstance(sample_latents, (list, tuple)):
+                            if len(sample_latents) != n_items:
+                                raise ValueError(
+                                    "Multi-vision cached-latent item count must match media item count: "
+                                    f"latents={len(sample_latents)} media={n_items}"
+                                )
+                            flattened_cached_latents.extend(sample_latents)
+                        elif n_items == 1:
+                            flattened_cached_latents.append(sample_latents)
+                        else:
+                            raise ValueError(
+                                "A multi-vision sample must provide one cached latent per vision item"
+                            )
+                    data_batch["video_latent"] = flattened_cached_latents
                 if data_batch[media_key][0].dtype == torch.float32 and not is_image_batch:
                     data_batch["is_preprocessed"] = (
                         True  # for video batch, is_processed = True means the video data is normalized. However, for the image batch, is_processed = True means the image data is augmented with a temporal dimension.
@@ -4538,9 +4563,9 @@ class OmniMoTModel(ImaginaireModel):
                     # Cache contract is [T_latent,C_latent,H,W], while the model
                     # consumes [B,C_latent,T_latent,H,W].
                     latent = latent.permute(1, 0, 2, 3).unsqueeze(0)
-                if latent.dim() != 5 or latent.shape[1] != 48 or latent.shape[2] != 5:
+                if latent.dim() != 5 or latent.shape[1] != 48 or latent.shape[2] <= 0:
                     raise ValueError(
-                        "Cached vision latent must have shape [1,48,5,H,W], "
+                        "Cached vision latent must have shape [1,48,T,H,W] with T > 0, "
                         f"got {tuple(latent.shape)}."
                     )
                 if latent.dtype != torch.float32:
