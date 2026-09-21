@@ -310,13 +310,21 @@ class ActionEnvironmentClient:
         resized = [self.resize_image(img) for img in images]
         return np.concatenate(resized, axis=1)
 
-    def predict(self, observation: np.ndarray | list[np.ndarray]) -> dict[str, Any]:
+    def predict(
+        self,
+        observation: np.ndarray | list[np.ndarray],
+        *,
+        profile_inference: bool = False,
+        return_video: bool = True,
+    ) -> dict[str, Any]:
         """Send observation(s) to model server and get predicted actions.
 
         Args:
             observation: Single image as np.ndarray or list of images for multi-view.
                 For multi-view, images are resized and concatenated horizontally before sending.
         """
+        client_total_t0 = time.perf_counter()
+        encode_t0 = time.perf_counter()
         if isinstance(observation, list):
             # Multi-view: resize each, concatenate horizontally, and send as single image
             concatenated = self.concatenate_images(observation)
@@ -325,17 +333,21 @@ class ActionEnvironmentClient:
             # Single view: send single image
             encoded = self.encode_image(observation)
 
+        encode_t1 = time.perf_counter()
         payload = {
             "image": encoded,
             "prompt": self.prompt,
             "domain_name": self.domain_name,
             "image_size": self.image_size,
+            "profile_inference": bool(profile_inference),
+            "return_video": bool(return_video),
         }
 
         local = self.memory.payload(0)
         if local is not None:
             payload["local_memory"] = local
 
+        http_t0 = time.perf_counter()
         resp = requests.post(
             f"{self.server_url}/predict",
             json=payload,
@@ -343,15 +355,30 @@ class ActionEnvironmentClient:
             timeout=self.timeout,
         )
         resp.raise_for_status()
+        http_t1 = time.perf_counter()
 
         result = resp.json()
         if "error" in result and result["error"]:
             raise RuntimeError(f"Model server error: {result['error']}")
+        ack_t0 = time.perf_counter()
         if self.memory.enabled:
             statuses = result.get("local_memory")
             if not isinstance(statuses, list) or len(statuses) != 1:
                 raise ValueError("TTT server did not acknowledge the memory request")
             self.memory.acknowledge(0, statuses[0])
+        ack_t1 = time.perf_counter()
+        if profile_inference:
+            timing = result.get("timing")
+            if not isinstance(timing, dict):
+                raise ValueError("profile inference requested but server returned no timing payload")
+            timing["client_ms"] = {
+                "image_encode": (encode_t1 - encode_t0) * 1000.0,
+                "http_roundtrip": (http_t1 - http_t0) * 1000.0,
+                "memory_ack": (ack_t1 - ack_t0) * 1000.0,
+                "total": (time.perf_counter() - client_total_t0) * 1000.0,
+            }
+            timing["client_resource"] = {"rss_peak_mb": _process_rss_peak_mb()}
+            result["timing"] = timing
         return result
 
     def predict_batch_detailed(
