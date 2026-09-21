@@ -801,6 +801,7 @@ class ActionTransformPipeline:
                 # action-only history builder subtracts H here, so restore the native
                 # start offset used by the aligned vision+action prefix.
                 sequence_plan.action_start_frame_offset = 1
+                sequence_plan.vision_item_source_frame_offsets = list(range(num_history_actions + 1))
 
         data_dict["sequence_plan"] = sequence_plan
         data_dict = self.local_dummy_transform(data_dict, sequence_plan)
