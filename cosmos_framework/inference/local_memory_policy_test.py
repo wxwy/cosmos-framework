@@ -160,3 +160,87 @@ def test_recent_history_checkpoint_uses_bounded_online_control():
     assert tuple(observed["local_memory"][0].shape) == (1, 32)
     assert result["_local_memory_status"][0]["memory_kind"] == "bounded_recent_history"
     assert policy.memory.metadata()["retained_source_steps"]["s"] == [1, 2]
+
+
+def window_adapter(history_horizon=2):
+    config = SimpleNamespace(
+        history_mode="window",
+        local_history_horizon=history_horizon,
+        local_ttt_enabled=False,
+        local_history_enabled=False,
+        local_history_backend="recurrent",
+        local_history_canonical_evidence=False,
+    )
+    model = SimpleNamespace(config=config, net=SimpleNamespace())
+    service = SimpleNamespace(
+        model=model,
+        action_normalization="quantile",
+        action_min=torch.full((10,), -1.0),
+        action_range=torch.full((10,), 2.0),
+        cfg=SimpleNamespace(action_chunk_size=16),
+    )
+    service._input_video_key = lambda: "video"
+    service._prep_policy_item = lambda request: {
+        "video_padded": torch.zeros(3, 17, 8, 8),
+        "padded_image_size": torch.tensor([8, 8, 8, 8]),
+    }
+    return PolicyLocalMemoryAdapter(service, mode="required")
+
+
+def window_req(step=2):
+    rows = []
+    for source_step in range(max(0, step - 2), step):
+        rows.append(
+            {
+                "source_step": source_step,
+                "image": f"frame-{source_step}",
+                "executed_action": [0.0] * 7,
+                "gripper_mode": "pm_one",
+            }
+        )
+    return {
+        "local_memory": {
+            "session_id": "window-session",
+            "episode_id": "window-episode",
+            "consumer_step": step,
+            "reset": step == 0,
+            "evidence_version": "causal_visual96_executed_action10_v1",
+            "evidence_format": "libero_rgb_action7_v1",
+            "evidence": rows,
+        }
+    }
+
+
+def test_native_window_prefixes_clean_history_and_returns_only_target_actions():
+    policy = window_adapter(history_horizon=2)
+    assert policy.info()["memory_kind"] == "native_window"
+    assert policy.info()["history_horizon"] == 2
+    plan = SimpleNamespace(
+        has_local_memory=False,
+        condition_frame_indexes_vision=[0],
+        condition_frame_indexes_action=[],
+        action_start_frame_offset=1,
+    )
+    observed = {
+        "video": [[torch.zeros(3, 17, 8, 8)]],
+        "action": [[torch.zeros(16, 64)]],
+        "image_size": torch.tensor([[8, 8, 8, 8]]),
+        "sequence_plan": [plan],
+    }
+
+    def generate():
+        assert len(observed["video"][0]) == 3
+        assert [item.shape[1] for item in observed["video"][0]] == [1, 1, 17]
+        assert observed["action"][0][0].shape == (18, 64)
+        assert len(observed["image_size"]) == 3
+        assert plan.condition_frame_indexes_vision == [0]
+        assert plan.condition_frame_indexes_action == [0, 1]
+        assert plan.action_start_frame_offset == 1
+        assert not plan.has_local_memory
+        return {"action": [torch.arange(18 * 10, dtype=torch.float32).reshape(18, 10)]}
+
+    result = policy.generate([window_req(2)], observed, generate)
+
+    assert result["action"][0].shape == (16, 10)
+    assert result["_local_memory_status"][0]["memory_kind"] == "native_window"
+    assert result["_local_memory_status"][0]["retained_source_steps"] == [0, 1]
