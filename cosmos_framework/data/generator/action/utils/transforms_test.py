@@ -468,3 +468,47 @@ def test_action_prompt_json_formatter_matches_video_json_common_metadata() -> No
     assert action_prompt["actions"][0]["time"] == video_prompt["actions"][0]["time"]
     assert action_prompt["actions"][0]["description"] == video_prompt["actions"][0]["description"]
     assert action_prompt["actions"][0]["idle_frame"] == "3 out of 22."
+
+
+@pytest.mark.L0
+def test_action_transform_pipeline_native_window_uses_clean_multi_vision_and_action_prefix() -> None:
+    pipeline = ActionTransformPipeline(tokenizer_config=None, max_action_dim=12)
+    main_video = torch.zeros(3, 17, 256, 512, dtype=torch.uint8)
+    main_latent = torch.zeros(5, 48, 16, 32)
+    history_latents = [
+        torch.full((1, 48, 16, 32), 1.0),
+        torch.full((1, 48, 16, 32), 2.0),
+    ]
+    history_action = torch.tensor(
+        [[0.1] * 10, [0.2] * 10],
+        dtype=torch.float32,
+    )
+    target_action = torch.zeros(16, 10)
+    data_dict = {
+        "ai_caption": "Open the drawer.",
+        "video": main_video,
+        "video_latent": main_latent,
+        "window_history_video_latent": history_latents,
+        "history_action": history_action,
+        "action": target_action,
+        "conditioning_fps": torch.tensor(20),
+        "mode": "wam",
+        "domain_id": torch.tensor(0),
+        "viewpoint": "concat_view",
+        "idle_frames": torch.tensor(0),
+    }
+
+    result = pipeline(data_dict, resolution=None)
+
+    assert isinstance(result["video"], list) and len(result["video"]) == 3
+    assert [item.shape[1] for item in result["video"]] == [1, 1, 17]
+    assert isinstance(result["video_latent"], list) and len(result["video_latent"]) == 3
+    assert [item.shape[0] for item in result["video_latent"]] == [1, 1, 5]
+    assert isinstance(result["image_size"], list) and len(result["image_size"]) == 3
+    assert result["action"].shape == (18, 12)
+    torch.testing.assert_close(result["action"][:2, :10], history_action)
+    plan = result["sequence_plan"]
+    assert plan.condition_frame_indexes_vision == [0]
+    assert plan.condition_frame_indexes_action == [0, 1]
+    assert plan.action_start_frame_offset == 1
+    assert not plan.has_local_memory
