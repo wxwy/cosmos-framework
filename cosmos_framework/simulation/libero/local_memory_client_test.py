@@ -48,3 +48,20 @@ def test_wrong_server_ack_does_not_drop_pending_evidence():
     with pytest.raises(ValueError, match="frontier"):
         memory.acknowledge(0, {"consumer_step": 99})
     assert memory.payload()["reset"]
+
+
+def test_native_window_ack_retains_only_bounded_causal_tail():
+    memory = ClientLocalMemory(enabled=True)
+    memory.retain_history_horizon = 2
+    memory.begin()
+    acknowledge(memory)
+    for step in range(3):
+        memory.record_executed(0, f"frame-{step}", [0.0] * 7, gripper_mode="pm_one")
+    payload = memory.payload()
+    assert payload["consumer_step"] == 3
+    assert [row["source_step"] for row in payload["evidence"]] == [1, 2]
+    acknowledge(memory)
+    retained = memory.payload()
+    assert [row["source_step"] for row in retained["evidence"]] == [1, 2]
+    memory.record_executed(0, "frame-3", [0.0] * 7, gripper_mode="pm_one")
+    assert [row["source_step"] for row in memory.payload()["evidence"]] == [2, 3]
