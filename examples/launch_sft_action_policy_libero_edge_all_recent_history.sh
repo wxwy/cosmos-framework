@@ -4,6 +4,8 @@ set -euo pipefail
 # E003 bounded recent-history matched control.
 # This formal launcher is pinned to H=16, matching ttt_tbptt_steps=16.
 # H=32 remains an optional stronger control and must use a distinct RUN_NAME.
+export PSM_HISTORY_MODE=gru
+export PSM_RECENT_HISTORY_HORIZON=16
 export PSM_R08_LOCAL_HISTORY_ENABLED=1
 export PSM_E003_RECENT_HISTORY_CONTROL=1
 export PSM_R08_LOCAL_HISTORY_HORIZON=16
