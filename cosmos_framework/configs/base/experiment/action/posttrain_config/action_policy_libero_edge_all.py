@@ -312,7 +312,7 @@ def _action_policy_libero_edge_dataloader():
         tokenizer_temporal_compression_factor=4,
         patch_spatial=2,
         max_sequence_length=None,  # None disables token packing (use max_samples_per_batch)
-        max_samples_per_batch=max_samples_per_batch,  # peak-mem bound; global = 128 x 1 x grad_accum 16 = 2048
+        max_samples_per_batch=max_samples_per_batch,  # GRU:128xGA16; WINDOW:16xGA128; both = 2048/update
         sound_latent_fps=0,
         audio_sample_rate=48000,
         seed=None,  # deterministic round-robin 1:1:1:1 (balanced per grad-accum window)
