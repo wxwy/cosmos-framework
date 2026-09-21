@@ -25,6 +25,7 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
 )
 from cosmos_framework.model.generator.mot.attention import SplitInfo, dispatch_attention
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork
+from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryState, MemoryValue
 from cosmos_framework.model.generator.mot.unified_mot import (
     LayerTypes,
     PackedAttentionMoT,
@@ -487,11 +488,27 @@ def test_memory_prefix_packed_attention_forwards_normalized_positionless_memory_
     assert dispatch_calls[0]["memory_prefix_sample_offsets"] is context.sample_offsets
 
 
+class _UnsupportedMemoryState(MemoryState):
+    """Real MemoryState fixture that inherits the fail-closed prefix capability."""
+
+    def init(self, hidden_states: dict, device: torch.device) -> None:
+        del hidden_states, device
+
+    def read_for_layer(self, layer_idx: int) -> MemoryValue:
+        raise AssertionError(f"owner guard must reject before layer {layer_idx} memory read")
+
+    def write_for_layer(self, layer_idx: int, kv_to_store: KVToStore) -> None:
+        raise AssertionError(f"owner guard must reject before layer {layer_idx} memory write: {kv_to_store!r}")
+
+    def is_gen_only(self) -> bool:
+        return False
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize(
     ("pad_for_cuda_graphs", "memory", "attention_io_layout", "parallel_dims", "message"),
     [
-        (False, object(), "sequence_sharded", None, "native MemoryState"),
+        (False, _UnsupportedMemoryState(), "sequence_sharded", None, "MemoryState KV cache"),
         (True, None, "sequence_sharded", None, "CUDA graph"),
         (False, None, "replicated", SimpleNamespace(cp_enabled=True), "replicated attention I/O"),
     ],
