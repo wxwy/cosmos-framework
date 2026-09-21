@@ -60,6 +60,9 @@ def compute_flow_matching_loss(
             ``sum / active_count`` semantics needed for distillation critics where
             conditioned frames contribute no signal and should not dilute the
             denominator.
+        exclude_fully_conditioned_items: When True, omit fully-clean items from
+            the final scalar mean while preserving their zero per-instance entries.
+            This prevents clean native-window controls from diluting the WAM target loss.
 
     Returns:
         tuple: A tuple containing two elements:
