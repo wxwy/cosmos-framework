@@ -960,6 +960,7 @@ def _run_episode(
         prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]] = []
         profile_records: list[dict[str, Any]] = []
         env_step_ms: list[float] = []
+        memory_record_ms: list[float] = []
         is_multi_view = len(cameras) > 1
         resolved_rotation_space = _infer_rotation_space(action_dim, rotation_space)
 
@@ -1101,7 +1102,10 @@ def _run_episode(
             if profile_inference:
                 env_step_ms.append((env_t1 - env_t0) * 1000.0)
             if completed_observation is not None:
+                record_t0 = time.perf_counter()
                 client.record_memory_step(0, completed_observation, action_list, gripper_mode=gripper_mode)
+                if profile_inference:
+                    memory_record_ms.append((time.perf_counter() - record_t0) * 1000.0)
             step += 1
             record_frame(obs)
 
@@ -1136,6 +1140,9 @@ def _run_episode(
                 "policy_query_count": len(profile_records),
                 "timing_summary": _summarize_profile_records(profile_records),
                 "env_step_ms": _summarize_profile_records([{"env_step_ms": value} for value in env_step_ms]),
+                "memory_record_ms": _summarize_profile_records(
+                    [{"memory_record_ms": value} for value in memory_record_ms]
+                ),
                 "client_process_rss_peak_mb": _process_rss_peak_mb(),
                 "action_only": True,
             }
