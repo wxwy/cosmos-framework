@@ -236,6 +236,7 @@ def test_native_window_prefixes_clean_history_and_returns_only_target_actions():
         assert plan.condition_frame_indexes_vision == [0]
         assert plan.condition_frame_indexes_action == [0, 1]
         assert plan.action_start_frame_offset == 1
+        assert plan.vision_item_source_frame_offsets == [0, 1, 2]
         assert not plan.has_local_memory
         return {"action": [torch.arange(18 * 10, dtype=torch.float32).reshape(18, 10)]}
 
