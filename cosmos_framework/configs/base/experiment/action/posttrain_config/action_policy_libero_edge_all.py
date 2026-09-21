@@ -65,7 +65,7 @@ def _history_mode() -> str:
         if mode not in _HISTORY_MODES:
             raise ValueError(f"PSM_HISTORY_MODE must be one of {sorted(_HISTORY_MODES)}, got {explicit!r}")
         return mode
-    if _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL"):
+    if _history_mode() == "gru":
         return "gru"
     if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
         return "ttt"
@@ -207,7 +207,13 @@ def _action_policy_libero_edge_dataloader():
     must *not* be read as "4 cycles" on that route.
     """
 
-    local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
+    history_mode = _history_mode()
+    explicit_history_mode = "PSM_HISTORY_MODE" in os.environ
+    local_history_enabled = (
+        history_mode in {"gru", "ttt"}
+        if explicit_history_mode
+        else os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
+    )
     b2_manifest_root = os.environ.get("PSM_R09_B2_STREAM_MANIFEST_ROOT")
 
     def _suite_dataset(_suite, *, iterable_shuffle=None):
@@ -256,10 +262,11 @@ def _action_policy_libero_edge_dataloader():
             local_dummy_tokens=int(os.environ.get("PSM_LOCAL_DUMMY_TOKENS", "1")),
             local_dummy_dim="${model.config.local_memory_dim}",
             local_dummy_mode=os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal"),
+            history_mode=history_mode,
             local_history_horizon=_local_history_horizon(
                 active=_strict_bool_env("PSM_R09_B_TTT_ACTIVE")
             )
-            if local_history_enabled
+            if (local_history_enabled or history_mode == "window")
             else 0,
             **cache_kwargs,
         )
@@ -364,7 +371,7 @@ if _strict_bool_env("PSM_R09_B1_TTT_ENABLED"):
         "local_memory_modality_embed",
     ]
 
-if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
+if _history_mode() == "ttt":
     # R09-B TTT active wiring adds the four frozen slow groups ON TOP OF the
     # inherited baseline allowlist (generation + action heads).  It must append,
     # not overwrite: the intended training scope is baseline heads + local-memory
@@ -470,7 +477,7 @@ if _r09_b1_probe_output:
         output_path=_r09_b1_probe_output,
     )
 
-if _strict_bool_env("PSM_R09_B_TTT_ENABLED") and not _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
+if _history_mode() == "ttt" and not _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
     # External-backward lifecycle seam: records the unscaled native loss before
     # the single backward, then marks/commits armed segments after it.
     # PSM_R09_B_TTT_ACTIVE=1 selects the canonical segment route instead, which
