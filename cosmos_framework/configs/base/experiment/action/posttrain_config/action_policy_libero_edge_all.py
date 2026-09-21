@@ -54,6 +54,24 @@ def _strict_bool_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+_HISTORY_MODES = {"none", "window", "gru", "ttt"}
+
+
+def _history_mode() -> str:
+    """Resolve the user-facing history selector while preserving legacy launchers."""
+    explicit = os.environ.get("PSM_HISTORY_MODE")
+    if explicit is not None:
+        mode = explicit.strip().lower()
+        if mode not in _HISTORY_MODES:
+            raise ValueError(f"PSM_HISTORY_MODE must be one of {sorted(_HISTORY_MODES)}, got {explicit!r}")
+        return mode
+    if _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL"):
+        return "gru"
+    if _strict_bool_env("PSM_R09_B_TTT_ENABLED"):
+        return "ttt"
+    return "none"
+
+
 def _local_history_horizon(*, active: bool) -> int:
     """Causal-history horizon; forced to zero on the canonical segment route.
 
@@ -66,8 +84,8 @@ def _local_history_horizon(*, active: bool) -> int:
     """
     if active:
         return 0
-    default_horizon = "16"
-    return int(os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", default_horizon))
+    default_horizon = os.environ.get("PSM_R08_LOCAL_HISTORY_HORIZON", "16")
+    return int(os.environ.get("PSM_RECENT_HISTORY_HORIZON", default_horizon))
 
 
 def _action_policy_libero_edge_model_config() -> dict:
@@ -82,12 +100,34 @@ def _action_policy_libero_edge_model_config() -> dict:
     cfg["tokenizer"]["encode_exact_durations"] = LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS
     cfg["tokenizer"]["encode_chunk_frames"] = LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES
     local_dummy_enabled = os.environ.get("PSM_LOCAL_DUMMY_ENABLED", "0") == "1"
-    local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
+    history_mode = _history_mode()
+    explicit_history_mode = "PSM_HISTORY_MODE" in os.environ
+    legacy_local_history_enabled = os.environ.get("PSM_R08_LOCAL_HISTORY_ENABLED", "0") == "1"
     b2_manifest_root = os.environ.get("PSM_R09_B2_STREAM_MANIFEST_ROOT")
     r09_b1_ttt_enabled = _strict_bool_env("PSM_R09_B1_TTT_ENABLED")
     r09_a1_enabled = _strict_bool_env("PSM_R09_A1_ENABLED")
-    r09_b_ttt_enabled = _strict_bool_env("PSM_R09_B_TTT_ENABLED")
-    e003_recent_history = _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL")
+    legacy_r09_b_ttt_enabled = _strict_bool_env("PSM_R09_B_TTT_ENABLED")
+    legacy_e003_recent_history = _strict_bool_env("PSM_E003_RECENT_HISTORY_CONTROL")
+    if explicit_history_mode:
+        if r09_a1_enabled or r09_b1_ttt_enabled:
+            raise ValueError("PSM_HISTORY_MODE cannot be combined with R09-A1/B1 engineering routes")
+        expected_flags = {
+            "PSM_R08_LOCAL_HISTORY_ENABLED": history_mode in {"gru", "ttt"},
+            "PSM_E003_RECENT_HISTORY_CONTROL": history_mode == "gru",
+            "PSM_R09_B_TTT_ENABLED": history_mode == "ttt",
+        }
+        for name, expected in expected_flags.items():
+            if name in os.environ and _strict_bool_env(name) != expected:
+                raise ValueError(f"{name} conflicts with PSM_HISTORY_MODE={history_mode!r}")
+        if _strict_bool_env("PSM_R09_B_TTT_ACTIVE") and history_mode != "ttt":
+            raise ValueError("PSM_R09_B_TTT_ACTIVE requires PSM_HISTORY_MODE=ttt")
+        local_history_enabled = history_mode in {"gru", "ttt"}
+        e003_recent_history = history_mode == "gru"
+        r09_b_ttt_enabled = history_mode == "ttt"
+    else:
+        local_history_enabled = legacy_local_history_enabled
+        e003_recent_history = legacy_e003_recent_history
+        r09_b_ttt_enabled = legacy_r09_b_ttt_enabled
     if local_dummy_enabled and local_history_enabled:
         raise ValueError("PSM_LOCAL_DUMMY_ENABLED and PSM_R08_LOCAL_HISTORY_ENABLED are mutually exclusive")
     if r09_b1_ttt_enabled and not local_history_enabled:
@@ -122,6 +162,7 @@ def _action_policy_libero_edge_model_config() -> dict:
     local_dummy_mode = os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal")
     if local_dummy_mode not in {"normal", "zero", "shuffle"}:
         raise ValueError(f"unsupported PSM_LOCAL_DUMMY_MODE: {local_dummy_mode}")
+    cfg["history_mode"] = history_mode
     cfg["local_memory_enabled"] = local_dummy_enabled or local_history_enabled
     cfg["local_history_enabled"] = local_history_enabled
     cfg["local_history_backend"] = "ttt_fast_weight" if (r09_b1_ttt_enabled or r09_b_ttt_enabled) else "recurrent"
@@ -135,8 +176,8 @@ def _action_policy_libero_edge_model_config() -> dict:
     )
     if cfg["local_history_horizon"] < 0:
         raise ValueError("PSM_R08_LOCAL_HISTORY_HORIZON must be non-negative")
-    if e003_recent_history and cfg["local_history_horizon"] <= 0:
-        raise ValueError("E003 bounded recent-history control requires a positive history horizon")
+    if history_mode in {"window", "gru"} and cfg["local_history_horizon"] <= 0:
+        raise ValueError(f"PSM_HISTORY_MODE={history_mode} requires a positive recent-history horizon")
     cfg["local_memory_dim"] = int(os.environ.get("PSM_LOCAL_DUMMY_DIM", "32")) if cfg["local_memory_enabled"] else None
     cfg["vlm_config"]["tokenizer"].update(
         repository=None,
