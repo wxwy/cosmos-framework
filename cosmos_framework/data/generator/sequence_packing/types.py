@@ -341,6 +341,7 @@ class SequencePlan:
     # and equal fps across items. Default False preserves single-clip and
     # image-editing semantics where items represent distinct time states.
     share_vision_temporal_positions: bool = False
+    vision_item_source_frame_offsets: list[int] | None = None
 
     # -- action modality --
     has_action: bool = False
@@ -361,6 +362,7 @@ class SequencePlan:
             "condition_frame_indexes_action": self.condition_frame_indexes_action,
             "condition_frame_indexes_sound": self.condition_frame_indexes_sound,
             "share_vision_temporal_positions": self.share_vision_temporal_positions,
+            "vision_item_source_frame_offsets": self.vision_item_source_frame_offsets,
         }
 
 
