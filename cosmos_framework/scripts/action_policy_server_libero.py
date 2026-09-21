@@ -45,6 +45,7 @@ import binascii
 import datetime
 import io
 import json
+import resource
 import threading
 import time
 import traceback
@@ -98,6 +99,17 @@ ResolvedActionNormalization = Literal["meanstd", "minmax", "quantile", "quantile
 
 _DURATION_FPS_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 _RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
+
+
+def _profile_cuda_sync(enabled: bool) -> None:
+    if enabled and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _profile_rss_mb() -> float:
+    # Linux ru_maxrss is KiB.
+    return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+
 
 # Viewpoint tag for the concat_view (third-person + wrist) eval the LIBERO client runs;
 # matches LIBEROLeRobotDataset's _VIEWPOINT_BY_CAMERA["concat_view"]. Used only when the
@@ -1039,7 +1051,16 @@ class ActionModelService:
 
         All action dimensions are returned. Video is the decoded predicted rollout as base64 PNGs.
         """
-        t0 = time.monotonic()
+        profile_inference = bool(req.get("profile_inference", False))
+        return_video = bool(req.get("return_video", True))
+        if profile_inference:
+            _profile_cuda_sync(True)
+            torch.cuda.reset_peak_memory_stats()
+            gpu_allocated_before = float(torch.cuda.memory_allocated()) / (1024.0**2)
+            gpu_reserved_before = float(torch.cuda.memory_reserved()) / (1024.0**2)
+        else:
+            gpu_allocated_before = gpu_reserved_before = 0.0
+        t0 = time.perf_counter()
 
         # Get or assign request ID
         injected_id = req.get("request_id", None)
@@ -1051,9 +1072,9 @@ class ActionModelService:
                 request_id = int(self._req_id)
 
         # Per-item preprocessing (validation, decode/resize/pad, prompt, sequence_plan).
-        t_decode0 = time.monotonic()
+        t_decode0 = time.perf_counter()
         prep = self._prep_policy_item(req)
-        t_decode1 = time.monotonic()
+        t_decode1 = time.perf_counter()
         img_chw_uint8 = prep["img_chw_uint8"]
         video_padded = prep["video_padded"]
         padded_image_size = prep["padded_image_size"]
@@ -1063,6 +1084,7 @@ class ActionModelService:
         image_size = prep["image_size"]
 
         # Action: zeros tensor as noise starting point for policy mode
+        t_batch0 = time.perf_counter()
         action_t_d = torch.zeros(
             (self.cfg.action_chunk_size, self.cfg.max_action_dim),
             dtype=torch.float32,
@@ -1099,37 +1121,55 @@ class ActionModelService:
         )
 
         # Run inference
-        t_inf0 = time.monotonic()
+        t_batch1 = time.perf_counter()
+        model_profile: dict[str, float] = {}
+
+        def _generate():
+            return self.model.generate_samples_from_batch(
+                batch,
+                guidance=self.cfg.guidance,
+                seed=[self.cfg.seed],
+                num_steps=self.cfg.num_steps,
+                has_negative_prompt=False,
+                _profile_timing=model_profile if profile_inference else None,
+            )
+
+        lock_wait_t0 = time.perf_counter()
         with self._lock:
+            lock_acquired_t = time.perf_counter()
+            _profile_cuda_sync(profile_inference)
+            t_policy0 = time.perf_counter()
             with torch.inference_mode():
-                samples = self.local_memory_adapter.generate(
-                    [req], batch, lambda: self.model.generate_samples_from_batch(
-                        batch, guidance=self.cfg.guidance, seed=[self.cfg.seed],
-                        num_steps=self.cfg.num_steps, has_negative_prompt=False,
-                    )
-                )
-                pred_action = samples["action"][0]  # [T,D] or [1,T,D]
+                samples = self.local_memory_adapter.generate([req], batch, _generate)
+            _profile_cuda_sync(profile_inference)
+            t_policy1 = time.perf_counter()
+            pred_action = samples["action"][0]  # [T,D] or [1,T,D]
 
-                # Decode vision for rollout video (samples["vision"] is a list; take first sample)
+            pred_video_c_t_h_w = None
+            t_vision_decode0 = time.perf_counter()
+            if return_video:
                 pred_video_c_t_h_w = self.model.decode(samples["vision"][0]).squeeze(0)  # [C,T,H,W]
-
-                # Remove reflection padding so the reported video matches the original resolution
                 pred_video_c_t_h_w = remove_reflection_padding(pred_video_c_t_h_w, padded_image_size)
-        t_inf1 = time.monotonic()
+            _profile_cuda_sync(profile_inference)
+            t_vision_decode1 = time.perf_counter()
 
         # Extract actions: return all dimensions — (T, D) or (1, T, D)
+        t_action_post0 = time.perf_counter()
         pred_action = pred_action.float().squeeze(0)  # [T,D]
         pred_action = self._denormalize_action(pred_action)
         pred_action_np = pred_action.detach().cpu().numpy()  # [T,D]
         pred_action_list = pred_action_np.tolist()  # List of [a0, a1, ..., aD]
+        t_action_post1 = time.perf_counter()
 
         # Convert video to base64-encoded PNG frames
-        pred_video_frames = _video_tensor_to_pil_images(pred_video_c_t_h_w)
+        t_png0 = time.perf_counter()
+        pred_video_frames = [] if pred_video_c_t_h_w is None else _video_tensor_to_pil_images(pred_video_c_t_h_w)
         pred_video_b64: list[str] = []
         for frame in pred_video_frames:
             buf = io.BytesIO()
             frame.save(buf, format="PNG")
             pred_video_b64.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+        t_png1 = time.perf_counter()
 
         # Optional offline debug dump
         if self._should_dump(request_id):
@@ -1152,16 +1192,51 @@ class ActionModelService:
                 # Never fail serving a request due to dump failures
                 log.error(f"[action-server] dump failed for request_id={request_id}: {e}")
 
-        dt_total_ms = (time.monotonic() - t0) * 1000.0
+        _profile_cuda_sync(profile_inference)
+        dt_total_ms = (time.perf_counter() - t0) * 1000.0
         dt_decode_ms = (t_decode1 - t_decode0) * 1000.0
-        dt_inf_ms = (t_inf1 - t_inf0) * 1000.0
+        dt_policy_ms = (t_policy1 - t_policy0) * 1000.0
+        timing = None
+        if profile_inference:
+            peak_allocated = float(torch.cuda.max_memory_allocated()) / (1024.0**2)
+            peak_reserved = float(torch.cuda.max_memory_reserved()) / (1024.0**2)
+            method_timing = (samples.get("_profile_timing") or [{}])[0]
+            timing = {
+                "server_ms": {
+                    "preprocess": dt_decode_ms,
+                    "batch_build": (t_batch1 - t_batch0) * 1000.0,
+                    "lock_wait": (lock_acquired_t - lock_wait_t0) * 1000.0,
+                    "policy_generate": dt_policy_ms,
+                    "vision_decode": (t_vision_decode1 - t_vision_decode0) * 1000.0,
+                    "action_postprocess": (t_action_post1 - t_action_post0) * 1000.0,
+                    "png_encode": (t_png1 - t_png0) * 1000.0,
+                    "total": dt_total_ms,
+                },
+                "model_ms": model_profile,
+                "history": method_timing,
+                "resource": {
+                    "gpu_allocated_before_mb": gpu_allocated_before,
+                    "gpu_reserved_before_mb": gpu_reserved_before,
+                    "gpu_peak_allocated_mb": peak_allocated,
+                    "gpu_peak_reserved_mb": peak_reserved,
+                    "gpu_peak_delta_allocated_mb": max(0.0, peak_allocated - gpu_allocated_before),
+                    "server_rss_peak_mb": _profile_rss_mb(),
+                },
+                "profile_action_only": not return_video,
+            }
         log.info(
             f"[action-server] request_id={request_id} done action_steps={len(pred_action_list)} "
             f"video_frames={len(pred_video_b64)} "
-            f"ms_total={dt_total_ms:.1f} ms_decode={dt_decode_ms:.1f} ms_infer={dt_inf_ms:.1f}"
+            f"ms_total={dt_total_ms:.1f} ms_decode={dt_decode_ms:.1f} ms_infer={dt_policy_ms:.1f}"
         )
-        return {"action": pred_action_list, "video": pred_video_b64,
-                "local_memory": samples.get("_local_memory_status")}
+        response = {
+            "action": pred_action_list,
+            "video": pred_video_b64,
+            "local_memory": samples.get("_local_memory_status"),
+        }
+        if timing is not None:
+            response["timing"] = timing
+        return response
 
     # ------------------------------------------------------------------
     # Developer validation (optional, --run-validation)
