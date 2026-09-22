@@ -233,6 +233,7 @@ class RoboCasaLeRobotDataset(BaseActionLeRobotDataset):
             action_normalization=action_normalization,
             tolerance_s=tolerance_s,
             sample_stride=sample_stride,
+            skip_video_loading=self._latent_cache_root is not None,
         )
 
         observation_ts = [i * self._dt for i in range(self._chunk_length + 1)]
@@ -434,18 +435,38 @@ class RoboCasaLeRobotDataset(BaseActionLeRobotDataset):
 
         if self._latent_cache_root is None:
             video = self._compose_sample_video(sample)
+            result = self._build_result(
+                mode=mode,
+                video=video,
+                action=action,
+                ai_caption=ai_caption,
+                **state_extras,
+                additional_view_description=robocasa_view_description(self._camera_set),
+            )
         else:
+            # The latent-cache path deliberately does not decode source video.
+            # Keep a zero uint8 placeholder with the correct pre-resize geometry
+            # so ActionTransformPipeline can build image_size/prompt metadata while
+            # the model consumes video_latent instead of running the VAE.
+            if "idle_frames" not in state_extras:
+                idle_frames = self._compute_idle_frames(action)
+                if idle_frames is not None:
+                    state_extras["idle_frames"] = idle_frames
+            if self._action_normalizer is not None:
+                action = self._action_normalizer.normalize_action(action)
             h, w = self.composed_output_size
-            video = torch.zeros((self._chunk_length + 1, 3, h, w), dtype=torch.float32)
+            result = {
+                "ai_caption": ai_caption,
+                "video": torch.zeros((3, self._chunk_length + 1, h, w), dtype=torch.uint8),
+                "action": action,
+                "conditioning_fps": torch.tensor(self._fps, dtype=torch.long),
+                "mode": mode,
+                "domain_id": torch.tensor(self._domain_id, dtype=torch.long),
+                "viewpoint": self._viewpoint,
+                "additional_view_description": robocasa_view_description(self._camera_set),
+                **state_extras,
+            }
 
-        result = self._build_result(
-            mode=mode,
-            video=video,
-            action=action,
-            ai_caption=ai_caption,
-            **state_extras,
-            additional_view_description=robocasa_view_description(self._camera_set),
-        )
         result.update(
             {
                 "video_latent": latent,
