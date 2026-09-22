@@ -20,13 +20,103 @@ from cosmos_framework.model.generator.vision_vae import (
     LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS,
 )
 
-CameraMode = Literal["wrist_top_agentview_lr_bottom"]
-_VIDEO_KEYS = (
-    "observation.images.robot0_eye_in_hand",
-    "observation.images.robot0_agentview_left",
-    "observation.images.robot0_agentview_right",
-)
-_CAMERA_MODE = "wrist_top_agentview_lr_bottom"
+CameraSet = Literal["left_wrist", "wrist_lr", "left_wrist_right"]
+
+_WRIST_KEY = "observation.images.robot0_eye_in_hand"
+_LEFT_KEY = "observation.images.robot0_agentview_left"
+_RIGHT_KEY = "observation.images.robot0_agentview_right"
+_DEFAULT_CAMERA_SET: CameraSet = "left_wrist"
+
+_CAMERA_SET_KEYS: dict[CameraSet, tuple[str, ...]] = {
+    "left_wrist": (_LEFT_KEY, _WRIST_KEY),
+    "wrist_lr": (_WRIST_KEY, _LEFT_KEY, _RIGHT_KEY),
+    "left_wrist_right": (_LEFT_KEY, _WRIST_KEY, _RIGHT_KEY),
+}
+_CAMERA_SET_VIEWPOINT: dict[CameraSet, str] = {
+    "left_wrist": "concat_view",
+    "wrist_lr": "wrist_top_agentview_lr_bottom",
+    "left_wrist_right": "concat_view",
+}
+_CAMERA_SET_DESCRIPTION: dict[CameraSet, str] = {
+    "left_wrist": "The left half is agentview left. The right half is the wrist-mounted camera.",
+    "wrist_lr": "The top view is the wrist-mounted camera. The bottom row is agentview left then agentview right.",
+    "left_wrist_right": (
+        "The three horizontal panels are agentview left, the wrist-mounted camera, "
+        "and agentview right, from left to right."
+    ),
+}
+_CAMERA_SET_ALIASES = {
+    "wrist_top_agentview_lr_bottom": "wrist_lr",
+}
+
+
+def normalize_robocasa_camera_set(value: str) -> CameraSet:
+    value = _CAMERA_SET_ALIASES.get(value, value)
+    if value not in _CAMERA_SET_KEYS:
+        raise ValueError(f"Unsupported RoboCasa camera_set={value!r}; expected one of {sorted(_CAMERA_SET_KEYS)}")
+    return value  # type: ignore[return-value]
+
+
+def robocasa_camera_keys(camera_set: str) -> tuple[str, ...]:
+    return _CAMERA_SET_KEYS[normalize_robocasa_camera_set(camera_set)]
+
+
+def robocasa_composed_size(camera_set: str, image_size: int = 256) -> tuple[int, int]:
+    camera_set = normalize_robocasa_camera_set(camera_set)
+    size = int(image_size)
+    if camera_set == "left_wrist":
+        return size, size * 2
+    if camera_set == "wrist_lr":
+        return size * 3 // 2, size
+    return size, size * 3
+
+
+def robocasa_view_description(camera_set: str) -> str:
+    return _CAMERA_SET_DESCRIPTION[normalize_robocasa_camera_set(camera_set)]
+
+
+def compose_robocasa_video(
+    frames: dict[str, torch.Tensor],
+    *,
+    camera_set: str,
+    image_size: int = 256,
+) -> torch.Tensor:
+    """Compose decoded RoboCasa views before the Cosmos resolution bucket.
+
+    Inputs are float32 tensors shaped [T,C,H,W]. The result keeps source-view
+    resolution; VideoResize(resolution=None) remains the only Cosmos canvas map.
+    """
+    camera_set = normalize_robocasa_camera_set(camera_set)
+    required = robocasa_camera_keys(camera_set)
+    missing = [key for key in required if key not in frames]
+    if missing:
+        raise KeyError(f"Missing RoboCasa camera tensors for {camera_set}: {missing}")
+
+    selected = [frames[key] for key in required]
+    if any(frame.dtype != torch.float32 for frame in selected):
+        raise ValueError("RoboCasa decoder must compose views in float32 [0,1]")
+
+    size = int(image_size)
+    selected = [
+        frame
+        if tuple(frame.shape[-2:]) == (size, size)
+        else F.interpolate(frame, size=(size, size), mode="bilinear", align_corners=False)
+        for frame in selected
+    ]
+
+    if camera_set == "left_wrist":
+        left, wrist = selected
+        return torch.cat([left, wrist], dim=-1)
+
+    if camera_set == "wrist_lr":
+        wrist, left, right = selected
+        half = size // 2
+        left = F.interpolate(left, size=(half, half), mode="bilinear", align_corners=False)
+        right = F.interpolate(right, size=(half, half), mode="bilinear", align_corners=False)
+        return torch.cat([wrist, torch.cat([left, right], dim=-1)], dim=-2)
+
+    left, wrist, right = selected
+    return torch.cat([left, wrist, right], dim=-1)
 
 
 def robocasa_task_identity(root: Path) -> tuple[str, str]:
@@ -51,14 +141,21 @@ class RoboCasaLeRobotDataset(ActionBaseDataset):
         chunk_length: int = 16,
         mode: str = "wam",
         tolerance_s: float = 1e-4,
-        camera_mode: CameraMode = _CAMERA_MODE,
+        camera_set: CameraSet = _DEFAULT_CAMERA_SET,
+        camera_mode: str | None = None,
         image_size: int = 256,
         sample_stride: int = 1,
         latent_cache_root: str | None = None,
         latent_cache_verify_ratio: float = 0.0,
     ) -> None:
-        if camera_mode != _CAMERA_MODE:
-            raise ValueError(f"Unsupported RoboCasa camera_mode={camera_mode!r}")
+        if camera_mode is not None:
+            legacy_camera_set = normalize_robocasa_camera_set(camera_mode)
+            if camera_set != _DEFAULT_CAMERA_SET and normalize_robocasa_camera_set(camera_set) != legacy_camera_set:
+                raise ValueError(
+                    f"Conflicting RoboCasa camera_set={camera_set!r} and legacy camera_mode={camera_mode!r}"
+                )
+            camera_set = legacy_camera_set
+        camera_set = normalize_robocasa_camera_set(camera_set)
         if chunk_length != 16:
             raise ValueError(f"RoboCasa exact-window cache requires chunk_length=16, got {chunk_length}")
         super().__init__(
@@ -69,13 +166,14 @@ class RoboCasaLeRobotDataset(ActionBaseDataset):
             mode=mode,
             pose_convention="backward_framewise",
             tolerance_s=tolerance_s,
-            viewpoint=_CAMERA_MODE,
+            viewpoint=_CAMERA_SET_VIEWPOINT[camera_set],
             action_normalization=None,
             sample_stride=sample_stride,
         )
         if int(self._info.get("fps", fps)) != int(fps):
             raise ValueError(f"RoboCasa fps mismatch: requested={fps}, source={self._info.get('fps')}")
-        self._camera_mode = camera_mode
+        self._camera_set = camera_set
+        self._camera_mode = camera_set
         self._image_size = int(image_size)
         self.task_id, self.task_slug = robocasa_task_identity(self._root)
         self._latent_cache_root = Path(latent_cache_root) if latent_cache_root else None
@@ -120,23 +218,38 @@ class RoboCasaLeRobotDataset(ActionBaseDataset):
     def __len__(self) -> int:
         return int(self._valid_cum[-1]) if self._valid_cum.size else 0
 
+    @property
+    def camera_set(self) -> CameraSet:
+        return self._camera_set
+
+    @property
+    def camera_keys(self) -> tuple[str, ...]:
+        return robocasa_camera_keys(self._camera_set)
+
+    @property
+    def composed_output_size(self) -> tuple[int, int]:
+        return robocasa_composed_size(self._camera_set, self._image_size)
+
     def _compose_video(self, frames: dict[str, torch.Tensor]) -> torch.Tensor:
-        wrist, left, right = (frames[key] for key in _VIDEO_KEYS)
-        if any(frame.dtype != torch.float32 for frame in (wrist, left, right)):
-            raise ValueError("RoboCasa decoder must compose views in float32 [0,1]")
-        half = self._image_size // 2
-        left = F.interpolate(left, size=(half, half), mode="bilinear", align_corners=False)
-        right = F.interpolate(right, size=(half, half), mode="bilinear", align_corners=False)
-        return torch.cat([wrist, torch.cat([left, right], dim=-1)], dim=-2)
+        return compose_robocasa_video(frames, camera_set=self._camera_set, image_size=self._image_size)
 
     def _load_video(self, episode: dict[str, Any], timestamps: list[float]) -> torch.Tensor:
         from lerobot.datasets.video_utils import decode_video_frames
 
         frames: dict[str, torch.Tensor] = {}
-        for key in _VIDEO_KEYS:
+        for key in self.camera_keys:
             from_ts = float(episode.get(f"videos/{key}/from_timestamp", 0.0))
-            value = decode_video_frames(self._video_path(episode, key), [from_ts + ts for ts in timestamps], self._tolerance_s)
-            frames[key] = F.interpolate(value, size=(self._image_size, self._image_size), mode="bilinear", align_corners=False)
+            value = decode_video_frames(
+                self._video_path(episode, key),
+                [from_ts + ts for ts in timestamps],
+                self._tolerance_s,
+            )
+            frames[key] = F.interpolate(
+                value,
+                size=(self._image_size, self._image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
         return self._compose_video(frames)
 
     def _validate_latent_cache_manifest(self) -> None:
@@ -147,13 +260,20 @@ class RoboCasaLeRobotDataset(ActionBaseDataset):
             "schema_version": "exact_window_v1",
             "suite": f"robocasa365_{self.task_id.split('/', 1)[0]}",
             "chunk_length": self._chunk_length,
-            "camera_mode": self._camera_mode,
             "sample_stride": self._sample_stride,
             "fps": self._fps,
         }
         for key, value in expected.items():
             if manifest.get(key) != value:
                 raise ValueError(f"RoboCasa latent cache {key} mismatch: cache={manifest.get(key)!r}, dataset={value!r}")
+        manifest_camera_set = manifest.get("camera_set", manifest.get("camera_mode"))
+        if not isinstance(manifest_camera_set, str):
+            raise ValueError("RoboCasa latent cache is missing camera_set/camera_mode")
+        if normalize_robocasa_camera_set(manifest_camera_set) != self._camera_set:
+            raise ValueError(
+                f"RoboCasa latent cache camera_set mismatch: cache={manifest_camera_set!r}, "
+                f"dataset={self._camera_set!r}"
+            )
         contract = {"compute_dtype": "torch.bfloat16", "encode_exact_durations": LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS, "encode_chunk_frames": LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES}
         if manifest.get("vae_encode_contract") != contract:
             raise ValueError("RoboCasa latent cache VAE encoding contract mismatch")
@@ -197,7 +317,8 @@ class RoboCasaLeRobotDataset(ActionBaseDataset):
             timestamps = [float(v) for v in self._row_timestamp[start : start + self._chunk_length + 1]]
             video = self._load_video(self._episodes[episode_index], timestamps)
         else:
-            video = torch.zeros((17, 3, self._image_size * 3 // 2, self._image_size), dtype=torch.float32)
+            composed_h, composed_w = self.composed_output_size
+            video = torch.zeros((17, 3, composed_h, composed_w), dtype=torch.float32)
         task = self._tasks[int(self._row_task[start])]
         result = self._build_result(mode=self._choose_mode(), video=video, action=torch.from_numpy(self._row_action[start : start + 16].copy()), ai_caption=task)
         result.update({
@@ -210,6 +331,7 @@ class RoboCasaLeRobotDataset(ActionBaseDataset):
             "task_index": torch.tensor(int(self._row_task[start]), dtype=torch.long),
             "window_frame_indices": torch.arange(local_start, local_start + 17),
             "latent_source_frame_indices": torch.arange(local_start, local_start + 17, 4),
-            "additional_view_description": "The top view is the eye-in-hand camera. The bottom row is agentview left then agentview right.",
+            "camera_set": self._camera_set,
+            "additional_view_description": robocasa_view_description(self._camera_set),
         })
         return result
