@@ -28,7 +28,6 @@ EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
     "behavior1k_lerobot": 22,  # BEHAVIOR-1K R1Pro mobile bimanual (23D joint action)
     "maniparena": 23,  # ManipArena x2robot/ex001_6r dual-arm; own 20D EE-direct action projection
     "robocasa": 30,  # RoboCasa PandaOmron; canonical upstream domain slot.
-    "robocasa_panda_omron": 30,  # Backward-compatible alias for older PSM-WMA configs.
 }
 
 
