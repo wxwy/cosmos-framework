@@ -25,6 +25,7 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
+from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset import RoboCasaLeRobotDataset
 from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
 
 
@@ -257,6 +258,75 @@ def get_action_droid_merged_lerobot_sft_dataset(
         append_resolution_info=append_resolution_info,
         append_idle_frames=append_idle_frames,
         idle_frames_dropout=idle_frames_dropout,
+        format_prompt_as_json=format_prompt_as_json,
+    )
+    sft = ActionSFTDataset(dataset, transform, resolution)
+    if iterable_shuffle:
+        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+    return sft
+
+
+def get_action_robocasa_sft_dataset(
+    *,
+    root: str,
+    suite: str,
+    fps: float = 20.0,
+    chunk_length: int = 16,
+    mode: str = "wam",
+    camera_set: str = "left_wrist",
+    use_state: bool = False,
+    use_base_action: bool = True,
+    base_encoding: str = "raw",
+    action_normalization: str | None = None,
+    split: str = "train",
+    split_val_ratio: float = 0.01,
+    split_seed: int = 42,
+    resolution: str | int | None = None,
+    max_action_dim: int = 64,
+    tokenizer_config: dict | None = None,
+    cfg_dropout_rate: float = 0.1,
+    append_viewpoint_info: bool = True,
+    append_duration_fps_timestamps: bool = True,
+    append_resolution_info: bool = True,
+    append_idle_frames: bool = True,
+    format_prompt_as_json: bool = False,
+    iterable_shuffle: bool = False,
+    episode_shuffle_seed: int = 42,
+    sample_stride: int = 1,
+    latent_cache_root: str | None = None,
+) -> Dataset:
+    """Build a flat LeRobot v3 RoboCasa365 action-policy SFT dataset.
+
+    The input root is one downloaded v3 repository (for example target-atomic,
+    target-composite-seen, or target-composite-unseen).  The dataset recovers
+    the underlying RoboCasa task class from annotation.human.task_name instead
+    of task_index, because task_index indexes natural-language phrasings.
+    """
+    dataset: Dataset = RoboCasaLeRobotDataset(
+        root=root,
+        suite=suite,
+        fps=fps,
+        chunk_length=chunk_length,
+        mode=mode,
+        camera_set=camera_set,
+        use_state=use_state,
+        use_base_action=use_base_action,
+        base_encoding=base_encoding,
+        action_normalization=action_normalization,
+        split=split,
+        split_val_ratio=split_val_ratio,
+        split_seed=split_seed,
+        sample_stride=sample_stride,
+        latent_cache_root=latent_cache_root,
+    )
+    transform = ActionTransformPipeline(
+        tokenizer_config=tokenizer_config,
+        cfg_dropout_rate=cfg_dropout_rate,
+        max_action_dim=max_action_dim,
+        append_viewpoint_info=append_viewpoint_info,
+        append_duration_fps_timestamps=append_duration_fps_timestamps,
+        append_resolution_info=append_resolution_info,
+        append_idle_frames=append_idle_frames,
         format_prompt_as_json=format_prompt_as_json,
     )
     sft = ActionSFTDataset(dataset, transform, resolution)
