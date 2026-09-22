@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -14,6 +16,7 @@ from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset im
     robocasa_composed_size,
 )
 from cosmos_framework.data.generator.action.utils.transforms import VideoResize
+from cosmos_framework.data.generator.action.utils.domain_utils import get_domain_id
 
 
 _WRIST = "observation.images.robot0_eye_in_hand"
@@ -120,3 +123,27 @@ def test_robocasa_v21_video_path_formats_episode_index(tmp_path) -> None:
     episode = {"episode_index": 23}
     path = dataset._video_path(episode, _LEFT)
     assert path == tmp_path / "videos/chunk-000" / _LEFT / "episode_000023.mp4"
+
+
+@pytest.mark.L0
+def test_robocasa_domain_uses_canonical_upstream_slot() -> None:
+    assert get_domain_id("robocasa") == 30
+    assert get_domain_id("robocasa_panda_omron") == 30
+
+
+@pytest.mark.L0
+def test_robocasa_metadata_loaders_fall_back_to_default_parquet_format(tmp_path) -> None:
+    episode_dir = tmp_path / "meta" / "episodes" / "chunk-000"
+    episode_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({"episode_index": [4], "length": [21]}),
+        episode_dir / "file-000.parquet",
+    )
+    pq.write_table(
+        pa.table({"task_index": [9], "task": ["Open drawer"]}),
+        tmp_path / "meta" / "tasks.parquet",
+    )
+    dataset = object.__new__(RoboCasaLeRobotDataset)
+    dataset._root = tmp_path
+    assert dataset._load_episodes() == {4: {"episode_index": 4, "length": 21}}
+    assert dataset._load_tasks() == {9: "Open drawer"}
