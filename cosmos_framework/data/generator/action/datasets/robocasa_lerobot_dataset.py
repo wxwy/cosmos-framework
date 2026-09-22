@@ -160,7 +160,7 @@ class RoboCasaLeRobotDataset(ActionBaseDataset):
             raise ValueError(f"RoboCasa exact-window cache requires chunk_length=16, got {chunk_length}")
         super().__init__(
             root=root,
-            domain_name="robocasa_panda_omron",
+            domain_name="robocasa",
             fps=fps,
             chunk_length=chunk_length,
             mode=mode,
@@ -204,6 +204,49 @@ class RoboCasaLeRobotDataset(ActionBaseDataset):
         if self._latent_cache_root is not None:
             self._validate_latent_cache_manifest()
 
+    def _load_episodes(self) -> dict[int, dict[str, Any]]:
+        """Read RoboCasa LeRobot v2.1 meta/episodes.jsonl."""
+        path = self._root / "meta" / "episodes.jsonl"
+        if not path.is_file():
+            return super()._load_episodes()
+        episodes: dict[int, dict[str, Any]] = {}
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if "episode_index" not in row:
+                    raise ValueError(f"Missing episode_index in {path}:{line_number}")
+                episode_index = int(row["episode_index"])
+                if episode_index in episodes:
+                    raise ValueError(f"Duplicate episode_index={episode_index} in {path}")
+                episodes[episode_index] = row
+        if not episodes:
+            raise ValueError(f"RoboCasa episode metadata is empty: {path}")
+        return episodes
+
+    def _load_tasks(self) -> dict[int, str]:
+        """Read RoboCasa LeRobot v2.1 meta/tasks.jsonl."""
+        path = self._root / "meta" / "tasks.jsonl"
+        if not path.is_file():
+            return super()._load_tasks()
+        tasks: dict[int, str] = {}
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if "task_index" not in row or "task" not in row:
+                    raise ValueError(f"Missing task_index/task in {path}:{line_number}")
+                task_index = int(row["task_index"])
+                if task_index in tasks:
+                    raise ValueError(f"Duplicate task_index={task_index} in {path}")
+                tasks[task_index] = str(row["task"])
+        if not tasks:
+            raise ValueError(f"RoboCasa task metadata is empty: {path}")
+        return tasks
     @property
     def action_dim(self) -> int:
         return 12

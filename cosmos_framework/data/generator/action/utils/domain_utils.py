@@ -27,6 +27,8 @@ EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
     "drawanything": 21,
     "behavior1k_lerobot": 22,  # BEHAVIOR-1K R1Pro mobile bimanual (23D joint action)
     "maniparena": 23,  # ManipArena x2robot/ex001_6r dual-arm; own 20D EE-direct action projection
+    "robocasa": 30,  # RoboCasa PandaOmron; canonical upstream domain slot.
+    "robocasa_panda_omron": 30,  # Backward-compatible alias for older PSM-WMA configs.
 }
 
 
@@ -51,11 +53,10 @@ EMBODIMENT_TO_RAW_ACTION_DIM: dict[str, int] = {
     "fractal": 10,
     "drawanything": 3,
     "behavior1k_lerobot": 23,  # base(3) trunk(4) arms(14) grippers(2)
-    # NOTE: ``libero`` (7/10/13 depending on ``rotation_space``) and ``hand_pose``
-    # (variable with ``keypoint_option`` and ``rotation_format``) are absent
-    # because their raw width is set per-dataset at construction time. Inference
-    # in inverse_dynamics/WAM modes is not supported for these domains until
-    # canonical widths are added here.
+    # NOTE: ``libero`` (7/10/13 depending on ``rotation_space``), ``hand_pose``
+    # (variable with ``keypoint_option`` / ``rotation_format``), and ``robocasa``
+    # (source data is 12D while model-side policy contracts may be 10/15/20D)
+    # intentionally have no single global raw-action width here.
 }
 
 

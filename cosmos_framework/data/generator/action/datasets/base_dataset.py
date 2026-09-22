@@ -65,16 +65,8 @@ class ActionBaseDataset(ABC, Dataset):
 
         self._root = Path(root)
         self._info = json.loads((self._root / "meta" / "info.json").read_text())
-        self._episodes = {
-            int(row["episode_index"]): row
-            for path in sorted((self._root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
-            for row in pq.read_table(path).to_pylist()
-        }
-        tasks_df = pd.read_parquet(self._root / "meta" / "tasks.parquet")
-        # LeRobot v2.x stores task text in a "task" column; v3.0 stores it as the
-        # (unnamed) DataFrame index and keeps only "task_index" as a column.
-        task_texts = tasks_df["task"] if "task" in tasks_df.columns else tasks_df.index
-        self._tasks = {int(task_index): str(task) for task, task_index in zip(task_texts, tasks_df["task_index"])}
+        self._episodes = self._load_episodes()
+        self._tasks = self._load_tasks()
         # ``self._rows`` (the flat, index-sorted list of every frame dict) is built
         # lazily on first access — see the ``_rows`` property. Materializing all
         # ~18M frames as Python dicts plus a full sort costs ~13 min and tens of GB;
@@ -82,6 +74,23 @@ class ActionBaseDataset(ABC, Dataset):
         # never touch it, so they must not pay for it at construction.
         self._rows_cache: list[dict[str, Any]] | None = None
 
+    def _load_episodes(self) -> dict[int, dict[str, Any]]:
+        """Load the default LeRobot v3 episode metadata.
+
+        Dataset-specific legacy formats should override this hook rather than
+        branching inside the shared constructor.
+        """
+        return {
+            int(row["episode_index"]): row
+            for path in sorted((self._root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+            for row in pq.read_table(path).to_pylist()
+        }
+
+    def _load_tasks(self) -> dict[int, str]:
+        """Load the default parquet task table without changing existing semantics."""
+        tasks_df = pd.read_parquet(self._root / "meta" / "tasks.parquet")
+        task_texts = tasks_df["task"] if "task" in tasks_df.columns else tasks_df.index
+        return {int(task_index): str(task) for task, task_index in zip(task_texts, tasks_df["task_index"])}
     @property
     def fps(self) -> float:
         return self._fps
@@ -170,12 +179,14 @@ class ActionBaseDataset(ABC, Dataset):
                 episode.get(f"videos/{video_key}/episode_file", episode.get("data/file_index", 0)),
             )
         )
+        episode_index = int(episode.get("episode_index", file_idx))
         rel = self._info["video_path"].format(
             video_key=video_key,
             chunk_index=chunk_idx,
             file_index=file_idx,
             episode_chunk=chunk_idx,
             episode_file=file_idx,
+            episode_index=episode_index,
         )
         return self._root / rel
 
