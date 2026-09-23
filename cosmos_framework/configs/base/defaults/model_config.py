@@ -165,10 +165,25 @@ def _require_ttt_finite_positive_scalar(inst: object, attr: attrs.Attribute, val
         raise ValueError(f"{attr.name} must be finite and positive.")
 
 
+_TTT_K_LOCAL_CHOICES = {1, 4, 8, 16}
+_TTT_ACTION_DIM_BY_FEATURE_VERSION = {
+    "causal_visual96_executed_action10_v1": 10,
+    "causal_visual96_executed_action20_v1": 20,
+}
+
+
 def _require_ttt_k_local(inst: object, attr: attrs.Attribute, value: object) -> None:
     del inst
-    if isinstance(value, bool) or not isinstance(value, int) or value != 1:
-        raise ValueError(f"{attr.name} must be exactly 1.")
+    if isinstance(value, bool) or not isinstance(value, int) or value not in _TTT_K_LOCAL_CHOICES:
+        raise ValueError(f"{attr.name} must be one of {sorted(_TTT_K_LOCAL_CHOICES)}.")
+
+
+def _require_ttt_feature_version(inst: object, attr: attrs.Attribute, value: object) -> None:
+    del inst
+    if value not in _TTT_ACTION_DIM_BY_FEATURE_VERSION:
+        raise ValueError(
+            f"{attr.name} must be one of {sorted(_TTT_ACTION_DIM_BY_FEATURE_VERSION)}."
+        )
 
 
 def _require_ttt_exact_string(expected: str) -> Callable[[object, attrs.Attribute, object], None]:
@@ -356,6 +371,7 @@ class OmniMoTModelConfig:
     local_history_backend: Literal["recurrent", "ttt_fast_weight"] = "recurrent"
     local_history_horizon: int = 16
     local_history_evidence_dim: int = 256
+    local_history_action_dim: int = attrs.field(default=10, validator=_require_ttt_positive_int)
     local_history_state_enabled: bool = False
     # E003 bounded recent-history control: use the same canonical
     # visual96 + executed_action10 evidence inventory as Local TTT while keeping
@@ -371,10 +387,12 @@ class OmniMoTModelConfig:
     local_ttt_enabled: bool = attrs.field(default=False, validator=_require_ttt_bool)
     ttt_tbptt_steps: int = attrs.field(default=16, validator=_require_ttt_positive_int)
     ttt_inner_lr: float = attrs.field(default=0.1, validator=_require_ttt_finite_positive_scalar)
+    ttt_dim: int = attrs.field(default=64, validator=_require_ttt_positive_int)
+    ttt_fast_hidden_dim: int = attrs.field(default=128, validator=_require_ttt_positive_int)
     k_local: int = attrs.field(default=1, validator=_require_ttt_k_local)
     local_evidence_feature_version: str = attrs.field(
         default="causal_visual96_executed_action10_v1",
-        validator=_require_ttt_exact_string("causal_visual96_executed_action10_v1"),
+        validator=_require_ttt_feature_version,
     )
     local_fast_state_dtype: str = attrs.field(default="fp32", validator=_require_ttt_exact_string("fp32"))
     local_runtime_resume_mode: str = attrs.field(
@@ -408,3 +426,10 @@ class OmniMoTModelConfig:
             )
         if self.local_ttt_enabled and (not self.local_memory_enabled or self.local_memory_dim != 32):
             raise ValueError("local_ttt_enabled requires local_memory_enabled=True and local_memory_dim=32.")
+        if self.local_ttt_enabled:
+            expected_action_dim = _TTT_ACTION_DIM_BY_FEATURE_VERSION[self.local_evidence_feature_version]
+            if self.local_history_action_dim != expected_action_dim:
+                raise ValueError(
+                    "local_history_action_dim disagrees with local_evidence_feature_version: "
+                    f"expected {expected_action_dim}, got {self.local_history_action_dim}."
+                )
