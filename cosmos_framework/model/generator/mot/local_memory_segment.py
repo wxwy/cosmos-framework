@@ -55,8 +55,12 @@ class SegmentBatch:
                 raise ValueError(f"{name} must have shape [B,T].")
         if tuple(self.evidence_visual_summary_prev.shape) != (batch, steps, 96):
             raise ValueError("evidence_visual_summary_prev must have shape [B,T,96].")
-        if tuple(self.evidence_executed_action_prev.shape) != (batch, steps, 10):
-            raise ValueError("evidence_executed_action_prev must have shape [B,T,10].")
+        if (
+            self.evidence_executed_action_prev.ndim != 3
+            or tuple(self.evidence_executed_action_prev.shape[:2]) != (batch, steps)
+            or self.evidence_executed_action_prev.shape[-1] <= 0
+        ):
+            raise ValueError("evidence_executed_action_prev must have shape [B,T,D_action] with D_action > 0.")
         if tuple(self.slot_id.shape) != (batch,) or len(self.episode_id) != batch or len(self.category) != batch:
             raise ValueError("slot/episode/category batch identities are incompatible.")
         if len(self.consumer_payload) != batch or any(len(row) != steps for row in self.consumer_payload):
