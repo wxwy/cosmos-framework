@@ -417,6 +417,8 @@ class OmniMoTModel(ImaginaireModel):
                         local_backend = ContinualTTTLocalMemoryCore(
                             evidence_dim=self.config.local_history_evidence_dim,
                             local_dim=self.config.local_memory_dim,
+                            ttt_dim=self.config.ttt_dim,
+                            fast_hidden_dim=self.config.ttt_fast_hidden_dim,
                             inner_lr=self.config.ttt_inner_lr,
                             ttt_tbptt_steps=self.config.ttt_tbptt_steps,
                             k_local=self.config.k_local,
@@ -432,6 +434,7 @@ class OmniMoTModel(ImaginaireModel):
                 encoder = LocalEvidenceEncoder(
                     evidence_dim=self.config.local_history_evidence_dim,
                     visual_dim=96,
+                    action_dim=self.config.local_history_action_dim,
                     feature_config=(
                         CANONICAL_EVIDENCE_FEATURE_CONFIG
                         if self.config.local_ttt_enabled or self.config.local_history_canonical_evidence
