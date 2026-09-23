@@ -180,7 +180,12 @@ def canonical_segment_streams(
     for index, category in enumerate(categories):
         producer = producers[category]
         slots = tuple(slot for slot in range(b_stream) if slot % len(categories) == index)
-        catalog = producer.episode_catalog()
+        episode_catalog = getattr(producer, "episode_catalog", None)
+        if callable(episode_catalog):
+            catalog = episode_catalog()
+        else:
+            ep_vals = producer.frame_source._ep_vals
+            catalog = tuple((position, int(ep_vals[position])) for position in range(len(ep_vals)))
 
         eligible: list[tuple[int, int]] = []
         for position, episode_index in catalog:
