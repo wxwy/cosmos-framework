@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-"""Edge-Policy-DROID warm-start recipe for RoboCasa365 v3 action-policy SFT.
+"""RoboCasa365 Edge-Policy-DROID + active Local-TTT training recipe.
 
-One flat RoboCasa365 v3 mirror is trained at a time, selected by
-``ROBOCASA_SUITE``.  All six supported suite keys share the same data path,
-resume contract, and model recipe.  The first formal PSM-WMA run uses
-``robocasa365_target_atomic``.
+RoboCasa's formal PSM-WMA training route starts directly with Local-TTT.  The
+target-atomic N=100 latent cache is consumed by the canonical segment producer;
+the outer dataloader is only a trainer clock on the active route.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import os
 import torch
 from hydra.core.config_store import ConfigStore
 
-from cosmos_framework.callbacks.action_dataloader_state import ActionIterableShuffleStateCallback
 from cosmos_framework.callbacks.stdout_loss_logger import StdoutLossLogger
 from cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano import (
     action_policy_libero_all_nano,
@@ -25,6 +23,8 @@ from cosmos_framework.configs.base.experiment.action.posttrain_config.action_pol
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
 from cosmos_framework.data.generator.action.datasets.action_sft_dataset import get_action_robocasa_sft_dataset
 from cosmos_framework.data.generator.joint_dataloader import IterativeJointDataLoader
+from cosmos_framework.model.generator.mot.active_local_memory_launch import ActiveLocalMemoryLaunchCallback
+from cosmos_framework.model.generator.mot.config_checkpoint_contract import SELECTORS as TTT_SLOW_GROUP_SELECTORS
 from cosmos_framework.model.generator.vision_vae import (
     LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES,
     LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS,
@@ -42,6 +42,20 @@ _ROBOCASA_SUITES = (
 )
 
 
+def _env_int(name: str, default: int) -> int:
+    value = int(os.environ.get(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _env_float(name: str, default: float) -> float:
+    value = float(os.environ.get(name, str(default)))
+    if not value > 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
 def _robocasa_suite() -> str:
     suite = os.environ.get("ROBOCASA_SUITE", "robocasa365_target_atomic").strip()
     if suite not in _ROBOCASA_SUITES:
@@ -49,7 +63,7 @@ def _robocasa_suite() -> str:
     return suite
 
 
-def _robocasa_edge_model_config() -> dict:
+def _robocasa_edge_local_ttt_model_config() -> dict:
     cfg = copy.deepcopy(EDGE_MODEL_CONFIG)
     cfg["max_num_tokens_after_packing"] = 74000
     cfg["activation_checkpointing"]["mode"] = "selective"
@@ -59,14 +73,28 @@ def _robocasa_edge_model_config() -> dict:
     cfg["tokenizer"]["encode_exact_durations"] = LIBERO_EXACT_WINDOW_ENCODE_EXACT_DURATIONS
     cfg["tokenizer"]["encode_chunk_frames"] = LIBERO_EXACT_WINDOW_ENCODE_CHUNK_FRAMES
 
-    # Baseline recipe: history/local-memory routes are explicitly disabled.
-    # Local-TTT is added later as a separate matched recipe.
-    cfg["history_mode"] = "none"
-    cfg["local_memory_enabled"] = False
-    cfg["local_history_enabled"] = False
-    cfg["local_ttt_enabled"] = False
+    # Formal RoboCasa route: active continual Local-TTT from the first run.
+    cfg["history_mode"] = "ttt"
+    cfg["local_memory_enabled"] = True
+    cfg["local_memory_dim"] = 32
+    cfg["local_history_enabled"] = True
+    cfg["local_history_backend"] = "ttt_fast_weight"
     cfg["local_history_horizon"] = 0
-    cfg["local_memory_dim"] = None
+    cfg["local_history_evidence_dim"] = 256
+    cfg["local_history_action_dim"] = 20
+    cfg["local_history_state_enabled"] = False
+    cfg["local_history_canonical_evidence"] = False
+    cfg["local_ttt_enabled"] = True
+    cfg["ttt_tbptt_steps"] = _env_int("PSM_R09_B_TTT_TBPTT_STEPS", 16)
+    cfg["ttt_inner_lr"] = _env_float("PSM_R09_B_TTT_INNER_LR", 0.1)
+    cfg["ttt_dim"] = _env_int("PSM_R09_B_TTT_DIM", 64)
+    cfg["ttt_fast_hidden_dim"] = _env_int("PSM_R09_B_TTT_FAST_HIDDEN_DIM", 256)
+    cfg["k_local"] = _env_int("PSM_R09_B_TTT_K_LOCAL", 4)
+    if cfg["k_local"] not in {1, 4, 8, 16}:
+        raise ValueError("PSM_R09_B_TTT_K_LOCAL must be one of 1,4,8,16")
+    cfg["local_evidence_feature_version"] = "causal_visual96_executed_action20_v1"
+    cfg["local_fast_state_dtype"] = "fp32"
+    cfg["local_runtime_resume_mode"] = "slow_only_no_mid_episode_resume"
 
     cfg["vlm_config"]["tokenizer"].update(
         repository=None,
@@ -76,20 +104,9 @@ def _robocasa_edge_model_config() -> dict:
     return cfg
 
 
-def _robocasa_dataloader() -> object:
+def _robocasa_dataset(*, iterable_shuffle: bool):
     suite = _robocasa_suite()
-    # Formal 8-GPU recipe defaults to two workers/rank (16 total workers).
-    # Override explicitly for machines with a different CPU/storage balance.
-    num_workers = int(os.environ.get("ROBOCASA_NUM_WORKERS", "2"))
-    prefetch_factor = int(os.environ.get("ROBOCASA_PREFETCH_FACTOR", "4"))
-    if num_workers < 0:
-        raise ValueError(f"ROBOCASA_NUM_WORKERS must be non-negative, got {num_workers}")
-    if num_workers > 0 and prefetch_factor <= 0:
-        raise ValueError(
-            f"ROBOCASA_PREFETCH_FACTOR must be positive when workers are enabled, got {prefetch_factor}"
-        )
-
-    dataset = L(get_action_robocasa_sft_dataset)(
+    return L(get_action_robocasa_sft_dataset)(
         root="${oc.env:ROBOCASA_ROOT}",
         suite=suite,
         fps=20.0,
@@ -98,7 +115,7 @@ def _robocasa_dataloader() -> object:
         camera_set="left_wrist",
         use_state=True,
         use_base_action=True,
-        base_encoding="raw",
+        base_encoding="ego",
         action_normalization=None,
         split="train",
         split_val_ratio=0.01,
@@ -112,22 +129,28 @@ def _robocasa_dataloader() -> object:
         append_resolution_info=True,
         append_idle_frames=True,
         format_prompt_as_json=True,
-        iterable_shuffle=True,
+        iterable_shuffle=iterable_shuffle,
         episode_shuffle_seed=42,
         shuffle_state_name=suite,
         sample_stride=1,
-        # Optional: unset/empty means decode source video and run the VAE online.
-        # A non-empty path switches RoboCasaLeRobotDataset to exact-window cached
-        # latents and skips source-video decoding.
         latent_cache_root=os.environ.get("ROBOCASA_LATENT_CACHE_ROOT") or None,
     )
 
-    return L(IterativeJointDataLoader)(
+
+def _robocasa_active_dataloader():
+    suite = _robocasa_suite()
+    active_datasets = {suite: _robocasa_dataset(iterable_shuffle=False)}
+
+    # Active Local-TTT ignores this batch content; one map-style sample is enough
+    # to drive the trainer fetch/device path. The canonical producer owns the real
+    # B_stream x TBPTT training samples.
+    outer_dataset = _robocasa_dataset(iterable_shuffle=False)
+    loader = L(IterativeJointDataLoader)(
         tokenizer_spatial_compression_factor=16,
         tokenizer_temporal_compression_factor=4,
         patch_spatial=2,
         max_sequence_length=None,
-        max_samples_per_batch=128,
+        max_samples_per_batch=1,
         sound_latent_fps=0,
         audio_sample_rate=48000,
         seed=None,
@@ -136,57 +159,71 @@ def _robocasa_dataloader() -> object:
             suite: dict(
                 ratio=1,
                 dataloader=L(torch.utils.data.DataLoader)(
-                    dataset=dataset,
+                    dataset=outer_dataset,
                     batch_size=1,
-                    in_order=False,
-                    num_workers=num_workers,
-                    persistent_workers=num_workers > 0,
+                    in_order=True,
+                    num_workers=0,
+                    persistent_workers=False,
                     pin_memory=True,
-                    prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                    prefetch_factor=None,
                     sampler=None,
                 ),
             )
         },
     )
+    return loader, active_datasets
 
 
 action_policy_robocasa_edge_all = copy.deepcopy(action_policy_libero_all_nano)
 action_policy_robocasa_edge_all["job"].update(
     project="cosmos3_action_robocasa",
     group="action_sft",
-    name="edge_robocasa365",
+    name="local_ttt_robocasa365_target_atomic_n100_fsdp8_k4",
     wandb_mode="disabled",
 )
-action_policy_robocasa_edge_all["model"]["config"] = _robocasa_edge_model_config()
-action_policy_robocasa_edge_all["dataloader_train"] = _robocasa_dataloader()
+action_policy_robocasa_edge_all["model"]["config"] = _robocasa_edge_local_ttt_model_config()
+action_policy_robocasa_edge_all["dataloader_train"], _robocasa_active_datasets = _robocasa_active_dataloader()
 action_policy_robocasa_edge_all["dataloader_val"] = None
 
-# FSDP shard degree auto-infers to WORLD_SIZE. The formal 8-GPU TOML uses GA=2,
-# so 128 consumers/rank x 8 ranks x 2 accumulation = 2048/update.
+# 8-GPU FSDP: B_stream=8, T=16, GA=2 gives
+# 8 slots x 16 consumers x 2 members x 8 ranks = 2048 consumers/update.
 action_policy_robocasa_edge_all["model"]["config"]["parallelism"]["data_parallel_shard_degree"] = -1
 action_policy_robocasa_edge_all["model"]["config"]["parallelism"]["data_parallel_replicate_degree"] = 1
+active_ga = _env_int("PSM_R09_B_TTT_ACTIVE_GA", 2)
+b_stream = _env_int("PSM_R09_B_TTT_B_STREAM", 8)
+action_policy_robocasa_edge_all["trainer"]["grad_accum_iter"] = active_ga
 
-# Preserve the DROID-trained action heads. RoboCasa uses a different embodiment
-# domain but the shared DomainAwareLinear embedding parameters must not decay
-# untouched domain rows.
+# Train the inherited generation/action heads together with the Local-TTT slow owner.
+baseline_selectors = list(action_policy_libero_all_nano["optimizer"]["keys_to_select"])
+action_policy_robocasa_edge_all["optimizer"]["keys_to_select"] = (
+    baseline_selectors + list(TTT_SLOW_GROUP_SELECTORS)
+)
+
+# Preserve DROID action heads on warm-start; do not decay untouched domain rows.
 action_policy_robocasa_edge_all["checkpoint"]["keys_to_skip_loading"] = ["net_ema."]
 action_policy_robocasa_edge_all["optimizer"]["weight_decay_skip_patterns"] = [
     r"action2llm\.(fc|bias)\.weight$",
     r"llm2action\.(fc|bias)\.weight$",
 ]
 
-# Fully offline training callbacks: no W&B, but keep optimizer safety/monitoring.
-for _default in action_policy_robocasa_edge_all["defaults"]:
-    if "override /callbacks" in _default:
-        _default["override /callbacks"] = ["optimization", "job_monitor"]
+for default in action_policy_robocasa_edge_all["defaults"]:
+    if "override /callbacks" in default:
+        default["override /callbacks"] = ["optimization", "job_monitor"]
         break
 
-action_policy_robocasa_edge_all["trainer"]["callbacks"]["stdout_loss_logger"] = L(StdoutLossLogger)(
-    every_n=1,
+action_policy_robocasa_edge_all["trainer"]["callbacks"]["stdout_loss_logger"] = L(StdoutLossLogger)(every_n=1)
+action_policy_robocasa_edge_all["trainer"]["callbacks"]["r09_b_active_wiring"] = L(
+    ActiveLocalMemoryLaunchCallback
+)(
+    suite_datasets=_robocasa_active_datasets,
+    b_stream=b_stream,
+    member_layout="a2",
+    group_size=b_stream,
+    ttt_tbptt_steps=action_policy_robocasa_edge_all["model"]["config"]["ttt_tbptt_steps"],
+    manifest_digest=f"{_robocasa_suite()}-n100",
+    config_digest="robocasa-local-ttt-t16-d64-h256-k4-v1",
+    source_digest=os.environ.get("ROBOCASA_LATENT_CACHE_ROOT") or "robocasa-exact-window-cache",
 )
-action_policy_robocasa_edge_all["trainer"]["callbacks"]["action_dataloader_state"] = L(
-    ActionIterableShuffleStateCallback
-)()
 
 ConfigStore.instance().store(
     group="experiment",
