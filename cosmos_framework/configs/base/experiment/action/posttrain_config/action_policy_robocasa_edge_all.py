@@ -114,7 +114,10 @@ def _robocasa_dataloader() -> object:
         episode_shuffle_seed=42,
         shuffle_state_name=suite,
         sample_stride=1,
-        latent_cache_root="${oc.env:ROBOCASA_LATENT_CACHE_ROOT}",
+        # Optional: unset/empty means decode source video and run the VAE online.
+        # A non-empty path switches RoboCasaLeRobotDataset to exact-window cached
+        # latents and skips source-video decoding.
+        latent_cache_root=os.environ.get("ROBOCASA_LATENT_CACHE_ROOT") or None,
     )
 
     return L(IterativeJointDataLoader)(

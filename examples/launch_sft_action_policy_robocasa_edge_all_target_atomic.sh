@@ -24,20 +24,20 @@ if [[ -z "$ROBOCASA_ROOT" ]]; then
     echo "ERROR: ROBOCASA_ROOT must point to one flat RoboCasa365 v3 mirror root" >&2
     exit 2
 fi
-if [[ -z "$ROBOCASA_LATENT_CACHE_ROOT" ]]; then
-    echo "ERROR: ROBOCASA_LATENT_CACHE_ROOT must point to its exact-window latent cache" >&2
-    exit 2
-fi
-
 if [[ "${DRY_RUN:-0}" != "1" ]]; then
     [[ -f "$ROBOCASA_ROOT/meta/info.json" ]] || {
         echo "ERROR: missing RoboCasa v3 metadata: $ROBOCASA_ROOT/meta/info.json" >&2
         exit 2
     }
-    [[ -f "$ROBOCASA_LATENT_CACHE_ROOT/dataset_manifest.json" ]] || {
-        echo "ERROR: missing latent-cache manifest: $ROBOCASA_LATENT_CACHE_ROOT/dataset_manifest.json" >&2
-        exit 2
-    }
+    if [[ -n "$ROBOCASA_LATENT_CACHE_ROOT" ]]; then
+        [[ -f "$ROBOCASA_LATENT_CACHE_ROOT/dataset_manifest.json" ]] || {
+            echo "ERROR: missing latent-cache manifest: $ROBOCASA_LATENT_CACHE_ROOT/dataset_manifest.json" >&2
+            exit 2
+        }
+        echo ">>> RoboCasa vision path: exact-window latent cache ($ROBOCASA_LATENT_CACHE_ROOT)"
+    else
+        echo ">>> RoboCasa vision path: online video decode + online VAE"
+    fi
 fi
 
 # Keep every RoboCasa baseline/history flag explicitly off.  The later Local-TTT
