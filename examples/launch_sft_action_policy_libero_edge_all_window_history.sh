@@ -25,5 +25,5 @@ export LIBERO_LATENT_CACHE_VERIFY_RATIO=0
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 export TOML_FILE="examples/toml/sft_config/action_policy_libero_edge_all_window_history.toml"
-export RUN_NAME="edge_libero_4in1_window_history_h16"
+export RUN_NAME="edge_libero_4in1_window_history_h16_fsdp8_rankshard"
 exec bash "$(dirname "${BASH_SOURCE[0]}")/launch_sft_action_policy_libero_edge_all.sh"

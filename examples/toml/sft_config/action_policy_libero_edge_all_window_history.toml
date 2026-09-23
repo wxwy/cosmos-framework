@@ -14,7 +14,7 @@ task       = "vfm"
 experiment = "action_policy_libero_edge_all"
 project    = "cosmos3_action_libero"
 group      = "action_sft"
-name       = "edge_libero_4in1_window_history_h16"
+name       = "edge_libero_4in1_window_history_h16_fsdp8_rankshard"
 wandb_mode = "disabled"
 
 [model]

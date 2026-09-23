@@ -8,7 +8,7 @@ set -euo pipefail
 # dataloader-resume path before the Local-TTT recipe is layered on top.
 
 : "${TOML_FILE:=examples/toml/sft_config/action_policy_robocasa_edge_all_target_atomic.toml}"
-: "${RUN_NAME:=edge_robocasa365_target_atomic}"
+: "${RUN_NAME:=edge_robocasa365_target_atomic_fsdp8}"
 : "${ROBOCASA_SUITE:=robocasa365_target_atomic}"
 : "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp}"
 : "${EDGE_POLICY_CHECKPOINT:=/disk/rl/models/Cosmos3-Edge-Policy-DROID}"

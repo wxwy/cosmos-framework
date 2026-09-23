@@ -10,7 +10,7 @@ task       = "vfm"
 experiment = "action_policy_robocasa_edge_all"
 project    = "cosmos3_action_robocasa"
 group      = "action_sft"
-name       = "edge_robocasa365_target_atomic"
+name       = "edge_robocasa365_target_atomic_fsdp8"
 wandb_mode = "disabled"
 
 [model]
