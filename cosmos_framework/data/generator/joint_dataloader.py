@@ -490,7 +490,10 @@ class JointDataLoader(webdataset.WebLoader):
             self.dataset_name_list.append(dataset_name)
             child_dataloader = instantiate(dataloader_data["dataloader"], collate_fn=custom_collate_fn)
             child_dataset = getattr(child_dataloader, "dataset", None)
-            if hasattr(child_dataset, "set_shard_assignment"):
+            if (
+                hasattr(child_dataset, "set_shard_assignment")
+                and getattr(child_dataset, "shard_assignment_source", "default") == "default"
+            ):
                 if torch.distributed.is_available() and torch.distributed.is_initialized():
                     shard_world_size = torch.distributed.get_world_size()
                     shard_rank = torch.distributed.get_rank()
