@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# RoboCasa365 target-atomic N=100 active Local-TTT, formal 8-GPU route.
+# B_stream=8, TBPTT=16, active GA=2 => 8*16*2*8 = 2048 consumers/update.
+# grad_accum_iter is intentionally omitted: the experiment config derives it
+# from PSM_R09_B_TTT_ACTIVE_GA so the active driver/window boundary cannot drift.
+
+[job]
+task       = "vfm"
+experiment = "action_policy_robocasa_edge_all"
+project    = "cosmos3_action_robocasa"
+group      = "action_sft"
+name       = "local_ttt_robocasa365_target_atomic_n100_fsdp8_k4"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 74000
+
+[model.parallelism]
+data_parallel_shard_degree     = -1
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [16000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter     = 5000
+logging_iter = 1
+
+[trainer.cudnn]
+benchmark = false
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 50
