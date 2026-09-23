@@ -15,11 +15,21 @@ set -euo pipefail
 : "${NPROC_PER_NODE:=8}"
 : "${ROBOCASA_NUM_WORKERS:=2}"
 : "${ROBOCASA_PREFETCH_FACTOR:=4}"
+: "${SAVE_ITER:=}"
 
 export NPROC_PER_NODE
 export ROBOCASA_SUITE EDGE_POLICY_CHECKPOINT ROBOCASA_NUM_WORKERS ROBOCASA_PREFETCH_FACTOR
 export ROBOCASA_ROOT="${ROBOCASA_ROOT:-}"
 export ROBOCASA_LATENT_CACHE_ROOT="${ROBOCASA_LATENT_CACHE_ROOT:-}"
+
+if ! [[ "$ROBOCASA_NUM_WORKERS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: ROBOCASA_NUM_WORKERS must be a non-negative integer, got: $ROBOCASA_NUM_WORKERS" >&2
+    exit 2
+fi
+if [[ -n "$SAVE_ITER" ]] && { ! [[ "$SAVE_ITER" =~ ^[0-9]+$ ]] || (( SAVE_ITER <= 0 )); }; then
+    echo "ERROR: SAVE_ITER must be a positive integer when set, got: $SAVE_ITER" >&2
+    exit 2
+fi
 
 if [[ -z "$ROBOCASA_ROOT" ]]; then
     echo "ERROR: ROBOCASA_ROOT must point to one flat RoboCasa365 v3 mirror root" >&2
@@ -53,6 +63,11 @@ export PSM_R09_B_TTT_ENABLED=0
 export PSM_R09_B_TTT_ACTIVE=0
 
 TAIL_OVERRIDES=(${EXTRA_TAIL_OVERRIDES:-})
+if [[ -n "$SAVE_ITER" ]]; then
+    # Direct launcher knob wins over the TOML default and any earlier
+    # EXTRA_TAIL_OVERRIDES entry for checkpoint.save_iter.
+    TAIL_OVERRIDES+=("checkpoint.save_iter=$SAVE_ITER")
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
