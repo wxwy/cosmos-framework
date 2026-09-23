@@ -21,6 +21,7 @@ import os
 import torch
 from hydra.core.config_store import ConfigStore
 
+from cosmos_framework.callbacks.action_dataloader_state import ActionIterableShuffleStateCallback
 from cosmos_framework.callbacks.online_vae_probe import OnlineVAEProbeCallback
 from cosmos_framework.callbacks.r07_parity_capture import R07ParityCaptureCallback
 from cosmos_framework.callbacks.r07_runtime_probe import R07RuntimeProbeCallback
@@ -253,6 +254,7 @@ def _action_policy_libero_edge_dataloader():
             val_ratio=0.01,
             iterable_shuffle=iterable_shuffle,
             episode_shuffle_seed=42,
+            shuffle_state_name=_suite,
             resolution=None,
             max_action_dim="${model.config.max_action_dim}",
             cfg_dropout_rate=0.1,
@@ -317,6 +319,7 @@ def _action_policy_libero_edge_dataloader():
         audio_sample_rate=48000,
         seed=None,  # deterministic round-robin 1:1:1:1 (balanced per grad-accum window)
         local_memory_shuffle=os.environ.get("PSM_LOCAL_DUMMY_MODE", "normal") == "shuffle",
+        lazy_initialize_child_iterators=True,
         dataloaders={
             _suite: dict(
                 ratio=1,
@@ -388,6 +391,14 @@ if _history_mode() == "ttt":
 # 单卡多 suite：替换 RankPartitionedDataLoader（world_size>=4 断言不满足）为
 # IterativeJointDataLoader 轮询等权混合（每 grad-accum 窗口 16 批 = 4 套 × 4 次）。
 action_policy_libero_edge_all["dataloader_train"], _libero_active_datasets = _action_policy_libero_edge_dataloader()
+
+# Standard ActionIterableShuffleDataset routes (baseline / WINDOW / GRU) use the
+# generic DCP dataloader slot. Active Local-TTT owns that slot itself and must
+# remain the only dataloader checkpoint handler on its route.
+if not _strict_bool_env("PSM_R09_B_TTT_ACTIVE") and not os.environ.get("PSM_R09_B2_STREAM_MANIFEST_ROOT"):
+    action_policy_libero_edge_all["trainer"]["callbacks"]["action_dataloader_state"] = L(
+        ActionIterableShuffleStateCallback
+    )()
 
 if _strict_bool_env("PSM_R09_B_TTT_ACTIVE"):
     # A2: GA grouped forwards, B_stream*T consumers each. Legacy single-row

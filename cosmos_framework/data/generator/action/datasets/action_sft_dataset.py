@@ -16,6 +16,8 @@ to ``RankPartitionedDataLoader`` (mirroring how the vision recipe uses
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -49,48 +51,135 @@ class ActionSFTDataset(Dataset):
         return self._dataset.get_shuffle_blocks()
 
 
+ACTION_SHUFFLE_STATE_NAME = "action_shuffle_state_name"
+ACTION_SHUFFLE_WORKER_ID = "action_shuffle_worker_id"
+ACTION_SHUFFLE_EPOCH = "action_shuffle_epoch"
+ACTION_SHUFFLE_BLOCK_CURSOR = "action_shuffle_block_cursor"
+ACTION_SHUFFLE_WINDOW_CURSOR = "action_shuffle_window_cursor"
+ACTION_SHUFFLE_GLOBAL_SHARD = "action_shuffle_global_shard"
+ACTION_SHUFFLE_TOTAL_SHARDS = "action_shuffle_total_shards"
+
+
+def action_shuffle_env_prefix(state_name: str, worker_id: int) -> str:
+    """Stable per-dataset/per-worker environment namespace used by DCP resume."""
+
+    token = re.sub(r"[^A-Za-z0-9]+", "_", str(state_name)).strip("_").upper() or "ACTION"
+    return f"PSM_ACTION_SHUFFLE_{token}_WORKER_{int(worker_id)}_"
+
+
 class ActionIterableShuffleDataset(IterableDataset):
-    """Streaming view of a map-style ``ActionSFTDataset``.
+    """Streaming action dataset with deterministic epoch shuffles and exact resume.
 
-    Each ``(rank, worker)`` is assigned a DISJOINT subset of episodes (sharded over
-    ``shard_world_size * num_workers``), shuffles its episode ORDER, and streams the
-    windows WITHIN each episode sequentially -> within-rank batch diversity (the N
-    workers of a rank stream N different episodes) AND cross-rank diversity, while
-    keeping reads sequential (I/O locality + COW; no RandomSampler random-access OOM).
-    Re-shuffles each epoch and streams indefinitely (the trainer stops at ``max_iter``).
+    Each ``(rank, worker)`` owns a disjoint episode subsequence. Epoch ``e``
+    deterministically uses ``seed + e``, so the permutation never needs to be
+    checkpointed. Instead each yielded sample carries the worker's exact
+    ``(epoch, block_cursor, window_cursor)``. A DCP dataloader callback persists
+    the last *consumed* coordinate and writes it back through the environment before
+    worker creation; the resumed iterator reconstructs the same permutation and
+    continues at the next sample.
 
-    ``shard_world_size`` / ``shard_rank`` are set by ``RankPartitionedDataLoader``.
+    ``shard_world_size`` / ``shard_rank`` remain externally owned. Resume fails
+    closed if the saved shard geometry differs from the current worker geometry.
     """
 
-    def __init__(self, dataset: "ActionSFTDataset", seed: int = 42):
+    def __init__(self, dataset: "ActionSFTDataset", seed: int = 42, state_name: str = "action"):
         super().__init__()
         self._dataset = dataset
         self._seed = int(seed)
+        self.state_name = str(state_name)
         self.shard_world_size = 1
         self.shard_rank = 0
 
     def __len__(self) -> int:  # informational only; iteration is infinite
         return len(self._dataset)
 
-    def __iter__(self):
-        import torch
+    @staticmethod
+    def _pop_resume_position(
+        state_name: str, worker_id: int, *, global_shard: int, total_shards: int
+    ) -> tuple[int, int, int] | None:
+        prefix = action_shuffle_env_prefix(state_name, worker_id)
+        keys = {
+            "epoch": prefix + "EPOCH",
+            "block_cursor": prefix + "BLOCK_CURSOR",
+            "window_cursor": prefix + "WINDOW_CURSOR",
+            "global_shard": prefix + "GLOBAL_SHARD",
+            "total_shards": prefix + "TOTAL_SHARDS",
+        }
+        present = {name: key in os.environ for name, key in keys.items()}
+        if not any(present.values()):
+            return None
+        if not all(present.values()):
+            missing = sorted(name for name, exists in present.items() if not exists)
+            raise RuntimeError(
+                f"incomplete action-shuffle resume state for {state_name!r}/worker{worker_id}: missing {missing}"
+            )
+        values = {name: int(os.environ.pop(key)) for name, key in keys.items()}
+        if values["epoch"] < 0 or values["block_cursor"] < 0 or values["window_cursor"] < 0:
+            raise RuntimeError("action-shuffle resume coordinates must be non-negative")
+        if values["global_shard"] != global_shard or values["total_shards"] != total_shards:
+            raise RuntimeError(
+                "action-shuffle resume shard geometry changed: "
+                f"saved=({values['global_shard']},{values['total_shards']}) "
+                f"current=({global_shard},{total_shards})"
+            )
+        return values["epoch"], values["block_cursor"], values["window_cursor"]
 
+    def __iter__(self):
         blocks = self._dataset.get_shuffle_blocks()
         wi = get_worker_info()
         wid = wi.id if wi is not None else 0
         nw = wi.num_workers if wi is not None else 1
         global_shard = int(self.shard_rank) * nw + wid
         total_shards = max(1, int(self.shard_world_size) * nw)
-        epoch = 0
+
+        resume = self._pop_resume_position(
+            self.state_name,
+            wid,
+            global_shard=global_shard,
+            total_shards=total_shards,
+        )
+        epoch = resume[0] if resume is not None else 0
+        resume_epoch = epoch if resume is not None else None
+        resume_block = resume[1] if resume is not None else None
+        resume_window = resume[2] if resume is not None else None
+
         while True:
             g = torch.Generator()
-            g.manual_seed(self._seed + epoch)  # same permutation across all (rank,worker) -> disjoint shard
+            g.manual_seed(self._seed + epoch)
             order = torch.randperm(len(blocks), generator=g).tolist()
-            for b in order[global_shard::total_shards]:
-                start, length = blocks[b]
-                for idx in range(start, start + length):
-                    yield self._dataset[idx]
+            local_order = order[global_shard::total_shards]
+
+            if resume_epoch == epoch and resume_block is not None and resume_block >= len(local_order):
+                raise RuntimeError(
+                    f"action-shuffle resume block_cursor={resume_block} exceeds worker block count={len(local_order)}"
+                )
+
+            for block_cursor, block_index in enumerate(local_order):
+                if resume_epoch == epoch and resume_block is not None and block_cursor < resume_block:
+                    continue
+
+                start, length = blocks[block_index]
+                first_window = 0
+                if resume_epoch == epoch and resume_block == block_cursor and resume_window is not None:
+                    if resume_window >= length:
+                        raise RuntimeError(
+                            f"action-shuffle resume window_cursor={resume_window} exceeds block length={length}"
+                        )
+                    first_window = resume_window + 1
+
+                for window_cursor in range(first_window, length):
+                    sample = self._dataset[start + window_cursor]
+                    sample[ACTION_SHUFFLE_STATE_NAME] = self.state_name
+                    sample[ACTION_SHUFFLE_WORKER_ID] = int(wid)
+                    sample[ACTION_SHUFFLE_EPOCH] = int(epoch)
+                    sample[ACTION_SHUFFLE_BLOCK_CURSOR] = int(block_cursor)
+                    sample[ACTION_SHUFFLE_WINDOW_CURSOR] = int(window_cursor)
+                    sample[ACTION_SHUFFLE_GLOBAL_SHARD] = int(global_shard)
+                    sample[ACTION_SHUFFLE_TOTAL_SHARDS] = int(total_shards)
+                    yield sample
+
             epoch += 1
+            resume_epoch = resume_block = resume_window = None
 
 
 class B2ManifestAwareIterableDataset(IterableDataset):
@@ -292,6 +381,7 @@ def get_action_robocasa_sft_dataset(
     format_prompt_as_json: bool = False,
     iterable_shuffle: bool = False,
     episode_shuffle_seed: int = 42,
+    shuffle_state_name: str | None = None,
     sample_stride: int = 1,
     latent_cache_root: str | None = None,
 ) -> Dataset:
@@ -331,7 +421,11 @@ def get_action_robocasa_sft_dataset(
     )
     sft = ActionSFTDataset(dataset, transform, resolution)
     if iterable_shuffle:
-        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+        return ActionIterableShuffleDataset(
+            sft,
+            seed=episode_shuffle_seed,
+            state_name=shuffle_state_name or suite,
+        )
     return sft
 
 
@@ -362,6 +456,7 @@ def get_action_libero_sft_dataset(
     format_prompt_as_json: bool = False,
     iterable_shuffle: bool = False,
     episode_shuffle_seed: int = 42,
+    shuffle_state_name: str | None = None,
     latent_cache_root: str | None = None,
     latent_cache_verify_ratio: float = 0.0,
     max_episodes: int | None = None,
@@ -429,5 +524,9 @@ def get_action_libero_sft_dataset(
         records = [json.loads(line) for line in Path(stream_manifest_path).read_text().splitlines() if line]
         return B2ManifestAwareIterableDataset(sft, records, stream_manifest_suite)
     if iterable_shuffle:
-        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+        return ActionIterableShuffleDataset(
+            sft,
+            seed=episode_shuffle_seed,
+            state_name=shuffle_state_name or Path(root).name,
+        )
     return sft
