@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset import (
+    RoboCasaLeRobotDataset,
     compose_robocasa_video,
     normalize_robocasa_camera_set,
     robocasa_camera_keys,
@@ -90,3 +91,12 @@ def test_robocasa_domain_is_canonical_30() -> None:
     assert get_domain_id("robocasa") == 30
     with pytest.raises(KeyError):
         get_domain_id("robocasa_panda_omron")
+
+
+@pytest.mark.L0
+def test_robocasa_ego_mobile_action_is_20d_for_policy_and_local_memory() -> None:
+    dataset = RoboCasaLeRobotDataset.__new__(RoboCasaLeRobotDataset)
+    dataset._use_base_action = True
+    dataset._base_encoding = "ego"
+    assert dataset.action_dim == 20
+    assert dataset.local_memory_action_dim == 20
