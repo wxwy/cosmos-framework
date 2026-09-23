@@ -39,6 +39,12 @@ set -uo pipefail
 # Repo root = parent of the wrapper's directory (examples/).
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[1]}")/.." && pwd)"
 
+# Prefer the repository environment for every SFT launcher. This prevents a
+# system/conda torchrun from silently selecting the wrong Python environment.
+if [[ -x "$WORKDIR/.venv/bin/torchrun" ]]; then
+    export PATH="$WORKDIR/.venv/bin:$PATH"
+fi
+
 # Anchor relative paths to $WORKDIR.
 [[ "$TOML_FILE" = /* ]] || TOML_FILE="$WORKDIR/$TOML_FILE"
 

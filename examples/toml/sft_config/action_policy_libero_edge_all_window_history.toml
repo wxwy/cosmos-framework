@@ -5,7 +5,9 @@
 # The last H=16 completed observations are passed as full-spatial single-frame
 # causal VAE latents plus their executed actions. No visual96 pooling, GRU, or
 # Local token is used. The final WAM item remains current-clean/future-noised.
-# Native forward packs 16 samples. Single-GPU default GA=128 preserves 2048 consumers/update.\n# Formal training ceiling defaults to 5000 optimizer steps; the owner may stop manually at any checkpoint.
+# Native forward packs 16 samples/rank. Formal 8-GPU GA=16 preserves
+# 16 x 8 x 16 = 2048 consumers/update.
+# Formal training ceiling defaults to 5000 optimizer steps; the owner may stop manually at any checkpoint.
 
 [job]
 task       = "vfm"
@@ -40,7 +42,7 @@ warm_up_steps = [200]
 [trainer]
 max_iter        = 5000
 logging_iter    = 1
-grad_accum_iter = 128
+grad_accum_iter = 16
 
 [trainer.cudnn]
 benchmark = false

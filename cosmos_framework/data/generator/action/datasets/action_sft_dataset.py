@@ -89,6 +89,20 @@ class ActionIterableShuffleDataset(IterableDataset):
         self.state_name = str(state_name)
         self.shard_world_size = 1
         self.shard_rank = 0
+        self.shard_assignment_source = "default"
+
+    def set_shard_assignment(self, world_size: int, rank: int, *, source: str) -> None:
+        """Bind this stream to one rank shard before DataLoader workers start."""
+
+        world_size = int(world_size)
+        rank = int(rank)
+        if world_size <= 0 or rank < 0 or rank >= world_size:
+            raise ValueError(
+                f"invalid action-shuffle shard assignment world_size={world_size}, rank={rank}"
+            )
+        self.shard_world_size = world_size
+        self.shard_rank = rank
+        self.shard_assignment_source = str(source)
 
     def __len__(self) -> int:  # informational only; iteration is infinite
         return len(self._dataset)

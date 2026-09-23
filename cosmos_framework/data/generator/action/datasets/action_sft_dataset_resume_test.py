@@ -84,3 +84,36 @@ def test_action_shuffle_resume_rejects_geometry_change(monkeypatch):
         assert "shard geometry changed" in str(error)
     else:
         raise AssertionError("resume must fail closed when worker geometry changes")
+
+
+class _EvenToyDataset:
+    def __init__(self) -> None:
+        self.blocks = [(0, 2), (2, 2), (4, 2), (6, 2)]
+
+    def get_shuffle_blocks(self):
+        return self.blocks
+
+    def __len__(self) -> int:
+        return 8
+
+    def __getitem__(self, idx: int):
+        return {"sample_id": idx}
+
+
+def test_action_shuffle_rank_assignments_are_disjoint():
+    rank0 = ActionIterableShuffleDataset(_EvenToyDataset(), seed=11, state_name="rank-shard")
+    rank1 = ActionIterableShuffleDataset(_EvenToyDataset(), seed=11, state_name="rank-shard")
+    rank0.set_shard_assignment(2, 0, source="test")
+    rank1.set_shard_assignment(2, 1, source="test")
+
+    it0, it1 = iter(rank0), iter(rank1)
+    samples0 = [next(it0) for _ in range(4)]
+    samples1 = [next(it1) for _ in range(4)]
+    ids0 = {sample["sample_id"] for sample in samples0}
+    ids1 = {sample["sample_id"] for sample in samples1}
+
+    assert ids0.isdisjoint(ids1)
+    assert ids0 | ids1 == set(range(8))
+    assert {sample[ACTION_SHUFFLE_GLOBAL_SHARD] for sample in samples0} == {0}
+    assert {sample[ACTION_SHUFFLE_GLOBAL_SHARD] for sample in samples1} == {1}
+    assert {sample[ACTION_SHUFFLE_TOTAL_SHARDS] for sample in samples0 + samples1} == {2}

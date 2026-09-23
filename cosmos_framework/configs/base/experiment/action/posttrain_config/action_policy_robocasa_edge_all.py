@@ -78,7 +78,9 @@ def _robocasa_edge_model_config() -> dict:
 
 def _robocasa_dataloader() -> object:
     suite = _robocasa_suite()
-    num_workers = int(os.environ.get("ROBOCASA_NUM_WORKERS", "12"))
+    # Formal 8-GPU recipe defaults to two workers/rank (16 total workers).
+    # Override explicitly for machines with a different CPU/storage balance.
+    num_workers = int(os.environ.get("ROBOCASA_NUM_WORKERS", "2"))
     prefetch_factor = int(os.environ.get("ROBOCASA_PREFETCH_FACTOR", "4"))
     if num_workers < 0:
         raise ValueError(f"ROBOCASA_NUM_WORKERS must be non-negative, got {num_workers}")
@@ -159,7 +161,8 @@ action_policy_robocasa_edge_all["model"]["config"] = _robocasa_edge_model_config
 action_policy_robocasa_edge_all["dataloader_train"] = _robocasa_dataloader()
 action_policy_robocasa_edge_all["dataloader_val"] = None
 
-# One-rank recipe; the TOML restores the official 2048-consumer/update scale by GA=16.
+# FSDP shard degree auto-infers to WORLD_SIZE. The formal 8-GPU TOML uses GA=2,
+# so 128 consumers/rank x 8 ranks x 2 accumulation = 2048/update.
 action_policy_robocasa_edge_all["model"]["config"]["parallelism"]["data_parallel_shard_degree"] = -1
 action_policy_robocasa_edge_all["model"]["config"]["parallelism"]["data_parallel_replicate_degree"] = 1
 

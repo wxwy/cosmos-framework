@@ -488,7 +488,25 @@ class JointDataLoader(webdataset.WebLoader):
             if dataloader_data["ratio"] <= 0:
                 continue
             self.dataset_name_list.append(dataset_name)
-            self.dataloader_list.append(instantiate(dataloader_data["dataloader"], collate_fn=custom_collate_fn))
+            child_dataloader = instantiate(dataloader_data["dataloader"], collate_fn=custom_collate_fn)
+            child_dataset = getattr(child_dataloader, "dataset", None)
+            if hasattr(child_dataset, "set_shard_assignment"):
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    shard_world_size = torch.distributed.get_world_size()
+                    shard_rank = torch.distributed.get_rank()
+                else:
+                    shard_world_size, shard_rank = 1, 0
+                child_dataset.set_shard_assignment(
+                    shard_world_size,
+                    shard_rank,
+                    source=f"{type(self).__name__}:{dataset_name}",
+                )
+                log.info(
+                    f"{type(self).__name__}: dataset {dataset_name!r} action-shuffle shard "
+                    f"rank={shard_rank}/{shard_world_size}",
+                    rank0_only=False,
+                )
+            self.dataloader_list.append(child_dataloader)
             self.data_ratios.append(dataloader_data["ratio"])
             self.lookahead_limits.append(int(_lookahead_overrides.get(dataset_name, self.default_lookahead_limit)))
 
@@ -1226,8 +1244,15 @@ class RankPartitionedDataLoader:
         shard_world_size = allocations[my_dataset_idx]
 
         dataset: Any = instantiate(dataset_configs[my_dataset_idx])
-        dataset.shard_world_size = shard_world_size
-        dataset.shard_rank = shard_rank
+        if hasattr(dataset, "set_shard_assignment"):
+            dataset.set_shard_assignment(
+                shard_world_size,
+                shard_rank,
+                source=f"RankPartitionedDataLoader:{names[my_dataset_idx]}",
+            )
+        else:
+            dataset.shard_world_size = shard_world_size
+            dataset.shard_rank = shard_rank
         dataset.shard_id = my_dataset_idx
 
         merged_kwargs = {**dataloader_kwargs, **per_dataset_kwargs[my_dataset_idx]}

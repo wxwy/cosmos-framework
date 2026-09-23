@@ -3,7 +3,7 @@
 
 # RoboCasa365 target-atomic Edge-Policy-DROID warm-start baseline.
 # The actual v3 mirror/cache roots are supplied by the launcher through env.
-# 128 consumers/rank x 1 rank x GA16 = 2048 consumers/optimizer update.
+# Formal 8-GPU run: 128 consumers/rank x 8 ranks x GA2 = 2048 consumers/update.
 
 [job]
 task       = "vfm"
@@ -38,7 +38,7 @@ warm_up_steps = [200]
 [trainer]
 max_iter        = 5000
 logging_iter    = 1
-grad_accum_iter = 16
+grad_accum_iter = 2
 
 [trainer.cudnn]
 benchmark = false

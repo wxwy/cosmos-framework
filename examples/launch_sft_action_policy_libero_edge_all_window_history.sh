@@ -20,6 +20,10 @@ unset PSM_R09_A1_PROBE_OUTPUT PSM_R09_B1_PROBE_OUTPUT PSM_R09_B2_STREAM_MANIFEST
 # so keep it disabled for this route.
 export LIBERO_LATENT_CACHE_VERIFY_RATIO=0
 
+# Formal WINDOW-H16 training is an 8-rank FSDP run. The TOML carries GA=16,
+# giving 16 native samples/rank x 8 ranks x GA16 = 2048 consumers/update.
+export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+
 export TOML_FILE="examples/toml/sft_config/action_policy_libero_edge_all_window_history.toml"
 export RUN_NAME="edge_libero_4in1_window_history_h16"
 exec bash "$(dirname "${BASH_SOURCE[0]}")/launch_sft_action_policy_libero_edge_all.sh"

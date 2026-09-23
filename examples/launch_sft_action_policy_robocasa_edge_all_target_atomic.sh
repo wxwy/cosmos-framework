@@ -12,10 +12,11 @@ set -euo pipefail
 : "${ROBOCASA_SUITE:=robocasa365_target_atomic}"
 : "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp}"
 : "${EDGE_POLICY_CHECKPOINT:=/disk/rl/models/Cosmos3-Edge-Policy-DROID}"
-: "${NPROC_PER_NODE:=1}"
-: "${ROBOCASA_NUM_WORKERS:=12}"
+: "${NPROC_PER_NODE:=8}"
+: "${ROBOCASA_NUM_WORKERS:=2}"
 : "${ROBOCASA_PREFETCH_FACTOR:=4}"
 
+export NPROC_PER_NODE
 export ROBOCASA_SUITE EDGE_POLICY_CHECKPOINT ROBOCASA_NUM_WORKERS ROBOCASA_PREFETCH_FACTOR
 export ROBOCASA_ROOT="${ROBOCASA_ROOT:-}"
 export ROBOCASA_LATENT_CACHE_ROOT="${ROBOCASA_LATENT_CACHE_ROOT:-}"
@@ -54,14 +55,6 @@ export PSM_R09_B_TTT_ACTIVE=0
 TAIL_OVERRIDES=(${EXTRA_TAIL_OVERRIDES:-})
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-# Prefer the repository virtualenv when present.  This avoids accidentally
-# picking up an unrelated system/conda torchrun (for example Python 3.11
-# without the project's dependencies).  Fall back to PATH only when the
-# repository venv is intentionally absent.
-if [[ -x "$REPO_ROOT/.venv/bin/torchrun" ]]; then
-    export PATH="$REPO_ROOT/.venv/bin:$PATH"
-fi
 
 OUTPUT_ROOT_FOR_RESUME="${OUTPUT_ROOT:-$REPO_ROOT/outputs/train}"
 [[ "$OUTPUT_ROOT_FOR_RESUME" = /* ]] || OUTPUT_ROOT_FOR_RESUME="$REPO_ROOT/$OUTPUT_ROOT_FOR_RESUME"
