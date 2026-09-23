@@ -101,14 +101,51 @@ class CanonicalLocalMemorySegmentProducer:
         self.config_digest = config_digest
         self.source_digest = source_digest
 
+        if hasattr(wrapped_dataset, "get_shuffle_blocks"):
+            blocks = wrapped_dataset.get_shuffle_blocks()
+        elif hasattr(frame_source, "get_shuffle_blocks"):
+            blocks = frame_source.get_shuffle_blocks()
+        elif hasattr(frame_source, "_valid_cum"):
+            blocks = []
+            previous = 0
+            for end in frame_source._valid_cum:
+                end = int(end)
+                if end > previous:
+                    blocks.append((previous, end - previous))
+                previous = end
+        else:
+            raise TypeError("segment producer requires episode-aligned shuffle blocks")
+        self._blocks = tuple((int(start), int(length)) for start, length in blocks if int(length) > 0)
+        if not self._blocks:
+            raise ValueError("segment producer found no valid episode blocks")
+
+        if hasattr(frame_source, "_ep_vals") and len(frame_source._ep_vals) == len(self._blocks):
+            episode_ids = [int(value) for value in frame_source._ep_vals]
+        elif hasattr(frame_source, "_episode_records") and len(frame_source._episode_records) == len(self._blocks):
+            episode_ids = [int(record[3]) for record in frame_source._episode_records]
+        elif hasattr(frame_source, "_resolve_index"):
+            episode_ids = [int(frame_source._resolve_index(start)[2]) for start, _ in self._blocks]
+        else:
+            raise TypeError("segment producer cannot resolve episode identities")
+        self._episode_catalog = tuple(enumerate(episode_ids))
+
+        evidence_action_dim = getattr(frame_source, "local_memory_action_dim", None)
+        if evidence_action_dim is None:
+            evidence_action_dim = getattr(frame_source, "action_dim", None)
+        self.evidence_action_dim = int(evidence_action_dim)
+        if self.evidence_action_dim <= 0:
+            raise ValueError("segment producer requires a positive evidence action dimension")
+
     # ---- geometry ----------------------------------------------------------
+
+    def episode_catalog(self) -> tuple[tuple[int, int], ...]:
+        """Return deterministic episode-position / episode-id pairs."""
+        return self._episode_catalog
 
     def valid_start_count(self, stream: CanonicalSegmentStream) -> int:
         """Number of dataset samples (window anchors) this episode can serve."""
         position = self._position(stream)
-        cum = self.frame_source._valid_cum
-        previous = int(cum[position - 1]) if position > 0 else 0
-        return int(cum[position]) - previous
+        return int(self._blocks[position][1])
 
     def block_count(self, stream: CanonicalSegmentStream) -> int:
         """Number of whole ``T``-blocks this episode can still serve."""
@@ -116,21 +153,19 @@ class CanonicalLocalMemorySegmentProducer:
 
     def _position(self, stream: CanonicalSegmentStream) -> int:
         position = stream.episode_position
-        ep_vals = self.frame_source._ep_vals
-        if not 0 <= position < len(ep_vals):
+        if not 0 <= position < len(self._episode_catalog):
             raise ValueError("segment stream episode position is out of range")
-        if int(ep_vals[position]) != stream.episode_index:
+        if int(self._episode_catalog[position][1]) != stream.episode_index:
             raise ValueError("segment stream episode index disagrees with its dataset position")
         return position
 
     def _flat_index(self, stream: CanonicalSegmentStream, local_frame: int) -> int:
         """Inverse of ``LIBEROLeRobotDataset._build_item``'s idx -> start mapping."""
         position = self._position(stream)
-        base = int(self.frame_source._valid_cum[position - 1]) if position > 0 else 0
-        return base + local_frame
-
-    def _row_index(self, stream: CanonicalSegmentStream, local_frame: int) -> int:
-        return int(self.frame_source._ep_starts[self._position(stream)]) + local_frame
+        start, length = self._blocks[position]
+        if not 0 <= local_frame < length:
+            raise ValueError("segment local frame is outside the episode block")
+        return int(start) + int(local_frame)
 
     # ---- evidence口径 (mirrors _build_local_history) -----------------------
 
@@ -141,17 +176,33 @@ class CanonicalLocalMemorySegmentProducer:
         return F.adaptive_avg_pool2d(latent[0].unsqueeze(0), output_size=(1, 2)).flatten()
 
     def _executed_action(self, stream: CanonicalSegmentStream, local_frame: int) -> torch.Tensor:
-        row = self._row_index(stream, local_frame)
-        raw = self.frame_source._row_action[row : row + 1]  # [1, 7]
-        action = self.frame_source._build_frame_wise_action(raw)[0]
-        if self.frame_source.action_normalization is None:
-            return action
-        return normalize_action(
-            action, self.frame_source.action_normalization, self.frame_source._load_norm_stats()
-        )
+        flat_index = self._flat_index(stream, local_frame)
+        hook = getattr(self.frame_source, "local_memory_executed_action", None)
+        if callable(hook):
+            action = hook(flat_index)
+        else:
+            position = self._position(stream)
+            row = int(self.frame_source._ep_starts[position]) + local_frame
+            raw = self.frame_source._row_action[row : row + 1]
+            action = self.frame_source._build_frame_wise_action(raw)[0]
+            if self.frame_source.action_normalization is not None:
+                action = normalize_action(
+                    action,
+                    self.frame_source.action_normalization,
+                    self.frame_source._load_norm_stats(),
+                )
+        action = action.detach().float().reshape(-1)
+        if tuple(action.shape) != (self.evidence_action_dim,) or not torch.isfinite(action).all():
+            raise ValueError(
+                "canonical Local evidence action mismatch: "
+                f"expected [{self.evidence_action_dim}], got {tuple(action.shape)}"
+            )
+        return action
 
     def _payload(self, stream: CanonicalSegmentStream, local_frame: int) -> Any:
-        item = self.frame_source._build_item(self._flat_index(stream, local_frame))
+        flat_index = self._flat_index(stream, local_frame)
+        builder = getattr(self.frame_source, "_build_item", None)
+        item = builder(flat_index) if callable(builder) else self.frame_source[flat_index]
         payload = self.wrapped_dataset._transform(item, self.wrapped_dataset._resolution)
         if not isinstance(payload, dict):
             return payload
@@ -190,7 +241,7 @@ class CanonicalLocalMemorySegmentProducer:
         payloads: list[Any] = []
         consumer_visual_summary = torch.zeros((1, width, VISUAL_SUMMARY_DIM), dtype=torch.float32)
         evidence_visual_summary_prev = torch.zeros((1, width, VISUAL_SUMMARY_DIM), dtype=torch.float32)
-        evidence_executed_action_prev = torch.zeros((1, width, self.frame_source.action_dim), dtype=torch.float32)
+        evidence_executed_action_prev = torch.zeros((1, width, self.evidence_action_dim), dtype=torch.float32)
         evidence_valid = torch.zeros((1, width), dtype=torch.bool)
         evidence_source_step = torch.full((1, width), -1, dtype=torch.long)
         consumer_step = torch.arange(base, base + width, dtype=torch.long).unsqueeze(0)
