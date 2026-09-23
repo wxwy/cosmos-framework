@@ -54,6 +54,15 @@ export PSM_R09_B_TTT_ACTIVE=0
 TAIL_OVERRIDES=(${EXTRA_TAIL_OVERRIDES:-})
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Prefer the repository virtualenv when present.  This avoids accidentally
+# picking up an unrelated system/conda torchrun (for example Python 3.11
+# without the project's dependencies).  Fall back to PATH only when the
+# repository venv is intentionally absent.
+if [[ -x "$REPO_ROOT/.venv/bin/torchrun" ]]; then
+    export PATH="$REPO_ROOT/.venv/bin:$PATH"
+fi
+
 OUTPUT_ROOT_FOR_RESUME="${OUTPUT_ROOT:-$REPO_ROOT/outputs/train}"
 [[ "$OUTPUT_ROOT_FOR_RESUME" = /* ]] || OUTPUT_ROOT_FOR_RESUME="$REPO_ROOT/$OUTPUT_ROOT_FOR_RESUME"
 CHECKPOINT_ROOT="$OUTPUT_ROOT_FOR_RESUME/cosmos3_action_robocasa/action_sft/$RUN_NAME/checkpoints"
