@@ -6,7 +6,6 @@ set -euo pipefail
 # RoboCasa365 target-atomic N=100 active Local-TTT, formal 8-GPU route.
 
 : "${TOML_FILE:=examples/toml/sft_config/action_policy_robocasa_edge_all_target_atomic_localmem_active.toml}"
-: "${RUN_NAME:=local_ttt_robocasa365_target_atomic_n100_fsdp8_k4}"
 : "${ROBOCASA_SUITE:=robocasa365_target_atomic}"
 : "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Edge-Policy-DROID-dcp}"
 : "${EDGE_POLICY_CHECKPOINT:=/disk/rl/models/Cosmos3-Edge-Policy-DROID}"
@@ -22,6 +21,7 @@ set -euo pipefail
 : "${TTT_INNER_LR:=0.1}"
 : "${TTT_B_STREAM:=8}"
 : "${TTT_ACTIVE_GA:=2}"
+: "${RUN_NAME:=local_ttt_robocasa365_target_atomic_n100_fsdp8_k${TTT_K_LOCAL}}"
 
 export NPROC_PER_NODE
 export ROBOCASA_SUITE EDGE_POLICY_CHECKPOINT
