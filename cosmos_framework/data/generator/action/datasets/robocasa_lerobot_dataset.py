@@ -269,6 +269,36 @@ class RoboCasaLeRobotDataset(BaseActionLeRobotDataset):
             return 10
         return 15 if self._base_encoding == "raw" else 20
 
+    @property
+    def local_memory_action_dim(self) -> int:
+        """Action evidence width consumed by Local-TTT."""
+        return self.action_dim
+
+    def local_memory_executed_action(self, idx: int) -> torch.Tensor:
+        """Return the first executable action for one flat window anchor.
+
+        With ego base encoding this is the full 20D mobile-manipulation
+        action: ego base delta(9) + control mode(1) + EEF/gripper(10).
+        """
+        dataset_idx, row_idx, _, _ = self._resolve_index(int(idx))
+        sample = self._get_dataset(dataset_idx)[row_idx]
+        raw = sample[_ACTION_FEATURE]
+        arm = self._build_frame_wise_action(raw)
+        if self._use_base_action and self._base_encoding == "ego":
+            base_delta = self._build_base_delta(sample[_STATE_FEATURE])
+            control_mode = raw.float()[:, _CONTROL_MODE]
+            action = torch.cat([base_delta, control_mode, arm], dim=-1)
+        else:
+            action = arm
+        if self._action_normalizer is not None:
+            action = self._action_normalizer.normalize_action(action)
+        result = action[0].detach().float()
+        if tuple(result.shape) != (self.action_dim,):
+            raise ValueError(
+                f"RoboCasa Local evidence action must have shape [{self.action_dim}], got {tuple(result.shape)}"
+            )
+        return result
+
     def _build_action_spec(self) -> ActionSpec:
         if not self._use_base_action:
             return build_action_spec(Pos(), Rot("rot6d"), Gripper())
