@@ -24,6 +24,11 @@ import torch
 from torch import nn
 
 _CONFIG_VERSION = 1
+_TTT_K_LOCAL_CHOICES = {1, 4, 8, 16}
+_TTT_ACTION_DIM_BY_FEATURE_VERSION = {
+    "causal_visual96_executed_action10_v1": 10,
+    "causal_visual96_executed_action20_v1": 20,
+}
 _PAYLOAD_VERSION = 1
 _CONFIG_KEYS = frozenset({"version", "ttt_tbptt_steps", "ttt_inner_lr", "k_local", "local_evidence_feature_version", "local_fast_state_dtype", "local_runtime_resume_mode"})
 _PAYLOAD_KEYS = frozenset({"version", "config", "feature_config", "base_identity", "parameters", "optimizer", "optimizer_identity", "scheduler", "scheduler_identity", "iteration"})
@@ -241,7 +246,8 @@ def _validate_feature_config_against_runtime(feature_config: FeatureConfigIdenti
     if (
         getattr(runtime_encoder, "evidence_dim", None) != feature_config.local_history_evidence_dim
         or getattr(getattr(runtime_encoder, "visual_proj", None), "in_features", None) != 96
-        or getattr(getattr(runtime_encoder, "action_proj", None), "in_features", None) != 10
+        or getattr(getattr(runtime_encoder, "action_proj", None), "in_features", None)
+        != _TTT_ACTION_DIM_BY_FEATURE_VERSION.get(feature_config.local_evidence_feature_version)
         or getattr(getattr(runtime_encoder, "feature_config", None), "state", None) is not False
         or getattr(getattr(runtime_encoder, "feature_config", None), "dt", None) is not False
         or getattr(getattr(runtime_encoder, "feature_config", None), "age", None) is not False
@@ -280,9 +286,9 @@ class LocalMemoryConfig:
             raise ValueError("ttt_tbptt_steps must be a positive integer")
         if isinstance(self.ttt_inner_lr, bool) or not isinstance(self.ttt_inner_lr, (int, float)) or not math.isfinite(float(self.ttt_inner_lr)) or self.ttt_inner_lr <= 0:
             raise ValueError("ttt_inner_lr must be finite and positive")
-        if isinstance(self.k_local, bool) or not isinstance(self.k_local, int) or self.k_local != 1:
-            raise ValueError("k_local must be exactly 1")
-        if self.local_evidence_feature_version != "causal_visual96_executed_action10_v1":
+        if isinstance(self.k_local, bool) or not isinstance(self.k_local, int) or self.k_local not in _TTT_K_LOCAL_CHOICES:
+            raise ValueError(f"k_local must be one of {sorted(_TTT_K_LOCAL_CHOICES)}")
+        if self.local_evidence_feature_version not in _TTT_ACTION_DIM_BY_FEATURE_VERSION:
             raise ValueError("local_evidence_feature_version is not canonical")
         if self.local_fast_state_dtype != "fp32":
             raise ValueError("local_fast_state_dtype must be fp32")
