@@ -221,7 +221,13 @@ action_policy_robocasa_edge_all["trainer"]["callbacks"]["r09_b_active_wiring"] =
     group_size=b_stream,
     ttt_tbptt_steps=action_policy_robocasa_edge_all["model"]["config"]["ttt_tbptt_steps"],
     manifest_digest=f"{_robocasa_suite()}-n100",
-    config_digest="robocasa-local-ttt-t16-d64-h256-k4-v1",
+    config_digest=(
+        "robocasa-local-ttt-"
+        f"t{action_policy_robocasa_edge_all['model']['config']['ttt_tbptt_steps']}-"
+        f"d{action_policy_robocasa_edge_all['model']['config']['ttt_dim']}-"
+        f"h{action_policy_robocasa_edge_all['model']['config']['ttt_fast_hidden_dim']}-"
+        f"k{action_policy_robocasa_edge_all['model']['config']['k_local']}-v1"
+    ),
     source_digest=os.environ.get("ROBOCASA_LATENT_CACHE_ROOT") or "robocasa-exact-window-cache",
 )
 
