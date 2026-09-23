@@ -187,7 +187,9 @@ def test_config_identity_is_versioned_deterministic_and_fail_closed() -> None:
     config.validate()
     mapping = config.to_mapping()
     assert LocalMemoryConfig.from_mapping(mapping) == config
-    for kwargs in ({"ttt_inner_lr": 0}, {"ttt_inner_lr": True}, {"ttt_tbptt_steps": True}, {"k_local": 4}, {"local_fast_state_dtype": "bf16"}, {"local_runtime_resume_mode": "resume"}):
+    for k_local in (1, 4, 8, 16):
+        LocalMemoryConfig(k_local=k_local).validate()
+    for kwargs in ({"ttt_inner_lr": 0}, {"ttt_inner_lr": True}, {"ttt_tbptt_steps": True}, {"k_local": 2}, {"local_fast_state_dtype": "bf16"}, {"local_runtime_resume_mode": "resume"}):
         with pytest.raises(ValueError):
             LocalMemoryConfig(**kwargs).validate()
     for bad in ({key: value for key, value in mapping.items() if key != "k_local"}, {**mapping, "runtime_evidence_steps": 1}):
@@ -196,6 +198,7 @@ def test_config_identity_is_versioned_deterministic_and_fail_closed() -> None:
 
 
 def test_feature_config_and_base_identity_are_exact_and_versioned() -> None:
+    FeatureConfigIdentity(local_evidence_feature_version="causal_visual96_executed_action20_v1").validate()
     feature = FeatureConfigIdentity()
     mapping = feature.to_mapping()
     assert len(mapping) == 15
