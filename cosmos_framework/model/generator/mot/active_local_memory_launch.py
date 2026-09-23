@@ -180,11 +180,10 @@ def canonical_segment_streams(
     for index, category in enumerate(categories):
         producer = producers[category]
         slots = tuple(slot for slot in range(b_stream) if slot % len(categories) == index)
-        ep_vals = producer.frame_source._ep_vals
+        catalog = producer.episode_catalog()
 
         eligible: list[tuple[int, int]] = []
-        for position in range(len(ep_vals)):
-            episode_index = int(ep_vals[position])
+        for position, episode_index in catalog:
             probe = CanonicalSegmentStream(
                 slot_id=slots[0], episode_index=episode_index, episode_position=position, category=category
             )
@@ -365,6 +364,13 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             )
             for category in categories
         }
+        encoder_action_dim = int(adapter.encoder.action_proj.in_features)
+        producer_action_dims = {producer.evidence_action_dim for producer in producers.values()}
+        if producer_action_dims != {encoder_action_dim}:
+            raise RuntimeError(
+                "active Local-Memory evidence action ABI mismatch: "
+                f"encoder={encoder_action_dim}, producers={sorted(producer_action_dims)}"
+            )
         driver = driver_type(
             **driver_extra,
             registry=registry,
