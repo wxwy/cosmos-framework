@@ -370,7 +370,10 @@ class ActiveLocalMemoryLaunchCallback(Callback):
             for category in categories
         }
         encoder_action_dim = int(adapter.encoder.action_proj.in_features)
-        producer_action_dims = {producer.evidence_action_dim for producer in producers.values()}
+        producer_action_dims = {
+            int(getattr(producer, "evidence_action_dim", encoder_action_dim))
+            for producer in producers.values()
+        }
         if producer_action_dims != {encoder_action_dim}:
             raise RuntimeError(
                 "active Local-Memory evidence action ABI mismatch: "
