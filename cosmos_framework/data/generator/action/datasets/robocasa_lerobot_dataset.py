@@ -320,7 +320,11 @@ class RoboCasaLeRobotDataset(BaseActionLeRobotDataset):
         control_mode = raw[:, _CONTROL_MODE]
         if self._base_encoding == "raw":
             return torch.cat([raw[:, _BASE_MOTION], control_mode, arm], dim=-1)
-        raise RuntimeError("ego base encoding requires observation.state and is built in __getitem__")
+        # Ego base motion requires observation.state, so this low-level helper
+        # returns only the 10D arm/gripper primitive. __getitem__ and the
+        # Local-TTT executed-action hook prepend ego base delta(9) + control(1)
+        # to form the canonical 20D mobile-manipulation action.
+        return arm
 
     def _build_base_delta(self, state_seq: torch.Tensor) -> torch.Tensor:
         state = state_seq[-self._chunk_length - 1 :].float()

@@ -100,3 +100,29 @@ def test_robocasa_ego_mobile_action_is_20d_for_policy_and_local_memory() -> None
     dataset._base_encoding = "ego"
     assert dataset.action_dim == 20
     assert dataset.local_memory_action_dim == 20
+
+
+@pytest.mark.L0
+def test_robocasa_ego_framewise_helper_returns_arm_primitive_for_20d_assembly() -> None:
+    dataset = RoboCasaLeRobotDataset.__new__(RoboCasaLeRobotDataset)
+    dataset._use_base_action = True
+    dataset._base_encoding = "ego"
+    raw = torch.zeros(3, 12, dtype=torch.float32)
+
+    arm = dataset._build_frame_wise_action(raw)
+
+    assert arm.shape == (3, 10)
+    assert torch.isfinite(arm).all()
+
+
+@pytest.mark.L0
+def test_robocasa_raw_framewise_helper_still_returns_15d_action() -> None:
+    dataset = RoboCasaLeRobotDataset.__new__(RoboCasaLeRobotDataset)
+    dataset._use_base_action = True
+    dataset._base_encoding = "raw"
+    raw = torch.zeros(3, 12, dtype=torch.float32)
+
+    action = dataset._build_frame_wise_action(raw)
+
+    assert action.shape == (3, 15)
+    assert torch.isfinite(action).all()
