@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# RoboCasa365 target-atomic Edge-Policy-DROID warm-start baseline.
+# The actual v3 mirror/cache roots are supplied by the launcher through env.
+# 128 consumers/rank x 1 rank x GA16 = 2048 consumers/optimizer update.
+
+[job]
+task       = "vfm"
+experiment = "action_policy_robocasa_edge_all"
+project    = "cosmos3_action_robocasa"
+group      = "action_sft"
+name       = "edge_robocasa365_target_atomic"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 74000
+
+[model.parallelism]
+data_parallel_shard_degree     = -1
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [16000]
+warm_up_steps = [200]
+
+[trainer]
+max_iter        = 5000
+logging_iter    = 1
+grad_accum_iter = 16
+
+[trainer.cudnn]
+benchmark = false
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 50
