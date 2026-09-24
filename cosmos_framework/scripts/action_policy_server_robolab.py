@@ -47,13 +47,14 @@ from cosmos_framework.data.generator.action.utils.pose_utils import (
     pose_abs_to_rel,
     pose_rel_to_abs,
 )
-from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
+from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline, VideoResize
 from cosmos_framework.data.generator.joint_dataloader import IterativeJointDataLoader
 from cosmos_framework.inference.args import GuidanceInterval, OmniSetupArgs, OmniSetupOverrides
 from cosmos_framework.inference.common.args import ConfigFileType, ConfigOverrides, tyro_cli
 from cosmos_framework.inference.common.config import deserialize_config, deserialize_config_dict, load_config
 from cosmos_framework.inference.common.init import init_output_dir
 from cosmos_framework.inference.inference import OmniInference
+from cosmos_framework.inference.local_memory_policy import PolicyLocalMemoryAdapter
 from cosmos_framework.scripts.action_policy_server_utils import (
     DEFAULT_FALLBACK_OUTPUT_DIR,
     disable_runtime_ema_for_frozen_config,
@@ -76,6 +77,9 @@ _CONCAT_VIEW_DESCRIPTION = (
     "The bottom row contains two horizontally concatenated third-person perspective views of the scene from opposite "
     "sides, with the robot visible."
 )
+_ROBOCASA_LEFT_WRIST_DESCRIPTION = (
+    "The left half is agentview left. The right half is the wrist-mounted camera."
+)
 _DEFAULT_HF_REVISION = "main"
 _ROBOLAB_POLICY_HF_REPOSITORIES = {
     "Cosmos3-Nano-Policy-DROID": "nvidia/Cosmos3-Nano-Policy-DROID",
@@ -84,7 +88,7 @@ _ROBOLAB_POLICY_HF_REPOSITORIES = {
     "nvidia/Cosmos3-Edge-Policy-DROID": "nvidia/Cosmos3-Edge-Policy-DROID",
 }
 
-ActionSpace = Literal["joint_pos", "midtrain"]
+ActionSpace = Literal["joint_pos", "midtrain", "robocasa_ego"]
 
 
 def _load_checkpoint_metadata(checkpoint_path: str) -> dict[str, Any] | None:
@@ -363,6 +367,11 @@ class RobolabServerArgs(pydantic.BaseModel):
     format_prompt_as_json: bool | None = None
     """Serve prompts as structured JSON (matching training ``format_prompt_as_json``)."""
 
+    local_memory_mode: Literal["auto", "off", "required", "zero", "init"] = "auto"
+    """Online Local Memory mode. RoboCasa Local-TTT evaluation should use required."""
+    local_memory_max_sessions: int = 64
+    """Maximum concurrent Local Memory episode sessions."""
+
 
 class RobolabPolicyService:
     def __init__(self, args: RobolabServerArgs) -> None:
@@ -404,7 +413,10 @@ class RobolabPolicyService:
             action_chunk_size=int(
                 args.action_chunk_size or inferred.get("action_chunk_size") or _DEFAULT_ACTION_CHUNK_SIZE
             ),
-            action_dim=int(args.action_dim or (8 if args.action_space == "joint_pos" else 10)),
+            action_dim=int(
+                args.action_dim
+                or (8 if args.action_space == "joint_pos" else 20 if args.action_space == "robocasa_ego" else 10)
+            ),
             image_height=int(args.image_height),
             image_width=int(args.image_width),
             action_space=args.action_space,
@@ -418,6 +430,12 @@ class RobolabPolicyService:
 
         self._lock = threading.Lock()
         self._rng = np.random.default_rng(self.cfg.seed)
+        self._local_memory_video_resize = VideoResize(pad_keys=["video"], keep_aspect_ratio=True)
+        self.local_memory_adapter = PolicyLocalMemoryAdapter(
+            self,
+            mode=args.local_memory_mode,
+            max_sessions=args.local_memory_max_sessions,
+        )
         log.info(
             f"[robolab-policy-server] ready domain={self.cfg.domain_name!r} resolution={self.cfg.resolution!r} "
             f"action_space={self.cfg.action_space} action_dim={self.cfg.action_dim} "
@@ -425,7 +443,8 @@ class RobolabPolicyService:
             f"image={self.cfg.image_height}x{self.cfg.image_width} fps={self.cfg.conditioning_fps} "
             f"guidance={self.cfg.guidance} guidance_interval={self.cfg.guidance_interval} "
             f"num_steps={self.cfg.num_steps} shift={self.cfg.shift} "
-            f"seed={self.cfg.seed} deterministic_seed={self.cfg.deterministic_seed}"
+            f"seed={self.cfg.seed} deterministic_seed={self.cfg.deterministic_seed} "
+            f"local_memory={self.local_memory_adapter.info()}"
         )
 
     def _build_setup_args(self, args: RobolabServerArgs) -> OmniSetupArgs:
@@ -464,15 +483,22 @@ class RobolabPolicyService:
             action_dataset_config = None
 
         if dataset_config is None or dataset_entry is None:
+            format_prompt_as_json = (
+                True if args.action_space == "robocasa_ego" and args.format_prompt_as_json is None
+                else bool(args.format_prompt_as_json)
+            )
+            if args.action_space == "robocasa_ego":
+                inferred["action_chunk_size"] = 16
+                inferred["conditioning_fps"] = 20.0
             log.warning(
                 "[robolab-policy-server] no training action dataset config found; using default "
-                f"ActionTransformPipeline (format_prompt_as_json={bool(args.format_prompt_as_json)})"
+                f"ActionTransformPipeline (format_prompt_as_json={format_prompt_as_json})"
             )
             return (
                 ActionTransformPipeline(
                     max_action_dim=max_action_dim,
                     cfg_dropout_rate=0.0,
-                    format_prompt_as_json=bool(args.format_prompt_as_json),
+                    format_prompt_as_json=format_prompt_as_json,
                 ),
                 inferred,
             )
@@ -518,8 +544,10 @@ class RobolabPolicyService:
         image = _extract_observation_image(obs)
         image_h = self.cfg.image_height
         image_w = self.cfg.image_width
-        if image.shape[:2] != (image_h, image_w):
+        if self.cfg.action_space != "robocasa_ego" and image.shape[:2] != (image_h, image_w):
             image = _resize_rgb_uint8(image, (image_h, image_w))
+        if self.cfg.action_space == "robocasa_ego":
+            image_h, image_w = image.shape[:2]
         t_frames = self.cfg.action_chunk_size + 1
         video = torch.zeros((3, t_frames, image_h, image_w), dtype=torch.uint8)  # [3,T,H,W]
         video[:, 0] = torch.from_numpy(image.copy()).permute(2, 0, 1)  # [3,H,W]
@@ -531,9 +559,9 @@ class RobolabPolicyService:
         )  # [T,D]
         history_action: torch.Tensor | None = None
         num_history_rows = self.cfg.history_length - use_state_rows
-        gripper_position = 1.0 - _ensure_gripper_array(obs["observation/gripper_position"])
 
         if self.cfg.action_space == "joint_pos":
+            gripper_position = 1.0 - _ensure_gripper_array(obs["observation/gripper_position"])
             joint_position = _ensure_2d_float_array(obs["observation/joint_position"], "observation/joint_position", 7)
             if self.cfg.use_state:
                 action[0] = torch.from_numpy(np.concatenate((joint_position[-1], gripper_position[-1])))  # [D]
@@ -547,6 +575,7 @@ class RobolabPolicyService:
                 history_action = torch.from_numpy(history_np).float()  # [H,D]
 
         if self.cfg.action_space == "midtrain":
+            gripper_position = 1.0 - _ensure_gripper_array(obs["observation/gripper_position"])
             eef_pos = _ensure_2d_float_array(obs["observation/eef_pos"], "observation/eef_pos", 3)
             eef_quat = _ensure_2d_float_array(obs["observation/eef_quat"], "observation/eef_quat", 4)
             if self.cfg.use_state:
@@ -563,6 +592,22 @@ class RobolabPolicyService:
                 )
                 history_action = torch.from_numpy(history_np).float()  # [H,D]
 
+        if self.cfg.action_space == "robocasa_ego":
+            if self.cfg.action_dim != 20:
+                raise ValueError("robocasa_ego requires action_dim=20")
+            if self.cfg.history_length != 1 or not self.cfg.use_state:
+                raise ValueError("robocasa_ego requires use_state=True and history_length=1")
+            state = _ensure_2d_float_array(obs["observation/state"], "observation/state", 16)[-1]
+            eef_pos = state[7:10]
+            eef_quat = state[10:14]
+            eef_rot6d = convert_rotation(eef_quat, "quat_xyzw", "rot6d")
+            gripper = np.asarray([state[14] - state[15]], dtype=np.float32)
+            initial = np.concatenate(
+                [np.zeros(10, dtype=np.float32), eef_pos.astype(np.float32), eef_rot6d.astype(np.float32), gripper],
+                axis=0,
+            )
+            action[0] = torch.from_numpy(initial)
+
         sample: dict[str, Any] = {
             "ai_caption": prompt,
             "video": video,
@@ -571,7 +616,11 @@ class RobolabPolicyService:
             "mode": "wam",
             "domain_id": torch.tensor(get_domain_id(self.cfg.domain_name), dtype=torch.long),  # []
             "viewpoint": "concat_view",
-            "additional_view_description": _CONCAT_VIEW_DESCRIPTION,
+            "additional_view_description": (
+                _ROBOCASA_LEFT_WRIST_DESCRIPTION
+                if self.cfg.action_space == "robocasa_ego"
+                else _CONCAT_VIEW_DESCRIPTION
+            ),
         }
         if history_action is not None:
             sample["history_action"] = history_action
@@ -580,30 +629,63 @@ class RobolabPolicyService:
             sample["ai_caption"] = json.dumps(sample["ai_caption"])
         return sample
 
+    def _local_memory_visual_summary(self, req: dict[str, Any], image: Any) -> torch.Tensor:
+        """Encode one completed RoboCasa pre-action left|wrist image to canonical visual96."""
+        if self.cfg.action_space != "robocasa_ego":
+            raise ValueError("RoboCasa Local Memory visual hook requires action_space=robocasa_ego")
+        rgb = _ensure_rgb_uint8_image(image, "local_memory.image")
+        video = torch.from_numpy(rgb.copy()).permute(2, 0, 1).unsqueeze(1).contiguous()
+        video = self._local_memory_video_resize({"video": video}, resolution=None)["video"]
+        first_frame = video[:, :1].unsqueeze(0)
+        memory = self.local_memory_adapter.memory
+        if memory is None:
+            raise ValueError("Local Memory visual summary requested while memory runtime is disabled")
+        device = next(memory.encoder.parameters()).device
+        with torch.inference_mode():
+            latent = self.model._encode_uint8_vision_item(first_frame.to(device))
+            if latent.ndim != 5 or latent.shape[1] != 48:
+                raise ValueError("RoboCasa Local Memory requires a 48-channel causal VAE latent")
+            summary = F.adaptive_avg_pool2d(latent[0, :, 0].unsqueeze(0), (1, 2)).flatten()
+        if tuple(summary.shape) != (96,) or not torch.isfinite(summary).all():
+            raise ValueError("RoboCasa Local Memory visual summary must be finite [96]")
+        return summary.float().cpu()
+
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+        command = obs.get("_local_memory_command")
+        if command is not None:
+            if command == "reset":
+                self.local_memory_adapter.reset(obs.get("session_id"))
+                return {"status": "reset", "session_id": obs.get("session_id")}
+            if command == "info":
+                return {"local_memory": self.local_memory_adapter.info()}
+            raise ValueError(f"unsupported local memory command: {command!r}")
+
         start_time = time.monotonic()
         sample = self._build_sample(obs)
         data_batch = _build_data_batch_from_sample(sample)
         seed = self._next_seed()
         log.info(f"[robolab-policy-server] prompt={data_batch['ai_caption'][0]!r} seed={seed}")
 
+        def _generate():
+            return self.model.generate_samples_from_batch(
+                data_batch,
+                guidance=self.cfg.guidance,
+                guidance_interval=(
+                    list(self.cfg.guidance_interval) if self.cfg.guidance_interval is not None else None
+                ),
+                seed=[seed],
+                num_steps=self.cfg.num_steps,
+                shift=self.cfg.shift,
+            )
+
         with self._lock:
-            with torch.inference_mode():
-                samples = self.model.generate_samples_from_batch(
-                    data_batch,
-                    guidance=self.cfg.guidance,
-                    guidance_interval=(
-                        list(self.cfg.guidance_interval) if self.cfg.guidance_interval is not None else None
-                    ),
-                    seed=[seed],
-                    num_steps=self.cfg.num_steps,
-                    shift=self.cfg.shift,
-                )
+            samples = self.local_memory_adapter.generate([obs], data_batch, _generate)
 
         action = samples["action"][0][:, : self.cfg.action_dim]  # [T,D]
         action = action[self.cfg.history_length :]  # [T2,D]
         action_np = action.detach().cpu().numpy()  # [T2,D]
-        action_np[:, -1] = 1.0 - action_np[:, -1]
+        if self.cfg.action_space != "robocasa_ego":
+            action_np[:, -1] = 1.0 - action_np[:, -1]
 
         if self.cfg.action_space == "midtrain":
             eef_pos = _ensure_2d_float_array(obs["observation/eef_pos"], "observation/eef_pos", 3)
@@ -621,7 +703,14 @@ class RobolabPolicyService:
             quat_xyzw = convert_rotation(abs_pose[1:, :3, :3], "matrix", "quat_xyzw")
             action_np = np.concatenate([position, quat_xyzw, action_np[:, 9:]], axis=-1)
 
-        outputs: dict[str, Any] = {"action": action_np}
+        outputs: dict[str, Any] = {
+            "action": action_np,
+            "local_memory": (
+                samples.get("_local_memory_status", [None])[0]
+                if self.local_memory_adapter.enabled
+                else None
+            ),
+        }
         if self.cfg.decode_video:
             pred_vision_latent = samples["vision"][0]  # [C,T,H,W]
             video = self.model.decode(pred_vision_latent)  # [1,C,T,H,W]
@@ -643,7 +732,13 @@ def serve(args: RobolabServerArgs) -> None:
     log.info(f"[robolab-policy-server] Server accessible at: ws://{local_ip}:{int(args.port)}/")
     log.info(f"[robolab-policy-server] Health check: http://{local_ip}:{int(args.port)}/healthz")
     server_cls = _load_openpi_websocket_policy_server()
-    server_cls(policy=service, host=args.host, port=int(args.port), metadata={}).serve_forever()
+    metadata = {
+        "local_memory": service.local_memory_adapter.info(),
+        "action_space": service.cfg.action_space,
+        "action_dim": service.cfg.action_dim,
+        "action_chunk_size": service.cfg.action_chunk_size,
+    }
+    server_cls(policy=service, host=args.host, port=int(args.port), metadata=metadata).serve_forever()
 
 
 def main() -> None:
