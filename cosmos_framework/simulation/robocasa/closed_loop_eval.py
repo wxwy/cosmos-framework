@@ -29,6 +29,20 @@ from cosmos_framework.data.generator.action.utils.pose_utils import convert_rota
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
 
 
+# Episode-held-out inverse calibration from formal target-atomic base-active frames
+# (87,013 pairs; train/test split by episode). Maps canonical
+# [ego_dx, ego_dy, relative_yaw] -> raw RoboCasa base_motion[0:3].
+_ROBOCASA_BASE_CALIBRATION_A = np.asarray(
+    [
+        [28.84, 0.396, 0.0438],
+        [-0.104, 29.53, -0.396],
+        [-0.0951, -5.776, 15.91],
+    ],
+    dtype=np.float32,
+)
+_ROBOCASA_BASE_CALIBRATION_B = np.asarray([0.039, -0.0076, -0.0014], dtype=np.float32)
+
+
 def _to_uint8(image: Any) -> np.ndarray:
     arr = np.asarray(image)
     if arr.ndim != 3 or arr.shape[-1] != 3:
@@ -233,7 +247,7 @@ def _rotation_matrix(value: np.ndarray, fmt: str) -> np.ndarray:
 def canonical20_to_env12(
     action20: np.ndarray | list[float],
     *,
-    base_decode_mode: str = "velocity",
+    base_decode_mode: str = "calibrated",
     fps: float = 20.0,
 ) -> np.ndarray:
     """Decode canonical model action into RoboCasa's official flat env action.
@@ -246,24 +260,36 @@ def canonical20_to_env12(
       EEF xyz3 + EEF axis-angle3 + gripper1
       + base_motion4 + control_mode1.
 
-    PandaOmron's base controller is velocity controlled. Training stores the
-    observed per-step base state delta, so velocity mode divides by dt (i.e.
-    multiplies by fps). delta sends per-step values directly; zero disables
-    mobile-base motion for manipulation-only smoke tests.
+    calibrated is the formal default: an episode-held-out linear inverse maps
+    [ego_dx, ego_dy, relative_yaw] back to raw base_motion[0:3], clamps those
+    normalized controller commands to [-1,1], and fixes base_motion[3] to 0
+    because that channel is identically zero in the formal training set.
+
+    Legacy diagnostic modes remain available:
+    - velocity: [ego_dx, ego_dy, relative_yaw, base_dz] * fps
+    - delta:    [ego_dx, ego_dy, relative_yaw, base_dz]
+    - zero:     disable mobile-base motion
     """
     action = np.asarray(action20, dtype=np.float32).reshape(-1)
     if action.shape != (20,) or not np.isfinite(action).all():
         raise ValueError("canonical RoboCasa action must be finite [20]")
     if fps <= 0:
         raise ValueError("fps must be positive")
-    if base_decode_mode not in {"velocity", "delta", "zero"}:
-        raise ValueError("base_decode_mode must be velocity, delta, or zero")
+    if base_decode_mode not in {"calibrated", "velocity", "delta", "zero"}:
+        raise ValueError("base_decode_mode must be calibrated, velocity, delta, or zero")
 
     base_xyz = action[0:3]
     base_rot = _rotation_matrix(action[3:9], "rot6d")
     base_yaw = math.atan2(float(base_rot[1, 0]), float(base_rot[0, 0]))
-    if base_decode_mode == "zero":
+    control = np.float32(1.0 if float(action[9]) >= 0.0 else -1.0)
+
+    if base_decode_mode == "zero" or (base_decode_mode == "calibrated" and control < 0):
         base_motion = np.zeros(4, dtype=np.float32)
+    elif base_decode_mode == "calibrated":
+        canonical_base = np.asarray([base_xyz[0], base_xyz[1], base_yaw], dtype=np.float32)
+        calibrated = _ROBOCASA_BASE_CALIBRATION_A @ canonical_base + _ROBOCASA_BASE_CALIBRATION_B
+        calibrated = np.clip(calibrated, -1.0, 1.0).astype(np.float32)
+        base_motion = np.asarray([calibrated[0], calibrated[1], calibrated[2], 0.0], dtype=np.float32)
     else:
         base_motion = np.asarray([base_xyz[0], base_xyz[1], base_yaw, base_xyz[2]], dtype=np.float32)
         if base_decode_mode == "velocity":
@@ -277,7 +303,6 @@ def canonical20_to_env12(
     if eef_rot.shape != (3,) or not np.isfinite(eef_rot).all():
         raise ValueError("decoded EEF axis-angle must be finite [3]")
 
-    control = np.float32(1.0 if float(action[9]) >= 0.0 else -1.0)
     env_action = np.concatenate(
         [eef_xyz, eef_rot, action[19:20], base_motion, np.asarray([control], dtype=np.float32)]
     ).astype(np.float32)
@@ -624,7 +649,7 @@ def main() -> None:
     parser.add_argument("--replan-steps", type=int, default=5)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--base-decode-mode", choices=("velocity", "delta", "zero"), default="velocity")
+    parser.add_argument("--base-decode-mode", choices=("calibrated", "velocity", "delta", "zero"), default="calibrated")
     parser.add_argument("--local-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-videos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-pred-mp4", action=argparse.BooleanOptionalAction, default=False)
