@@ -21,7 +21,7 @@ set -euo pipefail
 : "${TTT_INNER_LR:=0.1}"
 : "${TTT_B_STREAM:=8}"
 : "${TTT_ACTIVE_GA:=2}"
-: "${RUN_NAME:=local_ttt_robocasa365_target_atomic_n100_fsdp8_t${TTT_TBPTT_STEPS}_d${TTT_DIM}_h${TTT_FAST_HIDDEN_DIM}_k${TTT_K_LOCAL}}"
+: "${RUN_NAME:=local_ttt_robocasa365_target_atomic_n100_fsdp8_k${TTT_K_LOCAL}}"
 
 export NPROC_PER_NODE
 export ROBOCASA_SUITE EDGE_POLICY_CHECKPOINT
@@ -84,8 +84,10 @@ export PSM_R09_B_TTT_ACTIVE_GA="$TTT_ACTIVE_GA"
 export PSM_ACTIVE_PREFETCH_DEPTH="$ROBOCASA_NUM_WORKERS"
 
 TAIL_OVERRIDES=(${EXTRA_TAIL_OVERRIDES:-})
-# Keep the framework output namespace identical to the resume scan namespace,
-# including Local-TTT geometry changes.
+# Keep the framework output namespace identical to the resume scan namespace.
+# Local-TTT geometry compatibility is fail-closed by the checkpoint/runtime
+# contract; do not rename a live formal run merely because implementation
+# metadata was made more explicit.
 TAIL_OVERRIDES+=("job.name=$RUN_NAME")
 if [[ -n "$SAVE_ITER" ]]; then
     TAIL_OVERRIDES+=("checkpoint.save_iter=$SAVE_ITER")
