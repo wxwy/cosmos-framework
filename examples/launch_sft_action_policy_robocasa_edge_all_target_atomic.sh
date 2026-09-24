@@ -21,7 +21,7 @@ set -euo pipefail
 : "${TTT_INNER_LR:=0.1}"
 : "${TTT_B_STREAM:=8}"
 : "${TTT_ACTIVE_GA:=2}"
-: "${RUN_NAME:=local_ttt_robocasa365_target_atomic_n100_fsdp8_k${TTT_K_LOCAL}}"
+: "${RUN_NAME:=local_ttt_robocasa365_target_atomic_n100_fsdp8_t${TTT_TBPTT_STEPS}_d${TTT_DIM}_h${TTT_FAST_HIDDEN_DIM}_k${TTT_K_LOCAL}}"
 
 export NPROC_PER_NODE
 export ROBOCASA_SUITE EDGE_POLICY_CHECKPOINT
