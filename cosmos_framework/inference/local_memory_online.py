@@ -530,7 +530,8 @@ class OnlineRecentHistoryMemory:
     def metadata(self) -> dict:
         with self._lock:
             return {
-                "evidence_version": EVIDENCE_VERSION,
+                "evidence_version": self.evidence_version,
+                "action_dim": self.action_dim,
                 "memory_kind": "bounded_recent_history",
                 "history_horizon": self.history_horizon,
                 "sessions": len(self._records),
