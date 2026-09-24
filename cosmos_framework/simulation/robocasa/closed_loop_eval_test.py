@@ -87,6 +87,56 @@ def test_canonical20_to_env12_identity_rotations() -> None:
     assert np.isclose(env[11], -1.0)
 
 
+def test_calibrated_base_decoder_matches_heldout_inverse_and_zeroes_bm3() -> None:
+    yaw = 0.03
+    base_rot6d = np.asarray(
+        convert_rotation(
+            np.asarray([0.0, 0.0, yaw], dtype=np.float32),
+            input_format="axisangle",
+            output_format="rot6d",
+        ),
+        dtype=np.float32,
+    ).reshape(6)
+    eef_rot6d = _identity_rot6d()
+
+    action = np.zeros(20, dtype=np.float32)
+    action[0:3] = [0.01, 0.02, 0.5]  # base z must be ignored by calibrated decoder
+    action[3:9] = base_rot6d
+    action[9] = 1.0
+    action[13:19] = eef_rot6d
+
+    env = canonical20_to_env12(action, base_decode_mode="calibrated")
+
+    x = np.asarray([0.01, 0.02, yaw], dtype=np.float32)
+    matrix = np.asarray(
+        [
+            [28.84, 0.396, 0.0438],
+            [-0.104, 29.53, -0.396],
+            [-0.0951, -5.776, 15.91],
+        ],
+        dtype=np.float32,
+    )
+    bias = np.asarray([0.039, -0.0076, -0.0014], dtype=np.float32)
+    expected = np.clip(matrix @ x + bias, -1.0, 1.0)
+
+    np.testing.assert_allclose(env[7:10], expected, rtol=0, atol=1e-6)
+    assert env[10] == 0.0
+    assert env[11] == 1.0
+
+
+def test_calibrated_base_decoder_keeps_arm_active_base_inactive() -> None:
+    action = np.zeros(20, dtype=np.float32)
+    action[0:3] = [0.02, -0.03, 0.4]
+    action[3:9] = _identity_rot6d()
+    action[9] = -1.0
+    action[13:19] = _identity_rot6d()
+
+    env = canonical20_to_env12(action, base_decode_mode="calibrated")
+
+    np.testing.assert_allclose(env[7:11], 0.0, rtol=0, atol=0)
+    assert env[11] == -1.0
+
+
 def test_completed_action20_recomputes_observed_base_delta() -> None:
     rot6d = _identity_rot6d()
     predicted = np.zeros(20, dtype=np.float32)
