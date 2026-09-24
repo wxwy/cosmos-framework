@@ -462,6 +462,10 @@ class RobolabPolicyService:
             "checkpoint_path": args.checkpoint_path,
             "output_dir": args.output_dir or _DEFAULT_ROBOLAB_OUTPUT_DIR,
             "sampler": args.sampler,
+            # Training-time RoboCasa Local-TTT disables EMA. Keep inference on
+            # the regular checkpoint weights instead of relying on a CLI flag
+            # that this server does not expose.
+            "use_ema_weights": False,
         }
         if args.experiment is not None:
             setup_overrides["experiment"] = args.experiment
