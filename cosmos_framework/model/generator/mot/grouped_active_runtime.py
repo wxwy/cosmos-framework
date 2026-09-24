@@ -107,12 +107,17 @@ class GroupedSegmentRuntimeOwner(CanonicalSegmentRuntimeOwner):
             terminal = candidate.terminal_slots.get(identity.slot_id)
             if terminal is not None and identity.cursor == 0:
                 candidate.terminal_rebind(terminal)
-            # SegmentIdentity intentionally has no catalog-epoch field.  Reusing a
-            # fully exhausted slot can therefore revisit an equal episode/cursor
-            # identity in a later epoch.  Prune only that slot's historical audit
-            # lists before admission; live stable/terminal authority was already
-            # handled by terminal_rebind above.
-            if identity.cursor == 0 and identity in candidate.committed_identities:
+            # SegmentIdentity intentionally has no catalog-epoch field. A checkpoint
+            # snapshot keeps only the latest audit identity per slot, so after resume
+            # a reused episode may retain (for example) old cursor9 while old cursor0
+            # is no longer present. Checking only whether cursor0 itself is duplicated
+            # therefore misses the collision until that later cursor is reached.
+            #
+            # Any cursor0 after a terminal rebind starts a fresh slot binding. Historical
+            # admission/commit identities for that slot are audit-only (exposure counts
+            # live separately), so clear them unconditionally before admitting the fresh
+            # binding. This is safe both live and after compressed checkpoint restore.
+            if identity.cursor == 0:
                 candidate.admission_order[:] = [
                     item for item in candidate.admission_order if item.slot_id != identity.slot_id
                 ]

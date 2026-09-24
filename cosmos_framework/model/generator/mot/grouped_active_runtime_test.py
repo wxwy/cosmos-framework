@@ -430,3 +430,56 @@ def test_a2_and_scalar_window_objective_have_identical_consumer_mean_scale():
     )
     torch.testing.assert_close(grouped_total, scalar_total, rtol=0, atol=1e-12)
     torch.testing.assert_close(grouped_total, torch.stack(scalar_means).mean(), rtol=0, atol=1e-12)
+
+
+def test_resume_compressed_audit_does_not_collide_on_reused_episode_cursor() -> None:
+    """A resumed slot may retain only an old terminal cursor, not its old cursor0.
+
+    Rebinding at fresh cursor0 must clear the whole slot audit so reaching the
+    same terminal cursor again in a later catalog epoch cannot be rejected as a
+    duplicate committed identity.
+    """
+    driver, _, _ = make_driver(group_size=1, ga=1, widths=(10,))
+    owner = driver.registry.owner
+    scheduler = owner.scheduler
+    source = driver.producer.source_digest
+
+    old_terminal = SegmentIdentity(
+        slot_id=0,
+        episode_id="10",
+        category="suite",
+        cursor=9,
+        segment_id=9,
+        source_digest=source,
+        training_stream_end=True,
+    )
+    # Model the checkpoint-compressed runtime frontier: only the latest audit
+    # identity for the slot survives snapshot/rebuild.
+    scheduler.admission_order = [old_terminal]
+    scheduler.committed_identities = [old_terminal]
+    scheduler.stable_slots = {0: old_terminal}
+    scheduler.terminal_slots = {0: old_terminal}
+
+    for cursor in range(10):
+        identity = SegmentIdentity(
+            slot_id=0,
+            episode_id="10",
+            category="suite",
+            cursor=cursor,
+            segment_id=cursor,
+            source_digest=source,
+            training_stream_end=cursor == 9,
+        )
+        group = GroupedPlanMember(
+            (identity,),
+            (4,),
+            4,
+            "manifest",
+            "config",
+            source,
+        )
+        owner.scheduler = owner._stage_scheduler(group)
+
+    assert owner.scheduler.committed_identities[-1].cursor == 9
+    assert owner.scheduler.committed_identities[-1].episode_id == "10"
+    assert len(owner.scheduler.committed_identities) == 10
