@@ -88,6 +88,19 @@ class PolicyLocalMemoryAdapter:
         elif self.enabled:
             raise ValueError("required Local Memory is absent from this checkpoint model")
 
+        if self.memory is not None:
+            runtime_action_dim = int(getattr(self.memory, "action_dim", self.evidence_action_dim))
+            runtime_evidence_version = str(
+                getattr(self.memory, "evidence_version", self.evidence_version)
+            )
+            if runtime_action_dim != self.evidence_action_dim:
+                raise ValueError(
+                    "Local Memory action-width mismatch between model config and runtime encoder: "
+                    f"config={self.evidence_action_dim}, runtime={runtime_action_dim}"
+                )
+            self.evidence_action_dim = runtime_action_dim
+            self.evidence_version = runtime_evidence_version
+
     def _visual_summary(self, req, image):
         hook = getattr(self.service, "_local_memory_visual_summary", None)
         if hook is not None:
