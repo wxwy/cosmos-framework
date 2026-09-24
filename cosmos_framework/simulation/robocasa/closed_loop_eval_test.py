@@ -153,7 +153,7 @@ def test_annotate_frame_number_matches_libero_overlay_contract() -> None:
     assert annotated.size == frame.size
     assert np.array_equal(arr[0, 0], [0, 255, 0])
     # The top information bar is black away from text and the 3px border.
-    assert np.array_equal(arr[10, 64], [0, 0, 0])
+    assert np.array_equal(arr[20, 64], [0, 0, 0])
 
 
 def test_prediction_video_writer_uses_green_input_red_predictions_and_libero_paths(
