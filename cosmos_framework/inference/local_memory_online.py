@@ -23,7 +23,15 @@ from cosmos_framework.model.generator.mot.local_evidence import (
     RecurrentLocalMemoryBackend,
 )
 
-EVIDENCE_VERSION = "causal_visual96_executed_action10_v1"
+def evidence_version_for_action_dim(action_dim: int) -> str:
+    if not isinstance(action_dim, int) or action_dim <= 0:
+        raise ValueError(f"action_dim must be a positive integer, got {action_dim!r}")
+    return f"causal_visual96_executed_action{action_dim}_v1"
+
+
+# Backward-compatible LIBERO/default evidence version. Online memory instances
+# derive their actual version from the attached evidence encoder.
+EVIDENCE_VERSION = evidence_version_for_action_dim(10)
 
 
 
@@ -89,10 +97,16 @@ class OnlineLocalMemory:
         max_evidence_steps: int = 256,
     ):
         if encoder.feature_config != CANONICAL_EVIDENCE_FEATURE_CONFIG:
-            raise ValueError("online memory requires the canonical visual96/action10 encoder")
+            raise ValueError("online memory requires the canonical visual96/action encoder")
         if max_sessions <= 0 or max_evidence_steps <= 0:
             raise ValueError("online memory bounds must be positive")
+        action_proj = getattr(encoder, "action_proj", None)
+        action_dim = getattr(action_proj, "in_features", None)
+        if not isinstance(action_dim, int) or action_dim <= 0:
+            raise ValueError("online memory could not resolve evidence action width from encoder.action_proj")
         self.encoder, self.core = encoder, core
+        self.action_dim = int(action_dim)
+        self.evidence_version = evidence_version_for_action_dim(self.action_dim)
         self.max_sessions, self.max_evidence_steps = max_sessions, max_evidence_steps
         self._records: dict[str, _Record] = {}
         self._pending: dict[str, OnlineMemoryUpdate] = {}
@@ -111,12 +125,14 @@ class OnlineLocalMemory:
             raise ValueError("invalid or oversized completed-evidence chronology")
         visual = request.visual_summary.detach().to(device="cpu", dtype=torch.float32).clone()
         action = request.executed_action.detach().to(device="cpu", dtype=torch.float32).clone()
-        if tuple(visual.shape) != (n, 96) or tuple(action.shape) != (n, 10):
-            raise ValueError("online evidence must have shapes [N,96] and [N,10]")
+        if tuple(visual.shape) != (n, 96) or tuple(action.shape) != (n, self.action_dim):
+            raise ValueError(
+                f"online evidence must have shapes [N,96] and [N,{self.action_dim}]"
+            )
         if not torch.isfinite(visual).all() or not torch.isfinite(action).all():
             raise ValueError("online evidence must be finite")
         identity = (
-            EVIDENCE_VERSION,
+            self.evidence_version,
             request.session_id,
             request.episode_id,
             request.consumer_step,
@@ -282,7 +298,8 @@ class OnlineLocalMemory:
     def metadata(self) -> dict:
         with self._lock:
             return {
-                "evidence_version": EVIDENCE_VERSION,
+                "evidence_version": self.evidence_version,
+                "action_dim": self.action_dim,
                 "sessions": len(self._records),
                 "pending": len(self._pending),
                 "max_sessions": self.max_sessions,
@@ -335,14 +352,20 @@ class OnlineRecentHistoryMemory:
         max_evidence_steps: int = 256,
     ):
         if encoder.feature_config != CANONICAL_EVIDENCE_FEATURE_CONFIG:
-            raise ValueError("recent-history control requires canonical visual96/action10 evidence")
+            raise ValueError("recent-history control requires canonical visual96/action evidence")
         if recurrent_backend is None:
             raise ValueError("recent-history control requires a recurrent replay backend")
         if encoder.evidence_dim != recurrent_backend.evidence_dim:
             raise ValueError("recent-history encoder/backend evidence dimensions must match")
         if history_horizon <= 0 or max_sessions <= 0 or max_evidence_steps <= 0:
             raise ValueError("recent-history bounds must be positive")
+        action_proj = getattr(encoder, "action_proj", None)
+        action_dim = getattr(action_proj, "in_features", None)
+        if not isinstance(action_dim, int) or action_dim <= 0:
+            raise ValueError("recent-history control could not resolve action width from encoder.action_proj")
         self.encoder, self.recurrent_backend = encoder, recurrent_backend
+        self.action_dim = int(action_dim)
+        self.evidence_version = evidence_version_for_action_dim(self.action_dim)
         self.history_horizon = int(history_horizon)
         self.max_sessions, self.max_evidence_steps = max_sessions, max_evidence_steps
         self._records: dict[str, _RecentHistoryRecord] = {}
@@ -362,12 +385,14 @@ class OnlineRecentHistoryMemory:
             raise ValueError("invalid or oversized completed-evidence chronology")
         visual = request.visual_summary.detach().to(device="cpu", dtype=torch.float32).clone()
         action = request.executed_action.detach().to(device="cpu", dtype=torch.float32).clone()
-        if tuple(visual.shape) != (n, 96) or tuple(action.shape) != (n, 10):
-            raise ValueError("online evidence must have shapes [N,96] and [N,10]")
+        if tuple(visual.shape) != (n, 96) or tuple(action.shape) != (n, self.action_dim):
+            raise ValueError(
+                f"online evidence must have shapes [N,96] and [N,{self.action_dim}]"
+            )
         if not torch.isfinite(visual).all() or not torch.isfinite(action).all():
             raise ValueError("online evidence must be finite")
         identity = (
-            EVIDENCE_VERSION,
+            self.evidence_version,
             "recent_history",
             request.session_id,
             request.episode_id,
@@ -431,7 +456,7 @@ class OnlineRecentHistoryMemory:
                     raise RuntimeError("session limit reached; explicitly close an episode before admitting another")
                 retained_steps: tuple[int, ...] = ()
                 retained_visual = torch.empty(0, 96)
-                retained_action = torch.empty(0, 10)
+                retained_action = torch.empty(0, self.action_dim)
                 token = None
             else:
                 if previous.episode_id != request.episode_id:
