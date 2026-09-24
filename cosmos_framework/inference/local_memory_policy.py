@@ -41,6 +41,10 @@ class PolicyLocalMemoryAdapter:
         config = service.model.config
         self.history_mode = str(getattr(config, "history_mode", "none"))
         self.history_horizon = int(getattr(config, "local_history_horizon", 0))
+        self.evidence_action_dim = int(getattr(config, "local_history_action_dim", 10))
+        if self.evidence_action_dim <= 0:
+            raise ValueError("local_history_action_dim must be positive")
+        self.evidence_version = f"causal_visual96_executed_action{self.evidence_action_dim}_v1"
         ttt_available = bool(getattr(config, "local_ttt_enabled", False))
         recent_available = bool(
             getattr(config, "local_history_enabled", False)
@@ -85,6 +89,13 @@ class PolicyLocalMemoryAdapter:
             raise ValueError("required Local Memory is absent from this checkpoint model")
 
     def _visual_summary(self, req, image):
+        hook = getattr(self.service, "_local_memory_visual_summary", None)
+        if hook is not None:
+            summary = hook(req, image)
+            summary = torch.as_tensor(summary, dtype=torch.float32).flatten().cpu()
+            if tuple(summary.shape) != (96,) or not torch.isfinite(summary).all():
+                raise ValueError("service Local Memory visual summary hook must return finite [96]")
+            return summary
         prep = self.service._prep_policy_item({**req, "image": image})
         first_frame = prep["video_padded"][:, :1].unsqueeze(0)
         device = next(self.memory.encoder.parameters()).device
@@ -296,14 +307,20 @@ class PolicyLocalMemoryAdapter:
         memory = req.get("local_memory")
         if not isinstance(memory, dict):
             raise ValueError("Local Memory checkpoint requires a local_memory session/episode/consumer_step/evidence request")
-        if memory.get("evidence_version", EVIDENCE_VERSION) != EVIDENCE_VERSION:
-            raise ValueError("unsupported local evidence version")
+        if memory.get("evidence_version", self.evidence_version) != self.evidence_version:
+            raise ValueError(
+                f"unsupported local evidence version; expected {self.evidence_version!r}"
+            )
         rows = memory.get("evidence", [])
         if not isinstance(rows, list) or len(rows) > self.memory.max_evidence_steps:
             raise ValueError("invalid or oversized completed evidence list")
         fmt = memory.get("evidence_format", "canonical_features_v1")
-        if fmt not in {"canonical_features_v1", "libero_rgb_action7_v1"}:
+        if fmt not in {"canonical_features_v1", "libero_rgb_action7_v1", "robocasa_rgb_action20_v1"}:
             raise ValueError("unsupported local evidence format")
+        if fmt == "robocasa_rgb_action20_v1" and self.evidence_action_dim != 20:
+            raise ValueError(
+                "robocasa_rgb_action20_v1 requires local_history_action_dim=20"
+            )
         if profile:
             timing["request_validate_ms"] = _profile_elapsed_ms(validation_t0, profile)
         visuals, actions, steps = [], [], []
@@ -313,8 +330,25 @@ class PolicyLocalMemoryAdapter:
                 raise ValueError("each completed evidence row must be an object")
             steps.append(row["source_step"])
             if fmt == "canonical_features_v1":
-                visuals.append(torch.as_tensor(row["visual_summary"], dtype=torch.float32))
-                actions.append(torch.as_tensor(row["executed_action"], dtype=torch.float32))
+                visual = torch.as_tensor(row["visual_summary"], dtype=torch.float32).flatten()
+                action = torch.as_tensor(row["executed_action"], dtype=torch.float32).flatten()
+                if tuple(visual.shape) != (96,) or not torch.isfinite(visual).all():
+                    raise ValueError("canonical visual_summary must be finite [96]")
+                if tuple(action.shape) != (self.evidence_action_dim,) or not torch.isfinite(action).all():
+                    raise ValueError(
+                        f"canonical executed_action must be finite [{self.evidence_action_dim}]"
+                    )
+                visuals.append(visual)
+                actions.append(action)
+            elif fmt == "robocasa_rgb_action20_v1":
+                stage_t0 = _profile_start(profile)
+                visuals.append(self._visual_summary(req, row["image"]))
+                if profile:
+                    visual_encode_ms += _profile_elapsed_ms(stage_t0, profile)
+                action = torch.as_tensor(row["executed_action"], dtype=torch.float32).flatten()
+                if tuple(action.shape) != (20,) or not torch.isfinite(action).all():
+                    raise ValueError("RoboCasa completed executed_action must be finite canonical [20]")
+                actions.append(action)
             else:
                 stage_t0 = _profile_start(profile)
                 visuals.append(self._visual_summary(req, row["image"]))
@@ -329,7 +363,7 @@ class PolicyLocalMemoryAdapter:
                 if profile:
                     action_normalize_ms += _profile_elapsed_ms(stage_t0, profile)
         visual = torch.stack(visuals) if visuals else torch.empty(0, 96)
-        action = torch.stack(actions) if actions else torch.empty(0, 10)
+        action = torch.stack(actions) if actions else torch.empty(0, self.evidence_action_dim)
         request = OnlineMemoryRequest(
             memory.get("session_id"),
             memory.get("episode_id"),
@@ -455,7 +489,7 @@ class PolicyLocalMemoryAdapter:
             "enabled": self.enabled,
             "mode": self.mode,
             "history_mode": self.history_mode,
-            "evidence_version": EVIDENCE_VERSION,
+            "evidence_version": self.evidence_version,
             "memory_kind": data.get("memory_kind", self.memory_kind),
             "history_horizon": (
                 self.history_horizon if self.memory_kind == "native_window" else data.get("history_horizon")
