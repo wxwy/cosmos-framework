@@ -479,18 +479,69 @@ class RobolabPolicyService:
         model_max_action_dim = getattr(getattr(self.model, "config", None), "max_action_dim", None)
         max_action_dim = int(model_max_action_dim) if isinstance(model_max_action_dim, int) else 64
 
+        robocasa_dataset_config = None
         try:
-            dataset_config = (
-                training_config.dataloader_train.dataloaders.action_data.dataloader.dataset
-                if training_config is not None
-                else None
-            )
-            dataset_entry = dataset_config.list_of_datasets[0] if dataset_config is not None else None
-            action_dataset_config = dataset_entry.dataset if dataset_entry is not None else None
+            dataloaders = training_config.dataloader_train.dataloaders if training_config is not None else None
+            if dataloaders is not None and hasattr(dataloaders, "action_data"):
+                dataset_config = dataloaders.action_data.dataloader.dataset
+                dataset_entry = dataset_config.list_of_datasets[0]
+                action_dataset_config = dataset_entry.dataset
+            elif dataloaders is not None:
+                # RoboCasa active Local-TTT has one suite-keyed child dataloader
+                # instead of DROID's action_data/list_of_datasets wrapper.
+                values = list(dataloaders.values()) if hasattr(dataloaders, "values") else []
+                child = values[0] if values else None
+                robocasa_dataset_config = child.dataloader.dataset if child is not None else None
+                dataset_config = None
+                dataset_entry = None
+                action_dataset_config = None
+            else:
+                dataset_config = None
+                dataset_entry = None
+                action_dataset_config = None
         except (AttributeError, IndexError, TypeError):
             dataset_config = None
             dataset_entry = None
             action_dataset_config = None
+            robocasa_dataset_config = None
+
+        if robocasa_dataset_config is not None and args.action_space == "robocasa_ego":
+            chunk_length = getattr(robocasa_dataset_config, "chunk_length", None)
+            if isinstance(chunk_length, int):
+                inferred["action_chunk_size"] = chunk_length
+            fps = getattr(robocasa_dataset_config, "fps", None)
+            if isinstance(fps, (int, float)):
+                inferred["conditioning_fps"] = float(fps)
+            resolution = getattr(robocasa_dataset_config, "resolution", None)
+            if resolution is not None:
+                inferred["resolution"] = str(resolution)
+
+            format_prompt_as_json = (
+                bool(args.format_prompt_as_json)
+                if args.format_prompt_as_json is not None
+                else bool(getattr(robocasa_dataset_config, "format_prompt_as_json", True))
+            )
+            return (
+                ActionTransformPipeline(
+                    tokenizer_config=getattr(robocasa_dataset_config, "tokenizer_config", None),
+                    cfg_dropout_rate=0.0,
+                    max_action_dim=max_action_dim,
+                    append_viewpoint_info=bool(
+                        getattr(robocasa_dataset_config, "append_viewpoint_info", True)
+                    ),
+                    append_duration_fps_timestamps=bool(
+                        getattr(robocasa_dataset_config, "append_duration_fps_timestamps", True)
+                    ),
+                    append_resolution_info=bool(
+                        getattr(robocasa_dataset_config, "append_resolution_info", True)
+                    ),
+                    append_idle_frames=bool(
+                        getattr(robocasa_dataset_config, "append_idle_frames", True)
+                    ),
+                    format_prompt_as_json=format_prompt_as_json,
+                ),
+                inferred,
+            )
 
         if dataset_config is None or dataset_entry is None:
             format_prompt_as_json = (
@@ -632,6 +683,11 @@ class RobolabPolicyService:
                 else _CONCAT_VIEW_DESCRIPTION
             ),
         }
+        if self.cfg.action_space == "robocasa_ego":
+            # At inference the future idle count is unknowable. Match the
+            # established LIBERO serving convention and use the active-motion
+            # prior rather than silently dropping a training-time JSON field.
+            sample["idle_frames"] = torch.tensor(0, dtype=torch.long)
         if history_action is not None:
             sample["history_action"] = history_action
         sample = self._transform(sample, self.cfg.resolution)
