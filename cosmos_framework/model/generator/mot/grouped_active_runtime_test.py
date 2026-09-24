@@ -13,7 +13,7 @@ from .active_local_memory_driver import ActiveLocalMemoryWindowDriver
 from .active_local_memory_driver_test import _FakeProducer, _FakeStream, _model, _registry, _trainer
 from .grouped_active_driver import GroupedActiveLocalMemoryWindowDriver
 from .grouped_active_runtime import GroupedActiveWiringRegistry, GroupedSegmentRuntimeOwner
-from .local_memory_segment import RankLocalSegmentScheduler
+from .local_memory_segment import RankLocalSegmentScheduler, SegmentIdentity
 from .production_segment_bridge import NativeBatchResult
 from .production_segment_wiring import CanonicalSegmentWiring
 
