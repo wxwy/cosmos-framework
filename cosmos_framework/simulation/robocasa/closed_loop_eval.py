@@ -157,11 +157,6 @@ def _rename_with_outcome(path: Path, success: bool) -> None:
         new_path = path.with_name(f"{path.name}_{suffix}")
     else:
         new_path = path.with_name(f"{path.stem}_{suffix}{path.suffix}")
-    if new_path.exists():
-        if new_path.is_dir():
-            shutil.rmtree(new_path)
-        else:
-            new_path.unlink()
     path.rename(new_path)
 
 
