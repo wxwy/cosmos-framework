@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
+from PIL import Image
 
 from cosmos_framework.data.generator.action.utils.pose_utils import convert_rotation
+from cosmos_framework.simulation.robocasa import closed_loop_eval as robocasa_eval
 from cosmos_framework.simulation.robocasa.closed_loop_eval import (
+    _annotate_frame_number,
+    _prediction_frames_from_result,
+    _rename_with_outcome,
+    _save_prediction_videos,
     canonical20_to_env12,
     completed_action20,
     compose_left_wrist,
@@ -131,3 +138,70 @@ def test_robocasa_local_memory_frontier_ack_and_reset() -> None:
     assert after["consumer_step"] == 1
     assert after["evidence"] == []
     assert memory.end(0) == payload["session_id"]
+
+
+def test_annotate_frame_number_matches_libero_overlay_contract() -> None:
+    frame = Image.fromarray(np.full((64, 128, 3), 127, dtype=np.uint8), mode="RGB")
+    annotated = _annotate_frame_number(
+        frame,
+        12,
+        label="input",
+        instruction="pick up the bowl",
+        border_color=(0, 255, 0),
+    )
+    arr = np.asarray(annotated)
+    assert annotated.size == frame.size
+    assert np.array_equal(arr[0, 0], [0, 255, 0])
+    # The top information bar is black away from text and the 3px border.
+    assert np.array_equal(arr[10, 64], [0, 0, 0])
+
+
+def test_prediction_video_writer_uses_green_input_red_predictions_and_libero_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    calls: list[tuple[str, list[Image.Image], int]] = []
+
+    def fake_save_mp4(frames: list[Image.Image], output_path, fps: int) -> None:
+        calls.append((output_path.name, list(frames), fps))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"mp4")
+
+    monkeypatch.setattr(robocasa_eval, "_save_mp4", fake_save_mp4)
+
+    input_frame = Image.fromarray(np.zeros((64, 128, 3), dtype=np.uint8), mode="RGB")
+    rollout = np.stack(
+        [np.full((32, 64, 3), index, dtype=np.uint8) for index in range(17)],
+        axis=0,
+    )
+    predicted = _prediction_frames_from_result(rollout)
+    output_dir = tmp_path / "mp4_pred" / "task_TestTask" / "episode_000"
+    _save_prediction_videos(
+        [(7, input_frame, predicted, "test instruction")],
+        output_dir,
+        20,
+    )
+
+    assert [name for name, _, _ in calls] == [
+        "predict_step000007.mp4",
+        "predict_combined.mp4",
+    ]
+    per_query_frames = calls[0][1]
+    assert len(per_query_frames) == 17
+    assert np.array_equal(np.asarray(per_query_frames[0])[0, 0], [0, 255, 0])
+    assert np.array_equal(np.asarray(per_query_frames[1])[0, 0], [255, 0, 0])
+    assert per_query_frames[1].size == input_frame.size
+    assert calls[0][2] == 20
+    assert len(calls[1][1]) == 17
+
+
+def test_rename_with_outcome_matches_libero_file_and_directory_suffixes(tmp_path) -> None:
+    file_path = tmp_path / "episode_003.mp4"
+    file_path.write_bytes(b"x")
+    _rename_with_outcome(file_path, True)
+    assert (tmp_path / "episode_003_success.mp4").is_file()
+
+    directory = tmp_path / "episode_004"
+    directory.mkdir()
+    _rename_with_outcome(directory, False)
+    assert (tmp_path / "episode_004_fail").is_dir()
