@@ -32,6 +32,58 @@ def request(step=0, *, start=0, session="s", episode="e", reset=False):
     )
 
 
+def test_online_memory_parameterizes_action_width_from_encoder():
+    torch.manual_seed(59)
+    encoder = LocalEvidenceEncoder(
+        action_dim=20,
+        feature_config=CANONICAL_EVIDENCE_FEATURE_CONFIG,
+    )
+    core = ContinualTTTLocalMemoryCore()
+    memory = online.OnlineLocalMemory(encoder, core)
+
+    assert memory.action_dim == 20
+    assert memory.evidence_version == "causal_visual96_executed_action20_v1"
+    assert memory.metadata()["action_dim"] == 20
+    assert memory.metadata()["evidence_version"] == "causal_visual96_executed_action20_v1"
+
+    first = online.OnlineMemoryRequest(
+        "s20",
+        "e20",
+        0,
+        (),
+        torch.empty(0, 96),
+        torch.empty(0, 20),
+        False,
+    )
+    memory.commit(memory.prepare(first))
+
+    request20 = online.OnlineMemoryRequest(
+        "s20",
+        "e20",
+        2,
+        (0, 1),
+        torch.arange(2 * 96, dtype=torch.float32).reshape(2, 96) * 0.0001,
+        torch.arange(2 * 20, dtype=torch.float32).reshape(2, 20) * 0.001,
+        False,
+    )
+    update = memory.prepare(request20)
+    assert update.token is not None
+    memory.commit(update)
+    assert memory.metadata()["steps"] == {"s20": 2}
+
+    bad = online.OnlineMemoryRequest(
+        "other",
+        "e20",
+        0,
+        (),
+        torch.empty(0, 96),
+        torch.empty(0, 10),
+        False,
+    )
+    with pytest.raises(ValueError, match=r"\[N,20\]"):
+        memory.prepare(bad)
+
+
 @pytest.mark.parametrize("steps", [1, 3, 16])
 @pytest.mark.parametrize("inference_mode", [False, True])
 def test_online_matches_canonical_scan_and_never_mutates_slow_weights(steps, inference_mode):
