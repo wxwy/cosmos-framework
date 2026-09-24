@@ -17,10 +17,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image, ImageDraw
 
 from cosmos_framework.data.generator.action.utils.pose_utils import convert_rotation
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
@@ -44,6 +47,170 @@ def compose_left_wrist(obs: dict[str, Any]) -> np.ndarray:
     if left.shape != wrist.shape:
         raise ValueError(f"left/wrist camera shapes differ: {left.shape} vs {wrist.shape}")
     return np.concatenate([left, wrist], axis=1)
+
+
+def _annotate_frame_number(
+    frame: Image.Image,
+    frame_index: int,
+    *,
+    label: str = "",
+    instruction: str = "",
+    border_color: tuple[int, int, int] | None = None,
+) -> Image.Image:
+    """Mirror LIBERO video annotation: instruction left, step/label right, optional 3px border."""
+    annotated = frame.copy()
+    draw = ImageDraw.Draw(annotated)
+    w, h = annotated.size
+
+    bar_h = 24
+    draw.rectangle([(0, 0), (w, bar_h)], fill=(0, 0, 0))
+
+    if instruction:
+        instr = instruction.strip()
+        if len(instr) > 80:
+            instr = instr[:77] + "..."
+        draw.text((4, 5), instr, fill=(255, 255, 255))
+
+    frame_text = f"step {frame_index:04d}"
+    if label:
+        frame_text += f"  {label}"
+    bbox = draw.textbbox((0, 0), frame_text)
+    text_w = bbox[2] - bbox[0]
+    draw.text((w - text_w - 4, 5), frame_text, fill=(255, 255, 0))
+
+    if border_color is not None:
+        for i in range(3):
+            draw.rectangle([(i, i), (w - 1 - i, h - 1 - i)], outline=border_color)
+    return annotated
+
+
+def _save_mp4(frames: list[Image.Image], output_path: Path, fps: int) -> None:
+    """Mirror LIBERO MP4 writer: libx264/yuv420p first, OpenCV mp4v fallback."""
+    if not frames:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    h, w = np.asarray(frames[0]).shape[:2]
+
+    if shutil.which("ffmpeg") is not None:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            str(max(1, int(fps))),
+            "-i",
+            "pipe:0",
+            "-vcodec",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        proc = subprocess.run(
+            cmd,
+            input=b"".join(np.asarray(frame).tobytes() for frame in frames),
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            return
+
+    import cv2
+
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        max(1, int(fps)),
+        (w, h),
+    )
+    if not writer.isOpened():
+        return
+    try:
+        for frame in frames:
+            arr = np.asarray(frame)
+            if arr.ndim == 3:
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            writer.write(arr)
+    finally:
+        writer.release()
+
+
+def _rename_with_outcome(path: Path, success: bool) -> None:
+    """Append _success or _fail to a media file or directory, matching LIBERO."""
+    if not path.exists():
+        return
+    suffix = "success" if success else "fail"
+    if path.is_dir():
+        new_path = path.with_name(f"{path.name}_{suffix}")
+    else:
+        new_path = path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+    if new_path.exists():
+        if new_path.is_dir():
+            shutil.rmtree(new_path)
+        else:
+            new_path.unlink()
+    path.rename(new_path)
+
+
+def _prediction_frames_from_result(video: Any) -> list[Image.Image]:
+    arr = np.asarray(video)
+    if arr.ndim != 4 or arr.shape[-1] != 3:
+        raise ValueError(f"predicted RoboCasa rollout must have shape [T,H,W,3], got {arr.shape}")
+    return [Image.fromarray(_to_uint8(frame), mode="RGB") for frame in arr]
+
+
+def _save_prediction_videos(
+    prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]],
+    output_dir: Path,
+    fps: int,
+) -> None:
+    """Mirror LIBERO prediction videos: green input + red imagined frames, per query and combined."""
+    if not prediction_videos:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    combined: list[Image.Image] = []
+    for step, input_frame, action_frames, task_description in prediction_videos:
+        frames: list[Image.Image] = []
+        output_size = input_frame.size
+        frames.append(
+            _annotate_frame_number(
+                input_frame,
+                step,
+                label="input",
+                instruction=task_description,
+                border_color=(0, 255, 0),
+            )
+        )
+        pred_frames = action_frames[1:] if len(action_frames) > 1 else action_frames
+        n_pred = len(pred_frames)
+        for index, pred_frame in enumerate(pred_frames, start=1):
+            if pred_frame.size != output_size:
+                pred_frame = pred_frame.resize(output_size, Image.Resampling.BILINEAR)
+            frames.append(
+                _annotate_frame_number(
+                    pred_frame,
+                    step,
+                    label=f"pred {index:02d}/{n_pred:02d}",
+                    instruction=task_description,
+                    border_color=(255, 0, 0),
+                )
+            )
+        _save_mp4(frames, output_dir / f"predict_step{step:06d}.mp4", fps)
+        combined.extend(frames)
+    _save_mp4(combined, output_dir / "predict_combined.mp4", fps)
 
 
 def state16_from_observation(obs: dict[str, Any]) -> np.ndarray:
@@ -229,10 +396,10 @@ def evaluate_task(
     base_decode_mode: str,
     local_memory: bool,
     save_videos: bool,
+    save_pred_mp4: bool,
     video_fps: int,
 ) -> dict[str, Any]:
     import gymnasium as gym
-    import imageio.v2 as imageio
     import robocasa  # noqa: F401
     from openpi_client import websocket_client_policy
     from robocasa.utils.dataset_registry_utils import get_task_horizon
@@ -254,6 +421,8 @@ def evaluate_task(
     client = websocket_client_policy.WebsocketClientPolicy(host, port)
     task_root = output_dir / env_name
     task_root.mkdir(parents=True, exist_ok=True)
+    mp4_task_root = output_dir / "mp4" / f"task_{env_name}"
+    mp4_pred_task_root = output_dir / "mp4_pred" / f"task_{env_name}"
 
     successes = 0
     episodes: list[dict[str, Any]] = []
@@ -269,11 +438,15 @@ def evaluate_task(
             query_count = 0
             action_records: list[dict[str, Any]] = []
             prediction_records: list[dict[str, Any]] = []
-            video_frames: list[np.ndarray] = []
+            video_frames: list[Image.Image] = []
+            prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]] = []
 
             try:
                 if save_videos:
-                    video_frames.append(_to_uint8(env.render()))
+                    initial_frame = Image.fromarray(compose_left_wrist(obs), mode="RGB")
+                    video_frames.append(
+                        _annotate_frame_number(initial_frame, 0, instruction=prompt)
+                    )
 
                 while step_count < horizon and not success:
                     query_image = compose_left_wrist(obs)
@@ -303,12 +476,31 @@ def evaluate_task(
                             raise ValueError("Local-TTT response is missing local_memory acknowledgement")
                         memory.acknowledge(0, status)
 
+                    predicted_video = result.get("video")
+                    predicted_frames: list[Image.Image] = []
+                    if predicted_video is not None:
+                        predicted_frames = _prediction_frames_from_result(predicted_video)
+                    if save_pred_mp4:
+                        if not predicted_frames:
+                            raise ValueError(
+                                "save_pred_mp4 requested but policy server returned no predicted rollout video"
+                            )
+                        prediction_videos.append(
+                            (
+                                step_count,
+                                Image.fromarray(query_image, mode="RGB"),
+                                predicted_frames,
+                                prompt,
+                            )
+                        )
+
                     prediction_records.append(
                         {
                             "query_index": query_count,
                             "step_before_query": step_count,
                             "action_chunk": chunk.tolist(),
                             "local_memory": result.get("local_memory"),
+                            "video_frames": len(predicted_frames),
                         }
                     )
                     query_count += 1
@@ -343,8 +535,11 @@ def evaluate_task(
                             }
                         )
                         obs = next_obs
-                        if save_videos and (step_count % 2 == 0 or success or step_count >= horizon):
-                            video_frames.append(_to_uint8(env.render()))
+                        if save_videos:
+                            env_frame = Image.fromarray(compose_left_wrist(obs), mode="RGB")
+                            video_frames.append(
+                                _annotate_frame_number(env_frame, step_count, instruction=prompt)
+                            )
 
                 if success:
                     successes += 1
@@ -374,11 +569,16 @@ def evaluate_task(
                 "predictions": prediction_records,
             }
             _write_json_atomic(task_root / "episodes" / f"episode_{trial:03d}.json", episode_payload)
+
             if save_videos and video_frames:
-                suffix = "success" if success else "failure"
-                video_path = task_root / "videos" / f"episode_{trial:03d}_{suffix}.mp4"
-                video_path.parent.mkdir(parents=True, exist_ok=True)
-                imageio.mimwrite(video_path, video_frames, fps=video_fps)
+                mp4_path = mp4_task_root / f"episode_{trial:03d}.mp4"
+                _save_mp4(video_frames, mp4_path, video_fps)
+                _rename_with_outcome(mp4_path, success)
+
+            if save_pred_mp4 and prediction_videos:
+                pred_dir = mp4_pred_task_root / f"episode_{trial:03d}"
+                _save_prediction_videos(prediction_videos, pred_dir, video_fps)
+                _rename_with_outcome(pred_dir, success)
 
             episodes.append(
                 {
@@ -409,6 +609,7 @@ def evaluate_task(
         "horizon": horizon,
         "base_decode_mode": base_decode_mode,
         "local_memory": local_memory,
+        "save_pred_mp4": save_pred_mp4,
         "episode_results": episodes,
     }
     _write_json_atomic(task_root / "summary.json", summary)
@@ -431,6 +632,7 @@ def main() -> None:
     parser.add_argument("--base-decode-mode", choices=("velocity", "delta", "zero"), default="velocity")
     parser.add_argument("--local-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-videos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save-pred-mp4", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--video-fps", type=int, default=20)
     args = parser.parse_args()
 
@@ -462,6 +664,7 @@ def main() -> None:
                 base_decode_mode=args.base_decode_mode,
                 local_memory=bool(args.local_memory),
                 save_videos=bool(args.save_videos),
+                save_pred_mp4=bool(args.save_pred_mp4),
                 video_fps=args.video_fps,
             )
         )
@@ -479,6 +682,7 @@ def main() -> None:
         "replan_steps": args.replan_steps,
         "base_decode_mode": args.base_decode_mode,
         "local_memory": bool(args.local_memory),
+        "save_pred_mp4": bool(args.save_pred_mp4),
         "tasks": summaries,
     }
     _write_json_atomic(args.output_dir / "summary.json", final)
