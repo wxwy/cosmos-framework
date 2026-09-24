@@ -396,6 +396,23 @@ class RobolabPolicyService:
 
         training_config = _load_training_config(self.setup_args, args.checkpoint_path)
         self._transform, inferred = self._build_transform(training_config, args)
+        if args.action_space == "robocasa_ego":
+            resolved_fps = 20.0 if args.conditioning_fps == _DEFAULT_CONDITIONING_FPS else float(args.conditioning_fps)
+            resolved_resolution = None if args.resolution == "480" else args.resolution
+            resolved_chunk = 16 if args.action_chunk_size == _DEFAULT_ACTION_CHUNK_SIZE else int(args.action_chunk_size)
+            resolved_action_dim = 20 if args.action_dim == _DEFAULT_ACTION_DIM else int(args.action_dim)
+        else:
+            resolved_fps = float(
+                args.conditioning_fps or inferred.get("conditioning_fps") or _DEFAULT_CONDITIONING_FPS
+            )
+            resolved_resolution = args.resolution or inferred.get("resolution")
+            resolved_chunk = int(
+                args.action_chunk_size or inferred.get("action_chunk_size") or _DEFAULT_ACTION_CHUNK_SIZE
+            )
+            resolved_action_dim = int(
+                args.action_dim or (8 if args.action_space == "joint_pos" else 10)
+            )
+
         self.cfg = RobolabPolicyConfig(
             checkpoint_path=self.setup_args.checkpoint_path,
             domain_name=args.domain_name,
@@ -406,17 +423,10 @@ class RobolabPolicyService:
             guidance_interval=args.guidance_interval,
             num_steps=int(args.num_steps),
             shift=float(args.shift),
-            conditioning_fps=float(
-                args.conditioning_fps or inferred.get("conditioning_fps") or _DEFAULT_CONDITIONING_FPS
-            ),
-            resolution=args.resolution or inferred.get("resolution"),
-            action_chunk_size=int(
-                args.action_chunk_size or inferred.get("action_chunk_size") or _DEFAULT_ACTION_CHUNK_SIZE
-            ),
-            action_dim=int(
-                args.action_dim
-                or (8 if args.action_space == "joint_pos" else 20 if args.action_space == "robocasa_ego" else 10)
-            ),
+            conditioning_fps=resolved_fps,
+            resolution=resolved_resolution,
+            action_chunk_size=resolved_chunk,
+            action_dim=resolved_action_dim,
             image_height=int(args.image_height),
             image_width=int(args.image_width),
             action_space=args.action_space,
