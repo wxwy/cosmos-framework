@@ -11,10 +11,12 @@ from cosmos_framework.simulation.robocasa.closed_loop_eval import (
     _prediction_frames_from_result,
     _rename_with_outcome,
     _save_prediction_videos,
+    base_step_diagnostics,
     canonical20_to_env12,
     completed_action20,
     compose_left_wrist,
     state16_from_observation,
+    summarize_base_diagnostics,
 )
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
 
@@ -154,6 +156,93 @@ def test_completed_action20_recomputes_observed_base_delta() -> None:
     assert np.allclose(completed[3:9], rot6d, atol=1e-6)
     assert np.isclose(completed[9], 1.0)
     assert np.allclose(completed[10:], predicted[10:])
+
+
+def test_base_step_diagnostics_decontaminates_yaw_only_for_metrics() -> None:
+    predicted = np.zeros(20, dtype=np.float32)
+    predicted[3:9] = _identity_rot6d()
+    predicted[9] = 1.0
+    predicted[13:19] = _identity_rot6d()
+    predicted[1] = 0.01
+
+    yaw = 0.02
+    completed = predicted.copy()
+    completed[1] = 0.0062  # includes 0.21 * 0.02 = 0.0042 yaw coupling + 0.002 true side
+    completed[3:9] = np.asarray(
+        convert_rotation(
+            np.asarray([0.0, 0.0, yaw], dtype=np.float32),
+            input_format="axisangle",
+            output_format="rot6d",
+        ),
+        dtype=np.float32,
+    ).reshape(6)
+
+    env12 = np.zeros(12, dtype=np.float32)
+    env12[7:11] = [0.1, 0.12, 0.2, 0.0]
+    env12[11] = 1.0
+
+    before = completed.copy()
+    diag = base_step_diagnostics(predicted, completed, env12)
+
+    assert np.array_equal(completed, before)
+    assert diag["base_active"] is True
+    assert np.isclose(diag["completed_relative_yaw"], yaw, atol=1e-6)
+    assert np.isclose(diag["yaw_coupling_side_dy"], 0.0042, atol=1e-6)
+    assert np.isclose(diag["decontaminated_side_dy"], 0.0020, atol=1e-6)
+    assert diag["side_command_in_deadzone"] is True
+    assert diag["predicted_dy_vs_completed_dy_sign_match"] is True
+    assert diag["predicted_dy_vs_decontaminated_dy_sign_match"] is True
+
+
+def test_summarize_base_diagnostics_locks_contract_counts() -> None:
+    rows = [
+        {
+            "base_active": True,
+            "decoded_base_motion": [0.1, 0.12, 0.2, 0.0],
+            "side_command_in_deadzone": True,
+            "predicted_dy_vs_completed_dy_sign_match": False,
+            "predicted_dy_vs_decontaminated_dy_sign_match": True,
+            "decoded_bm1_vs_completed_dy_sign_match": False,
+            "decoded_bm1_vs_decontaminated_dy_sign_match": True,
+        },
+        {
+            "base_active": True,
+            "decoded_base_motion": [-0.4, 0.4, -0.1, 0.0],
+            "side_command_in_deadzone": False,
+            "predicted_dy_vs_completed_dy_sign_match": True,
+            "predicted_dy_vs_decontaminated_dy_sign_match": True,
+            "decoded_bm1_vs_completed_dy_sign_match": True,
+            "decoded_bm1_vs_decontaminated_dy_sign_match": True,
+        },
+        {
+            "base_active": False,
+            "decoded_base_motion": [0.0, 0.0, 0.0, 0.0],
+            "side_command_in_deadzone": False,
+            "predicted_dy_vs_completed_dy_sign_match": None,
+            "predicted_dy_vs_decontaminated_dy_sign_match": None,
+            "decoded_bm1_vs_completed_dy_sign_match": None,
+            "decoded_bm1_vs_decontaminated_dy_sign_match": None,
+        },
+    ]
+
+    summary = summarize_base_diagnostics(rows)
+
+    assert summary["base_active_steps"] == 2
+    assert summary["arm_active_steps"] == 1
+    assert summary["side_deadzone_steps"] == 1
+    assert summary["side_deadzone_fraction"] == 0.5
+    assert summary["bm3_nonzero_steps"] == 0
+    assert summary["arm_active_nonzero_base_steps"] == 0
+    assert summary["predicted_dy_vs_completed_dy"] == {
+        "matches": 1,
+        "count": 2,
+        "rate": 0.5,
+    }
+    assert summary["predicted_dy_vs_decontaminated_dy"] == {
+        "matches": 2,
+        "count": 2,
+        "rate": 1.0,
+    }
 
 
 def test_robocasa_local_memory_frontier_ack_and_reset() -> None:
