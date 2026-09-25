@@ -41,6 +41,10 @@ _ROBOCASA_BASE_CALIBRATION_A = np.asarray(
     dtype=np.float32,
 )
 _ROBOCASA_BASE_CALIBRATION_B = np.asarray([0.039, -0.0076, -0.0014], dtype=np.float32)
+_ROBOCASA_BASE_DECODER_VERSION = "target_atomic_calibrated_linear_v1_20260924"
+_ROBOCASA_BASE_YAW_LEVER_ARM_M = 0.21
+_ROBOCASA_BASE_SIDE_DEADZONE_CMD = 0.25
+_ROBOCASA_RGB_CONTRACT = "training_matched_vertical_flip_v1"
 
 
 def _to_uint8(image: Any) -> np.ndarray:
@@ -321,6 +325,10 @@ def completed_action20(
     Arm/control channels come from the executed command. Base channels are
     recomputed from observed pre/post state exactly like the training loader's
     _build_base_delta path.
+
+    This function is training-parity evidence. Do not subtract yaw/reference-
+    point coupling from completed ego-dy here: the formal training labels
+    contain that coupling. Physics decontamination belongs only in diagnostics.
     """
     predicted = np.asarray(predicted_action20, dtype=np.float32).reshape(-1)
     pre = np.asarray(pre_state16, dtype=np.float32).reshape(-1)
@@ -347,6 +355,136 @@ def completed_action20(
     if result.shape != (20,) or not np.isfinite(result).all():
         raise ValueError("completed RoboCasa evidence must be finite [20]")
     return result
+
+
+def _relative_yaw_from_rot6d(rot6d: np.ndarray | list[float]) -> float:
+    matrix = _rotation_matrix(np.asarray(rot6d, dtype=np.float32), "rot6d")
+    return float(math.atan2(float(matrix[1, 0]), float(matrix[0, 0])))
+
+
+def _nonzero_sign_match(a: float, b: float, *, eps: float = 1e-6) -> bool | None:
+    if abs(a) <= eps or abs(b) <= eps:
+        return None
+    return bool((a > 0.0) == (b > 0.0))
+
+
+def base_step_diagnostics(
+    predicted_action20: np.ndarray | list[float],
+    completed_action20_value: np.ndarray | list[float],
+    env_action12: np.ndarray | list[float],
+) -> dict[str, Any]:
+    """Evaluation-only base diagnostics; never used as Local-TTT evidence."""
+    predicted = np.asarray(predicted_action20, dtype=np.float32).reshape(-1)
+    completed = np.asarray(completed_action20_value, dtype=np.float32).reshape(-1)
+    env12 = np.asarray(env_action12, dtype=np.float32).reshape(-1)
+    if predicted.shape != (20,) or completed.shape != (20,) or env12.shape != (12,):
+        raise ValueError("base diagnostics require predicted[20], completed[20], env_action[12]")
+    if not (np.isfinite(predicted).all() and np.isfinite(completed).all() and np.isfinite(env12).all()):
+        raise ValueError("base diagnostics require finite inputs")
+
+    predicted_yaw = _relative_yaw_from_rot6d(predicted[3:9])
+    completed_yaw = _relative_yaw_from_rot6d(completed[3:9])
+    control_mode = float(env12[11])
+    base_active = control_mode > 0.0
+    decoded_base_motion = env12[7:11].astype(np.float32)
+    yaw_coupling_dy = _ROBOCASA_BASE_YAW_LEVER_ARM_M * completed_yaw
+    decontaminated_side_dy = float(completed[1]) - yaw_coupling_dy
+
+    return {
+        "base_decoder_version": _ROBOCASA_BASE_DECODER_VERSION,
+        "control_mode": control_mode,
+        "base_active": base_active,
+        "predicted_ego_dx": float(predicted[0]),
+        "predicted_ego_dy": float(predicted[1]),
+        "predicted_ego_dz": float(predicted[2]),
+        "predicted_relative_yaw": predicted_yaw,
+        "decoded_base_motion": decoded_base_motion.tolist(),
+        "completed_ego_dx": float(completed[0]),
+        "completed_ego_dy": float(completed[1]),
+        "completed_ego_dz": float(completed[2]),
+        "completed_relative_yaw": completed_yaw,
+        "yaw_coupling_side_dy": yaw_coupling_dy,
+        "decontaminated_side_dy": decontaminated_side_dy,
+        "side_deadzone_threshold": _ROBOCASA_BASE_SIDE_DEADZONE_CMD,
+        "side_command_in_deadzone": bool(
+            base_active and abs(float(decoded_base_motion[1])) < _ROBOCASA_BASE_SIDE_DEADZONE_CMD
+        ),
+        "predicted_dy_vs_completed_dy_sign_match": _nonzero_sign_match(
+            float(predicted[1]), float(completed[1])
+        ),
+        "predicted_dy_vs_decontaminated_dy_sign_match": _nonzero_sign_match(
+            float(predicted[1]), decontaminated_side_dy
+        ),
+        "decoded_bm1_vs_completed_dy_sign_match": _nonzero_sign_match(
+            float(decoded_base_motion[1]), float(completed[1])
+        ),
+        "decoded_bm1_vs_decontaminated_dy_sign_match": _nonzero_sign_match(
+            float(decoded_base_motion[1]), decontaminated_side_dy
+        ),
+    }
+
+
+def _sign_summary(rows: list[dict[str, Any]], key: str) -> dict[str, int | float | None]:
+    valid = [row.get(key) for row in rows if isinstance(row.get(key), bool)]
+    matches = sum(int(value) for value in valid)
+    return {
+        "matches": matches,
+        "count": len(valid),
+        "rate": matches / len(valid) if valid else None,
+    }
+
+
+def summarize_base_diagnostics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    base_rows = [row for row in rows if bool(row.get("base_active"))]
+    arm_rows = [row for row in rows if not bool(row.get("base_active"))]
+    deadzone_count = sum(int(bool(row.get("side_command_in_deadzone"))) for row in base_rows)
+
+    decoded = (
+        np.asarray([row["decoded_base_motion"][:3] for row in base_rows], dtype=np.float32)
+        if base_rows
+        else np.empty((0, 3), dtype=np.float32)
+    )
+    if decoded.size:
+        decoded_stats: dict[str, Any] = {
+            "mean": decoded.mean(axis=0).tolist(),
+            "std": decoded.std(axis=0).tolist(),
+            "min": decoded.min(axis=0).tolist(),
+            "max": decoded.max(axis=0).tolist(),
+        }
+    else:
+        decoded_stats = {"mean": None, "std": None, "min": None, "max": None}
+
+    return {
+        "base_decoder_version": _ROBOCASA_BASE_DECODER_VERSION,
+        "rgb_contract": _ROBOCASA_RGB_CONTRACT,
+        "yaw_lever_arm_m": _ROBOCASA_BASE_YAW_LEVER_ARM_M,
+        "side_deadzone_threshold": _ROBOCASA_BASE_SIDE_DEADZONE_CMD,
+        "steps_total": len(rows),
+        "base_active_steps": len(base_rows),
+        "arm_active_steps": len(arm_rows),
+        "side_deadzone_steps": deadzone_count,
+        "side_deadzone_fraction": deadzone_count / len(base_rows) if base_rows else None,
+        "decoded_bm012_stats": decoded_stats,
+        "predicted_dy_vs_completed_dy": _sign_summary(
+            base_rows, "predicted_dy_vs_completed_dy_sign_match"
+        ),
+        "predicted_dy_vs_decontaminated_dy": _sign_summary(
+            base_rows, "predicted_dy_vs_decontaminated_dy_sign_match"
+        ),
+        "decoded_bm1_vs_completed_dy": _sign_summary(
+            base_rows, "decoded_bm1_vs_completed_dy_sign_match"
+        ),
+        "decoded_bm1_vs_decontaminated_dy": _sign_summary(
+            base_rows, "decoded_bm1_vs_decontaminated_dy_sign_match"
+        ),
+        "arm_active_nonzero_base_steps": sum(
+            int(any(abs(float(v)) > 1e-6 for v in row["decoded_base_motion"]))
+            for row in arm_rows
+        ),
+        "bm3_nonzero_steps": sum(
+            int(abs(float(row["decoded_base_motion"][3])) > 1e-6) for row in rows
+        ),
+    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -460,6 +598,7 @@ def evaluate_task(
             prediction_records: list[dict[str, Any]] = []
             video_frames: list[Image.Image] = []
             prediction_videos: list[tuple[int, Image.Image, list[Image.Image], str]] = []
+            base_diagnostics: list[dict[str, Any]] = []
 
             try:
                 if save_videos:
@@ -538,6 +677,8 @@ def evaluate_task(
                         next_obs, reward, terminated, truncated, info = env.step(convert_action(env12))
                         post_state = state16_from_observation(next_obs)
                         completed20 = completed_action20(action20, pre_state, post_state)
+                        diagnostics = base_step_diagnostics(action20, completed20, env12)
+                        base_diagnostics.append(diagnostics)
                         memory.record_executed(0, pre_image, completed20)
 
                         step_count += 1
@@ -548,6 +689,7 @@ def evaluate_task(
                                 "predicted_canonical20": np.asarray(action20).tolist(),
                                 "completed_canonical20": completed20.tolist(),
                                 "env_action12": env12.tolist(),
+                                "base_diagnostics": diagnostics,
                                 "success_after_step": success,
                                 "reward": float(reward),
                                 "terminated": bool(terminated),
@@ -583,6 +725,9 @@ def evaluate_task(
                 "horizon": horizon,
                 "base_decode_mode": base_decode_mode,
                 "local_memory": local_memory,
+                "base_decoder_version": _ROBOCASA_BASE_DECODER_VERSION,
+                "rgb_contract": _ROBOCASA_RGB_CONTRACT,
+                "base_diagnostics_summary": summarize_base_diagnostics(base_diagnostics),
                 "error": error,
                 "reset_info": reset_info,
                 "actions": action_records,
@@ -606,6 +751,7 @@ def evaluate_task(
                     "success": success,
                     "steps": step_count,
                     "queries": query_count,
+                    "base_diagnostics_summary": summarize_base_diagnostics(base_diagnostics),
                     "error": error,
                 }
             )
@@ -628,8 +774,27 @@ def evaluate_task(
         "success_rate": successes / num_trials,
         "horizon": horizon,
         "base_decode_mode": base_decode_mode,
+        "base_decoder_version": _ROBOCASA_BASE_DECODER_VERSION,
+        "rgb_contract": _ROBOCASA_RGB_CONTRACT,
         "local_memory": local_memory,
         "save_pred_mp4": save_pred_mp4,
+        "base_diagnostics": {
+            "base_active_steps": sum(
+                int(item["base_diagnostics_summary"]["base_active_steps"]) for item in episodes
+            ),
+            "arm_active_steps": sum(
+                int(item["base_diagnostics_summary"]["arm_active_steps"]) for item in episodes
+            ),
+            "side_deadzone_steps": sum(
+                int(item["base_diagnostics_summary"]["side_deadzone_steps"]) for item in episodes
+            ),
+            "bm3_nonzero_steps": sum(
+                int(item["base_diagnostics_summary"]["bm3_nonzero_steps"]) for item in episodes
+            ),
+            "arm_active_nonzero_base_steps": sum(
+                int(item["base_diagnostics_summary"]["arm_active_nonzero_base_steps"]) for item in episodes
+            ),
+        },
         "episode_results": episodes,
     }
     _write_json_atomic(task_root / "summary.json", summary)
@@ -701,6 +866,8 @@ def main() -> None:
         "num_trials_per_task": args.num_trials,
         "replan_steps": args.replan_steps,
         "base_decode_mode": args.base_decode_mode,
+        "base_decoder_version": _ROBOCASA_BASE_DECODER_VERSION,
+        "rgb_contract": _ROBOCASA_RGB_CONTRACT,
         "local_memory": bool(args.local_memory),
         "save_pred_mp4": bool(args.save_pred_mp4),
         "tasks": summaries,
