@@ -28,6 +28,15 @@ A `justfile` is provided at the root with longer recipes (`just install`, `just 
 
 ## Rules
 
+### PSM-WMA project role boundary
+
+For the PSM-WMA `v2` branch, `ds_pro` is validation-only: it may run tests,
+simulator probes, statistics, and produce evidence/artifacts, but it must not
+modify or commit production source, launchers, configs, or formal tests.
+Production-code changes are owned by the GPT/ChatGPT build side. If local
+ds_pro changes are discovered, preserve experiment artifacts/reports and
+restore production files to the GPT/ChatGPT formal child SHA before proceeding.
+
 - Always answer questions with references to code or documentation in `file:line` format.
 - When unsure, point the user to the closest doc rather than guessing.
 - Keep this file short. Link out to skills and docs for detail — this file is included in every prompt.
