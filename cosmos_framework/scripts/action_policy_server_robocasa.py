@@ -477,6 +477,9 @@ class ActionServerArgs(pydantic.BaseModel):
     """Output directory for ``OmniInference`` (saved config.yaml, benchmarks).
     Defaults to ``--dump-dir`` if set, else ``/tmp/cosmos3_action_server``."""
 
+    guardrails: bool = True
+    """是否初始化 common inference 的生成内容 guardrails。"""
+
     # ----- single-rank parallelism / sampler ----------------------------------
     sampler: Literal["unipc", "edm"] = "unipc"
     """Diffusion sampler used by ``OmniInference``."""
@@ -554,6 +557,7 @@ class ActionServerArgs(pydantic.BaseModel):
         base = OmniSetupOverrides.model_validate(self.checkpoint.model_dump())
         base.output_dir = output_dir
         base.sampler = self.sampler
+        base.guardrails = self.guardrails
         return base
 
 

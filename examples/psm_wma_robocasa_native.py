@@ -240,6 +240,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
                 "--num-steps",
                 "30",
                 "--http-400-on-error",
+                "--no-guardrails",
             ]
             # 官方 CLI 没有 normalization=none；不传 stats 即保持原动作值。
         return command, env

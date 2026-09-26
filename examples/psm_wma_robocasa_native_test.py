@@ -214,6 +214,7 @@ class NativeGlueTest(unittest.TestCase):
         checkpoint = self.checkpoint()
         command, _ = native.build_command(self.args("server"))
         self.assertIn(str(checkpoint), command)
+        self.assertIn("--no-guardrails", command)
         for flag, value in (("--raw-action-dim", "15"), ("--action-chunk-size", "32"), ("--fps", "20")):
             self.assertEqual(command[command.index(flag) + 1], value)
         self.assertNotIn("--action-normalization", command)
@@ -224,6 +225,29 @@ class NativeGlueTest(unittest.TestCase):
         self.checkpoint(base_encoding="ego")
         with self.assertRaisesRegex(ValueError, "base_encoding"):
             native.build_command(self.args("server"))
+
+    def test_server_guardrails_default_is_preserved(self):
+        from cosmos_framework.scripts.action_policy_server_robocasa import ActionServerArgs, CheckpointOverrides
+
+        args = ActionServerArgs(checkpoint=CheckpointOverrides(checkpoint_path=str(self.base)))
+        self.assertTrue(args.guardrails)
+        self.assertTrue(args.build_setup_overrides().guardrails)
+
+    def test_server_wrapper_cli_disables_guardrails_in_setup(self):
+        from cosmos_framework.scripts import action_policy_server_robocasa as server
+
+        self.checkpoint()
+        command, _ = native.build_command(self.args("server"))
+        # 使用生产 main 的完整 tyro 配置；只截断 serve，不实例化模型或监听端口。
+        with (
+            mock.patch.object(sys, "argv", ["server", *command[3:]]),
+            mock.patch.object(server, "serve") as serve,
+        ):
+            server.main()
+        args = serve.call_args.args[0]
+        self.assertFalse(args.guardrails)
+        self.assertFalse(args.build_setup_overrides().guardrails)
+        self.assertEqual((args.raw_action_dim, args.action_chunk_size, args.fps), (15, 32, 20))
 
     def test_export_does_not_implicitly_launch_gpu_verify(self):
         self.checkpoint()
