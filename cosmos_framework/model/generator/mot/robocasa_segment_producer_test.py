@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+import h5py
 import pytest
 import torch
 
@@ -107,13 +108,17 @@ def test_foreign_identity_or_wrong_terminal_rejected(tmp_path, change):
         producer.produce(replace(identity, **change))
 
 
-@pytest.mark.parametrize("kind", ["length", "dim64", "nan", "inf"])
+@pytest.mark.parametrize("kind", ["length", "dim64", "dim12", "nan", "inf"])
 def test_source_action_length_and_raw15_fail_closed(tmp_path, kind):
     raw15 = torch.zeros(67, 15)
     if kind == "length":
         raw15 = raw15[:-1]
     elif kind == "dim64":
         raw15 = torch.zeros(67, 64)
+    elif kind == "dim12":
+        path = write_cache(tmp_path / "native.h5")
+        with h5py.File(path, "r") as cache:
+            raw15 = torch.from_numpy(cache["robot/action"][:])
     else:
         raw15[0, 0] = float(kind)
     with pytest.raises(ValueError):

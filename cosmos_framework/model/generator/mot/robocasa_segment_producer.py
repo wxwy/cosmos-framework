@@ -15,7 +15,7 @@ from cosmos_framework.model.generator.mot.robocasa_latent_evidence import RoboCa
 
 
 class RoboCasaSegmentProducer:
-    """T16 是 consumer 段长，chunk32/33帧是每个 consumer 的独立 policy 合同。"""
+    """T16 是 consumer 段长；raw15 必须由 V3 loader 转换，不读取 H5 robot/action。"""
 
     ttt_tbptt_steps = 16
     policy_chunk_length = 32
@@ -36,7 +36,7 @@ class RoboCasaSegmentProducer:
         if episode_id != reader.episode_id or not category:
             raise ValueError("producer episode/category 与缓存身份不匹配")
         if raw15.shape != (reader.source_frames, 15) or raw15.device.type != "cpu":
-            raise ValueError("raw15 必须为与源视频等长的 CPU [source_frames,15]")
+            raise ValueError("raw15 必须为 V3 loader 转换的 CPU [source_frames,15]；禁止 H5 原生12D action")
         if not raw15.is_floating_point() or not torch.isfinite(raw15).all():
             raise ValueError("raw15 必须为有限浮点数，不能使用 padded64 或 state conditioning 行")
         if not callable(payload_at):
