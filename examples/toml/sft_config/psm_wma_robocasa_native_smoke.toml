@@ -1,0 +1,32 @@
+# PSM-WMA V3 Stage A：继承官方 raw15，不复制或修改数据/动作配置。
+# 路径由入口注入；仅缩小运行预算。GA=1，单卡，每步一个样本。
+
+[job]
+task = "vfm"
+experiment = "action_policy_robocasa_nano"
+project = "psm_wma_v3"
+group = "native_robocasa"
+name = "smoke"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree = 1
+data_parallel_replicate_degree = 1
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[trainer]
+max_iter = 3
+logging_iter = 1
+grad_accum_iter = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 1
+
+[dataloader_train]
+max_samples_per_batch = 1
