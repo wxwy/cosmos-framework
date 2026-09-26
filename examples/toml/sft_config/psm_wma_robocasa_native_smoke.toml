@@ -1,11 +1,11 @@
-# PSM-WMA V3 Stage A：继承官方 raw15，不复制或修改数据/动作配置。
+# PSM-WMA V3 Stage A：Edge-Policy-DROID + 官方 RoboCasa raw15。
 # 路径由入口注入；仅缩小运行预算。GA=1，单卡，每步一个样本。
 
 [job]
 task = "vfm"
-experiment = "action_policy_robocasa_nano"
+experiment = "action_policy_robocasa_edge"
 project = "psm_wma_v3"
-group = "native_robocasa"
+group = "edge_robocasa"
 name = "smoke"
 wandb_mode = "disabled"
 

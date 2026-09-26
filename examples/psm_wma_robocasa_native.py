@@ -1,4 +1,4 @@
-"""PSM-WMA V3 原生 raw15 入口；仅组合官方命令，不改变训练与仿真语义。"""
+"""PSM-WMA V3 Edge-Policy-DROID raw15 入口；组合官方训练与仿真命令。"""
 
 from __future__ import annotations
 
@@ -14,6 +14,57 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 RECIPE = REPO / "examples/toml/sft_config/psm_wma_robocasa_native_smoke.toml"
 DATASET_NODE = "dataloader_train.dataloader.datasets.robocasa.dataset"
+
+
+def check_edge_checkpoint(value: str | None) -> Path:
+    if not value or not value.strip():
+        raise ValueError("必须设置非空 EDGE_POLICY_CHECKPOINT，指向本地 Cosmos3-Edge-Policy-DROID")
+    root = require_path(Path(value), "EDGE_POLICY_CHECKPOINT", directory=True)
+    config = json.loads(require_path(root / "config.json", "Edge config.json").read_text())
+    model = config.get("model", {}).get("config", {})
+    expected = dict(action_gen=True, vision_gen=True, max_action_dim=64, num_embodiment_domains=32)
+    for key, expected_value in expected.items():
+        if model.get(key) != expected_value:
+            raise ValueError(f"Edge-Policy-DROID 配置不匹配：{key}")
+    if (
+        model.get("tokenizer", {}).get("encode_exact_durations") != [33]
+        or model.get("vlm_config", {}).get("model_name") != "nvidia/Cosmos3-Edge-Policy-DROID"
+        or config.get("text_config", {}).get("hidden_size") != 2048
+    ):
+        raise ValueError("必须使用 Cosmos3-Edge-Policy-DROID 的配置与 tokenizer")
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "processor_config.json",
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+        "chat_template.jinja",
+    ):
+        require_path(root / name, f"本地 Edge tokenizer {name}")
+    return root
+
+
+def check_droid_dcp(base: Path) -> None:
+    # 仅读 CPU 元数据，不加载模型张量；形状检查可在启动前拒绝 Nano/无动作头基座。
+    from torch.distributed.checkpoint import FileSystemReader
+
+    require_path(base / "model/.metadata", "基座 DCP model/.metadata")
+    policy = json.loads(require_path(base / "checkpoint.json", "DROID policy 元信息").read_text()).get("policy", {})
+    if policy != dict(action_chunk_size=32, conditioning_fps=15.0, domain_name="droid_lerobot"):
+        raise ValueError("基座 DCP 必须来自 Edge-Policy-DROID（32 chunk / 15fps / droid_lerobot）")
+    metadata = FileSystemReader(base / "model").read_metadata().state_dict_metadata
+    expected = {
+        "net.action2llm.fc.weight": (32, 131072),
+        "net.action2llm.bias.weight": (32, 2048),
+        "net.llm2action.fc.weight": (32, 131072),
+        "net.llm2action.bias.weight": (32, 64),
+        "net.action_modality_embed": (2048,),
+        "net.vae2llm.weight": (2048, 192),
+        "net.llm2vae.weight": (192, 2048),
+    }
+    for key, shape in expected.items():
+        if tuple(getattr(metadata.get(key), "size", ())) != shape:
+            raise ValueError(f"Edge DCP 缺少或形状不符：{key}，应为 {shape}")
 
 
 def require_path(value: Path | None, label: str, *, directory: bool = False) -> Path:
@@ -70,13 +121,21 @@ def check_raw15_config(config: Path) -> None:
             raise ValueError(f"raw15 配置不匹配：{key} 应为 {value!r}，实际 {dataset.get(key)!r}")
     if durations != [33]:
         raise ValueError(f"raw15 VAE encode_exact_durations 应为 [33]，实际 {durations!r}")
+    model = data["model"]["config"]
+    for key, value in dict(action_gen=True, vision_gen=True, max_action_dim=64, num_embodiment_domains=32).items():
+        if model.get(key) != value:
+            raise ValueError(f"Edge 模型配置不匹配：{key}")
+    tokenizer = model.get("vlm_config", {}).get("tokenizer", {})
+    local = check_edge_checkpoint(os.environ.get("EDGE_POLICY_CHECKPOINT"))
+    if tokenizer.get("repository") is not None or tokenizer.get("tokenizer_type") != str(local):
+        raise ValueError("训练配置 tokenizer 必须匹配本地 EDGE_POLICY_CHECKPOINT，禁止联网 repo")
 
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("stage", choices=("config", "train", "server", "export", "eval"))
     p.add_argument("--print-command", action="store_true", help="只检查输入并打印命令，不加载模型")
-    p.add_argument("--output-root", type=Path, default=Path("outputs/psm_wma_v3_native"))
+    p.add_argument("--output-root", type=Path, default=Path("outputs/psm_wma_v3_edge"))
     p.add_argument("--dataset-root", type=Path, default=os.environ.get("ROBOCASA_ROOT"))
     p.add_argument("--base-checkpoint", type=Path, default=os.environ.get("BASE_CHECKPOINT_PATH"))
     p.add_argument("--vae", type=Path, default=os.environ.get("WAN_VAE_PATH"))
@@ -103,14 +162,15 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     if not 1 <= args.port <= 65535:
         raise ValueError("--port 必须在 1..65535")
     output = args.output_root.expanduser().resolve()
-    job = output / "psm_wma_v3/native_robocasa/smoke"
+    job = output / "psm_wma_v3/edge_robocasa/smoke"
     env = {"PYTHONPATH": str(REPO)}
     python = sys.executable
 
     if args.stage in ("train", "config"):
         root = check_dataset(args.dataset_root, args.task)
         base = require_path(args.base_checkpoint, "--base-checkpoint / BASE_CHECKPOINT_PATH", directory=True)
-        require_path(base / "model/.metadata", "基座 DCP model/.metadata")
+        edge = check_edge_checkpoint(os.environ.get("EDGE_POLICY_CHECKPOINT"))
+        check_droid_dcp(base)
         vae = require_path(args.vae, "--vae / WAN_VAE_PATH")
         if (job / "checkpoints").exists():
             raise ValueError(f"输出中已有 checkpoint；请使用新的 --output-root，避免 smoke 自动续训：{job}")
@@ -118,6 +178,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
             ROBOCASA_ROOT=str(root),
             BASE_CHECKPOINT_PATH=str(base),
             WAN_VAE_PATH=str(vae),
+            EDGE_POLICY_CHECKPOINT=str(edge),
             IMAGINAIRE_OUTPUT_ROOT=str(output),
         )
         command = [python]
