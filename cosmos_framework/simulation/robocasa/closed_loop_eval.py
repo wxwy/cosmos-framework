@@ -384,6 +384,7 @@ def base_step_diagnostics(
 
     predicted_yaw = _relative_yaw_from_rot6d(predicted[3:9])
     completed_yaw = _relative_yaw_from_rot6d(completed[3:9])
+    predicted_control_value = float(predicted[9])
     control_mode = float(env12[11])
     base_active = control_mode > 0.0
     decoded_base_motion = env12[7:11].astype(np.float32)
@@ -392,6 +393,8 @@ def base_step_diagnostics(
 
     return {
         "base_decoder_version": _ROBOCASA_BASE_DECODER_VERSION,
+        "predicted_control_value": predicted_control_value,
+        "control_mode_threshold": 0.0,
         "control_mode": control_mode,
         "base_active": base_active,
         "predicted_ego_dx": float(predicted[0]),
@@ -439,6 +442,9 @@ def summarize_base_diagnostics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     arm_rows = [row for row in rows if not bool(row.get("base_active"))]
     deadzone_count = sum(int(bool(row.get("side_command_in_deadzone"))) for row in base_rows)
 
+    predicted_control = np.asarray(
+        [float(row["predicted_control_value"]) for row in rows], dtype=np.float32
+    )
     decoded = (
         np.asarray([row["decoded_base_motion"][:3] for row in base_rows], dtype=np.float32)
         if base_rows
@@ -462,6 +468,21 @@ def summarize_base_diagnostics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "steps_total": len(rows),
         "base_active_steps": len(base_rows),
         "arm_active_steps": len(arm_rows),
+        "base_active_fraction": len(base_rows) / len(rows) if rows else None,
+        "predicted_control_value_stats": {
+            "mean": float(predicted_control.mean()) if predicted_control.size else None,
+            "std": float(predicted_control.std()) if predicted_control.size else None,
+            "min": float(predicted_control.min()) if predicted_control.size else None,
+            "max": float(predicted_control.max()) if predicted_control.size else None,
+            "positive_fraction": (
+                float(np.mean(predicted_control >= 0.0)) if predicted_control.size else None
+            ),
+            "near_threshold_fraction_abs_lt_0p1": (
+                float(np.mean(np.abs(predicted_control) < 0.1))
+                if predicted_control.size
+                else None
+            ),
+        },
         "side_deadzone_steps": deadzone_count,
         "side_deadzone_fraction": deadzone_count / len(base_rows) if base_rows else None,
         "decoded_bm012_stats": decoded_stats,
@@ -779,6 +800,9 @@ def evaluate_task(
         "local_memory": local_memory,
         "save_pred_mp4": save_pred_mp4,
         "base_diagnostics": {
+            "steps_total": sum(
+                int(item["base_diagnostics_summary"]["steps_total"]) for item in episodes
+            ),
             "base_active_steps": sum(
                 int(item["base_diagnostics_summary"]["base_active_steps"]) for item in episodes
             ),
