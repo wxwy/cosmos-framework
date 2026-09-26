@@ -186,6 +186,8 @@ def test_base_step_diagnostics_decontaminates_yaw_only_for_metrics() -> None:
 
     assert np.array_equal(completed, before)
     assert diag["base_active"] is True
+    assert np.isclose(diag["predicted_control_value"], 1.0)
+    assert diag["control_mode_threshold"] == 0.0
     assert np.isclose(diag["completed_relative_yaw"], yaw, atol=1e-6)
     assert np.isclose(diag["yaw_coupling_side_dy"], 0.0042, atol=1e-6)
     assert np.isclose(diag["decontaminated_side_dy"], 0.0020, atol=1e-6)
@@ -198,6 +200,7 @@ def test_summarize_base_diagnostics_locks_contract_counts() -> None:
     rows = [
         {
             "base_active": True,
+            "predicted_control_value": 0.2,
             "decoded_base_motion": [0.1, 0.12, 0.2, 0.0],
             "side_command_in_deadzone": True,
             "predicted_dy_vs_completed_dy_sign_match": False,
@@ -207,6 +210,7 @@ def test_summarize_base_diagnostics_locks_contract_counts() -> None:
         },
         {
             "base_active": True,
+            "predicted_control_value": 0.8,
             "decoded_base_motion": [-0.4, 0.4, -0.1, 0.0],
             "side_command_in_deadzone": False,
             "predicted_dy_vs_completed_dy_sign_match": True,
@@ -216,6 +220,7 @@ def test_summarize_base_diagnostics_locks_contract_counts() -> None:
         },
         {
             "base_active": False,
+            "predicted_control_value": -0.6,
             "decoded_base_motion": [0.0, 0.0, 0.0, 0.0],
             "side_command_in_deadzone": False,
             "predicted_dy_vs_completed_dy_sign_match": None,
@@ -231,6 +236,10 @@ def test_summarize_base_diagnostics_locks_contract_counts() -> None:
     assert summary["arm_active_steps"] == 1
     assert summary["side_deadzone_steps"] == 1
     assert summary["side_deadzone_fraction"] == 0.5
+    assert summary["base_active_fraction"] == pytest.approx(2 / 3)
+    assert summary["predicted_control_value_stats"]["positive_fraction"] == pytest.approx(2 / 3)
+    assert summary["predicted_control_value_stats"]["min"] == pytest.approx(-0.6)
+    assert summary["predicted_control_value_stats"]["max"] == pytest.approx(0.8)
     assert summary["bm3_nonzero_steps"] == 0
     assert summary["arm_active_nonzero_base_steps"] == 0
     assert summary["predicted_dy_vs_completed_dy"] == {
