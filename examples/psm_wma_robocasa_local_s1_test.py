@@ -425,6 +425,35 @@ def test_cuda_memory_record_schema_and_no_gpu_guard(monkeypatch: pytest.MonkeyPa
         s1.execute_cuda(_paths(tmp_path), [], {}, None, None)
 
 
+def test_native_consumer_uses_joint_batch_abi_and_packs_text() -> None:
+    from cosmos_framework.data.generator.sequence_packing.sequence import PackedSequenceBuilder
+    from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
+
+    payload = {
+        "video": torch.zeros(3, 33, 2, 4),
+        "action": torch.zeros(33, 64),
+        "action_raw": torch.zeros(33, 15),
+        "text_token_ids": torch.tensor([1, 2, 3]),
+        "conditioning_fps": torch.tensor(20),
+        "raw_action_dim": 15,
+    }
+    batch = s1.collate_native_consumer(payload)
+    for key, shape in (
+        ("video", (3, 33, 2, 4)),
+        ("action", (33, 64)),
+        ("action_raw", (33, 15)),
+        ("text_token_ids", (3,)),
+    ):
+        assert len(batch[key]) == len(batch[key][0]) == 1
+        assert batch[key][0][0].shape == shape
+    assert len(batch["conditioning_fps"]) == 1 and batch["conditioning_fps"][0].shape == (1,)
+    text_ids = OmniMoTModel._load_and_tokenize_text_data(object(), batch, iteration=0)
+    assert text_ids == [[1, 2, 3]]
+    builder = PackedSequenceBuilder()
+    assert builder.pack_text_tokens(text_ids[0], {"eos_token_id": 42, "start_of_generation": 43}, True) == 5
+    assert builder.text_ids == [1, 2, 3, 42, 43]
+
+
 def test_native_callback_single_sample_rgb_and_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     events = []
     monkeypatch.setattr(s1, "record_cuda", lambda trace, phase, index=None: events.append((phase, index)))
@@ -435,12 +464,19 @@ def test_native_callback_single_sample_rgb_and_leaf(monkeypatch: pytest.MonkeyPa
 
     class FakeModel:
         def training_step(self, batch, iteration, *, _local_memory_prefixes):
-            assert iteration == 0 and len(batch["video"]) == 1
+            assert iteration == 0 and len(batch["video"]) == len(batch["video"][0]) == 1
+            assert batch["text_token_ids"][0][0].tolist() == [1, 2, 3]
             leaf = _local_memory_prefixes[0]
             return {}, torch.tensor(0.0) if leaf is None else leaf.square().sum()
 
     callback = s1.native_callback(FakeModel(), [], {})
-    payload = {"video": torch.zeros(3, 33, 2, 4), "action": torch.zeros(33, 15), "ai_caption": "CloseFridge"}
+    payload = {
+        "video": torch.zeros(3, 33, 2, 4),
+        "action": torch.zeros(33, 64),
+        "action_raw": torch.zeros(33, 15),
+        "text_token_ids": torch.tensor([1, 2, 3]),
+        "ai_caption": "CloseFridge",
+    }
     assert callback(payload, None, 0).loss == 0
     leaf = torch.ones(4, 32, requires_grad=True)
     result = callback(payload, leaf, 1)

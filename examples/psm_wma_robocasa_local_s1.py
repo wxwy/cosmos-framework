@@ -228,7 +228,6 @@ def build_stage_a_action_transform(paths: SmokePaths):
 
 
 def _validate_native_payload(payload: dict[str, Any], raw_action: torch.Tensor, step: int) -> dict[str, Any]:
-    from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
     from cosmos_framework.data.generator.sequence_packing import SequencePlan
 
     tokens = payload.get("text_token_ids")
@@ -263,7 +262,18 @@ def _validate_native_payload(payload: dict[str, Any], raw_action: torch.Tensor, 
     structured = json.loads(caption)
     if not isinstance(structured, dict) or not structured.get("actions"):
         raise ValueError(f"consumer {step} 的 Stage-A caption 不是结构化 JSON")
-    custom_collate_fn([payload])
+    batch = collate_native_consumer(payload)
+    for key, value in (
+        ("text_token_ids", tokens),
+        ("video", video),
+        ("action", action),
+        ("action_raw", action_raw),
+    ):
+        items = batch.get(key)
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], list) or len(items[0]) != 1:
+            raise ValueError(f"consumer {step} 的 {key} 不符合生产 JointDataLoader 批次封装")
+        if not torch.equal(items[0][0], value):
+            raise ValueError(f"consumer {step} 的 {key} 批次数据与 Stage-A payload 不一致")
     return {
         "ai_caption": structured,
         "text_token_count": int(tokens.numel()),
@@ -378,9 +388,24 @@ def load_episode_segment(paths: SmokePaths) -> tuple[SegmentBatch, SegmentIdenti
     )
 
 
+def collate_native_consumer(payload: dict[str, Any]) -> dict[str, Any]:
+    """复用生产 JointDataLoader 的单样本拆分与批次封装。"""
+    from collections import deque
+
+    from cosmos_framework.data.generator.joint_dataloader import JointDataLoader, custom_collate_fn
+
+    # B2-C 只有一个 consumer；不启动 worker，但要经过与正式训练相同的 batch ABI。
+    loader = object.__new__(JointDataLoader)
+    loader.buffers = [deque()]
+    loader.dataloaders = [iter((custom_collate_fn([payload]),))]
+    sample = loader._get_next_sample(0)
+    batch: dict[str, Any] = {}
+    loader._update_output_batch(batch, sample)
+    return batch
+
+
 def native_callback(model: Any, trace: list[dict[str, Any]], state: dict[str, Any]):
     """B2-B 单 consumer ABI：仅 policy 原生 loss，缓存 latent 只供 B0 evidence。"""
-    from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
     from cosmos_framework.utils import misc
 
     def forward(payload: dict[str, Any], leaf: torch.Tensor | None, index: int) -> NativeConsumerResult:
@@ -391,7 +416,7 @@ def native_callback(model: Any, trace: list[dict[str, Any]], state: dict[str, An
             record_cuda(trace, "consumer_backward", index - 1)
         state["phase"], state["consumer"] = "native_forward", index
         torch.cuda.reset_peak_memory_stats()
-        batch = misc.to(custom_collate_fn([payload]), device="cuda")
+        batch = misc.to(collate_native_consumer(payload), device="cuda")
         diagnostics, loss = model.training_step(batch, iteration=0, _local_memory_prefixes=(leaf,))
         if not isinstance(loss, torch.Tensor) or loss.ndim != 0:
             raise ValueError("原生 total policy loss 必须为标量")
