@@ -22,6 +22,11 @@ from cosmos_framework.model.generator.mot.robocasa_grouped_segment import (
     materialize_member,
 )
 from cosmos_framework.trainer import ImaginaireTrainer
+from cosmos_framework.trainer.local_memory_grouped_resume import (
+    GroupedLocalMemoryStateCallback,
+    require_dcp_grouped_resume_component,
+    restore_grouped_local_state,
+)
 from cosmos_framework.utils import misc
 
 
@@ -47,10 +52,35 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         self,
         planner: RankLocalGroupedPlanner,
         producer_for: Callable[[CatalogEpisode], Any],
+        *,
+        config_digest: str,
     ) -> None:
-        if getattr(self, "_grouped_window", None) is not None or not callable(producer_for):
-            raise RuntimeError("grouped stream 已启动或 producer_for 不可调用")
+        if (
+            hasattr(self, "_grouped_planner")
+            or getattr(self, "_grouped_window", None) is not None
+            or not callable(producer_for)
+            or not config_digest
+        ):
+            raise RuntimeError("grouped stream 已绑定或 producer_for/config_digest 不合法")
+        if not hasattr(self.callbacks, "_callbacks") or any(
+            getattr(callback, "checkpoint_component", None) == "dataloader" for callback in self.callbacks._callbacks
+        ):
+            raise ValueError("H3-D 要求独占 DCP dataloader state callback")
         self._grouped_planner, self._grouped_producer_for = planner, producer_for
+        self._grouped_config_digest = config_digest
+        self._grouped_completed_iteration = 0
+        self._pending_grouped_resume = None
+        self._resume_required = False
+        self._grouped_restore_failed = False
+        self.callbacks._callbacks.insert(0, GroupedLocalMemoryStateCallback(self))
+
+    def train(self, model, dataloader_train, dataloader_val) -> None:
+        if not hasattr(self, "_grouped_planner"):
+            raise RuntimeError("H3-D train 前必须绑定 grouped stream")
+        if self.config.trainer.save_zero_checkpoint or not self.config.checkpoint.strict_resume:
+            raise ValueError("H3-D 禁止零步 checkpoint，并要求 strict_resume")
+        self._resume_required = require_dcp_grouped_resume_component(self.checkpointer)
+        super().train(model, dataloader_train, dataloader_val)
 
     @staticmethod
     def _require_finite_gradients(optimizer: torch.optim.Optimizer) -> None:
@@ -102,9 +132,27 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             raise ValueError("H3-C 要求 trainer GA2 和 grad_accum_iter 0/1")
         if not hasattr(self, "_grouped_planner"):
             raise RuntimeError("必须先 bind_grouped_stream")
+        if self._grouped_restore_failed:
+            raise RuntimeError("Local 恢复失败后不得继续使用该 trainer 实例")
         model = model_ddp.module if self.config.trainer.distributed_parallelism == "ddp" else model_ddp
         if not hasattr(self, "_grouped_window"):
             self._grouped_window = GroupedLocalMemoryWindow(model, self._grouped_planner)
+            pending = self._pending_grouped_resume
+            if self._resume_required and pending is None:
+                self._grouped_restore_failed = True
+                raise RuntimeError("同 job DCP 未向 grouped callback 恢复 Local 状态")
+            if pending is not None:
+                try:
+                    restore_grouped_local_state(
+                        self._grouped_window,
+                        pending,
+                        iteration=iteration,
+                        config_digest=self._grouped_config_digest,
+                    )
+                except Exception:
+                    self._grouped_restore_failed = True
+                    raise
+                self._pending_grouped_resume = None
         window = self._grouped_window
         if grad_accum_iter == 0:
             window.begin()
@@ -144,6 +192,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             model.on_before_optimizer_step(optimizer, scheduler, iteration=iteration)
             self._require_finite_gradients(optimizer)
             window.finish(lambda: self._optimizer_step_success(optimizer, scheduler, grad_scaler))
+            self._grouped_completed_iteration = iteration + 1
             self.callbacks.on_before_zero_grad(model, optimizer, scheduler, iteration=iteration)
             model.on_before_zero_grad(optimizer, scheduler, iteration=iteration)
             self._zero_grad(model, optimizer, iteration)

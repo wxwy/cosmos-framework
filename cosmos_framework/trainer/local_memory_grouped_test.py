@@ -19,6 +19,7 @@ from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrai
 class _Hooks:
     def __init__(self):
         self.events = []
+        self._callbacks = []
 
     def __getattr__(self, name):
         def record(*args, **kwargs):
@@ -55,7 +56,9 @@ def _trainer() -> GroupedLocalMemoryTrainer:
     trainer.config = SimpleNamespace(trainer=SimpleNamespace(grad_accum_iter=2, distributed_parallelism="fsdp"))
     trainer.callbacks = _Hooks()
     trainer.training_timer = lambda name: nullcontext()
-    trainer.bind_grouped_stream(RankLocalGroupedPlanner(_rank_catalog(16, frames=64), rank=0), lambda _: None)
+    trainer.bind_grouped_stream(
+        RankLocalGroupedPlanner(_rank_catalog(16, frames=64), rank=0), lambda _: None, config_digest="config"
+    )
     return trainer
 
 
