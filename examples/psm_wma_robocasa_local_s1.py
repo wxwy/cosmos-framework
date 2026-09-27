@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
 import os
+import random
 import subprocess
 import sys
 import traceback
@@ -32,6 +35,7 @@ CURSOR = 0
 T = 16
 LOCAL_PARAMS = 165_312
 LR = 5e-5
+TRANSFORM_SEED = 0
 STAGE_A_ROOT = Path(
     "/disk/rl/worktrees/psm_wma-v3/artifacts/v3/stage_a_edge_raw15_run02/psm_wma_v3/edge_robocasa/smoke"
 )
@@ -202,6 +206,74 @@ def load_stage_a_host(model: torch.nn.Module, checkpoint: Path) -> dict[str, Any
     return report
 
 
+def build_stage_a_action_transform(paths: SmokePaths):
+    """使用冻结 Stage-A 数据配置构建与 SFT dataset 相同的转换链。"""
+    from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
+    from cosmos_framework.utils.lazy_config import LazyConfig
+
+    dataset = LazyConfig.load(str(paths.config)).dataloader_train.dataloader.datasets.robocasa.dataset
+    if dataset.tokenizer_config.tokenizer_type != str(paths.edge):
+        raise ValueError("Stage-A 数据 tokenizer 必须指向本地 Edge checkpoint")
+    transform = ActionTransformPipeline(
+        tokenizer_config=dataset.tokenizer_config,
+        cfg_dropout_rate=dataset.cfg_dropout_rate,
+        max_action_dim=dataset.max_action_dim,
+        append_viewpoint_info=dataset.append_viewpoint_info,
+        append_duration_fps_timestamps=dataset.append_duration_fps_timestamps,
+        append_resolution_info=dataset.append_resolution_info,
+        append_idle_frames=dataset.append_idle_frames,
+        format_prompt_as_json=dataset.format_prompt_as_json,
+    )
+    return transform, dataset.resolution
+
+
+def _validate_native_payload(payload: dict[str, Any], raw_action: torch.Tensor, step: int) -> dict[str, Any]:
+    from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
+    from cosmos_framework.data.generator.sequence_packing import SequencePlan
+
+    tokens = payload.get("text_token_ids")
+    plan = payload.get("sequence_plan")
+    action, action_raw, video = payload.get("action"), payload.get("action_raw"), payload.get("video")
+    if not isinstance(tokens, torch.Tensor) or tokens.ndim != 1 or tokens.dtype != torch.long or not tokens.numel():
+        raise ValueError(f"consumer {step} 缺少有效 text_token_ids")
+    if (
+        not isinstance(plan, SequencePlan)
+        or not all(getattr(plan, key, False) for key in ("has_text", "has_vision", "has_action"))
+        or getattr(plan, "condition_frame_indexes_vision", None) != [0]
+        or getattr(plan, "condition_frame_indexes_action", None) != [0]
+    ):
+        raise ValueError(f"consumer {step} 缺少 WAM action-policy sequence_plan")
+    if not isinstance(action_raw, torch.Tensor) or not torch.equal(action_raw, raw_action):
+        raise ValueError(f"consumer {step} 的 action_raw 不再等于官方 raw15")
+    if (
+        not isinstance(action, torch.Tensor)
+        or action.shape != (33, 64)
+        or not torch.equal(action[:, :15], raw_action)
+        or bool(torch.count_nonzero(action[:, 15:]))
+        or payload.get("raw_action_dim") != 15
+    ):
+        raise ValueError(f"consumer {step} 的 padded64 动作合同不匹配")
+    if not isinstance(video, torch.Tensor) or video.ndim != 4 or video.shape[:2] != (3, 33):
+        raise ValueError(f"consumer {step} 的 Stage-A RGB/33 帧合同不匹配")
+    if "video_latent" in payload:
+        raise ValueError("cached latent 不得进入主 policy payload")
+    caption = payload.get("ai_caption")
+    if not isinstance(caption, str) or not caption:
+        raise ValueError(f"consumer {step} 的 Stage-A caption 被 CFG dropout 清空")
+    structured = json.loads(caption)
+    if not isinstance(structured, dict) or not structured.get("actions"):
+        raise ValueError(f"consumer {step} 的 Stage-A caption 不是结构化 JSON")
+    custom_collate_fn([payload])
+    return {
+        "ai_caption": structured,
+        "text_token_count": int(tokens.numel()),
+        "text_token_sha256": hashlib.sha256(",".join(map(str, tokens.tolist())).encode()).hexdigest(),
+        "sequence_plan": plan.as_dict(),
+        "action_shape": list(action.shape),
+        "action_raw_shape": list(action_raw.shape),
+    }
+
+
 def load_episode_segment(paths: SmokePaths) -> tuple[SegmentBatch, SegmentIdentity, dict[str, Any]]:
     """从精确 v3 episode0 取得完整 raw15 与 16 个官方 RGB payload。"""
     from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset import RoboCasaLeRobotDataset
@@ -246,7 +318,7 @@ def load_episode_segment(paths: SmokePaths) -> tuple[SegmentBatch, SegmentIdenti
     raw15 = torch.cat((raw12[:, :5], dataset._build_frame_wise_action(raw12)), dim=-1)
     if raw15.shape != (frames, 15) or not torch.isfinite(raw15).all():
         raise ValueError("官方转换的完整 episode raw15 非法")
-    payloads = []
+    raw_payloads = []
     for step in range(T):
         flat = flat_start + step
         if dataset._resolve_index(flat) != (source, row_start + step, EPISODE_INDEX, step):
@@ -267,6 +339,16 @@ def load_episode_segment(paths: SmokePaths) -> tuple[SegmentBatch, SegmentIdenti
             raise ValueError(f"consumer {step} 的重叠 raw15 transition 不一致")
         if "video_latent" in payload:
             raise ValueError("cached latent 不得进入主 policy payload")
+        raw_payloads.append(payload)
+    transform, resolution = build_stage_a_action_transform(paths)
+    random.seed(TRANSFORM_SEED)
+    payloads = []
+    consumer0 = None
+    for step, raw_payload in enumerate(raw_payloads):
+        payload = transform(copy.deepcopy(raw_payload), resolution)
+        summary = _validate_native_payload(payload, raw_payload["action"], step)
+        if step == 0:
+            consumer0 = summary
         payloads.append(payload)
     reader = RoboCasaLatentReader(paths.cache, expected_episode_id=EPISODE_ID, expected_source_frames=frames)
     producer = RoboCasaSegmentProducer(
@@ -283,7 +365,17 @@ def load_episode_segment(paths: SmokePaths) -> tuple[SegmentBatch, SegmentIdenti
     segment = producer.produce(identity)
     if segment.consumer_step.tolist() != [list(range(T))] or not bool(segment.consumer_valid.all()):
         raise ValueError("B2-C cursor0 必须恰有 16 个有效 consumer")
-    return segment, identity, {"frames": frames, "raw_action_dim": 15, "payloads": len(payloads)}
+    return (
+        segment,
+        identity,
+        {
+            "frames": frames,
+            "raw_action_dim": 15,
+            "payloads": len(payloads),
+            "transform_seed": TRANSFORM_SEED,
+            "consumer0": consumer0,
+        },
+    )
 
 
 def native_callback(model: Any, trace: list[dict[str, Any]], state: dict[str, Any]):

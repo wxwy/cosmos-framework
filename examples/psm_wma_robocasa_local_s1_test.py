@@ -179,6 +179,57 @@ def test_stage_a_dcp_load_writes_host_and_preserves_local(tmp_path: Path, monkey
 
 def test_episode0_official_raw15_overlap_and_b1_segment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     paths = _paths(tmp_path)
+    import yaml
+
+    paths.config.parent.mkdir(parents=True)
+    paths.config.write_text(
+        yaml.safe_dump(
+            {
+                "dataloader_train": {
+                    "dataloader": {
+                        "datasets": {
+                            "robocasa": {
+                                "dataset": {
+                                    "tokenizer_config": {
+                                        "_target_": "cosmos_framework.data.generator.processors.build_processor_lazy",
+                                        "tokenizer_type": str(paths.edge),
+                                    },
+                                    "cfg_dropout_rate": 0.1,
+                                    "max_action_dim": 64,
+                                    "append_viewpoint_info": True,
+                                    "append_duration_fps_timestamps": True,
+                                    "append_resolution_info": True,
+                                    "append_idle_frames": True,
+                                    "format_prompt_as_json": True,
+                                    "resolution": None,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        )
+    )
+    from cosmos_framework.data.generator.action.utils import transforms
+    from cosmos_framework.data.generator.augmentors import text_tokenizer
+
+    class FakeProcessor:
+        def tokenize_text(self, caption, *, is_video, use_system_prompt):
+            assert not is_video and not use_system_prompt
+            return list(caption.encode())
+
+    monkeypatch.setattr(text_tokenizer, "lazy_instantiate", lambda config: FakeProcessor())
+
+    def resize(self, data, resolution):
+        assert resolution is None
+        data["image_size"] = (2, 4)
+        return data
+
+    monkeypatch.setattr(transforms.VideoResize, "__call__", resize)
+    transform, resolution = s1.build_stage_a_action_transform(paths)
+    assert resolution is None and transform.max_action_dim == 64
+    assert transform.prompt_json_formatter is not None and transform.text_tokenizer.cfg_dropout_rate == 0.1
+    assert transform.text_tokenizer._processor.__class__ is FakeProcessor
     raw12 = torch.arange(48 * 12, dtype=torch.float32).reshape(48, 12) / 100
     arm = torch.cat((raw12[:, 5:8], torch.ones(48, 6), raw12[:, 11:12]), dim=-1)
     raw15 = torch.cat((raw12[:, :5], arm), dim=-1)
@@ -211,7 +262,19 @@ def test_episode0_official_raw15_overlap_and_b1_segment(tmp_path: Path, monkeypa
             action = torch.cat((torch.zeros(1, 15), raw15[index : index + 32]))
             if corrupt["enabled"] and index == 3:
                 action[1, 0] += 1
-            return {"action": action, "video": torch.zeros(3, 33, 2, 4)}
+            payload = {
+                "action": action,
+                "video": torch.zeros(3, 33, 2, 4),
+                "ai_caption": "CloseFridge",
+                "conditioning_fps": torch.tensor(20),
+                "mode": "wam",
+                "domain_id": torch.tensor(30),
+                "viewpoint": "concat_view",
+                "idle_frames": torch.tensor(0),
+                "additional_view_description": "The left half is a third-person view. The right half is a wrist view.",
+            }
+            assert "text_token_ids" not in payload and "sequence_plan" not in payload
+            return payload
 
     from cosmos_framework.data.generator.action.datasets import robocasa_lerobot_dataset
 
@@ -229,10 +292,38 @@ def test_episode0_official_raw15_overlap_and_b1_segment(tmp_path: Path, monkeypa
     segment, identity, evidence = s1.load_episode_segment(paths)
     assert segment.consumer_step.tolist() == [list(range(16))]
     assert segment.evidence_source_step.tolist() == [[-1, *range(15)]]
-    assert identity.episode_id == "ep_000000" and evidence == {"frames": 48, "raw_action_dim": 15, "payloads": 16}
+    assert identity.episode_id == "ep_000000"
+    assert {key: evidence[key] for key in ("frames", "raw_action_dim", "payloads", "transform_seed")} == {
+        "frames": 48,
+        "raw_action_dim": 15,
+        "payloads": 16,
+        "transform_seed": 0,
+    }
+    assert evidence["consumer0"]["ai_caption"]["actions"][0]["description"] == "CloseFridge."
+    assert evidence["consumer0"]["text_token_count"] > 0
+    assert evidence["consumer0"]["action_shape"] == [33, 64]
+    assert evidence["consumer0"]["action_raw_shape"] == [33, 15]
+    for step, payload in enumerate(segment.consumer_payload[0]):
+        assert payload["text_token_ids"].dtype == torch.long and payload["text_token_ids"].numel()
+        assert payload["sequence_plan"].has_action and payload["sequence_plan"].has_text
+        torch.testing.assert_close(payload["action_raw"][1:], raw15[step : step + 32])
+        assert payload["action"].shape == (33, 64) and payload["raw_action_dim"] == 15
+        assert "video_latent" not in payload
+    repeated, _, repeated_evidence = s1.load_episode_segment(paths)
+    assert repeated_evidence["consumer0"]["text_token_sha256"] == evidence["consumer0"]["text_token_sha256"]
+    assert repeated_evidence["consumer0"]["text_token_count"] == evidence["consumer0"]["text_token_count"]
+    assert all(payload["ai_caption"] for payload in repeated.consumer_payload[0])
     corrupt["enabled"] = True
     with pytest.raises(ValueError, match="重叠 raw15"):
         s1.load_episode_segment(paths)
+
+
+def test_untransformed_raw_payload_reproduces_missing_text_tokens() -> None:
+    raw = torch.zeros(33, 15)
+    payload = {"action": raw, "video": torch.zeros(3, 33, 2, 4), "ai_caption": "CloseFridge"}
+    assert "text_token_ids" not in payload and "sequence_plan" not in payload
+    with pytest.raises(ValueError, match="text_token_ids"):
+        s1._validate_native_payload(payload, raw, 0)
 
 
 def test_local_config_overlay_and_optimizer_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
