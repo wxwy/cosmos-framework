@@ -32,6 +32,7 @@ from cosmos_framework.model.generator.mot.flex_attention import (
     SensorMaskItem,
     build_multiview_block_mask,
 )
+from cosmos_framework.model.generator.mot.memory_prefix import LocalMemoryRuntime, build_memory_prefix_context
 from cosmos_framework.model.generator.mot.modeling_utils import TimestepEmbedder, has_noisy_tokens
 from cosmos_framework.model.generator.mot.multiview_attention import (
     reject_mixed_caption_layouts,
@@ -87,6 +88,15 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         joint_attn_implementation="two_way",
         multiview_attention_config: MultiviewAttentionConfig | None = None,
         action_dim=32,
+        local_memory_enabled: bool = False,
+        local_memory_dim: int = 32,
+        local_memory_evidence_dim: int = 256,
+        local_memory_action_dim: int = 15,
+        local_memory_ttt_dim: int = 64,
+        local_memory_fast_hidden_dim: int = 256,
+        local_memory_inner_lr: float = 0.1,
+        local_memory_ttt_tbptt_steps: int = 16,
+        local_memory_k_local: int = 4,
         num_embodiment_domains=32,
         action_io_projector_type: str = ACTION_IO_PROJECTOR_DOMAIN_AWARE,
         temporal_compression_factor_vision=4,
@@ -152,6 +162,15 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         # action related parameters
         self.action_gen = action_gen  # whether to generate action tokens
         self.action_dim = action_dim
+        self.local_memory_enabled = local_memory_enabled
+        self.local_memory_dim = local_memory_dim
+        self.local_memory_evidence_dim = local_memory_evidence_dim
+        self.local_memory_action_dim = local_memory_action_dim
+        self.local_memory_ttt_dim = local_memory_ttt_dim
+        self.local_memory_fast_hidden_dim = local_memory_fast_hidden_dim
+        self.local_memory_inner_lr = local_memory_inner_lr
+        self.local_memory_ttt_tbptt_steps = local_memory_ttt_tbptt_steps
+        self.local_memory_k_local = local_memory_k_local
         self.num_embodiment_domains = num_embodiment_domains
         if action_io_projector_type not in ACTION_IO_PROJECTOR_TYPES:
             raise ValueError(
@@ -193,6 +212,21 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         self.num_hidden_layers = text_config.num_hidden_layers
         self.attention_io_layout = "sequence_sharded"
         self.predict_text_tokens = config.predict_text_tokens
+        if config.local_memory_enabled:
+            if config.joint_attn_implementation != "two_way":
+                raise ValueError("Local Memory requires two_way attention")
+            self.local_memory_runtime = LocalMemoryRuntime(
+                evidence_dim=config.local_memory_evidence_dim,
+                action_dim=config.local_memory_action_dim,
+                local_dim=config.local_memory_dim,
+                ttt_dim=config.local_memory_ttt_dim,
+                fast_hidden_dim=config.local_memory_fast_hidden_dim,
+                inner_lr=config.local_memory_inner_lr,
+                ttt_tbptt_steps=config.local_memory_ttt_tbptt_steps,
+                k_local=config.local_memory_k_local,
+            )
+            self.local_memory2llm = nn.Linear(config.local_memory_dim, self.hidden_size)
+            self.local_memory_modality_embed = nn.Parameter(torch.empty(self.hidden_size))
 
         if config.natten_parameter_list is not None and config.joint_attn_implementation != "three_way":
             raise NotImplementedError(
@@ -325,6 +359,16 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         self.parallel_dims = None
 
     def init_weights(self, buffer_device: torch.device | None):
+        if self.config.local_memory_enabled:
+            self.local_memory_runtime.encoder.visual_proj.reset_parameters()
+            self.local_memory_runtime.encoder.action_proj.reset_parameters()
+            self.local_memory_runtime.encoder.norm.reset_parameters()
+            self.local_memory_runtime.core.reset_parameters()
+            std = 1.0 / math.sqrt(self.config.local_memory_dim)
+            torch.nn.init.trunc_normal_(self.local_memory2llm.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.zeros_(self.local_memory2llm.bias)
+            std = 1.0 / math.sqrt(self.hidden_size)
+            torch.nn.init.trunc_normal_(self.local_memory_modality_embed, std=std, a=-3 * std, b=3 * std)
         if self.config.vision_gen or self.config.action_gen or self.config.sound_gen:
             self.time_embedder._init_weights(buffer_device=buffer_device)
 
@@ -1446,7 +1490,37 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         # This is intentional for proper batch norm / dropout behavior
         # assert self.training, "Cosmos3VFMNetwork only supports training mode"
 
+        local_tokens = packed_seq.local_memory_tokens
+        has_local_tokens = local_tokens is not None and any(token is not None for token in local_tokens)
+        if has_local_tokens:
+            if (
+                not self.config.local_memory_enabled
+                or not self.training
+                or not torch.is_grad_enabled()
+                or torch.is_inference_mode_enabled()
+                or memory is not None
+            ):
+                raise ValueError("Local Memory is limited to enabled native training without KV cache")
+            if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
+                raise ValueError("Local Memory does not support context parallelism")
+            if self.pad_for_cuda_graphs or self.flex_backend is not None or self.multiview_backend is not None:
+                raise ValueError("Local Memory does not support CUDA graphs or multiview")
+            if any(
+                token is not None and token.shape != (self.config.local_memory_k_local, self.config.local_memory_dim)
+                for token in local_tokens
+            ):
+                raise ValueError("Local Memory token K/D does not match configured prefix")
+
         packed_sequence, target_dtype = self._encode_text(packed_seq)  # packed_sequence: [N_total,hidden_size]
+        memory_prefix_context = None
+        if has_local_tokens:
+            memory_prefix_context = build_memory_prefix_context(
+                local_tokens,
+                self.local_memory2llm,
+                self.local_memory_modality_embed,
+                target_dtype=target_dtype,
+                k_local=self.config.local_memory_k_local,
+            )
 
         # encode vision tokens
         original_latent_shapes: List[Tuple[int, int, int]] | None = None
@@ -1624,6 +1698,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             position_ids=packed_position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            memory_prefix_context=memory_prefix_context,
         )
         last_hidden_state = get_context_parallel_last_hidden_state(
             packed_outputs=packed_outputs,

@@ -68,6 +68,9 @@ class GenerationDataClean:
     x0_tokens_sound: torch.Tensor | None = None
     fps_sound: torch.Tensor | None = None
 
+    # Dense over samples whose SequencePlan.has_local_memory is true; never noised.
+    x0_tokens_local_memory: list[torch.Tensor] | None = None
+
     # Action (dense list of per-sample tensors, only action-having samples)
     raw_state_action: list[torch.Tensor] | None = None
     x0_tokens_action: list[torch.Tensor] | None = None

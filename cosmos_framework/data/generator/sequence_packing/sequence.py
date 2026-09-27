@@ -1276,6 +1276,9 @@ class PackedSequence:
     action: ModalityData | None = None
     sound: ModalityData | None = None
 
+    # Out-of-band K/V-only payload; one immutable entry per sample.
+    local_memory_tokens: tuple[torch.Tensor | None, ...] | None = None
+
     # Multi-control transfer: per-sample list of per-vision-item token counts.
     # For a multi-control transfer sample with N controls + 1 noisy target,
     # vision_item_split_lens[i] = [L_ctrl0, L_ctrl1, ..., L_ctrlN-1, L_noisy].
@@ -1366,6 +1369,11 @@ class PackedSequence:
             self.action.to_cuda()
         if self.sound is not None:
             self.sound.to_cuda()
+        if self.local_memory_tokens is not None:
+            self.local_memory_tokens = tuple(
+                to_device_nonblocking(token, "cuda") if token is not None else None
+                for token in self.local_memory_tokens
+            )
         if host_text_indexes is None and self._sequence_pack_metadata is not None:
             return  # already prepared on CUDA; the layout has not changed
         self.prepare_sequence_pack_metadata(host_text_indexes=host_text_indexes)
@@ -1487,6 +1495,7 @@ class SequencePlan:
 
     # -- action modality --
     has_action: bool = False
+    has_local_memory: bool = False
     condition_frame_indexes_action: list[int] = field(default_factory=list)
     action_start_frame_offset: int = 1
 
@@ -1502,6 +1511,7 @@ class SequencePlan:
             "has_lidar": self.has_lidar,
             "has_radar": self.has_radar,
             "has_action": self.has_action,
+            "has_local_memory": self.has_local_memory,
             "has_sound": self.has_sound,
             "condition_frame_indexes_vision": self.condition_frame_indexes_vision,
             "condition_view_indexes_vision": self.condition_view_indexes_vision,

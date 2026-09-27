@@ -530,6 +530,15 @@ class OmniMoTModel(ImaginaireModel):
                 timestep_scale=1.0 / float(num_train_timesteps) * self.config.diffusion_expert_config.timestep_range,
                 timestep_range=self.config.diffusion_expert_config.timestep_range,
                 action_dim=self.config.max_action_dim,
+                local_memory_enabled=self.config.local_memory_enabled,
+                local_memory_dim=self.config.local_memory_dim,
+                local_memory_evidence_dim=self.config.local_memory_evidence_dim,
+                local_memory_action_dim=self.config.local_memory_action_dim,
+                local_memory_ttt_dim=self.config.local_memory_ttt_dim,
+                local_memory_fast_hidden_dim=self.config.local_memory_fast_hidden_dim,
+                local_memory_inner_lr=self.config.local_memory_inner_lr,
+                local_memory_ttt_tbptt_steps=self.config.local_memory_ttt_tbptt_steps,
+                local_memory_k_local=self.config.local_memory_k_local,
                 num_embodiment_domains=self.config.num_embodiment_domains,
                 action_io_projector_type=self.config.action_io_projector_type,
                 temporal_compression_factor_vision=(
@@ -1345,7 +1354,11 @@ class OmniMoTModel(ImaginaireModel):
         return local_training_data
 
     def training_step(
-        self, data_batch: dict[str, torch.Tensor], iteration: int
+        self,
+        data_batch: dict[str, torch.Tensor],
+        iteration: int,
+        *,
+        _local_memory_prefixes: tuple[torch.Tensor | None, ...] | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """
         Performs a single training step for the rectified-flow (flow-matching) model.
@@ -1368,9 +1381,23 @@ class OmniMoTModel(ImaginaireModel):
                 - Tensor: The computed loss for the training step as a PyTorch Tensor.
 
         """
+        if "local_memory" in data_batch or "x0_tokens_local_memory" in data_batch:
+            raise ValueError("Dataset Local Memory authority is forbidden; use private B0 scan override")
         input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes = (
             self._get_training_inputs(data_batch, iteration)
         )
+        if _local_memory_prefixes is not None:
+            if not self.config.local_memory_enabled or len(_local_memory_prefixes) != gen_data_clean.batch_size:
+                raise ValueError("Local Memory override requires enabled model and one entry per sample")
+            from cosmos_framework.model.generator.mot.memory_prefix import attach_local_prefixes
+
+            sequence_plans, gen_data_clean = attach_local_prefixes(
+                sequence_plans,
+                gen_data_clean,
+                _local_memory_prefixes,
+                k_local=self.config.local_memory_k_local,
+                local_dim=self.config.local_memory_dim,
+            )
 
         # Calculate number of tokens per sample (before 2x2 merge) for dynamic shift
         # gen_data_clean.x0_tokens_vision: B, C, T, H, W

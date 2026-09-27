@@ -375,6 +375,15 @@ class OmniMoTModelConfig:
     # action configs
     action_gen: bool = False  # whether to use action related parameters and condition/generate action tokens
     max_action_dim: int = 32  # maximum dimension of the action space, we need to pad the data to this dimension.
+    local_memory_enabled: bool = False
+    local_memory_dim: int = 32
+    local_memory_evidence_dim: int = 256
+    local_memory_action_dim: int = 15
+    local_memory_ttt_dim: int = 64
+    local_memory_fast_hidden_dim: int = 256
+    local_memory_inner_lr: float = 0.1
+    local_memory_ttt_tbptt_steps: int = 16
+    local_memory_k_local: int = 4
     num_embodiment_domains: int = 32  # number of action domains/types supported by the I/O projectors
     # Selects both action2llm and llm2action together so experiments cannot accidentally
     # compare a hybrid encoder/decoder pair. Legacy configs retain domain-aware behavior.

@@ -16,6 +16,7 @@ from cosmos_framework.model.attention import (
     multi_dimensional_attention_varlen,
 )
 from cosmos_framework.model.attention.masks import CausalType
+from cosmos_framework.model.generator.mot.memory_prefix import prepend_memory_kv
 from cosmos_framework.model.generator.mot.multiview_attention import multiview_attention
 from cosmos_framework.model.generator.mot.multiview_maskless_attention import MultiviewMasklessPlan
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryValue
@@ -203,6 +204,10 @@ def two_way_attention(
     packed_key_states: SequencePack,
     packed_value_states: SequencePack,
     packed_key_states_normalized: SequencePack | None = None,
+    memory_prefix_key_states: torch.Tensor | None = None,
+    memory_prefix_value_states: torch.Tensor | None = None,
+    memory_prefix_sample_offsets: torch.Tensor | None = None,
+    memory_prefix_max_len: int = 4,
 ):
     """
     Performs two-way attention with causal and full attention.
@@ -332,6 +337,19 @@ def two_way_attention(
     if use_varlen:
         sample_k, sample_kv_offsets, max_sample_len = get_all_seq(packed_key_normalized)
         sample_v, _, _ = get_all_seq(packed_value_states)
+        if memory_prefix_key_states is not None:
+            if memory_prefix_value_states is None or memory_prefix_sample_offsets is None:
+                raise ValueError("Memory Prefix requires K, V and sample offsets")
+            sample_k, sample_v, sample_kv_offsets, max_sample_len = prepend_memory_kv(
+                memory_prefix_key_states,
+                memory_prefix_value_states,
+                memory_prefix_sample_offsets,
+                sample_k,
+                sample_v,
+                sample_kv_offsets,
+                max_native_len=max_sample_len,
+                k_local=memory_prefix_max_len,
+            )
         # The same guards as the causal pass above, for the streams and unbacked dims this
         # pass uses. See there for why Dynamo cannot discharge them on its own.
         #
@@ -366,6 +384,8 @@ def two_way_attention(
             max_seqlen_KV=max_sample_len,
         )
     else:
+        if memory_prefix_key_states is not None:
+            raise ValueError("Memory Prefix requires varlen training attention")
         # This branch takes the unpadded stream, and has to.
         #
         # A padded stream is only safe next to offsets that fence the padding off, and the
@@ -769,7 +789,18 @@ def dispatch_attention(
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
     packed_key_states_normalized: SequencePack | None = None,
+    memory_prefix_key_states: torch.Tensor | None = None,
+    memory_prefix_value_states: torch.Tensor | None = None,
+    memory_prefix_sample_offsets: torch.Tensor | None = None,
+    memory_prefix_max_len: int = 4,
 ) -> tuple[SequencePack, KVToStore | None]:
+    if memory_prefix_key_states is not None and (
+        memory_value is not None
+        or attention_mask.is_three_way
+        or attention_mask.control_stream_token_ranges is not None
+        or _multiview_gen_description(attention_mask) is not None
+    ):
+        raise ValueError("Memory Prefix supports only native two_way attention")
     if memory_value is not None:
         raise ValueError("MemoryValue is not supported by dispatch_attention")
 
@@ -820,6 +851,10 @@ def dispatch_attention(
             packed_key_states,
             packed_value_states,
             packed_key_states_normalized=packed_key_states_normalized,
+            memory_prefix_key_states=memory_prefix_key_states,
+            memory_prefix_value_states=memory_prefix_value_states,
+            memory_prefix_sample_offsets=memory_prefix_sample_offsets,
+            memory_prefix_max_len=memory_prefix_max_len,
         )
     return output, None
 

@@ -314,6 +314,14 @@ def pack_input_sequence(
     idx_radar = 0
     idx_action = 0
     idx_sound = 0
+    idx_local_memory = 0
+    local_memory_tokens: list[torch.Tensor | None] = []
+    if any(plan.has_local_memory for plan in sequence_plans) and gen_data_clean.x0_tokens_local_memory is None:
+        raise ValueError("Local Memory plan requires x0_tokens_local_memory")
+    if gen_data_clean.x0_tokens_local_memory is not None and len(gen_data_clean.x0_tokens_local_memory) != sum(
+        plan.has_local_memory for plan in sequence_plans
+    ):
+        raise ValueError("Local Memory payload count must match present plans")
     null_action_flags: list[bool] = []  # collected from TC path; asserted consistent after the loop
 
     # Validate: all samples must have text (causal split is always required for two-way attention).
@@ -324,6 +332,12 @@ def pack_input_sequence(
 
     # Pack each sample based on its sequence plan
     for sample_idx, sequence_plan in enumerate(sequence_plans):
+        if sequence_plan.has_local_memory:
+            assert gen_data_clean.x0_tokens_local_memory is not None
+            local_memory_tokens.append(gen_data_clean.x0_tokens_local_memory[idx_local_memory])
+            idx_local_memory += 1
+        else:
+            local_memory_tokens.append(None)
         sample_len = 0
 
         # mRoPE temporal offset resets per sample.
@@ -857,6 +871,8 @@ def pack_input_sequence(
         seq_builder.null_action_supertokens = null_action_flags[0]
 
     # Finalize and return packed data
-    return seq_builder.finalize(
+    packed = seq_builder.finalize(
         gen_data_clean=gen_data_clean,
     )
+    packed.local_memory_tokens = tuple(local_memory_tokens)
+    return packed

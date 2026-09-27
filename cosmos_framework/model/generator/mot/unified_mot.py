@@ -20,6 +20,7 @@ from cosmos_framework.model.generator.mot.attention import (
     AttentionMaskType,
     dispatch_attention,
 )
+from cosmos_framework.model.generator.mot.memory_prefix import MemoryPrefixContext
 
 # Nemotron 3 Dense VL imports
 from cosmos_framework.model.generator.reasoner.nemotron_3_dense_vl.configuration_nemotron_3_dense_vl import (
@@ -701,6 +702,7 @@ class PackedAttentionMoT(nn.Module):
         packed_position_embeddings: tuple[SequencePack, SequencePack],
         natten_metadata: dict | None = None,
         memory_value: MemoryValue | None = None,
+        memory_prefix_context: MemoryPrefixContext | None = None,
     ) -> tuple[SequencePack, KVToStore | None]:
         """Forward pass with optional memory-augmented attention.
 
@@ -806,6 +808,20 @@ class PackedAttentionMoT(nn.Module):
         else:
             packed_key_states_normalized_ = None
 
+        memory_prefix_kwargs = {}
+        if memory_prefix_context is not None:
+            prefix_k = self.k_proj_moe_gen(memory_prefix_context.hidden).view(
+                -1, self.num_key_value_heads, self.head_dim
+            )
+            prefix_v = self.v_proj_moe_gen(memory_prefix_context.hidden).view(
+                -1, self.num_key_value_heads, self.head_dim
+            )
+            memory_prefix_kwargs = dict(
+                memory_prefix_key_states=self.k_norm_moe_gen(prefix_k),
+                memory_prefix_value_states=prefix_v,
+                memory_prefix_sample_offsets=memory_prefix_context.sample_offsets,
+                memory_prefix_max_len=memory_prefix_context.k_local,
+            )
         packed_attn_output, kv_to_store = self.dispatch_attention_fn(
             packed_query_states_,
             packed_key_states_,
@@ -814,6 +830,7 @@ class PackedAttentionMoT(nn.Module):
             natten_metadata=natten_metadata,
             memory_value=memory_value,
             packed_key_states_normalized=packed_key_states_normalized_,
+            **memory_prefix_kwargs,
         )
 
         # Produce kv_to_store for MemoryState.write_for_layer() when the
@@ -1087,6 +1104,7 @@ def _impl_forward(
     position_ids: torch.Tensor,
     natten_metadata_list: list | None = None,
     memory: MemoryState | None = None,
+    memory_prefix_context: MemoryPrefixContext | None = None,
 ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
     """Shared training forward pass for the three MoT text models.
 
@@ -1153,6 +1171,7 @@ def _impl_forward(
             position_embeddings,
             natten_metadata=None if natten_metadata_list is None else natten_metadata_list[i],
             memory_value=memory_value,
+            memory_prefix_context=memory_prefix_context,
             gen_only=memory_gen_only,
         )
 
@@ -1369,6 +1388,7 @@ class MoTDecoderLayer(nn.Module):
         natten_metadata: dict | None = None,
         memory_value: MemoryValue | None = None,
         gen_only: bool = False,
+        memory_prefix_context: MemoryPrefixContext | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata], KVToStore | None]:
         """Forward pass with MoT routing and optional memory-augmented attention.
 
@@ -1449,6 +1469,11 @@ class MoTDecoderLayer(nn.Module):
             self.input_layernorm_moe_gen(get_gen_seq(layer_input)),  # [N_gen,hidden_size]
             layer_input,
         )  # [N_und+N_gen,hidden_size]
+        normalized_memory_prefix = (
+            memory_prefix_context.replace_hidden(self.input_layernorm_moe_gen(memory_prefix_context.hidden))
+            if memory_prefix_context is not None
+            else None
+        )
 
         # Self Attention + Residual
         kv_to_store: KVToStore | None = None
@@ -1498,6 +1523,7 @@ class MoTDecoderLayer(nn.Module):
                 layer_position_embeddings,
                 natten_metadata=natten_metadata,
                 memory_value=memory_value,
+                memory_prefix_context=normalized_memory_prefix,
             )
             residual_und = get_und_seq(layer_input) + get_und_seq(pack_attn_out)  # [N_und,hidden_size]
             residual_gen = get_gen_seq(layer_input) + get_gen_seq(pack_attn_out)  # [N_gen,hidden_size]
@@ -2479,6 +2505,7 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
         position_ids: torch.Tensor,
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
+        memory_prefix_context: MemoryPrefixContext | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
         """Training forward pass — delegates to the dense text model."""
         outputs = self.model(
@@ -2487,6 +2514,7 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
             position_ids=position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            memory_prefix_context=memory_prefix_context,
         )
         return outputs
 
@@ -2646,6 +2674,7 @@ class Qwen3VLMoeTextForCausalLM(Qwen3VLMoePreTrainedModel):
         position_ids: torch.Tensor,
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
+        memory_prefix_context: MemoryPrefixContext | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
         """Training forward pass — delegates to the MoE text model."""
 
@@ -2655,6 +2684,7 @@ class Qwen3VLMoeTextForCausalLM(Qwen3VLMoePreTrainedModel):
             position_ids=position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            memory_prefix_context=memory_prefix_context,
         )
 
         return outputs
@@ -2817,6 +2847,7 @@ class Nemotron3DenseVLTextForCausalLM(Nemotron3DenseVLPreTrainedModel):
         position_ids: torch.Tensor,
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
+        memory_prefix_context: MemoryPrefixContext | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
         return self.model(
             pack=pack,
@@ -2824,6 +2855,7 @@ class Nemotron3DenseVLTextForCausalLM(Nemotron3DenseVLPreTrainedModel):
             position_ids=position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            memory_prefix_context=memory_prefix_context,
         )
 
     def generate_reasoner_text(
