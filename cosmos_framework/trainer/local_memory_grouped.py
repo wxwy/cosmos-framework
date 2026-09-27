@@ -48,6 +48,13 @@ def collate_grouped_native_batch(payloads: tuple[dict[str, Any], ...]) -> dict[s
 class GroupedLocalMemoryTrainer(ImaginaireTrainer):
     """保留上游 train loop；两次 training_step 是一个完整的 grouped optimizer window。"""
 
+    def _observe_grouped(
+        self, phase: str, *, iteration: int, member: int, index: int | None = None, loss: torch.Tensor | None = None
+    ) -> None:
+        observer = getattr(self, "grouped_observer", None)
+        if observer is not None:
+            observer(phase=phase, iteration=iteration, member=member, index=index, loss=loss, trainer=self)
+
     def bind_grouped_stream(
         self,
         planner: RankLocalGroupedPlanner,
@@ -160,6 +167,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             raise RuntimeError("第二次 GA 调用缺少 pending grouped window")
         assert window.plan is not None
         output: dict[str, Any] = {}
+        backward_index = 0
 
         def native_loss(payloads, prefixes, index):
             nonlocal output
@@ -170,14 +178,18 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 output, loss = model_ddp.training_step(batch, iteration, _local_memory_prefixes=prefixes)
             if "_backward_loss" in output:
                 raise ValueError("H3-C 禁止额外 surrogate backward loss")
+            self._observe_grouped("native_forward", iteration=iteration, member=grad_accum_iter, index=index, loss=loss)
             self.callbacks.on_after_forward(iteration=iteration)
             return loss
 
         def backward(weighted_loss: torch.Tensor, retain_graph: bool) -> None:
+            nonlocal backward_index
             self.callbacks.on_before_backward(model, weighted_loss, iteration=iteration)
             with self.training_timer("backward"):
                 grad_scaler.scale(weighted_loss).backward(retain_graph=retain_graph)
                 model.on_after_backward()
+            self._observe_grouped("native_backward", iteration=iteration, member=grad_accum_iter, index=backward_index)
+            backward_index += 1
             self.callbacks.on_after_backward(model, iteration=iteration)
 
         try:
@@ -191,7 +203,9 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             self.callbacks.on_before_optimizer_step(model, optimizer, scheduler, grad_scaler, iteration=iteration)
             model.on_before_optimizer_step(optimizer, scheduler, iteration=iteration)
             self._require_finite_gradients(optimizer)
+            self._observe_grouped("pre_optimizer", iteration=iteration, member=grad_accum_iter)
             window.finish(lambda: self._optimizer_step_success(optimizer, scheduler, grad_scaler))
+            self._observe_grouped("post_commit", iteration=iteration, member=grad_accum_iter)
             self._grouped_completed_iteration = iteration + 1
             self.callbacks.on_before_zero_grad(model, optimizer, scheduler, iteration=iteration)
             model.on_before_zero_grad(optimizer, scheduler, iteration=iteration)
