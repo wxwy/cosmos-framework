@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -69,10 +69,16 @@ class CanonicalLocalMemorySegmentAdapter:
         encoder: LocalEvidenceEncoder,
         core: ContinualTTTLocalMemoryCore,
         sidecar: LocalMemorySegmentSidecar,
+        scan_local_memory: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, ContinualTTTFastState | None],
+            tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor],
+        ]
+        | None = None,
     ) -> None:
         if encoder.evidence_dim != core.evidence_dim:
             raise ValueError("encoder/core evidence_dim 不匹配")
         self.encoder, self.core, self.sidecar = encoder, core, sidecar
+        self.scan_local_memory = scan_local_memory
         self._pending: tuple[SegmentIdentity, LocalMemoryTransaction, SegmentScanResult, SegmentProvenance] | None = (
             None
         )
@@ -108,13 +114,18 @@ class CanonicalLocalMemorySegmentAdapter:
         transaction.scheduler.validate(identity)
         state = self.sidecar.read(identity, provenance)
         device = self.core.slot_queries.device
-        tokens, candidate, present = self.core.scan_segment_masked_encoded_many(
-            self.encoder,
-            segment.evidence_visual_summary_prev.to(device),
-            segment.evidence_executed_action_prev.to(device),
-            segment.evidence_valid.to(device),
-            state,
-        )
+        visual = segment.evidence_visual_summary_prev.to(device)
+        action = segment.evidence_executed_action_prev.to(device)
+        valid = segment.evidence_valid.to(device)
+        if self.scan_local_memory is None:
+            tokens, candidate, present = self.core.scan_segment_masked_encoded_many(
+                self.encoder, visual, action, valid, state
+            )
+        else:
+            tokens, candidate, present = self.scan_local_memory(visual, action, valid, state)
+            self.core.validate_state(candidate, 1)
+            if tokens.shape != (*visual.shape[:2], self.core.k_local, self.core.local_dim):
+                raise ValueError("model-owned Local scan 返回的 token 形状不匹配")
         payloads, locals_, identities = segment.gather_consumers(tokens, present)
         result = SegmentScanResult(tokens, present, candidate, payloads, locals_, identities)
         transaction.prepare(identity, result, count)

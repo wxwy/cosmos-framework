@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from cosmos_framework.model.generator.mot.local_memory_segment import (
     GAWindowPlan,
@@ -33,6 +34,10 @@ class NativeConsumerResult:
 
 
 NativeForward = Callable[[Any, torch.Tensor | None, int], NativeConsumerResult]
+
+
+def _local_params_are_dtensors(runtime: nn.Module) -> bool:
+    return any(isinstance(parameter, DTensor) for parameter in runtime.parameters())
 
 
 def _detach_metadata(value: Any) -> Any:
@@ -81,7 +86,14 @@ class SingleSegmentNativeGradientRelay:
         self.sidecar = sidecar if sidecar is not None else LocalMemorySegmentSidecar()
         self.scheduler = scheduler if scheduler is not None else RankLocalSegmentScheduler()
         runtime = model.net.local_memory_runtime
-        self.adapter = CanonicalLocalMemorySegmentAdapter(runtime.encoder, runtime.core, self.sidecar)
+        scan = getattr(model.net, "scan_local_memory", None)
+        if _local_params_are_dtensors(runtime) and (
+            scan is None or not getattr(model.net, "_local_memory_scan_fsdp_registered", False)
+        ):
+            raise RuntimeError("FSDP-owned Local parameters require registered model scan_local_memory")
+        self.adapter = CanonicalLocalMemorySegmentAdapter(
+            runtime.encoder, runtime.core, self.sidecar, scan_local_memory=scan
+        )
         if self.adapter.encoder is not runtime.encoder or self.adapter.core is not runtime.core:
             raise RuntimeError("Local adapter must reuse model-owned encoder/core instances")
         named = dict(model.net.named_parameters())

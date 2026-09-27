@@ -32,6 +32,7 @@ from cosmos_framework.model.generator.mot.flex_attention import (
     SensorMaskItem,
     build_multiview_block_mask,
 )
+from cosmos_framework.model.generator.mot.local_evidence import ContinualTTTFastState
 from cosmos_framework.model.generator.mot.memory_prefix import LocalMemoryRuntime, build_memory_prefix_context
 from cosmos_framework.model.generator.mot.modeling_utils import TimestepEmbedder, has_noisy_tokens
 from cosmos_framework.model.generator.mot.multiview_attention import (
@@ -357,6 +358,21 @@ class Cosmos3VFMNetwork(PreTrainedModel):
 
         self.config = config
         self.parallel_dims = None
+
+    def scan_local_memory(
+        self,
+        visual_summary: torch.Tensor,
+        executed_action: torch.Tensor,
+        valid: torch.Tensor,
+        state_in: ContinualTTTFastState | None,
+    ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
+        """通过模型持有的 encoder/core 扫描，使 root FSDP 可管理参数生命周期。"""
+        if not self.config.local_memory_enabled:
+            raise RuntimeError("Local Memory is disabled")
+        runtime = self.local_memory_runtime
+        return runtime.core.scan_segment_masked_encoded_many(
+            runtime.encoder, visual_summary, executed_action, valid, state_in
+        )
 
     def init_weights(self, buffer_device: torch.device | None):
         if self.config.local_memory_enabled:
