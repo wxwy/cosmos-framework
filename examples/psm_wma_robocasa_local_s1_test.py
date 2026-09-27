@@ -454,6 +454,54 @@ def test_native_consumer_uses_joint_batch_abi_and_packs_text() -> None:
     assert builder.text_ids == [1, 2, 3, 42, 43]
 
 
+def test_local_witness_uses_cpu_dtensor_shard(tmp_path: Path) -> None:
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    assert not dist.is_initialized()
+    dist.init_process_group("gloo", store=dist.FileStore(str(tmp_path / "store"), 1), rank=0, world_size=1)
+    try:
+        mesh = DeviceMesh("cpu", [0])
+
+        def shard(value: torch.Tensor) -> DTensor:
+            return DTensor.from_local(value, mesh, (Shard(0),))
+
+        names = (
+            "net.local_memory_runtime.encoder.visual_proj.weight",
+            "net.local_memory_runtime.core.slot_queries",
+            "net.local_memory_runtime.core.w0_fast_in_weight",
+            "net.local_memory2llm.weight",
+            "net.local_memory_modality_embed",
+        )
+        parameters = {name: SimpleNamespace(grad=shard(torch.ones(2))) for name in names}
+        parameters["net.host.weight"] = SimpleNamespace(grad=None)
+        model = SimpleNamespace(named_parameters=lambda: iter(parameters.items()))
+        witness = s1._witness(model)
+        assert set(witness) == set(names)
+        assert all(item["nonzero"] == 2 and item["norm"] == pytest.approx(2**0.5) for item in witness.values())
+        local = s1._local_witness_tensor(parameters[names[0]].grad)
+        assert isinstance(local, torch.Tensor) and not isinstance(local, DTensor)
+        torch.testing.assert_close(local, torch.ones(2))
+        assert s1._local_witness_tensor(local) is local
+        before = s1._local_witness_tensor(shard(torch.ones(2))).clone()
+        assert torch.equal(before, s1._local_witness_tensor(shard(torch.ones(2))))
+        assert not torch.equal(before, s1._local_witness_tensor(shard(torch.zeros(2))))
+
+        parameters[names[0]].grad = shard(torch.zeros(2))
+        with pytest.raises(ValueError, match="全零"):
+            s1._witness(model)
+        parameters[names[0]].grad = shard(torch.tensor([1.0, float("nan")]))
+        with pytest.raises(ValueError, match="非有限"):
+            s1._witness(model)
+        parameters[names[0]].grad = shard(torch.ones(2))
+        parameters["net.host.weight"].grad = shard(torch.ones(2))
+        with pytest.raises(ValueError, match="host 参数出现梯度"):
+            s1._witness(model)
+    finally:
+        dist.destroy_process_group()
+
+
 def test_native_callback_single_sample_rgb_and_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     events = []
     monkeypatch.setattr(s1, "record_cuda", lambda trace, phase, index=None: events.append((phase, index)))

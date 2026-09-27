@@ -521,6 +521,13 @@ def lock_implementation_pair() -> dict[str, str]:
     return {"root": root_sha, "child": child_sha, "gitlink": gitlink}
 
 
+def _local_witness_tensor(value: torch.Tensor) -> torch.Tensor:
+    """单 rank FSDP2 的诊断只读取本地 shard，避免不支持的 DTensor 归约。"""
+    from torch.distributed.tensor import DTensor
+
+    return value.to_local() if isinstance(value, DTensor) else value
+
+
 def _witness(model: torch.nn.Module) -> dict[str, Any]:
     names = (
         "net.local_memory_runtime.encoder.visual_proj.weight",
@@ -533,9 +540,13 @@ def _witness(model: torch.nn.Module) -> dict[str, Any]:
     witness = {}
     for name in names:
         gradient = selected[name].grad
-        if gradient is None or not bool(torch.isfinite(gradient).all()) or not bool(torch.count_nonzero(gradient)):
+        local_gradient = None if gradient is None else _local_witness_tensor(gradient)
+        if local_gradient is None or not bool(torch.isfinite(local_gradient).all()):
             raise ValueError(f"Local 梯度 witness 缺失、非有限或全零：{name}")
-        witness[name] = {"norm": float(gradient.float().norm()), "nonzero": int(torch.count_nonzero(gradient))}
+        nonzero = int(torch.count_nonzero(local_gradient))
+        if not nonzero:
+            raise ValueError(f"Local 梯度 witness 缺失、非有限或全零：{name}")
+        witness[name] = {"norm": float(local_gradient.float().norm()), "nonzero": nonzero}
     if any(
         parameter.grad is not None for name, parameter in selected.items() if not name.startswith("net.local_memory")
     ):
@@ -583,17 +594,13 @@ def execute_cuda(
     record_cuda(trace, "local_optimizer_ready")
     relay = SingleSegmentNativeGradientRelay(model, optimizer)
     plan = GAWindowPlan((identity.member,), (T,))
-    before_host = (
-        next(
-            parameter
-            for name, parameter in model.named_parameters()
-            if name.startswith("net.") and "local_memory" not in name
-        )
-        .detach()
-        .flatten()[:128]
-        .clone()
+    host_parameter = next(
+        parameter
+        for name, parameter in model.named_parameters()
+        if name.startswith("net.") and "local_memory" not in name
     )
-    before_local = model.net.local_memory2llm.weight.detach().clone()
+    before_host = _local_witness_tensor(host_parameter.detach()).flatten()[:128].clone()
+    before_local = _local_witness_tensor(model.net.local_memory2llm.weight.detach()).clone()
     real_step, real_relay, real_commit = optimizer.step, relay._relay_gradients, relay.adapter.commit
     witnesses: dict[str, Any] = {}
     step_calls = 0
@@ -617,19 +624,11 @@ def execute_cuda(
 
     def commit_and_record(*args: Any, **kwargs: Any) -> None:
         state["phase"] = "fast_state_commit"
-        after_host = (
-            next(
-                parameter
-                for name, parameter in model.named_parameters()
-                if name.startswith("net.") and "local_memory" not in name
-            )
-            .detach()
-            .flatten()[:128]
-        )
+        after_host = _local_witness_tensor(host_parameter.detach()).flatten()[:128]
         if (
             step_calls != 1
             or not torch.equal(before_host, after_host)
-            or torch.equal(before_local, model.net.local_memory2llm.weight)
+            or torch.equal(before_local, _local_witness_tensor(model.net.local_memory2llm.weight.detach()))
         ):
             raise ValueError("Local-only step 或冻结 host witness 不匹配")
         real_commit(*args, **kwargs)
