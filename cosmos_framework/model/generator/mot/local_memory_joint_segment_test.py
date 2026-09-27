@@ -15,6 +15,7 @@ from torch.nn import functional as F
 
 import cosmos_framework.model.generator.mot.attention as attention_module
 from cosmos_framework.data.generator.sequence_packing.runtime import get_gen_seq
+from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
 from cosmos_framework.model.generator.mot.attention import build_packed_sequence, two_way_attention
 from cosmos_framework.model.generator.mot.local_memory_joint_segment import (
     SingleSegmentNativeJointAutograd,
@@ -33,7 +34,7 @@ def _model() -> nn.Module:
     model.net.local_memory_modality_embed = nn.Parameter(torch.randn(8) * 0.02)
     model.net.moe_gen = nn.Linear(8, 8)
     model.net.action2llm = nn.Linear(8, 8)
-    model.net.llm2action = nn.Linear(8, 1)
+    model.net.llm2action = nn.Linear(8, 64)
     model.net.reasoner = nn.Linear(8, 8)
     for parameter in model.net.reasoner.parameters():
         parameter.requires_grad_(False)
@@ -42,6 +43,11 @@ def _model() -> nn.Module:
 
 def _identity() -> SegmentIdentity:
     return SegmentIdentity(0, "episode", "robocasa", 0, 0, "source")
+
+
+class _UnitWeightFlow:
+    def train_time_weight(self, timesteps, tensor_kwargs):
+        return torch.ones_like(timesteps, **tensor_kwargs)
 
 
 def _native_loss(model: nn.Module, seen: list[torch.Tensor | None]):
@@ -80,8 +86,20 @@ def _native_loss(model: nn.Module, seen: list[torch.Tensor | None]):
             memory_prefix_value_states=None if context is None else context.hidden.view(4, 1, 8),
             memory_prefix_sample_offsets=None if context is None else context.sample_offsets,
         )
-        action = model.net.llm2action(get_gen_seq(output).mean(dim=0).flatten()).squeeze()
-        return (action - payload["step"] / 10).square()
+        action = model.net.llm2action(get_gen_seq(output).mean(dim=0).flatten())[None]
+        target = torch.full_like(action, payload["step"] / 10)
+        loss, _ = compute_flow_matching_loss(
+            pred=[action],
+            target=[target],
+            condition_mask=[torch.zeros(1, 1)],
+            timesteps=torch.zeros(1, 1),
+            has_valid_tokens=True,
+            rectified_flow=_UnitWeightFlow(),
+            tensor_kwargs_fp32={"dtype": torch.float32},
+            raw_action_dim=[torch.tensor(15)],
+            action_valid_mask=[torch.ones(64, dtype=torch.bool)],
+        )
+        return loss
 
     return callback
 
