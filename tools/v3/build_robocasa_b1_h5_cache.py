@@ -27,7 +27,9 @@ partial caches are deleted and rebuilt, never trusted as complete.
 Multi-process / multi-GPU sharding is prepared via `--workers/--worker`
 (record-ordinal modulo split) but is not executed by this Gate.
 """
+
 from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -35,10 +37,12 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
 import h5py
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+
 LEFT_CAMERA = "observation.images.robot0_agentview_left"
 WRIST_CAMERA = "observation.images.robot0_eye_in_hand"
 CAMERAS = (LEFT_CAMERA, WRIST_CAMERA)
@@ -140,6 +144,7 @@ def enumerate_train_episodes(
         DEFAULT_ALL_ATOMIC_TASKS,
         RoboCasaLeRobotDataset,
     )
+
     if task_names is None:
         task_names = DEFAULT_ALL_ATOMIC_TASKS
     ds = RoboCasaLeRobotDataset(
@@ -183,6 +188,7 @@ def enumerate_train_episodes(
 
 def decode_episode_frames(mp4_path: Path, start_frame: int, num_frames: int, fps: int) -> torch.Tensor:
     from lerobot.datasets.video_utils import decode_video_frames
+
     if num_frames <= 0:
         raise ValueError("num_frames must be positive")
     timestamps = [(start_frame + k) / fps for k in range(num_frames)]
@@ -273,6 +279,7 @@ def write_episode_h5(
 def verify_episode_h5(path: Path, *, episode_id: str, frame_count: int) -> None:
     """Round-trip the canonical reader; raises on any contract violation."""
     from cosmos_framework.model.generator.mot.robocasa_latent_evidence import RoboCasaLatentReader
+
     reader = RoboCasaLatentReader(
         str(path),
         expected_episode_id=episode_id,
@@ -332,6 +339,7 @@ def build_cache(
         from cosmos_framework.model.generator.tokenizers.wan2pt2_vae_4x16x16 import (
             Wan2pt2VAEInterface,
         )
+
         vae = Wan2pt2VAEInterface(
             vae_path=str(vae_path),
             encode_chunk_frames={"256": 68, "480": 24, "720": 8, "768": 8},

@@ -12,7 +12,6 @@ import h5py
 import numpy as np
 import pytest
 import torch
-
 from build_robocasa_b1_h5_cache import (
     CAMERAS,
     LEFT_CAMERA,

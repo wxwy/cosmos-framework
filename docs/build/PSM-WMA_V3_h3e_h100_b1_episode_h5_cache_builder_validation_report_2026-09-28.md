@@ -3,7 +3,8 @@
 - 日期：2026-09-28
 - 提交方：ds（execution/validation only）
 - 依据：`docs/build/PSM-WMA_V3_h3e_h100_data_asset_path_decision_2026-09-28.md` §4/§5（B1 frozen H5 contract + tiny PASS 后 GPU 全量授权）
-- 范围：B1 数据资产工具；本次将已验证 builder/test 正式落入 `tools/v3/`，不修改 production loader / Local model / H3-E 训练语义>
+- 范围：B1 数据资产工具；本次将已验证 builder/test 正式落入 `tools/v3/`，不修改 production loader / Local model / H3-E 训练语义
+
 > **2026-09-28 canonical source 路径变更备注**：canonical source renamed by owner; filesystem mv only; dataset identity unchanged。
 > 原 `/mnt/data1/data_v2_0617/robocasa365_official_v30` 经 `mv` 更名为 `/mnt/data1/data_v2_0617/robocasa365_official_v30`，数据内容及冻结身份未变
 > （18 atomic task classes / 9126 full episodes / 2231347 frames / fps=20 / LeRobot v3.0 / train split → 9036 / raw15 / chunk32 / left_wrist 不变）。
