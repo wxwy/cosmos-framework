@@ -67,8 +67,6 @@ FROZEN_LOADER_KWARGS = {
 
 
 @dataclass(frozen=True)
-
-
 class EpisodeSpec:
     shard: Path
     task: str
@@ -77,9 +75,11 @@ class EpisodeSpec:
     frame_count: int
     source_row_start: int
     valid_count: int
+
     @property
     def episode_id(self) -> str:
         return f"ep_{self.episode_index:06d}"
+
     @property
     def full_id(self) -> str:
         """Globally-unique identity: episode_index is shard-local, task/date disambiguate."""
@@ -440,5 +440,7 @@ def main() -> int:
     args.report.write_text(json.dumps(reports, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(reports, ensure_ascii=False))
     return 0
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

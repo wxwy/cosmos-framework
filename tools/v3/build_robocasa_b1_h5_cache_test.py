@@ -156,10 +156,7 @@ def test_atomic_publication_no_tmp_left(tmp_path: Path) -> None:
     assert path.is_file()
     assert not path.with_suffix(".h5.tmp").exists()
     broken = episode_output_path(tmp_path, "CloseFridge", "20250816", 1)
-    bad_latents = {
-        cam: torch.zeros(3, 48, 16, 16, dtype=torch.float16)
-        for cam in CAMERAS
-    }
+    bad_latents = {cam: torch.zeros(3, 48, 16, 16, dtype=torch.float16) for cam in CAMERAS}
     with pytest.raises(ValueError):
         write_episode_h5(
             broken,
@@ -184,8 +181,7 @@ def test_enumerate_train_episodes_exactly_9036() -> None:
         assert spec.episode_id == f"ep_{spec.episode_index:06d}"
         assert spec.valid_count == spec.frame_count - 32
     assert [spec.full_id for spec in specs] == [
-        spec.full_id
-        for spec in _restore_env(lambda: enumerate_train_episodes(V30_SOURCE))
+        spec.full_id for spec in _restore_env(lambda: enumerate_train_episodes(V30_SOURCE))
     ]
 
 
@@ -230,14 +226,7 @@ def test_static_build_source_untouched_and_reader_reads(tmp_path: Path) -> None:
     from cosmos_framework.model.generator.mot.robocasa_latent_evidence import RoboCasaLatentReader
 
     out = tmp_path / "cache"
-    probe = (
-        V30_SOURCE
-        / "CloseFridge"
-        / "20250816"
-        / "lerobot"
-        / "meta"
-        / "info.json"
-    )
+    probe = V30_SOURCE / "CloseFridge" / "20250816" / "lerobot" / "meta" / "info.json"
     before = probe.read_bytes()
     reports = _restore_env(
         lambda: build_cache(

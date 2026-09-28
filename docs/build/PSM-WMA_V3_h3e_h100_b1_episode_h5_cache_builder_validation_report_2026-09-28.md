@@ -6,7 +6,7 @@
 - 范围：B1 数据资产工具；本次将已验证 builder/test 正式落入 `tools/v3/`，不修改 production loader / Local model / H3-E 训练语义
 
 > **2026-09-28 canonical source 路径变更备注**：canonical source renamed by owner; filesystem mv only; dataset identity unchanged。
-> 原 `/mnt/data1/data_v2_0617/robocasa365_official_v30` 经 `mv` 更名为 `/mnt/data1/data_v2_0617/robocasa365_official_v30`，数据内容及冻结身份未变
+> owner 仅对原 canonical 目录执行了 filesystem `mv`，现唯一 canonical 路径为 `/mnt/data1/data_v2_0617/robocasa365_official_v30`；数据内容及冻结身份未变
 > （18 atomic task classes / 9126 full episodes / 2231347 frames / fps=20 / LeRobot v3.0 / train split → 9036 / raw15 / chunk32 / left_wrist 不变）。
 > 本报告所有 `robocasa365_official_v30` 引用即指向该 canonical 目录。
 
