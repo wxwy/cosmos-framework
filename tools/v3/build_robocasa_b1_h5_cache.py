@@ -60,7 +60,11 @@ FROZEN_LOADER_KWARGS = {
     "camera_set": "left_wrist",
     "action_normalization": None,
 }
+
+
 @dataclass(frozen=True)
+
+
 class EpisodeSpec:
     shard: Path
     task: str
@@ -76,6 +80,8 @@ class EpisodeSpec:
     def full_id(self) -> str:
         """Globally-unique identity: episode_index is shard-local, task/date disambiguate."""
         return f"{self.task}/{self.date}/ep_{self.episode_index:06d}"
+
+
 def endpoint_vector(frame_count: int) -> list[int]:
     """0,4,8,... plus a terminal `frame_count - 1` when the grid misses it."""
     if not isinstance(frame_count, int) or isinstance(frame_count, bool) or frame_count <= 0:
@@ -84,11 +90,15 @@ def endpoint_vector(frame_count: int) -> list[int]:
     if endpoints[-1] != frame_count - 1:
         endpoints.append(frame_count - 1)
     return endpoints
+
+
 def episode_output_path(output_root: Path, task: str, date: str, episode_index: int) -> Path:
     """Exact relative layout: ///lerobot/ep_XXXXXX.h5."""
     if not task or not date:
         raise ValueError("task and date must be non-empty")
     return output_root / task / date / "lerobot" / f"ep_{episode_index:06d}.h5"
+
+
 def load_shard_episode_meta(shard: Path) -> dict[int, dict]:
     """Read v3.0 per-episode metadata (length + per-camera video chunk/file index)."""
     tables = []
@@ -119,6 +129,8 @@ def load_shard_episode_meta(shard: Path) -> dict[int, dict]:
                 raise ValueError(f"duplicate episode_index {ep} ({shard})")
             meta[ep] = entry
     return meta
+
+
 def enumerate_train_episodes(
     source_root: Path,
     task_names: list[str] | tuple[str, ...] | None = None,
@@ -167,6 +179,8 @@ def enumerate_train_episodes(
             )
         )
     return specs
+
+
 def decode_episode_frames(mp4_path: Path, start_frame: int, num_frames: int, fps: int) -> torch.Tensor:
     from lerobot.datasets.video_utils import decode_video_frames
     if num_frames <= 0:
@@ -176,6 +190,8 @@ def decode_episode_frames(mp4_path: Path, start_frame: int, num_frames: int, fps
     if frames.ndim != 4 or frames.shape[0] != num_frames:
         raise ValueError(f"decoded frame count mismatch: expected {num_frames}, got {tuple(frames.shape)}")
     return (frames * 255.0).round().clamp(0.0, 255.0).to(torch.uint8)
+
+
 def encode_episode(vae: object, frames_uint8: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, list[int]]:
     """Wan2.2 VAE RGB encoding contract (normalize div_(127.5).sub_(1.0), causal prefix)."""
     if frames_uint8.ndim != 4 or frames_uint8.dtype != torch.uint8:
@@ -194,6 +210,8 @@ def encode_episode(vae: object, frames_uint8: torch.Tensor, device: torch.device
     if not torch.isfinite(latent).all():
         raise FloatingPointError("VAE produced non-finite latents")
     return latent.to(torch.float16), endpoints
+
+
 def static_latents(episode_id: str, n: int) -> dict[str, torch.Tensor]:
     """Deterministic CPU-only latents for schema/round-trip validation."""
     seed = int(hashlib.sha256(episode_id.encode("utf-8")).hexdigest()[:16], 16)
@@ -202,6 +220,8 @@ def static_latents(episode_id: str, n: int) -> dict[str, torch.Tensor]:
         cam: torch.from_numpy(rng.standard_normal((n, 48, 16, 16), dtype=np.float32)).to(torch.float16)
         for cam in CAMERAS
     }
+
+
 def write_episode_h5(
     path: Path,
     *,
@@ -248,6 +268,8 @@ def write_episode_h5(
         if temporary.exists():
             temporary.unlink()
         raise
+
+
 def verify_episode_h5(path: Path, *, episode_id: str, frame_count: int) -> None:
     """Round-trip the canonical reader; raises on any contract violation."""
     from cosmos_framework.model.generator.mot.robocasa_latent_evidence import RoboCasaLatentReader
@@ -263,6 +285,8 @@ def verify_episode_h5(path: Path, *, episode_id: str, frame_count: int) -> None:
         raise ValueError(f"reader visual96 shape mismatch: {tuple(reader._summaries.shape)}")
     if not torch.isfinite(reader._summaries).all():
         raise FloatingPointError("reader visual96 contains non-finite values")
+
+
 def is_complete_episode(path: Path, *, episode_id: str, frame_count: int) -> bool:
     """True only when the existing H5 validates fully (resume gate)."""
     try:
@@ -270,6 +294,8 @@ def is_complete_episode(path: Path, *, episode_id: str, frame_count: int) -> boo
         return True
     except BaseException:
         return False
+
+
 def build_cache(
     source_root: Path,
     output_root: Path,
@@ -372,6 +398,8 @@ def build_cache(
     reports["elapsed_s"] = round(time.time() - t0, 1)
     reports["built_count"] = built_count
     return reports
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default="/mnt/data1/data_v2_0617/robocasa365_official_v30")
