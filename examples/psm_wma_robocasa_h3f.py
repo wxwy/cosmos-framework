@@ -14,7 +14,10 @@ from typing import Any
 
 import torch
 
-from cosmos_framework.model.generator.mot.robocasa_grouped_segment import RankLocalGroupedPlanner, StageARoboCasaEpisodeBinder
+from cosmos_framework.model.generator.mot.robocasa_grouped_segment import (
+    RankLocalGroupedPlanner,
+    StageARoboCasaEpisodeBinder,
+)
 from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrainer
 from cosmos_framework.utils import distributed
 from cosmos_framework.utils.context_managers import model_init
@@ -311,7 +314,9 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
 
     job = Path(report["job"])
     evidence = Path(report["evidence_dir"])
-    evidence.mkdir(parents=True, exist_ok=False)
+    # Preflight rejects a pre-existing attempt directory. During torchrun all ranks
+    # race to create the same fresh directory, so creation itself must be idempotent.
+    evidence.mkdir(parents=True, exist_ok=True)
     result_path = evidence / f"rank_{rank}.json"
     progress_path = evidence / f"rank_{rank}_progress.jsonl"
     result: dict[str, Any] = dict(report, rank=rank, result="FAIL")
