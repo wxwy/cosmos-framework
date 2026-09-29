@@ -24,6 +24,7 @@ from cosmos_framework.model.generator.mot.robocasa_grouped_segment import (
     RankLocalGroupedPlanner,
     RoboCasaEpisodeCatalog,
     StageARoboCasaEpisodeBinder,
+    materialize_member,
 )
 from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrainer, collate_grouped_native_batch
 from cosmos_framework.trainer.local_memory_grouped_resume import snapshot_grouped_local_state
@@ -31,17 +32,9 @@ from cosmos_framework.utils import distributed
 from cosmos_framework.utils.context_managers import model_init
 from cosmos_framework.utils.lazy_config import instantiate
 from examples.psm_wma_robocasa_local_s1 import (
-    DEFAULT_CACHE,
-    DEFAULT_CHECKPOINT,
-    DEFAULT_CONFIG,
-    DEFAULT_DATASET_ROOT,
-    DEFAULT_EDGE,
-    DEFAULT_VAE,
     LOCAL_PARAMS,
-    ROOT_WORKTREE,
     SmokePaths,
     build_stage_a_action_transform,
-    load_episode_segment,
     read_stage_a_contract,
 )
 from examples.psm_wma_robocasa_native import RECIPE
@@ -57,7 +50,62 @@ HOST_KEYS = (
 )
 SELECTED_KEYS = (*HOST_KEYS, "local_memory")
 MANIFEST_DIGEST = "a8cad3f053232b348ea155f15bf79c2c9cf807dedcf39b89e246b17e43f283df"
-CACHE_ROOT = DEFAULT_CACHE.parents[3]
+
+ROOT_WORKTREE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/psm_wma_v3")
+STAGE_A_ROOT = Path("/mnt/data1/data_v2_0617/psm_wma_v3_stage_a_h100/psm_wma_v3/edge_robocasa/smoke")
+DEFAULT_CHECKPOINT = STAGE_A_ROOT / "checkpoints/iter_000000001"
+DEFAULT_CONFIG = STAGE_A_ROOT / "config.yaml"
+DEFAULT_DATASET_ROOT = Path("/mnt/data1/data_v2_0617/robocasa365_official_v30")
+CACHE_ROOT = Path("/mnt/data1/data_v2_0617/robocasa365_official_v30_wan2.2vae_latent_b1")
+DEFAULT_CACHE = CACHE_ROOT / "CloseFridge/20250816/lerobot/ep_000067.h5"
+DEFAULT_EDGE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Cosmos3-Edge-Policy-DROID")
+DEFAULT_VAE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth")
+
+STAGE_A_CONFIG_SHA256 = "f64036c499f891979213469523a160ac08cb3d976a2add8d8fdf93750c5a5439"
+STAGE_A_MODEL_METADATA_SHA256 = "53adef43a58e23f37d1132c4868ea8055be1b095cf76762b2e3e0b69ea287731"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_h100_asset_authority() -> dict[str, str]:
+    """Fail closed on any H100 source/cache/Stage-A authority drift."""
+    required_dirs = (ROOT_WORKTREE, DEFAULT_CHECKPOINT, DEFAULT_DATASET_ROOT, CACHE_ROOT, DEFAULT_EDGE)
+    required_files = (
+        DEFAULT_CONFIG,
+        DEFAULT_CHECKPOINT / "model/.metadata",
+        DEFAULT_CHECKPOINT / "trainer/.metadata",
+        DEFAULT_CACHE,
+        DEFAULT_EDGE / "config.json",
+        DEFAULT_VAE,
+        DEFAULT_DATASET_ROOT / "CloseFridge/20250816/lerobot/meta/info.json",
+    )
+    missing = [str(path) for path in required_dirs if not path.is_dir()]
+    missing.extend(str(path) for path in required_files if not path.is_file())
+    if missing:
+        raise FileNotFoundError(f"H3-E H100 authority assets missing: {missing}")
+
+    config_sha = _sha256_file(DEFAULT_CONFIG)
+    model_metadata_sha = _sha256_file(DEFAULT_CHECKPOINT / "model/.metadata")
+    if config_sha != STAGE_A_CONFIG_SHA256 or model_metadata_sha != STAGE_A_MODEL_METADATA_SHA256:
+        raise ValueError(
+            "H3-E Stage-A H100 authority digest mismatch: "
+            f"config={config_sha}, model_metadata={model_metadata_sha}"
+        )
+    return {
+        "config_sha256": config_sha,
+        "model_metadata_sha256": model_metadata_sha,
+        "stage_a_checkpoint": str(DEFAULT_CHECKPOINT),
+        "source_root": str(DEFAULT_DATASET_ROOT),
+        "cache_root": str(CACHE_ROOT),
+        "edge": str(DEFAULT_EDGE),
+        "vae": str(DEFAULT_VAE),
+    }
 
 
 def load_stage_a_config():
@@ -117,11 +165,13 @@ def _paths(output_root: Path) -> SmokePaths:
 
 def config_digest() -> str:
     authority = {
-        "stage_a_config_sha256": hashlib.sha256(DEFAULT_CONFIG.read_bytes()).hexdigest(),
+        "stage_a_config_sha256": _sha256_file(DEFAULT_CONFIG),
+        "stage_a_model_metadata_sha256": _sha256_file(DEFAULT_CHECKPOINT / "model/.metadata"),
         "source": str(DEFAULT_DATASET_ROOT),
         "cache": str(CACHE_ROOT),
         "geometry": [8, 8, 2, 16, 4, 32, 33, 15, 64],
         "optimizer": [*SELECTED_KEYS, "FusedAdam", 5e-5],
+        "manifest_digest": MANIFEST_DIGEST,
     }
     return hashlib.sha256(json.dumps(authority, sort_keys=True).encode()).hexdigest()
 
@@ -168,6 +218,8 @@ def make_catalog() -> tuple[RoboCasaLeRobotDataset, RoboCasaEpisodeCatalog]:
         fps=20,
         chunk_length=32,
         split="train",
+        split_seed=42,
+        split_val_ratio=0.01,
         mode="wam",
         task_names=DEFAULT_ALL_ATOMIC_TASKS,
         use_state=True,
@@ -206,6 +258,42 @@ class GroupedTriggerLoader:
         return self.max_iter * 2 - self.start
 
 
+def preflight_native_batch(
+    dataset: RoboCasaLeRobotDataset,
+    catalog: RoboCasaEpisodeCatalog,
+    paths: SmokePaths,
+    *,
+    digest: str,
+) -> dict[str, Any]:
+    """Materialize rank0's first grouped member through the production catalog/binder path."""
+    transform, resolution = build_stage_a_action_transform(paths)
+    binder = StageARoboCasaEpisodeBinder(
+        dataset,
+        catalog,
+        source_root=DEFAULT_DATASET_ROOT,
+        cache_root=CACHE_ROOT,
+        transform=transform,
+        resolution=resolution,
+        config_digest=digest,
+    )
+    planner = RankLocalGroupedPlanner(catalog, rank=0, world_size=8, seed=0)
+    plan = planner.plan_window(planner.initial_frontier())
+    segments = materialize_member(plan.members[0], binder.producer_for)
+    payloads = tuple(segment.consumer_payload[0][0] for segment in segments)
+    batch = collate_grouped_native_batch(payloads)
+    if (
+        len(segments) != 8
+        or len(batch["sequence_plan"]) != 8
+        or any(item[0].shape != (33, 64) for item in batch["action"])
+        or any(item[0].shape != (33, 15) for item in batch["action_raw"])
+    ):
+        raise ValueError("H3-E Stage-A grouped 8-slot native batch ABI 不匹配")
+    return {
+        "native_batch": 8,
+        "preflight_uids": [request.episode.uid for request in plan.members[0]],
+    }
+
+
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
     pair = lock_pair(args.expected_root, args.expected_child)
     output_root = args.output_root.expanduser().resolve()
@@ -217,28 +305,23 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     if args.phase == "resume" and not (job / "checkpoints/latest_checkpoint.txt").is_file():
         raise FileNotFoundError("resume 缺少同 job latest_checkpoint.txt")
     paths = _paths(output_root)
+    asset_authority = validate_h100_asset_authority()
     contract = read_stage_a_contract(paths)
     config = load_stage_a_config()
     overlay_h100_config(config, phase=args.phase, job_name=args.job_name)
     dataset, catalog = make_catalog()
-    del dataset
-    segment, _, _ = load_episode_segment(paths)
-    batch = collate_grouped_native_batch(segment.consumer_payload[0][:8])
-    if (
-        len(batch["sequence_plan"]) != 8
-        or any(item[0].shape != (33, 64) for item in batch["action"])
-        or any(item[0].shape != (33, 15) for item in batch["action_raw"])
-    ):
-        raise ValueError("H3-E Stage-A 8-consumer native batch ABI 不匹配")
+    digest = config_digest()
+    native = preflight_native_batch(dataset, catalog, paths, digest=digest)
     return {
         "pair": pair,
         "phase": args.phase,
         "job": str(job),
         "catalog_episodes": len(catalog.episodes),
         "manifest_digest": catalog.manifest_digest,
-        "config_digest": config_digest(),
+        "config_digest": digest,
         "stage_a_dcp_keys": contract["dcp_keys"],
-        "native_batch": 8,
+        "asset_authority": asset_authority,
+        **native,
         "geometry": [8, 8, 2, 16, 4],
         "selector": list(SELECTED_KEYS),
     }

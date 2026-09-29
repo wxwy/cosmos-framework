@@ -102,24 +102,18 @@ def test_preflight_phase_is_fail_closed_without_creating_output(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(h100, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40})
+    monkeypatch.setattr(
+        h100,
+        "validate_h100_asset_authority",
+        lambda: {"config_sha256": h100.STAGE_A_CONFIG_SHA256},
+    )
     monkeypatch.setattr(h100, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
+    fake_catalog = SimpleNamespace(episodes=(1,) * 9036, manifest_digest=h100.MANIFEST_DIGEST)
+    monkeypatch.setattr(h100, "make_catalog", lambda: (object(), fake_catalog))
     monkeypatch.setattr(
         h100,
-        "make_catalog",
-        lambda: (None, SimpleNamespace(episodes=(1,) * 9036, manifest_digest=h100.MANIFEST_DIGEST)),
-    )
-    segment = SimpleNamespace(
-        consumer_payload=(({"action": 1},) * 16,),
-    )
-    monkeypatch.setattr(h100, "load_episode_segment", lambda *_: (segment, None, {}))
-    monkeypatch.setattr(
-        h100,
-        "collate_grouped_native_batch",
-        lambda *_: {
-            "sequence_plan": [1] * 8,
-            "action": [[SimpleNamespace(shape=(33, 64))]] * 8,
-            "action_raw": [[SimpleNamespace(shape=(33, 15))]] * 8,
-        },
+        "preflight_native_batch",
+        lambda *args, **kwargs: {"native_batch": 8, "preflight_uids": [f"uid-{i}" for i in range(8)]},
     )
     args = _args(tmp_path)
     report = h100.preflight(args)
@@ -138,13 +132,110 @@ def test_preflight_phase_is_fail_closed_without_creating_output(
 
 
 def test_config_digest_ignores_phase_and_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    file = tmp_path / "config.yaml"
-    file.write_text("a")
-    monkeypatch.setattr(h100, "DEFAULT_CONFIG", file)
+    config = tmp_path / "config.yaml"
+    metadata = tmp_path / "checkpoint/model/.metadata"
+    metadata.parent.mkdir(parents=True)
+    config.write_text("a")
+    metadata.write_text("m")
+    monkeypatch.setattr(h100, "DEFAULT_CONFIG", config)
+    monkeypatch.setattr(h100, "DEFAULT_CHECKPOINT", tmp_path / "checkpoint")
     first = h100.config_digest()
     assert first == h100.config_digest()
-    file.write_text("b")
+    config.write_text("b")
     assert first != h100.config_digest()
+
+
+def test_h100_asset_authority_is_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    stage = tmp_path / "stage"
+    checkpoint = stage / "checkpoints/iter_000000001"
+    source = tmp_path / "source"
+    cache_root = tmp_path / "cache"
+    cache = cache_root / "CloseFridge/20250816/lerobot/ep_000067.h5"
+    edge = tmp_path / "edge"
+    vae = tmp_path / "wan.pth"
+    config = stage / "config.yaml"
+
+    for directory in (root, checkpoint / "model", checkpoint / "trainer", source, cache.parent, edge):
+        directory.mkdir(parents=True, exist_ok=True)
+    (source / "CloseFridge/20250816/lerobot/meta").mkdir(parents=True)
+    config.write_text("stage-a-config")
+    (checkpoint / "model/.metadata").write_text("model-metadata")
+    (checkpoint / "trainer/.metadata").write_text("trainer-metadata")
+    cache.touch()
+    (edge / "config.json").write_text("{}")
+    vae.touch()
+    (source / "CloseFridge/20250816/lerobot/meta/info.json").write_text("{}")
+
+    monkeypatch.setattr(h100, "ROOT_WORKTREE", root)
+    monkeypatch.setattr(h100, "DEFAULT_CHECKPOINT", checkpoint)
+    monkeypatch.setattr(h100, "DEFAULT_CONFIG", config)
+    monkeypatch.setattr(h100, "DEFAULT_DATASET_ROOT", source)
+    monkeypatch.setattr(h100, "CACHE_ROOT", cache_root)
+    monkeypatch.setattr(h100, "DEFAULT_CACHE", cache)
+    monkeypatch.setattr(h100, "DEFAULT_EDGE", edge)
+    monkeypatch.setattr(h100, "DEFAULT_VAE", vae)
+    monkeypatch.setattr(h100, "STAGE_A_CONFIG_SHA256", h100._sha256_file(config))
+    monkeypatch.setattr(
+        h100,
+        "STAGE_A_MODEL_METADATA_SHA256",
+        h100._sha256_file(checkpoint / "model/.metadata"),
+    )
+    report = h100.validate_h100_asset_authority()
+    assert report["stage_a_checkpoint"] == str(checkpoint)
+
+    config.write_text("drift")
+    with pytest.raises(ValueError, match="authority digest"):
+        h100.validate_h100_asset_authority()
+
+
+def test_preflight_native_batch_uses_grouped_catalog_binder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    episodes = tuple(SimpleNamespace(uid=f"task/date/ep_{i:06d}") for i in range(8))
+    requests = tuple(SimpleNamespace(episode=episode) for episode in episodes)
+    plan = SimpleNamespace(members=(requests, requests))
+
+    class FakePlanner:
+        def __init__(self, catalog, *, rank, world_size, seed):
+            assert rank == 0 and world_size == 8 and seed == 0
+
+        def initial_frontier(self):
+            return "frontier"
+
+        def plan_window(self, frontier):
+            assert frontier == "frontier"
+            return plan
+
+    class FakeBinder:
+        def __init__(self, dataset, catalog, **kwargs):
+            assert kwargs["source_root"] == h100.DEFAULT_DATASET_ROOT
+            assert kwargs["cache_root"] == h100.CACHE_ROOT
+            assert kwargs["config_digest"] == "digest"
+            self.producer_for = object()
+
+    segments = tuple(
+        SimpleNamespace(consumer_payload=(({"slot": index},),))
+        for index in range(8)
+    )
+    monkeypatch.setattr(h100, "RankLocalGroupedPlanner", FakePlanner)
+    monkeypatch.setattr(h100, "StageARoboCasaEpisodeBinder", FakeBinder)
+    monkeypatch.setattr(h100, "build_stage_a_action_transform", lambda paths: ("transform", "resolution"))
+    monkeypatch.setattr(
+        h100,
+        "materialize_member",
+        lambda members, producer_for: segments,
+    )
+    monkeypatch.setattr(
+        h100,
+        "collate_grouped_native_batch",
+        lambda payloads: {
+            "sequence_plan": [1] * 8,
+            "action": [[SimpleNamespace(shape=(33, 64))]] * 8,
+            "action_raw": [[SimpleNamespace(shape=(33, 15))]] * 8,
+        },
+    )
+    evidence = h100.preflight_native_batch(object(), object(), SimpleNamespace(), digest="digest")
+    assert evidence["native_batch"] == 8
+    assert evidence["preflight_uids"] == [episode.uid for episode in episodes]
 
 
 def test_observer_records_consumer_memory_gradient_and_commit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
