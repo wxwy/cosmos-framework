@@ -28,6 +28,7 @@ from cosmos_framework.trainer.local_memory_grouped_resume import (
     restore_grouped_local_state,
 )
 from cosmos_framework.utils import misc
+from cosmos_framework.utils.generator.optimizer import OptimizersContainer
 
 
 def collate_grouped_native_batch(payloads: tuple[dict[str, Any], ...]) -> dict[str, Any]:
@@ -90,10 +91,27 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         super().train(model, dataloader_train, dataloader_val)
 
     @staticmethod
-    def _require_finite_gradients(optimizer: torch.optim.Optimizer) -> None:
-        parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+    def _optimizer_parameters(optimizer: Any) -> list[torch.Tensor]:
+        optimizers = optimizer.optimizers if isinstance(optimizer, OptimizersContainer) else [optimizer]
+        if not optimizers:
+            raise ValueError("H3-C optimizer container 为空")
+        parameters: list[torch.Tensor] = []
+        seen: set[int] = set()
+        for inner_optimizer in optimizers:
+            if not hasattr(inner_optimizer, "param_groups"):
+                raise TypeError("H3-C inner optimizer 缺少 param_groups")
+            for group in inner_optimizer.param_groups:
+                for parameter in group["params"]:
+                    if id(parameter) not in seen:
+                        seen.add(id(parameter))
+                        parameters.append(parameter)
         if not parameters:
             raise ValueError("H3-C optimizer 选中参数为空")
+        return parameters
+
+    @staticmethod
+    def _require_finite_gradients(optimizer: Any) -> None:
+        parameters = GroupedLocalMemoryTrainer._optimizer_parameters(optimizer)
         local_bad = 0
         present = False
         for parameter in parameters:

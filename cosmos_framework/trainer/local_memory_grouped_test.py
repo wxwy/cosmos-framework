@@ -14,6 +14,7 @@ from cosmos_framework.model.generator.mot.local_memory_grouped_window_test impor
 from cosmos_framework.model.generator.mot.memory_prefix import LocalMemoryRuntime
 from cosmos_framework.model.generator.mot.robocasa_grouped_segment import RankLocalGroupedPlanner
 from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrainer, collate_grouped_native_batch
+from cosmos_framework.utils.generator.optimizer import OptimizersContainer
 
 
 class _Hooks:
@@ -133,6 +134,48 @@ def test_scaler_skip_does_not_advance_scheduler() -> None:
 
     assert GroupedLocalMemoryTrainer._optimizer_step_success(optimizer, scheduler, SkippingScaler()) is False
     assert scheduler.last_epoch == 0
+
+
+def test_optimizer_parameters_supports_container_and_plain_optimizer() -> None:
+    first = nn.Parameter(torch.tensor(1.0))
+    second = nn.Parameter(torch.tensor(2.0))
+    third = nn.Parameter(torch.tensor(3.0))
+    first_optimizer = torch.optim.SGD([first, second], lr=0.1)
+    second_optimizer = torch.optim.AdamW([third], lr=0.1)
+    container = object.__new__(OptimizersContainer)
+    container.optimizers = [first_optimizer, second_optimizer]
+
+    assert GroupedLocalMemoryTrainer._optimizer_parameters(first_optimizer) == [first, second]
+    assert GroupedLocalMemoryTrainer._optimizer_parameters(container) == [first, second, third]
+
+
+def test_optimizer_parameters_container_is_fail_closed() -> None:
+    container = object.__new__(OptimizersContainer)
+    container.optimizers = []
+    with pytest.raises(ValueError, match="container"):
+        GroupedLocalMemoryTrainer._optimizer_parameters(container)
+
+    container.optimizers = [SimpleNamespace()]
+    with pytest.raises(TypeError, match="param_groups"):
+        GroupedLocalMemoryTrainer._optimizer_parameters(container)
+
+
+def test_finite_gradient_check_unwraps_optimizer_container() -> None:
+    first = nn.Parameter(torch.tensor(1.0))
+    second = nn.Parameter(torch.tensor(2.0))
+    first.grad = torch.tensor(0.5)
+    second.grad = torch.tensor(0.25)
+    container = object.__new__(OptimizersContainer)
+    container.optimizers = [
+        torch.optim.SGD([first], lr=0.1),
+        torch.optim.AdamW([second], lr=0.1),
+    ]
+
+    GroupedLocalMemoryTrainer._require_finite_gradients(container)
+
+    second.grad = torch.tensor(float("nan"))
+    with pytest.raises(FloatingPointError, match="非有限"):
+        GroupedLocalMemoryTrainer._require_finite_gradients(container)
 
 
 def test_nonfinite_selected_gradient_fails_before_optimizer() -> None:
