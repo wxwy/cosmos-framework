@@ -241,6 +241,25 @@ def test_preflight_native_batch_uses_grouped_catalog_binder(monkeypatch: pytest.
     assert evidence["preflight_uids"] == [episode.uid for episode in episodes]
 
 
+def test_optimizer_parameter_ids_unwraps_optimizers_container() -> None:
+    from cosmos_framework.utils.generator.optimizer import OptimizersContainer
+
+    first = torch.nn.Parameter(torch.tensor(1.0))
+    second = torch.nn.Parameter(torch.tensor(2.0))
+    third = torch.nn.Parameter(torch.tensor(3.0))
+    container = object.__new__(OptimizersContainer)
+    container.optimizers = [
+        torch.optim.SGD([first, second], lr=1e-3),
+        torch.optim.AdamW([third], lr=1e-3),
+    ]
+
+    assert h100._optimizer_parameter_ids(container) == {id(first), id(second), id(third)}
+
+    container.optimizers = []
+    with pytest.raises(ValueError, match="container"):
+        h100._optimizer_parameter_ids(container)
+
+
 def test_observer_records_consumer_memory_gradient_and_commit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 12)

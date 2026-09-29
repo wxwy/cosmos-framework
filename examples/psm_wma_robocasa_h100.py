@@ -31,6 +31,7 @@ from cosmos_framework.trainer.local_memory_grouped_resume import snapshot_groupe
 from cosmos_framework.utils import distributed
 from cosmos_framework.utils.context_managers import model_init
 from cosmos_framework.utils.lazy_config import instantiate
+from cosmos_framework.utils.generator.optimizer import OptimizersContainer
 from examples.psm_wma_robocasa_local_s1 import (
     LOCAL_PARAMS,
     SmokePaths,
@@ -329,6 +330,21 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _optimizer_parameter_ids(optimizer: Any) -> set[int]:
+    """Return the union of parameters owned by a framework optimizer/container."""
+    optimizers = optimizer.optimizers if isinstance(optimizer, OptimizersContainer) else [optimizer]
+    if not optimizers:
+        raise ValueError("H3-E optimizer container 为空")
+    selected: set[int] = set()
+    for inner_optimizer in optimizers:
+        if not hasattr(inner_optimizer, "param_groups"):
+            raise TypeError("H3-E inner optimizer 缺少 param_groups")
+        selected.update(id(parameter) for group in inner_optimizer.param_groups for parameter in group["params"])
+    if not selected:
+        raise ValueError("H3-E optimizer 未选择任何参数")
+    return selected
+
+
 def _local(value: torch.Tensor) -> torch.Tensor:
     return value.to_local() if isinstance(value, DTensor) else value
 
@@ -440,7 +456,7 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
         def checked_optimizer(optimizer_config, scheduler_config):
             optimizer, scheduler = original(optimizer_config, scheduler_config)
             named = dict(model.named_parameters())
-            selected = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
+            selected = _optimizer_parameter_ids(optimizer)
             selected_names = {name for name, parameter in named.items() if id(parameter) in selected}
             local_names = {name for name in named if name.startswith("net.local_memory")}
             if (
