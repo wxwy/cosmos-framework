@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,8 @@ from examples.psm_wma_robocasa_h100 import (
 H3F_SAVE_ITER = 1_000
 H3F_WARMUP_STEPS = 500
 H3F_GROUP = "h3f_edge_local_h100"
+H3F_READINESS_GROUP = "h3f_edge_local_h100_readiness"
+H3F_READINESS_MAX_STEPS = 100
 
 
 def parser() -> argparse.ArgumentParser:
@@ -62,28 +65,30 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output-root", type=Path, required=True)
     result.add_argument("--job-name", default="edge_local_target_atomic_30k")
     result.add_argument("--attempt", type=int, default=1)
+    result.add_argument("--readiness-steps", type=int)
     result.add_argument("--expected-root", required=True)
     result.add_argument("--expected-child", required=True)
     return result
 
 
-def overlay_h3f_config(config: Any, *, phase: str, job_name: str) -> None:
+def overlay_h3f_config(config: Any, *, phase: str, job_name: str, readiness_steps: int | None = None) -> None:
     from examples.psm_wma_robocasa_h100 import overlay_h100_config
 
     overlay_h100_config(config, phase=phase, job_name=job_name)
-    config.trainer.max_iter = H3F_FORMAL_MAX_ITER
+    target_iteration = readiness_steps if readiness_steps is not None else H3F_FORMAL_MAX_ITER
+    config.trainer.max_iter = target_iteration
     config.trainer.logging_iter = 50
     config.scheduler.cycle_lengths = [H3F_FORMAL_MAX_ITER]
     config.scheduler.warm_up_steps = [H3F_WARMUP_STEPS]
-    config.checkpoint.save_iter = H3F_SAVE_ITER
-    config.job.group = H3F_GROUP
+    config.checkpoint.save_iter = target_iteration if readiness_steps is not None else H3F_SAVE_ITER
+    config.job.group = H3F_READINESS_GROUP if readiness_steps is not None else H3F_GROUP
     config.job.name = job_name
     if (
         config.trainer.grad_accum_iter != 2
-        or config.trainer.max_iter != 30_000
+        or config.trainer.max_iter != target_iteration
         or config.scheduler.cycle_lengths != [30_000]
         or config.scheduler.warm_up_steps != [500]
-        or config.checkpoint.save_iter != 1_000
+        or config.checkpoint.save_iter != (target_iteration if readiness_steps is not None else 1_000)
         or any(step % H3F_SAVE_ITER for step in H3F_FORMAL_CHECKPOINT_ITERS)
     ):
         raise ValueError("H3-F 30k/scheduler/checkpoint 合同不匹配")
@@ -92,8 +97,10 @@ def overlay_h3f_config(config: Any, *, phase: str, job_name: str) -> None:
 def config_digest() -> str:
     authority = {
         "h3e_runtime": h3e_config_digest(),
-        "max_iter": H3F_FORMAL_MAX_ITER,
-        "save_iter": H3F_SAVE_ITER,
+        "formal_max_iter": H3F_FORMAL_MAX_ITER,
+        "readiness_steps": readiness_steps,
+        "target_iteration": readiness_steps if readiness_steps is not None else H3F_FORMAL_MAX_ITER,
+        "save_iter": readiness_steps if readiness_steps is not None else H3F_SAVE_ITER,
         "warmup_steps": H3F_WARMUP_STEPS,
         "cycle_lengths": [H3F_FORMAL_MAX_ITER],
         "primary_eval_iters": list(H3F_FORMAL_CHECKPOINT_ITERS),
@@ -101,8 +108,19 @@ def config_digest() -> str:
     return hashlib.sha256(json.dumps(authority, sort_keys=True).encode()).hexdigest()
 
 
-def _job(output_root: Path, job_name: str) -> Path:
-    return output_root / "psm_wma_v3" / H3F_GROUP / job_name
+def readiness_config_digest(steps: int) -> str:
+    authority = {
+        "formal_config_digest": config_digest(),
+        "readiness_steps": steps,
+        "scheduler_cycle": [H3F_FORMAL_MAX_ITER],
+        "scheduler_warmup": [H3F_WARMUP_STEPS],
+    }
+    return hashlib.sha256(json.dumps(authority, sort_keys=True).encode()).hexdigest()
+
+
+def _job(output_root: Path, job_name: str, *, readiness_steps: int | None = None) -> Path:
+    group = H3F_READINESS_GROUP if readiness_steps is not None else H3F_GROUP
+    return output_root / "psm_wma_v3" / group / job_name
 
 
 def _resume_iteration(job: Path) -> int:
@@ -145,7 +163,13 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     if type(args.attempt) is not int or args.attempt <= 0:
         raise ValueError("H3-F attempt 必须为正整数")
 
-    job = _job(output_root, args.job_name)
+    readiness_steps = args.readiness_steps
+    if readiness_steps is not None:
+        if args.phase != "fresh" or not 2 <= readiness_steps <= H3F_READINESS_MAX_STEPS:
+            raise ValueError("H3-F readiness-steps 仅允许 fresh 且范围 2..100")
+        if args.attempt != 1:
+            raise ValueError("H3-F readiness smoke 必须使用 attempt=1")
+    job = _job(output_root, args.job_name, readiness_steps=readiness_steps)
     authority_rank = _authority_preflight_rank()
     if args.phase == "fresh":
         if args.attempt != 1:
@@ -166,11 +190,11 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     asset_authority = validate_h100_asset_authority()
     contract = read_stage_a_contract(paths)
     config = load_stage_a_config()
-    overlay_h3f_config(config, phase=args.phase, job_name=args.job_name)
+    overlay_h3f_config(config, phase=args.phase, job_name=args.job_name, readiness_steps=readiness_steps)
     dataset, catalog = make_catalog()
     if catalog.manifest_digest != MANIFEST_DIGEST:
         raise ValueError("H3-F manifest authority 漂移")
-    digest = config_digest()
+    digest = readiness_config_digest(readiness_steps) if readiness_steps is not None else config_digest()
     native = preflight_native_batch(dataset, catalog, paths, digest=digest)
     return {
         "pair": pair,
@@ -211,6 +235,7 @@ class FormalObserver:
         self.loss_max = float("-inf")
         self.completed = 0
         self.last_record: dict[str, Any] | None = None
+        self.last_commit_time: float | None = None
 
     def _bind_iteration(self, iteration: int) -> None:
         if self.iteration is None:
@@ -256,6 +281,9 @@ class FormalObserver:
                 f"H3-F iteration event count 错误: fwd={self.forward}, bwd={self.backward}, pre={self.pre_optimizer}"
             )
         completed = trainer._grouped_completed_iteration + 1
+        now = time.perf_counter()
+        step_wall_seconds = None if self.last_commit_time is None else now - self.last_commit_time
+        self.last_commit_time = now
         record = {
             "iteration": completed,
             "native_forward": self.forward,
@@ -266,6 +294,7 @@ class FormalObserver:
             "loss_min": self.loss_min,
             "loss_max": self.loss_max,
             "frontier_epoch": trainer._grouped_window.live.frontier.epoch,
+            "step_wall_seconds": step_wall_seconds,
             "allocated_bytes": torch.cuda.memory_allocated(),
             "reserved_bytes": torch.cuda.memory_reserved(),
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
@@ -320,7 +349,9 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
     os.environ["EDGE_POLICY_CHECKPOINT"] = str(DEFAULT_EDGE)
     os.environ["WAN_VAE_PATH"] = str(DEFAULT_VAE)
     config = load_stage_a_config()
-    overlay_h3f_config(config, phase=args.phase, job_name=args.job_name)
+    overlay_h3f_config(
+        config, phase=args.phase, job_name=args.job_name, readiness_steps=report["readiness_steps"]
+    )
 
     job = Path(report["job"])
     evidence = Path(report["evidence_dir"])
@@ -359,12 +390,13 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
         trainer.grouped_observer = observer
         trainer.train(model, GroupedTriggerLoader(config.trainer.max_iter), None)
 
-        if trainer._grouped_completed_iteration != H3F_FORMAL_MAX_ITER:
-            raise RuntimeError("H3-F 未完成 30000 optimizer iterations")
-        if observer.completed != H3F_FORMAL_MAX_ITER - report["start_iteration"]:
+        target_iteration = report["target_iteration"]
+        if trainer._grouped_completed_iteration != target_iteration:
+            raise RuntimeError("H3-F 未完成目标 optimizer iterations")
+        if observer.completed != target_iteration - report["start_iteration"]:
             raise RuntimeError("H3-F observer 完成 iteration 数与 resume 起点不匹配")
 
-        final = job / "checkpoints" / f"iter_{H3F_FORMAL_MAX_ITER:09d}"
+        final = job / "checkpoints" / f"iter_{target_iteration:09d}"
         if (
             (job / "checkpoints/latest_checkpoint.txt").read_text().strip() != final.name
             or any(not (final / key / ".metadata").is_file() for key in ("model", "optim", "scheduler", "trainer"))

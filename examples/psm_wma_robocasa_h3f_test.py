@@ -12,13 +12,16 @@ import torch
 from examples import psm_wma_robocasa_h3f as h3f
 
 
-def _args(tmp_path: Path, phase: str = "fresh", attempt: int = 1) -> argparse.Namespace:
+def _args(
+    tmp_path: Path, phase: str = "fresh", attempt: int = 1, readiness_steps: int | None = None
+) -> argparse.Namespace:
     return argparse.Namespace(
         phase=phase,
         preflight=True,
         output_root=tmp_path,
         job_name="formal",
         attempt=attempt,
+        readiness_steps=readiness_steps,
         expected_root="a" * 40,
         expected_child="b" * 40,
     )
@@ -34,6 +37,39 @@ def test_overlay_freezes_30k_schedule() -> None:
     assert config.checkpoint.save_iter == 1_000
     assert config.job.group == h3f.H3F_GROUP
     assert all(step % config.checkpoint.save_iter == 0 for step in h3f.H3F_FORMAL_CHECKPOINT_ITERS)
+
+
+def test_readiness_overlay_keeps_formal_scheduler_but_stops_early() -> None:
+    config = h3f.load_stage_a_config()
+    h3f.overlay_h3f_config(config, phase="fresh", job_name="timing", readiness_steps=10)
+    assert config.trainer.max_iter == 10
+    assert config.scheduler.cycle_lengths == [30_000]
+    assert config.scheduler.warm_up_steps == [500]
+    assert config.checkpoint.save_iter == 10
+    assert config.job.group == h3f.H3F_READINESS_GROUP
+
+
+def test_readiness_preflight_is_separate_and_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
+    monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
+    monkeypatch.setattr(h3f, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
+    fake_catalog = SimpleNamespace(episodes=(1,) * 9036, manifest_digest=h3f.MANIFEST_DIGEST)
+    monkeypatch.setattr(h3f, "make_catalog", lambda: (object(), fake_catalog))
+    monkeypatch.setattr(
+        h3f,
+        "preflight_native_batch",
+        lambda *args, **kwargs: {"native_batch": 8, "preflight_uids": [f"uid-{i}" for i in range(8)]},
+    )
+    monkeypatch.setattr(h3f, "_disk_free_bytes", lambda _: 123)
+
+    report = h3f.preflight(_args(tmp_path, readiness_steps=10))
+    assert report["readiness_steps"] == report["target_iteration"] == report["save_iter"] == 10
+    assert h3f.H3F_READINESS_GROUP in report["job"]
+    assert report["config_digest"] != h3f.config_digest()
+    with pytest.raises(ValueError, match="2..100"):
+        h3f.preflight(_args(tmp_path, readiness_steps=1))
+    with pytest.raises(ValueError, match="仅允许 fresh"):
+        h3f.preflight(_args(tmp_path, phase="resume", attempt=2, readiness_steps=10))
 
 
 def test_resume_iteration_and_attempt_identity(tmp_path: Path) -> None:
@@ -64,7 +100,8 @@ def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.Monkey
 
     fresh = _args(tmp_path)
     report = h3f.preflight(fresh)
-    assert report["max_iter"] == 30_000 and report["save_iter"] == 1_000
+    assert report["formal_max_iter"] == 30_000 and report["target_iteration"] == 30_000
+    assert report["save_iter"] == 1_000
     assert report["disk_free_bytes"] == 123
     assert not Path(report["job"]).exists()
 
@@ -111,6 +148,8 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 22)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 33)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+    ticks = iter((100.0,))
+    monkeypatch.setattr(h3f.time, "perf_counter", lambda: next(ticks))
 
     model = torch.nn.Module()
     model.register_parameter("local_memory_weight", torch.nn.Parameter(torch.tensor(1.0)))
@@ -145,6 +184,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     assert observer.last_record["iteration"] == 8
     assert observer.last_record["native_forward"] == observer.last_record["native_backward"] == 32
     assert observer.last_record["local_grad_nonzero_shards"] == 1
+    assert observer.last_record["step_wall_seconds"] is None
     assert len((tmp_path / "progress.jsonl").read_text().splitlines()) == 1
 
 
@@ -165,5 +205,6 @@ def test_formal_observer_rejects_incomplete_iteration(tmp_path: Path) -> None:
 def test_config_digest_is_long_run_specific(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(h3f, "h3e_config_digest", lambda: "base")
     first = h3f.config_digest()
+    assert h3f.readiness_config_digest(10) != first
     monkeypatch.setattr(h3f, "H3F_WARMUP_STEPS", 501)
     assert first != h3f.config_digest()
