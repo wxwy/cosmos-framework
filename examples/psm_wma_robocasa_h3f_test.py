@@ -108,7 +108,9 @@ def test_nonzero_rank_tolerates_rank0_startup_directory_race(
     assert report["evidence_dir"] == str(evidence)
 
 
-def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_formal_observer_aggregates_one_record_per_iteration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 11)
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 22)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 33)

@@ -166,6 +166,8 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     config = load_stage_a_config()
     overlay_h3f_config(config, phase=args.phase, job_name=args.job_name)
     dataset, catalog = make_catalog()
+    if catalog.manifest_digest != MANIFEST_DIGEST:
+        raise ValueError("H3-F manifest authority 漂移")
     digest = config_digest()
     native = preflight_native_batch(dataset, catalog, paths, digest=digest)
     return {
@@ -320,15 +322,17 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
 
     job = Path(report["job"])
     evidence = Path(report["evidence_dir"])
-    # Preflight rejects a pre-existing attempt directory. During torchrun all ranks
-    # race to create the same fresh directory, so creation itself must be idempotent.
-    evidence.mkdir(parents=True, exist_ok=True)
     result_path = evidence / f"rank_{rank}.json"
     progress_path = evidence / f"rank_{rank}_progress.jsonl"
     result: dict[str, Any] = dict(report, rank=rank, result="FAIL")
 
     try:
         distributed.init()
+        if rank == 0:
+            evidence.mkdir(parents=True, exist_ok=False)
+        torch.distributed.barrier()
+        if not evidence.is_dir():
+            raise FileNotFoundError("H3-F rank0 未发布 evidence attempt 目录")
         config.validate()
         config.freeze()
         trainer = GroupedLocalMemoryTrainer(config)
@@ -378,7 +382,8 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
         result["traceback"] = traceback.format_exc()
         raise
     finally:
-        result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+        if evidence.is_dir():
+            result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def main(argv: list[str] | None = None) -> None:
