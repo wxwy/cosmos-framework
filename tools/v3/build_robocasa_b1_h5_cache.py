@@ -123,11 +123,17 @@ def load_shard_episode_meta(shard: Path) -> dict[int, dict]:
             entry: dict = {"length": length, "from_index": from_index, "video": {}}
             for cam in CAMERAS:
                 prefix = f"videos/{cam}"
-                if f"{prefix}/chunk_index" not in data or f"{prefix}/file_index" not in data:
+                required = (
+                    f"{prefix}/chunk_index",
+                    f"{prefix}/file_index",
+                    f"{prefix}/from_timestamp",
+                )
+                if any(key not in data for key in required):
                     raise ValueError(f"episode {ep} missing camera columns {prefix} ({shard})")
                 entry["video"][cam] = {
                     "chunk_index": int(data[f"{prefix}/chunk_index"][i]),
                     "file_index": int(data[f"{prefix}/file_index"][i]),
+                    "from_timestamp": float(data[f"{prefix}/from_timestamp"][i]),
                 }
             if ep in meta:
                 raise ValueError(f"duplicate episode_index {ep} ({shard})")
@@ -184,6 +190,21 @@ def enumerate_train_episodes(
             )
         )
     return specs
+
+
+def video_local_start_frame(video: dict, fps: int) -> int:
+    """Convert a per-camera file-local timestamp to its frame offset."""
+    if not isinstance(fps, int) or isinstance(fps, bool) or fps <= 0:
+        raise ValueError(f"fps must be a positive int, got {fps!r}")
+    timestamp = video.get("from_timestamp")
+    if (
+        not isinstance(timestamp, (int, float, np.integer, np.floating))
+        or isinstance(timestamp, (bool, np.bool_))
+        or not np.isfinite(timestamp)
+        or float(timestamp) < 0.0
+    ):
+        raise ValueError(f"video from_timestamp must be finite and non-negative, got {timestamp!r}")
+    return int(round(float(timestamp) * fps))
 
 
 def decode_episode_frames(mp4_path: Path, start_frame: int, num_frames: int, fps: int) -> torch.Tensor:
@@ -394,9 +415,9 @@ def build_cache(
                     )
                     if not mp4.is_file():
                         raise FileNotFoundError(f"missing video: {mp4}")
-                    frames = decode_episode_frames(
-                        mp4, entry["from_index"], spec.frame_count, FROZEN_LOADER_KWARGS["fps"]
-                    )
+                    fps = FROZEN_LOADER_KWARGS["fps"]
+                    local_start = video_local_start_frame(video, fps)
+                    frames = decode_episode_frames(mp4, local_start, spec.frame_count, fps)
                     z, ep_endpoints[cam] = encode_episode(vae, frames, torch_device)
                     latents[cam] = z
             write_episode_h5(

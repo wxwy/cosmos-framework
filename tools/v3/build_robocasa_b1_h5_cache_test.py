@@ -21,7 +21,9 @@ from build_robocasa_b1_h5_cache import (
     enumerate_train_episodes,
     episode_output_path,
     is_complete_episode,
+    load_shard_episode_meta,
     static_latents,
+    video_local_start_frame,
     write_episode_h5,
 )
 
@@ -53,6 +55,14 @@ def _restore_env(call):
     finally:
         os.environ.clear()
         os.environ.update(snapshot)
+
+
+def test_video_local_start_frame_uses_file_local_timestamp() -> None:
+    assert video_local_start_frame({"from_timestamp": 23.7}, 20) == 474
+    assert video_local_start_frame({"from_timestamp": 0.0}, 20) == 0
+    for video in ({}, {"from_timestamp": -0.1}, {"from_timestamp": float("nan")}):
+        with pytest.raises(ValueError):
+            video_local_start_frame(video, 20)
 
 
 def test_endpoint_vector_grid_and_terminal() -> None:
@@ -288,3 +298,15 @@ def test_full_id_filter_selects_exact_shard_local_identity(tmp_path: Path) -> No
     assert not reports["failed"]
     path = Path(reports["built"][0])
     assert path == episode_output_path(out, target.task, target.date, target.episode_index)
+
+
+@REQUIRES_SOURCE
+def test_multifile_wrist_episode_461_uses_local_file_offset() -> None:
+    shard = V30_SOURCE / "SlideDishwasherRack" / "20250820" / "lerobot"
+    entry = load_shard_episode_meta(shard)[461]
+    wrist = entry["video"][WRIST_CAMERA]
+    assert entry["from_index"] == 76996
+    assert wrist["file_index"] == 1
+    assert wrist["from_timestamp"] == pytest.approx(23.7)
+    assert video_local_start_frame(wrist, 20) == 474
+    assert video_local_start_frame(wrist, 20) != entry["from_index"]
