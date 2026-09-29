@@ -22,7 +22,7 @@ TTT_B_STREAM="${TTT_B_STREAM:-8}"
 TTT_ACTIVE_GA="${TTT_ACTIVE_GA:-2}"
 ROBOCASA_NUM_WORKERS="${ROBOCASA_NUM_WORKERS:-6}"
 
-[[ "$SAVE_ITER" == "500" ]] || { echo "SAVE_ITER must be 500" >&2; exit 2; }
+[[ "$SAVE_ITER" =~ ^[1-9][0-9]*$ ]] || { echo "SAVE_ITER must be a positive integer" >&2; exit 2; }
 [[ "$TTT_TBPTT_STEPS" == "16" ]] || { echo "TTT_TBPTT_STEPS must be 16" >&2; exit 2; }
 [[ "$TTT_DIM" == "64" ]] || { echo "TTT_DIM must be 64" >&2; exit 2; }
 [[ "$TTT_FAST_HIDDEN_DIM" == "256" ]] || { echo "TTT_FAST_HIDDEN_DIM must be 256" >&2; exit 2; }

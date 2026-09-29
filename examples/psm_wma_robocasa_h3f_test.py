@@ -37,6 +37,8 @@ def test_overlay_freezes_30k_schedule() -> None:
     assert config.checkpoint.save_iter == 500
     assert config.job.group == h3f.H3F_GROUP
     assert all(step % config.checkpoint.save_iter == 0 for step in h3f.H3F_FORMAL_CHECKPOINT_ITERS)
+    h3f.overlay_h3f_config(config, phase="fresh", job_name="formal", save_iter=1_000)
+    assert config.checkpoint.save_iter == 1_000
 
 
 def test_readiness_overlay_keeps_formal_scheduler_but_stops_early() -> None:
@@ -50,7 +52,7 @@ def test_readiness_overlay_keeps_formal_scheduler_but_stops_early() -> None:
 
 
 def test_readiness_preflight_is_separate_and_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {})
+    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {"SAVE_ITER": 500})
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
     monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
     monkeypatch.setattr(h3f, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
@@ -155,7 +157,7 @@ def test_resume_iteration_and_attempt_identity(tmp_path: Path) -> None:
 
 
 def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {})
+    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {"SAVE_ITER": 500})
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
     monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
     monkeypatch.setattr(h3f, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
@@ -191,7 +193,7 @@ def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.Monkey
 
 
 def test_nonzero_rank_tolerates_rank0_startup_directory_race(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {})
+    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {"SAVE_ITER": 500})
     monkeypatch.setenv("RANK", "1")
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
     monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
@@ -308,6 +310,7 @@ def test_owner_shell_facade_targets_h3f() -> None:
     script = (Path(__file__).parent / "launch_sft_action_policy_robocasa_edge_all_target_atomic.sh").read_text()
     assert "psm_wma_robocasa_h3f.py" in script
     assert 'SAVE_ITER:-500' in script
+    assert "SAVE_ITER must be a positive integer" in script
     assert 'TTT_TBPTT_STEPS:-16' in script
     assert 'TTT_K_LOCAL:-4' in script
     assert "torchrun" in script
