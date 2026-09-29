@@ -56,6 +56,9 @@ H3F_WARMUP_STEPS = 500
 H3F_GROUP = "h3f_edge_local_h100"
 H3F_READINESS_GROUP = "h3f_edge_local_h100_readiness"
 H3F_READINESS_MAX_STEPS = 100
+H3F_BASE_CHECKPOINT_LINEAGE = Path(
+    "/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Cosmos3-Edge-Policy-DROID-dcp"
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -71,7 +74,14 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def overlay_h3f_config(config: Any, *, phase: str, job_name: str, readiness_steps: int | None = None) -> None:
+def overlay_h3f_config(
+    config: Any,
+    *,
+    phase: str,
+    job_name: str,
+    readiness_steps: int | None = None,
+    save_iter: int = H3F_SAVE_ITER,
+) -> None:
     from examples.psm_wma_robocasa_h100 import overlay_h100_config
 
     overlay_h100_config(config, phase=phase, job_name=job_name)
@@ -80,7 +90,7 @@ def overlay_h3f_config(config: Any, *, phase: str, job_name: str, readiness_step
     config.trainer.logging_iter = 50
     config.scheduler.cycle_lengths = [H3F_FORMAL_MAX_ITER]
     config.scheduler.warm_up_steps = [H3F_WARMUP_STEPS]
-    config.checkpoint.save_iter = target_iteration if readiness_steps is not None else H3F_SAVE_ITER
+    config.checkpoint.save_iter = target_iteration if readiness_steps is not None else save_iter
     config.job.group = H3F_READINESS_GROUP if readiness_steps is not None else H3F_GROUP
     config.job.name = job_name
     if (
@@ -88,17 +98,18 @@ def overlay_h3f_config(config: Any, *, phase: str, job_name: str, readiness_step
         or config.trainer.max_iter != target_iteration
         or config.scheduler.cycle_lengths != [30_000]
         or config.scheduler.warm_up_steps != [500]
-        or config.checkpoint.save_iter != (target_iteration if readiness_steps is not None else H3F_SAVE_ITER)
-        or any(step % H3F_SAVE_ITER for step in H3F_FORMAL_CHECKPOINT_ITERS)
+        or config.checkpoint.save_iter != (target_iteration if readiness_steps is not None else save_iter)
+        or save_iter <= 0
+        or any(step % save_iter for step in H3F_FORMAL_CHECKPOINT_ITERS)
     ):
         raise ValueError("H3-F 30k/scheduler/checkpoint 合同不匹配")
 
 
-def config_digest() -> str:
+def config_digest(save_iter: int = H3F_SAVE_ITER) -> str:
     authority = {
         "h3e_runtime": h3e_config_digest(),
         "max_iter": H3F_FORMAL_MAX_ITER,
-        "save_iter": H3F_SAVE_ITER,
+        "save_iter": save_iter,
         "warmup_steps": H3F_WARMUP_STEPS,
         "cycle_lengths": [H3F_FORMAL_MAX_ITER],
         "primary_eval_iters": list(H3F_FORMAL_CHECKPOINT_ITERS),
@@ -106,9 +117,9 @@ def config_digest() -> str:
     return hashlib.sha256(json.dumps(authority, sort_keys=True).encode()).hexdigest()
 
 
-def readiness_config_digest(steps: int) -> str:
+def readiness_config_digest(steps: int, save_iter: int = H3F_SAVE_ITER) -> str:
     authority = {
-        "formal_config_digest": config_digest(),
+        "formal_config_digest": config_digest(save_iter),
         "readiness_steps": steps,
         "scheduler_cycle": [H3F_FORMAL_MAX_ITER],
         "scheduler_warmup": [H3F_WARMUP_STEPS],
@@ -155,7 +166,6 @@ def _validate_output_root(output_root: Path) -> None:
 
 def _validate_contract_env(output_root: Path) -> dict[str, Any]:
     exact_ints = {
-        "SAVE_ITER": H3F_SAVE_ITER,
         "TTT_TBPTT_STEPS": 16,
         "TTT_DIM": 64,
         "TTT_FAST_HIDDEN_DIM": 256,
@@ -164,6 +174,16 @@ def _validate_contract_env(output_root: Path) -> dict[str, Any]:
         "TTT_ACTIVE_GA": 2,
     }
     observed: dict[str, Any] = {}
+
+    save_value = os.environ.get("SAVE_ITER", str(H3F_SAVE_ITER))
+    try:
+        save_iter = int(save_value)
+    except ValueError as error:
+        raise ValueError("H3-F SAVE_ITER 必须为正整数") from error
+    if save_iter <= 0 or any(step % save_iter for step in H3F_FORMAL_CHECKPOINT_ITERS):
+        raise ValueError("H3-F SAVE_ITER 必须为正整数且整除全部 primary eval milestones")
+    observed["SAVE_ITER"] = save_iter
+
     for name, expected in exact_ints.items():
         value = os.environ.get(name)
         if value is None:
@@ -186,11 +206,35 @@ def _validate_contract_env(output_root: Path) -> dict[str, Any]:
             raise ValueError(f"H3-F TTT_INNER_LR={parsed_lr} 与冻结值 0.1 不匹配")
         observed["TTT_INNER_LR"] = parsed_lr
 
-    cache_env = os.environ.get("ROBOCASA_LATENT_CACHE_ROOT")
-    if cache_env is not None and Path(cache_env).expanduser().resolve() != CACHE_ROOT:
-        raise ValueError("H3-F ROBOCASA_LATENT_CACHE_ROOT 与冻结 B1 cache 不匹配")
-    if cache_env is not None:
-        observed["ROBOCASA_LATENT_CACHE_ROOT"] = str(CACHE_ROOT)
+    for name, expected in (
+        ("ROBOCASA_ROOT", DEFAULT_DATASET_ROOT),
+        ("ROBOCASA_LATENT_CACHE_ROOT", CACHE_ROOT),
+        ("EDGE_POLICY_CHECKPOINT", DEFAULT_EDGE),
+        ("WAN_VAE_PATH", DEFAULT_VAE),
+    ):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        resolved = Path(value).expanduser().resolve()
+        if resolved != expected.resolve():
+            raise ValueError(f"H3-F {name} 与冻结 authority 不匹配")
+        observed[name] = str(resolved)
+
+    base_env = os.environ.get("BASE_CHECKPOINT_PATH")
+    if base_env is not None:
+        base = Path(base_env).expanduser().resolve()
+        if base != H3F_BASE_CHECKPOINT_LINEAGE.resolve():
+            raise ValueError("H3-F BASE_CHECKPOINT_PATH 与冻结 Edge-DROID lineage 不匹配")
+        if not (base / "model/.metadata").is_file():
+            raise FileNotFoundError(f"H3-F BASE_CHECKPOINT_PATH 缺少 model/.metadata：{base}")
+        observed["BASE_CHECKPOINT_PATH"] = str(base)
+        observed["EFFECTIVE_WARMSTART"] = "frozen Stage-A H100 iter1 authority"
+
+    cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda is not None and cuda != "0,1,2,3,4,5,6,7":
+        raise ValueError("H3-F CUDA_VISIBLE_DEVICES 必须为 0,1,2,3,4,5,6,7")
+    if cuda is not None:
+        observed["CUDA_VISIBLE_DEVICES"] = cuda
 
     output_env = os.environ.get("OUTPUT_ROOT")
     if output_env is not None and Path(output_env).expanduser().resolve() != output_root:
@@ -208,14 +252,6 @@ def _validate_contract_env(output_root: Path) -> dict[str, Any]:
             raise ValueError("H3-F ROBOCASA_NUM_WORKERS 必须为正整数")
         observed["ROBOCASA_NUM_WORKERS"] = parsed_workers
         observed["ROBOCASA_NUM_WORKERS_EFFECT"] = "contract-only; grouped planner/binder 同步物化，不驱动 DataLoader workers"
-
-    base_env = os.environ.get("BASE_CHECKPOINT_PATH")
-    if base_env is not None:
-        base = Path(base_env).expanduser().resolve()
-        if not base.is_dir():
-            raise FileNotFoundError(f"H3-F BASE_CHECKPOINT_PATH 不存在：{base}")
-        observed["BASE_CHECKPOINT_PATH_COMPAT"] = str(base)
-        observed["EFFECTIVE_WARMSTART"] = "frozen Stage-A H100 checkpoint authority"
 
     return observed
 
@@ -260,15 +296,26 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         raise FileExistsError("H3-F evidence attempt 已存在；禁止覆盖")
 
     contract_env = _validate_contract_env(output_root)
+    save_iter = int(contract_env["SAVE_ITER"])
     paths = _paths(output_root)
     asset_authority = validate_h100_asset_authority()
     contract = read_stage_a_contract(paths)
     config = load_stage_a_config()
-    overlay_h3f_config(config, phase=args.phase, job_name=args.job_name, readiness_steps=readiness_steps)
+    overlay_h3f_config(
+        config,
+        phase=args.phase,
+        job_name=args.job_name,
+        readiness_steps=readiness_steps,
+        save_iter=save_iter,
+    )
     dataset, catalog = make_catalog()
     if catalog.manifest_digest != MANIFEST_DIGEST:
         raise ValueError("H3-F manifest authority 漂移")
-    digest = readiness_config_digest(readiness_steps) if readiness_steps is not None else config_digest()
+    digest = (
+        readiness_config_digest(readiness_steps, save_iter)
+        if readiness_steps is not None
+        else config_digest(save_iter)
+    )
     native = preflight_native_batch(dataset, catalog, paths, digest=digest)
     return {
         "pair": pair,
@@ -289,7 +336,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "formal_max_iter": H3F_FORMAL_MAX_ITER,
         "readiness_steps": readiness_steps,
         "target_iteration": readiness_steps if readiness_steps is not None else H3F_FORMAL_MAX_ITER,
-        "save_iter": readiness_steps if readiness_steps is not None else H3F_SAVE_ITER,
+        "save_iter": readiness_steps if readiness_steps is not None else save_iter,
         "scheduler_cycle": [H3F_FORMAL_MAX_ITER],
         "scheduler_warmup": [H3F_WARMUP_STEPS],
         "primary_eval_iters": list(H3F_FORMAL_CHECKPOINT_ITERS),
@@ -448,7 +495,11 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
     os.environ["WAN_VAE_PATH"] = str(DEFAULT_VAE)
     config = load_stage_a_config()
     overlay_h3f_config(
-        config, phase=args.phase, job_name=args.job_name, readiness_steps=report["readiness_steps"]
+        config,
+        phase=args.phase,
+        job_name=args.job_name,
+        readiness_steps=report["readiness_steps"],
+        save_iter=int(report["contract_env"]["SAVE_ITER"]),
     )
 
     job = Path(report["job"])

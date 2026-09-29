@@ -29,7 +29,7 @@ def _args(
 
 def test_overlay_freezes_30k_schedule() -> None:
     config = h3f.load_stage_a_config()
-    h3f.overlay_h3f_config(config, phase="fresh", job_name="formal")
+    h3f.overlay_h3f_config(config, phase="fresh", job_name="formal", save_iter=500)
     assert config.trainer.max_iter == 30_000
     assert config.trainer.grad_accum_iter == 2
     assert config.scheduler.cycle_lengths == [30_000]
@@ -86,11 +86,22 @@ def test_output_root_allows_only_ignored_worktree_outputs(monkeypatch: pytest.Mo
 
 def test_contract_env_validates_owner_launch_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     output = tmp_path / "out"
+    dataset = tmp_path / "dataset"
     cache = tmp_path / "cache"
+    edge = tmp_path / "edge"
+    vae = tmp_path / "vae.pth"
     base = tmp_path / "base"
+    dataset.mkdir()
     cache.mkdir()
-    base.mkdir()
+    edge.mkdir()
+    vae.touch()
+    (base / "model").mkdir(parents=True)
+    (base / "model/.metadata").touch()
+    monkeypatch.setattr(h3f, "DEFAULT_DATASET_ROOT", dataset)
     monkeypatch.setattr(h3f, "CACHE_ROOT", cache)
+    monkeypatch.setattr(h3f, "DEFAULT_EDGE", edge)
+    monkeypatch.setattr(h3f, "DEFAULT_VAE", vae)
+    monkeypatch.setattr(h3f, "H3F_BASE_CHECKPOINT_LINEAGE", base)
     values = {
         "SAVE_ITER": "500",
         "TTT_TBPTT_STEPS": "16",
@@ -101,8 +112,12 @@ def test_contract_env_validates_owner_launch_values(monkeypatch: pytest.MonkeyPa
         "TTT_B_STREAM": "8",
         "TTT_ACTIVE_GA": "2",
         "ROBOCASA_NUM_WORKERS": "6",
+        "ROBOCASA_ROOT": str(dataset),
         "ROBOCASA_LATENT_CACHE_ROOT": str(cache),
         "BASE_CHECKPOINT_PATH": str(base),
+        "EDGE_POLICY_CHECKPOINT": str(edge),
+        "WAN_VAE_PATH": str(vae),
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
         "OUTPUT_ROOT": str(output),
     }
     for name, value in values.items():
@@ -111,10 +126,18 @@ def test_contract_env_validates_owner_launch_values(monkeypatch: pytest.MonkeyPa
     assert report["SAVE_ITER"] == 500
     assert report["TTT_K_LOCAL"] == 4
     assert report["ROBOCASA_NUM_WORKERS"] == 6
+    assert report["ROBOCASA_ROOT"] == str(dataset)
+    assert report["BASE_CHECKPOINT_PATH"] == str(base)
+    assert report["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
     assert "contract-only" in report["ROBOCASA_NUM_WORKERS_EFFECT"]
 
     monkeypatch.setenv("TTT_K_LOCAL", "8")
     with pytest.raises(ValueError, match="冻结值"):
+        h3f._validate_contract_env(output)
+
+    monkeypatch.setenv("TTT_K_LOCAL", "4")
+    monkeypatch.setenv("SAVE_ITER", "750")
+    with pytest.raises(ValueError, match="primary eval"):
         h3f._validate_contract_env(output)
 
 
@@ -292,7 +315,8 @@ def test_owner_shell_facade_targets_h3f() -> None:
 
 def test_config_digest_is_long_run_specific(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(h3f, "h3e_config_digest", lambda: "base")
-    first = h3f.config_digest()
-    assert h3f.readiness_config_digest(10) != first
+    first = h3f.config_digest(500)
+    assert h3f.config_digest(1000) != first
+    assert h3f.readiness_config_digest(10, 500) != first
     monkeypatch.setattr(h3f, "H3F_WARMUP_STEPS", 501)
     assert first != h3f.config_digest()
