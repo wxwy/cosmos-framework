@@ -257,3 +257,34 @@ def test_static_build_source_untouched_and_reader_reads(tmp_path: Path) -> None:
         expected_episode_id=episode_id,
         expected_source_frames=frame_count,
     )
+
+
+@REQUIRES_SOURCE
+def test_full_id_filter_selects_exact_shard_local_identity(tmp_path: Path) -> None:
+    specs = _restore_env(lambda: enumerate_train_episodes(V30_SOURCE))
+    by_episode_id: dict[str, list] = {}
+    for spec in specs:
+        by_episode_id.setdefault(spec.episode_id, []).append(spec)
+    duplicate_group = next(group for group in by_episode_id.values() if len({spec.task for spec in group}) >= 2)
+    target = duplicate_group[0]
+    out = tmp_path / "cache"
+    reports = _restore_env(
+        lambda: build_cache(
+            V30_SOURCE,
+            out,
+            mode="static",
+            vae_path=None,
+            device="cpu",
+            task_names=None,
+            episode_filter=set(),
+            limit=0,
+            workers=1,
+            worker=0,
+            full_id_filter={target.full_id},
+        )
+    )
+    assert reports["selected_full_ids"] == [target.full_id]
+    assert len(reports["built"]) == 1
+    assert not reports["failed"]
+    path = Path(reports["built"][0])
+    assert path == episode_output_path(out, target.task, target.date, target.episode_index)

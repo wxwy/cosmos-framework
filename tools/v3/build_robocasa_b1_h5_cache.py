@@ -315,6 +315,7 @@ def build_cache(
     limit: int,
     workers: int,
     worker: int,
+    full_id_filter: set[str] | None = None,
     vae: object | None = None,
 ) -> dict:
     """Build (or resume) the cache for the frozen train split.
@@ -323,6 +324,9 @@ def build_cache(
     """
     if mode not in ("static", "build"):
         raise ValueError(f"mode must be 'static' or 'build', got {mode!r}")
+    full_id_filter = full_id_filter or set()
+    if full_id_filter and workers != 1:
+        raise ValueError("full_id_filter is a formal tiny-smoke selector and requires workers=1")
     specs = enumerate_train_episodes(source_root, task_names)
     if len(specs) != 9036:
         raise RuntimeError(
@@ -349,11 +353,16 @@ def build_cache(
         vae.model.scale = (scale_mean.to(torch_device), scale_inv_std.to(torch_device))
     meta_cache: dict[Path, dict[int, dict]] = {}
     built_count = 0
+    selected_full_ids: set[str] = set()
     for ordinal, spec in enumerate(specs):
         if ordinal % workers != worker:
             continue
         if episode_filter and spec.episode_id not in episode_filter:
             continue
+        if full_id_filter and spec.full_id not in full_id_filter:
+            continue
+        if full_id_filter:
+            selected_full_ids.add(spec.full_id)
         if limit and (len(reports["built"]) + len(reports["skipped"])) >= limit:
             break
         cache_path = episode_output_path(output_root, spec.task, spec.date, spec.episode_index)
@@ -403,8 +412,12 @@ def build_cache(
             reports["failed"].append({"path": str(cache_path), "error": str(error)})
             if cache_path.exists():
                 cache_path.unlink()
+    if full_id_filter and selected_full_ids != full_id_filter:
+        missing = sorted(full_id_filter - selected_full_ids)
+        raise RuntimeError(f"full_id_filter did not resolve exact train identities: {missing}")
     reports["elapsed_s"] = round(time.time() - t0, 1)
     reports["built_count"] = built_count
+    reports["selected_full_ids"] = sorted(selected_full_ids)
     return reports
 
 
@@ -416,7 +429,13 @@ def main() -> int:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--mode", choices=["static", "build"], default="static")
     parser.add_argument("--tasks", nargs="*", default=[])
-    parser.add_argument("--episode-filter", nargs="*", default=[], help="tiny smoke: ep_XXXXXX subset")
+    parser.add_argument("--episode-filter", nargs="*", default=[], help="legacy tiny smoke: shard-local ep_XXXXXX subset")
+    parser.add_argument(
+        "--full-id-filter",
+        nargs="*",
+        default=[],
+        help="formal tiny smoke: exact task/date/ep_XXXXXX identities",
+    )
     parser.add_argument("--limit", type=int, default=0, help="0 = all train records")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--worker", type=int, default=0)
@@ -435,6 +454,7 @@ def main() -> int:
         limit=args.limit,
         workers=args.workers,
         worker=args.worker,
+        full_id_filter=set(args.full_id_filter),
     )
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(reports, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
