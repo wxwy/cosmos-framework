@@ -51,7 +51,7 @@ from examples.psm_wma_robocasa_h100 import (
     config_digest as h3e_config_digest,
 )
 
-H3F_SAVE_ITER = 1_000
+H3F_SAVE_ITER = 500
 H3F_WARMUP_STEPS = 500
 H3F_GROUP = "h3f_edge_local_h100"
 H3F_READINESS_GROUP = "h3f_edge_local_h100_readiness"
@@ -88,7 +88,7 @@ def overlay_h3f_config(config: Any, *, phase: str, job_name: str, readiness_step
         or config.trainer.max_iter != target_iteration
         or config.scheduler.cycle_lengths != [30_000]
         or config.scheduler.warm_up_steps != [500]
-        or config.checkpoint.save_iter != (target_iteration if readiness_steps is not None else 1_000)
+        or config.checkpoint.save_iter != (target_iteration if readiness_steps is not None else H3F_SAVE_ITER)
         or any(step % H3F_SAVE_ITER for step in H3F_FORMAL_CHECKPOINT_ITERS)
     ):
         raise ValueError("H3-F 30k/scheduler/checkpoint 合同不匹配")
@@ -144,6 +144,82 @@ def _authority_preflight_rank() -> bool:
     return rank is None or int(rank) == 0
 
 
+def _validate_output_root(output_root: Path) -> None:
+    if output_root == ROOT_WORKTREE:
+        raise ValueError("H3-F 产物不能直接写入 root worktree")
+    if ROOT_WORKTREE in output_root.parents:
+        allowed = ROOT_WORKTREE / "outputs"
+        if output_root != allowed and allowed not in output_root.parents:
+            raise ValueError("H3-F worktree 内只允许写入已忽略的 outputs/ 子树")
+
+
+def _validate_contract_env(output_root: Path) -> dict[str, Any]:
+    exact_ints = {
+        "SAVE_ITER": H3F_SAVE_ITER,
+        "TTT_TBPTT_STEPS": 16,
+        "TTT_DIM": 64,
+        "TTT_FAST_HIDDEN_DIM": 256,
+        "TTT_K_LOCAL": 4,
+        "TTT_B_STREAM": 8,
+        "TTT_ACTIVE_GA": 2,
+    }
+    observed: dict[str, Any] = {}
+    for name, expected in exact_ints.items():
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except ValueError as error:
+            raise ValueError(f"H3-F {name} 必须为整数") from error
+        if parsed != expected:
+            raise ValueError(f"H3-F {name}={parsed} 与冻结值 {expected} 不匹配")
+        observed[name] = parsed
+
+    inner_lr = os.environ.get("TTT_INNER_LR")
+    if inner_lr is not None:
+        try:
+            parsed_lr = float(inner_lr)
+        except ValueError as error:
+            raise ValueError("H3-F TTT_INNER_LR 必须为浮点数") from error
+        if parsed_lr != 0.1:
+            raise ValueError(f"H3-F TTT_INNER_LR={parsed_lr} 与冻结值 0.1 不匹配")
+        observed["TTT_INNER_LR"] = parsed_lr
+
+    cache_env = os.environ.get("ROBOCASA_LATENT_CACHE_ROOT")
+    if cache_env is not None and Path(cache_env).expanduser().resolve() != CACHE_ROOT:
+        raise ValueError("H3-F ROBOCASA_LATENT_CACHE_ROOT 与冻结 B1 cache 不匹配")
+    if cache_env is not None:
+        observed["ROBOCASA_LATENT_CACHE_ROOT"] = str(CACHE_ROOT)
+
+    output_env = os.environ.get("OUTPUT_ROOT")
+    if output_env is not None and Path(output_env).expanduser().resolve() != output_root:
+        raise ValueError("H3-F OUTPUT_ROOT 与 --output-root 不一致")
+    if output_env is not None:
+        observed["OUTPUT_ROOT"] = str(output_root)
+
+    workers = os.environ.get("ROBOCASA_NUM_WORKERS")
+    if workers is not None:
+        try:
+            parsed_workers = int(workers)
+        except ValueError as error:
+            raise ValueError("H3-F ROBOCASA_NUM_WORKERS 必须为正整数") from error
+        if parsed_workers <= 0:
+            raise ValueError("H3-F ROBOCASA_NUM_WORKERS 必须为正整数")
+        observed["ROBOCASA_NUM_WORKERS"] = parsed_workers
+        observed["ROBOCASA_NUM_WORKERS_EFFECT"] = "contract-only; grouped planner/binder 同步物化，不驱动 DataLoader workers"
+
+    base_env = os.environ.get("BASE_CHECKPOINT_PATH")
+    if base_env is not None:
+        base = Path(base_env).expanduser().resolve()
+        if not base.is_dir():
+            raise FileNotFoundError(f"H3-F BASE_CHECKPOINT_PATH 不存在：{base}")
+        observed["BASE_CHECKPOINT_PATH_COMPAT"] = str(base)
+        observed["EFFECTIVE_WARMSTART"] = "frozen Stage-A H100 checkpoint authority"
+
+    return observed
+
+
 def _disk_free_bytes(output_root: Path) -> int:
     probe = output_root.expanduser().resolve()
     while not probe.exists() and probe != probe.parent:
@@ -154,8 +230,7 @@ def _disk_free_bytes(output_root: Path) -> int:
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
     pair = lock_pair(args.expected_root, args.expected_child)
     output_root = args.output_root.expanduser().resolve()
-    if output_root == ROOT_WORKTREE or ROOT_WORKTREE in output_root.parents:
-        raise ValueError("H3-F 产物必须位于 root worktree 之外")
+    _validate_output_root(output_root)
     if not args.job_name or "/" in args.job_name or args.job_name in (".", ".."):
         raise ValueError("H3-F job-name 不合法")
     if type(args.attempt) is not int or args.attempt <= 0:
@@ -184,6 +259,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     if evidence.exists() and authority_rank:
         raise FileExistsError("H3-F evidence attempt 已存在；禁止覆盖")
 
+    contract_env = _validate_contract_env(output_root)
     paths = _paths(output_root)
     asset_authority = validate_h100_asset_authority()
     contract = read_stage_a_contract(paths)
@@ -206,6 +282,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "config_digest": digest,
         "stage_a_dcp_keys": contract["dcp_keys"],
         "asset_authority": asset_authority,
+        "contract_env": contract_env,
         **native,
         "geometry": [8, 8, 2, 16, 4],
         "selector": list(SELECTED_KEYS),
@@ -236,6 +313,7 @@ class FormalObserver:
         self.completed = 0
         self.last_record: dict[str, Any] | None = None
         self.last_commit_time: float | None = None
+        self.step_wall_samples: list[float] = []
 
     def _bind_iteration(self, iteration: int) -> None:
         if self.iteration is None:
@@ -284,6 +362,8 @@ class FormalObserver:
         now = time.perf_counter()
         step_wall_seconds = None if self.last_commit_time is None else now - self.last_commit_time
         self.last_commit_time = now
+        if step_wall_seconds is not None:
+            self.step_wall_samples.append(step_wall_seconds)
         record = {
             "iteration": completed,
             "native_forward": self.forward,
@@ -311,6 +391,25 @@ class FormalObserver:
         self.loss_min = float("inf")
         self.loss_max = float("-inf")
         torch.cuda.reset_peak_memory_stats()
+
+
+    def timing_summary(self) -> dict[str, float | int | None]:
+        if not self.step_wall_samples:
+            return {"samples": 0, "min": None, "median": None, "max": None, "mean": None}
+        values = sorted(self.step_wall_samples)
+        midpoint = len(values) // 2
+        median = (
+            values[midpoint]
+            if len(values) % 2
+            else (values[midpoint - 1] + values[midpoint]) / 2
+        )
+        return {
+            "samples": len(values),
+            "min": values[0],
+            "median": median,
+            "max": values[-1],
+            "mean": sum(values) / len(values),
+        }
 
 
 def _install_optimizer_inventory_check(model: torch.nn.Module, result: dict[str, Any]) -> None:
@@ -410,6 +509,7 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
             completed_iteration=trainer._grouped_completed_iteration,
             progress_records=observer.completed,
             final_record=observer.last_record,
+            timing=observer.timing_summary(),
             final_checkpoint=str(final),
         )
     except Exception:

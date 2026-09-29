@@ -34,7 +34,7 @@ def test_overlay_freezes_30k_schedule() -> None:
     assert config.trainer.grad_accum_iter == 2
     assert config.scheduler.cycle_lengths == [30_000]
     assert config.scheduler.warm_up_steps == [500]
-    assert config.checkpoint.save_iter == 1_000
+    assert config.checkpoint.save_iter == 500
     assert config.job.group == h3f.H3F_GROUP
     assert all(step % config.checkpoint.save_iter == 0 for step in h3f.H3F_FORMAL_CHECKPOINT_ITERS)
 
@@ -50,6 +50,7 @@ def test_readiness_overlay_keeps_formal_scheduler_but_stops_early() -> None:
 
 
 def test_readiness_preflight_is_separate_and_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {})
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
     monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
     monkeypatch.setattr(h3f, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
@@ -72,6 +73,51 @@ def test_readiness_preflight_is_separate_and_fail_closed(monkeypatch: pytest.Mon
         h3f.preflight(_args(tmp_path, phase="resume", attempt=2, readiness_steps=10))
 
 
+def test_output_root_allows_only_ignored_worktree_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(h3f, "ROOT_WORKTREE", root)
+    h3f._validate_output_root(root / "outputs" / "formal")
+    with pytest.raises(ValueError, match="outputs"):
+        h3f._validate_output_root(root / "checkpoints" / "formal")
+    with pytest.raises(ValueError, match="root worktree"):
+        h3f._validate_output_root(root)
+
+
+def test_contract_env_validates_owner_launch_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    output = tmp_path / "out"
+    cache = tmp_path / "cache"
+    base = tmp_path / "base"
+    cache.mkdir()
+    base.mkdir()
+    monkeypatch.setattr(h3f, "CACHE_ROOT", cache)
+    values = {
+        "SAVE_ITER": "500",
+        "TTT_TBPTT_STEPS": "16",
+        "TTT_DIM": "64",
+        "TTT_FAST_HIDDEN_DIM": "256",
+        "TTT_K_LOCAL": "4",
+        "TTT_INNER_LR": "0.1",
+        "TTT_B_STREAM": "8",
+        "TTT_ACTIVE_GA": "2",
+        "ROBOCASA_NUM_WORKERS": "6",
+        "ROBOCASA_LATENT_CACHE_ROOT": str(cache),
+        "BASE_CHECKPOINT_PATH": str(base),
+        "OUTPUT_ROOT": str(output),
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    report = h3f._validate_contract_env(output)
+    assert report["SAVE_ITER"] == 500
+    assert report["TTT_K_LOCAL"] == 4
+    assert report["ROBOCASA_NUM_WORKERS"] == 6
+    assert "contract-only" in report["ROBOCASA_NUM_WORKERS_EFFECT"]
+
+    monkeypatch.setenv("TTT_K_LOCAL", "8")
+    with pytest.raises(ValueError, match="冻结值"):
+        h3f._validate_contract_env(output)
+
+
 def test_resume_iteration_and_attempt_identity(tmp_path: Path) -> None:
     job = tmp_path / "job"
     (job / "checkpoints").mkdir(parents=True)
@@ -86,6 +132,7 @@ def test_resume_iteration_and_attempt_identity(tmp_path: Path) -> None:
 
 
 def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {})
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
     monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
     monkeypatch.setattr(h3f, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
@@ -101,7 +148,7 @@ def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.Monkey
     fresh = _args(tmp_path)
     report = h3f.preflight(fresh)
     assert report["formal_max_iter"] == 30_000 and report["target_iteration"] == 30_000
-    assert report["save_iter"] == 1_000
+    assert report["save_iter"] == 500
     assert report["disk_free_bytes"] == 123
     assert not Path(report["job"]).exists()
 
@@ -121,6 +168,7 @@ def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.Monkey
 
 
 def test_nonzero_rank_tolerates_rank0_startup_directory_race(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {})
     monkeypatch.setenv("RANK", "1")
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
     monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
@@ -148,7 +196,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 22)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 33)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
-    ticks = iter((100.0,))
+    ticks = iter((100.0, 112.5))
     monkeypatch.setattr(h3f.time, "perf_counter", lambda: next(ticks))
 
     model = torch.nn.Module()
@@ -185,7 +233,38 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     assert observer.last_record["native_forward"] == observer.last_record["native_backward"] == 32
     assert observer.last_record["local_grad_nonzero_shards"] == 1
     assert observer.last_record["step_wall_seconds"] is None
-    assert len((tmp_path / "progress.jsonl").read_text().splitlines()) == 1
+
+    trainer._grouped_completed_iteration = 8
+    for index in range(32):
+        observer(
+            phase="native_forward",
+            iteration=8,
+            member=index // 16,
+            index=index % 16,
+            loss=torch.tensor(9.0 + index / 100),
+            trainer=trainer,
+        )
+        observer(
+            phase="native_backward",
+            iteration=8,
+            member=index // 16,
+            index=index % 16,
+            loss=None,
+            trainer=trainer,
+        )
+    observer(phase="pre_optimizer", iteration=8, member=1, index=None, loss=None, trainer=trainer)
+    observer(phase="post_commit", iteration=8, member=1, index=None, loss=None, trainer=trainer)
+
+    assert observer.last_record["iteration"] == 9
+    assert observer.last_record["step_wall_seconds"] == 12.5
+    assert observer.timing_summary() == {
+        "samples": 1,
+        "min": 12.5,
+        "median": 12.5,
+        "max": 12.5,
+        "mean": 12.5,
+    }
+    assert len((tmp_path / "progress.jsonl").read_text().splitlines()) == 2
 
 
 def test_formal_observer_rejects_incomplete_iteration(tmp_path: Path) -> None:
@@ -200,6 +279,15 @@ def test_formal_observer_rejects_incomplete_iteration(tmp_path: Path) -> None:
     observer(phase="native_forward", iteration=0, member=0, index=0, loss=torch.tensor(1.0), trainer=trainer)
     with pytest.raises(RuntimeError, match="event count"):
         observer(phase="post_commit", iteration=0, member=1, index=None, loss=None, trainer=trainer)
+
+
+def test_owner_shell_facade_targets_h3f() -> None:
+    script = (Path(__file__).parent / "launch_sft_action_policy_robocasa_edge_all_target_atomic.sh").read_text()
+    assert "psm_wma_robocasa_h3f.py" in script
+    assert 'SAVE_ITER:-500' in script
+    assert 'TTT_TBPTT_STEPS:-16' in script
+    assert 'TTT_K_LOCAL:-4' in script
+    assert "torchrun" in script
 
 
 def test_config_digest_is_long_run_specific(monkeypatch: pytest.MonkeyPatch) -> None:
