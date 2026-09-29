@@ -145,8 +145,10 @@ def test_optimizer_parameters_supports_container_and_plain_optimizer() -> None:
     container = object.__new__(OptimizersContainer)
     container.optimizers = [first_optimizer, second_optimizer]
 
-    assert GroupedLocalMemoryTrainer._optimizer_parameters(first_optimizer) == [first, second]
-    assert GroupedLocalMemoryTrainer._optimizer_parameters(container) == [first, second, third]
+    plain = GroupedLocalMemoryTrainer._optimizer_parameters(first_optimizer)
+    grouped = GroupedLocalMemoryTrainer._optimizer_parameters(container)
+    assert [id(parameter) for parameter in plain] == [id(first), id(second)]
+    assert [id(parameter) for parameter in grouped] == [id(first), id(second), id(third)]
 
 
 def test_optimizer_parameters_container_is_fail_closed() -> None:
