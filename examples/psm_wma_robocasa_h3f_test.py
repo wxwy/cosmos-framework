@@ -83,6 +83,31 @@ def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.Monkey
         h3f.preflight(_args(tmp_path, phase="resume", attempt=1))
 
 
+def test_nonzero_rank_tolerates_rank0_startup_directory_race(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
+    monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
+    monkeypatch.setattr(h3f, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
+    fake_catalog = SimpleNamespace(episodes=(1,) * 9036, manifest_digest=h3f.MANIFEST_DIGEST)
+    monkeypatch.setattr(h3f, "make_catalog", lambda: (object(), fake_catalog))
+    monkeypatch.setattr(
+        h3f,
+        "preflight_native_batch",
+        lambda *args, **kwargs: {"native_batch": 8, "preflight_uids": [f"uid-{i}" for i in range(8)]},
+    )
+    monkeypatch.setattr(h3f, "_disk_free_bytes", lambda _: 123)
+
+    args = _args(tmp_path)
+    job = h3f._job(tmp_path, args.job_name)
+    evidence = h3f._evidence_dir(job, phase="fresh", attempt=1, start_iteration=0)
+    evidence.mkdir(parents=True)
+    report = h3f.preflight(args)
+    assert report["job"] == str(job)
+    assert report["evidence_dir"] == str(evidence)
+
+
 def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 11)
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 22)

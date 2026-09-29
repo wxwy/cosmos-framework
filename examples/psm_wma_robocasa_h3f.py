@@ -121,6 +121,11 @@ def _evidence_dir(job: Path, *, phase: str, attempt: int, start_iteration: int) 
     return job / "h3f_evidence" / f"attempt_{attempt:04d}_{phase}_from_{start_iteration:09d}"
 
 
+def _authority_preflight_rank() -> bool:
+    rank = os.environ.get("RANK")
+    return rank is None or int(rank) == 0
+
+
 def _disk_free_bytes(output_root: Path) -> int:
     probe = output_root.expanduser().resolve()
     while not probe.exists() and probe != probe.parent:
@@ -139,10 +144,11 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("H3-F attempt 必须为正整数")
 
     job = _job(output_root, args.job_name)
+    authority_rank = _authority_preflight_rank()
     if args.phase == "fresh":
         if args.attempt != 1:
             raise ValueError("H3-F fresh 必须使用 attempt=1")
-        if job.exists():
+        if job.exists() and authority_rank:
             raise FileExistsError("H3-F fresh job 已存在；禁止覆盖")
         start_iteration = 0
     else:
@@ -151,7 +157,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         start_iteration = _resume_iteration(job)
 
     evidence = _evidence_dir(job, phase=args.phase, attempt=args.attempt, start_iteration=start_iteration)
-    if evidence.exists():
+    if evidence.exists() and authority_rank:
         raise FileExistsError("H3-F evidence attempt 已存在；禁止覆盖")
 
     paths = _paths(output_root)
