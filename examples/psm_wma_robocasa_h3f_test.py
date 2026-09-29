@@ -83,9 +83,7 @@ def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.Monkey
         h3f.preflight(_args(tmp_path, phase="resume", attempt=1))
 
 
-def test_nonzero_rank_tolerates_rank0_startup_directory_race(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_nonzero_rank_tolerates_rank0_startup_directory_race(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("RANK", "1")
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
     monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
@@ -108,9 +106,7 @@ def test_nonzero_rank_tolerates_rank0_startup_directory_race(
     assert report["evidence_dir"] == str(evidence)
 
 
-def test_formal_observer_aggregates_one_record_per_iteration(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 11)
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 22)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 33)
