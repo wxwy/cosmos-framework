@@ -257,8 +257,13 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     monkeypatch.setattr(h3f.time, "perf_counter", lambda: next(ticks))
 
     model = torch.nn.Module()
-    model.register_parameter("local_memory_weight", torch.nn.Parameter(torch.tensor(1.0)))
-    model.local_memory_weight.grad = torch.tensor(0.25)
+    model.net = torch.nn.Module()
+    model.net.language_model = torch.nn.Module()
+    model.net.language_model.register_parameter("reason_weight", torch.nn.Parameter(torch.tensor(1.0)))
+    model.net.local_memory = torch.nn.Module()
+    model.net.local_memory.register_parameter("weight", torch.nn.Parameter(torch.tensor(1.0)))
+    model.net.language_model.reason_weight.grad = torch.tensor(0.5)
+    model.net.local_memory.weight.grad = torch.tensor(0.25)
     observer = h3f.FormalObserver(tmp_path / "progress.jsonl", model)
     trainer = SimpleNamespace(
         _grouped_completed_iteration=7,
@@ -289,6 +294,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     assert observer.last_record["iteration"] == 8
     assert observer.last_record["native_forward"] == observer.last_record["native_backward"] == 32
     assert observer.last_record["local_grad_nonzero_shards"] == 1
+    assert observer.last_record["reasoner_grad_nonzero_shards"] == 1
     assert observer.last_record["step_wall_seconds"] is None
 
     trainer._grouped_completed_iteration = 8

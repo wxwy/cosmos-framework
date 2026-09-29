@@ -394,16 +394,26 @@ class FormalObserver:
         if phase == "pre_optimizer":
             self.pre_optimizer += 1
             selected_local = []
+            selected_reasoner = []
             for name, parameter in self.model.named_parameters():
-                if not parameter.requires_grad or "local_memory" not in name or parameter.grad is None:
+                if not parameter.requires_grad or parameter.grad is None:
+                    continue
+                if not (_is_h3f_local_parameter(name) or _is_h3f_reasoner_parameter(name)):
                     continue
                 gradient = _local(parameter.grad)
                 if not bool(torch.isfinite(gradient).all()):
-                    raise FloatingPointError("H3-F Local gradient 非有限")
-                selected_local.append((name, int(gradient.numel()), float(gradient.float().norm())))
+                    raise FloatingPointError("H3-F Reasoner/Local gradient 非有限")
+                witness = (name, int(gradient.numel()), float(gradient.float().norm()))
+                if _is_h3f_local_parameter(name):
+                    selected_local.append(witness)
+                else:
+                    selected_reasoner.append(witness)
             if not selected_local:
                 raise FloatingPointError("H3-F 缺少 Local gradient witness")
+            if not any(numel > 0 and norm > 0 for _, numel, norm in selected_reasoner):
+                raise FloatingPointError("H3-F 缺少非零 Reasoner gradient witness")
             self.local_grad_witness = selected_local
+            self.reasoner_grad_witness = selected_reasoner
             return
         if phase != "post_commit":
             raise ValueError(f"H3-F 未知 grouped observer phase: {phase}")
@@ -433,6 +443,10 @@ class FormalObserver:
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             "local_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.local_grad_witness),
             "local_grad_nonzero_shards": sum(numel > 0 and norm > 0 for _, numel, norm in self.local_grad_witness),
+            "reasoner_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.reasoner_grad_witness),
+            "reasoner_grad_nonzero_shards": sum(
+                numel > 0 and norm > 0 for _, numel, norm in self.reasoner_grad_witness
+            ),
         }
         with self.path.open("a") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
