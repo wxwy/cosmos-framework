@@ -83,4 +83,15 @@ fi
 echo "NOTE: ROBOCASA_NUM_WORKERS=$ROBOCASA_NUM_WORKERS is contract metadata; grouped planner/binder materialization is synchronous."
 
 export PYTHONPATH="$CHILD${PYTHONPATH:+:$PYTHONPATH}"
-exec torchrun   --standalone   --nnodes=1   --nproc_per_node=8   examples/psm_wma_robocasa_h3f.py   --phase "$PHASE"   --attempt "$ATTEMPT"   --output-root "$OUTPUT_ROOT"   --job-name "$JOB_NAME"   --expected-root "$EXPECTED_ROOT"   --expected-child "$EXPECTED_CHILD"   "${EXTRA_ARGS[@]}"
+exec torchrun \
+  --standalone \
+  --nnodes=1 \
+  --nproc_per_node=8 \
+  examples/psm_wma_robocasa_h3f.py \
+  --phase "$PHASE" \
+  --attempt "$ATTEMPT" \
+  --output-root "$OUTPUT_ROOT" \
+  --job-name "$JOB_NAME" \
+  --expected-root "$EXPECTED_ROOT" \
+  --expected-child "$EXPECTED_CHILD" \
+  "${EXTRA_ARGS[@]}"

@@ -392,7 +392,6 @@ class FormalObserver:
         self.loss_max = float("-inf")
         torch.cuda.reset_peak_memory_stats()
 
-
     def timing_summary(self) -> dict[str, float | int | None]:
         if not self.step_wall_samples:
             return {"samples": 0, "min": None, "median": None, "max": None, "mean": None}
