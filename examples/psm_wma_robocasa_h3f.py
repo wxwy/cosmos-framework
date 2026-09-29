@@ -39,13 +39,15 @@ from examples.psm_wma_robocasa_h100 import (
     _optimizer_parameter_ids,
     _paths,
     build_stage_a_action_transform,
-    config_digest as h3e_config_digest,
     load_stage_a_config,
     lock_pair,
     make_catalog,
     preflight_native_batch,
     read_stage_a_contract,
     validate_h100_asset_authority,
+)
+from examples.psm_wma_robocasa_h100 import (
+    config_digest as h3e_config_digest,
 )
 
 H3F_SAVE_ITER = 1_000
