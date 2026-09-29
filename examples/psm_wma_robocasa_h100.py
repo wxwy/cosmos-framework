@@ -30,8 +30,8 @@ from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrai
 from cosmos_framework.trainer.local_memory_grouped_resume import snapshot_grouped_local_state
 from cosmos_framework.utils import distributed
 from cosmos_framework.utils.context_managers import model_init
-from cosmos_framework.utils.lazy_config import instantiate
 from cosmos_framework.utils.generator.optimizer import OptimizersContainer
+from cosmos_framework.utils.lazy_config import instantiate
 from examples.psm_wma_robocasa_local_s1 import (
     LOCAL_PARAMS,
     SmokePaths,

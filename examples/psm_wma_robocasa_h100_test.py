@@ -254,6 +254,7 @@ def test_optimizer_parameter_ids_unwraps_optimizers_container() -> None:
     ]
 
     assert h100._optimizer_parameter_ids(container) == {id(first), id(second), id(third)}
+    assert h100._optimizer_parameter_ids(container.optimizers[0]) == {id(first), id(second)}
 
     container.optimizers = []
     with pytest.raises(ValueError, match="container"):
