@@ -429,7 +429,9 @@ def main() -> int:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--mode", choices=["static", "build"], default="static")
     parser.add_argument("--tasks", nargs="*", default=[])
-    parser.add_argument("--episode-filter", nargs="*", default=[], help="legacy tiny smoke: shard-local ep_XXXXXX subset")
+    parser.add_argument(
+        "--episode-filter", nargs="*", default=[], help="legacy tiny smoke: shard-local ep_XXXXXX subset"
+    )
     parser.add_argument(
         "--full-id-filter",
         nargs="*",
