@@ -35,6 +35,8 @@ def test_overlay_freezes_30k_schedule() -> None:
     assert config.scheduler.cycle_lengths == [30_000]
     assert config.scheduler.warm_up_steps == [500]
     assert config.checkpoint.save_iter == 500
+    assert config.optimizer.keys_to_select == ["language_model", "local_memory"]
+    assert config.optimizer.lr_multipliers == {}
     assert config.job.group == h3f.H3F_GROUP
     assert all(step % config.checkpoint.save_iter == 0 for step in h3f.H3F_FORMAL_CHECKPOINT_ITERS)
     h3f.overlay_h3f_config(config, phase="fresh", job_name="formal", save_iter=1_000)
@@ -141,6 +143,36 @@ def test_contract_env_validates_owner_launch_values(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("SAVE_ITER", "750")
     with pytest.raises(ValueError, match="primary eval"):
         h3f._validate_contract_env(output)
+
+
+def test_reasoner_ttt_profile_excludes_generation_duplicates_and_action_heads() -> None:
+    assert h3f._is_h3f_reasoner_parameter("net.language_model.model.layers.0.weight")
+    assert h3f._is_h3f_reasoner_parameter("net.language_model.lm_head.weight")
+    assert not h3f._is_h3f_reasoner_parameter("net.language_model.model.layers.0_moe_gen.weight")
+    assert not h3f._is_h3f_reasoner_parameter("net.moe_gen.layers.0.weight")
+    assert not h3f._is_h3f_reasoner_parameter("net.action2llm.fc.weight")
+    assert h3f._is_h3f_local_parameter("net.local_memory.core.slot_queries")
+
+
+def test_configure_reasoner_ttt_trainables_is_exact() -> None:
+    class TinyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.net = torch.nn.Module()
+            self.net.language_model = torch.nn.Module()
+            self.net.language_model.register_parameter("reason_weight", torch.nn.Parameter(torch.ones(2)))
+            self.net.language_model.register_parameter("reason_moe_gen", torch.nn.Parameter(torch.ones(2)))
+            self.net.local_memory = torch.nn.Module()
+            self.net.local_memory.register_parameter("weight", torch.nn.Parameter(torch.ones(2)))
+            self.net.action2llm = torch.nn.Linear(2, 2)
+
+    model = TinyModel()
+    named = h3f._configure_reasoner_ttt_trainables(model)
+    trainable = {name for name, parameter in named.items() if parameter.requires_grad}
+    assert trainable == {
+        "net.language_model.reason_weight",
+        "net.local_memory.weight",
+    }
 
 
 def test_resume_iteration_and_attempt_identity(tmp_path: Path) -> None:
@@ -319,6 +351,7 @@ def test_owner_shell_facade_targets_h3f() -> None:
 def test_config_digest_is_long_run_specific(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(h3f, "h3e_config_digest", lambda: "base")
     first = h3f.config_digest(500)
+    assert h3f.H3F_TRAINABLE_PROFILE == "reasoner_without_moe_gen+local_memory"
     assert h3f.config_digest(1000) != first
     assert h3f.readiness_config_digest(10, 500) != first
     monkeypatch.setattr(h3f, "H3F_WARMUP_STEPS", 501)

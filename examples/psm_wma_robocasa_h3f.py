@@ -34,7 +34,6 @@ from examples.psm_wma_robocasa_h100 import (
     LOCAL_PARAMS,
     MANIFEST_DIGEST,
     ROOT_WORKTREE,
-    SELECTED_KEYS,
     GroupedTriggerLoader,
     _local,
     _optimizer_parameter_ids,
@@ -57,6 +56,8 @@ H3F_GROUP = "h3f_edge_local_h100"
 H3F_READINESS_GROUP = "h3f_edge_local_h100_readiness"
 H3F_READINESS_MAX_STEPS = 100
 H3F_BASE_CHECKPOINT_LINEAGE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Cosmos3-Edge-Policy-DROID-dcp")
+H3F_OPTIMIZER_KEYS = ("language_model", "local_memory")
+H3F_TRAINABLE_PROFILE = "reasoner_without_moe_gen+local_memory"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -84,6 +85,8 @@ def overlay_h3f_config(
 
     overlay_h100_config(config, phase=phase, job_name=job_name)
     target_iteration = readiness_steps if readiness_steps is not None else H3F_FORMAL_MAX_ITER
+    config.optimizer.keys_to_select = list(H3F_OPTIMIZER_KEYS)
+    config.optimizer.lr_multipliers = {}
     config.trainer.max_iter = target_iteration
     config.trainer.logging_iter = 50
     config.scheduler.cycle_lengths = [H3F_FORMAL_MAX_ITER]
@@ -92,7 +95,9 @@ def overlay_h3f_config(
     config.job.group = H3F_READINESS_GROUP if readiness_steps is not None else H3F_GROUP
     config.job.name = job_name
     if (
-        config.trainer.grad_accum_iter != 2
+        config.optimizer.keys_to_select != list(H3F_OPTIMIZER_KEYS)
+        or config.optimizer.lr_multipliers
+        or config.trainer.grad_accum_iter != 2
         or config.trainer.max_iter != target_iteration
         or config.scheduler.cycle_lengths != [30_000]
         or config.scheduler.warm_up_steps != [500]
@@ -106,6 +111,8 @@ def overlay_h3f_config(
 def config_digest(save_iter: int = H3F_SAVE_ITER) -> str:
     authority = {
         "h3e_runtime": h3e_config_digest(),
+        "trainable_profile": H3F_TRAINABLE_PROFILE,
+        "optimizer_keys": list(H3F_OPTIMIZER_KEYS),
         "max_iter": H3F_FORMAL_MAX_ITER,
         "save_iter": save_iter,
         "warmup_steps": H3F_WARMUP_STEPS,
@@ -330,7 +337,8 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "contract_env": contract_env,
         **native,
         "geometry": [8, 8, 2, 16, 4],
-        "selector": list(SELECTED_KEYS),
+        "selector": list(H3F_OPTIMIZER_KEYS),
+        "trainable_profile": H3F_TRAINABLE_PROFILE,
         "formal_max_iter": H3F_FORMAL_MAX_ITER,
         "readiness_steps": readiness_steps,
         "target_iteration": readiness_steps if readiness_steps is not None else H3F_FORMAL_MAX_ITER,
@@ -452,25 +460,56 @@ class FormalObserver:
         }
 
 
+def _is_h3f_reasoner_parameter(name: str) -> bool:
+    return name.startswith("net.language_model.") and "_moe_gen" not in name
+
+
+def _is_h3f_local_parameter(name: str) -> bool:
+    return name.startswith("net.local_memory")
+
+
+def _configure_reasoner_ttt_trainables(model: torch.nn.Module) -> dict[str, torch.nn.Parameter]:
+    named = dict(model.named_parameters())
+    for name, parameter in named.items():
+        parameter.requires_grad_(_is_h3f_reasoner_parameter(name) or _is_h3f_local_parameter(name))
+    return named
+
+
 def _install_optimizer_inventory_check(model: torch.nn.Module, result: dict[str, Any]) -> None:
     original = model.init_optimizer_scheduler
 
     def checked_optimizer(optimizer_config, scheduler_config):
+        named = _configure_reasoner_ttt_trainables(model)
+        expected_names = {
+            name for name in named if _is_h3f_reasoner_parameter(name) or _is_h3f_local_parameter(name)
+        }
+        reasoner_names = {name for name in expected_names if _is_h3f_reasoner_parameter(name)}
+        local_names = {name for name in expected_names if _is_h3f_local_parameter(name)}
+        if not reasoner_names:
+            raise ValueError("H3-F reasoner inventory 为空")
+        if sum(named[name].numel() for name in local_names) != LOCAL_PARAMS:
+            raise ValueError("H3-F Local-TTT inventory 必须精确为 165312")
+
         optimizer, scheduler = original(optimizer_config, scheduler_config)
-        named = dict(model.named_parameters())
         selected = _optimizer_parameter_ids(optimizer)
         selected_names = {name for name, parameter in named.items() if id(parameter) in selected}
-        local_names = {name for name in named if name.startswith("net.local_memory")}
+        forbidden_host = {
+            name
+            for name in selected_names
+            if any(key in name for key in HOST_KEYS) or "_moe_gen" in name
+        }
         if (
-            not local_names <= selected_names
-            or not all(any(key in name for name in selected_names) for key in HOST_KEYS)
-            or sum(named[name].numel() for name in local_names) != LOCAL_PARAMS
-            or not all(any(key in name for key in SELECTED_KEYS) for name in selected_names)
-            or any(parameter.requires_grad for name, parameter in named.items() if name not in selected_names)
+            selected_names != expected_names
+            or forbidden_host
+            or any(parameter.requires_grad != (name in expected_names) for name, parameter in named.items())
         ):
-            raise ValueError("H3-F optimizer Edge+Local inventory 不匹配")
+            raise ValueError("H3-F optimizer 必须精确为 Reasoner + Local-TTT，generation/action 支路必须冻结")
+
         result["selected_names"] = sorted(selected_names)
+        result["selected_reasoner_tensors"] = len(reasoner_names)
+        result["selected_reasoner_params"] = sum(named[name].numel() for name in reasoner_names)
         result["selected_local_params"] = LOCAL_PARAMS
+        result["trainable_profile"] = H3F_TRAINABLE_PROFILE
         return optimizer, scheduler
 
     model.init_optimizer_scheduler = checked_optimizer
