@@ -64,6 +64,9 @@ DEFAULT_VAE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Wan2.2-TI
 STAGE_A_CONFIG_SHA256 = "f64036c499f891979213469523a160ac08cb3d976a2add8d8fdf93750c5a5439"
 STAGE_A_MODEL_METADATA_SHA256 = "53adef43a58e23f37d1132c4868ea8055be1b095cf76762b2e3e0b69ea287731"
 
+H3F_FORMAL_MAX_ITER = 30_000
+H3F_FORMAL_CHECKPOINT_ITERS = (1_000, 2_000, 4_000, 8_000, 12_000, 16_000, 20_000, 24_000, 30_000)
+
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -94,8 +97,7 @@ def validate_h100_asset_authority() -> dict[str, str]:
     model_metadata_sha = _sha256_file(DEFAULT_CHECKPOINT / "model/.metadata")
     if config_sha != STAGE_A_CONFIG_SHA256 or model_metadata_sha != STAGE_A_MODEL_METADATA_SHA256:
         raise ValueError(
-            "H3-E Stage-A H100 authority digest mismatch: "
-            f"config={config_sha}, model_metadata={model_metadata_sha}"
+            f"H3-E Stage-A H100 authority digest mismatch: config={config_sha}, model_metadata={model_metadata_sha}"
         )
     return {
         "config_sha256": config_sha,

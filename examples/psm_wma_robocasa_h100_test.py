@@ -88,6 +88,12 @@ def test_h100_overlay_preserves_edge_and_stage_a_optimizer() -> None:
     assert config.trainer.max_iter == 2 and config.job.name == "matched"
 
 
+def test_h3f_formal_training_budget_is_30000() -> None:
+    assert h100.H3F_FORMAL_MAX_ITER == 30_000
+    assert h100.H3F_FORMAL_CHECKPOINT_ITERS[-1] == h100.H3F_FORMAL_MAX_ITER
+    assert h100.H3F_FORMAL_CHECKPOINT_ITERS == tuple(sorted(set(h100.H3F_FORMAL_CHECKPOINT_ITERS)))
+
+
 def test_trigger_resume_starts_at_second_window() -> None:
     fresh = h100.GroupedTriggerLoader(1)
     assert list(fresh) == [{}, {}]
@@ -212,10 +218,7 @@ def test_preflight_native_batch_uses_grouped_catalog_binder(monkeypatch: pytest.
             assert kwargs["config_digest"] == "digest"
             self.producer_for = object()
 
-    segments = tuple(
-        SimpleNamespace(consumer_payload=(({"slot": index},),))
-        for index in range(8)
-    )
+    segments = tuple(SimpleNamespace(consumer_payload=(({"slot": index},),)) for index in range(8))
     monkeypatch.setattr(h100, "RankLocalGroupedPlanner", FakePlanner)
     monkeypatch.setattr(h100, "StageARoboCasaEpisodeBinder", FakeBinder)
     monkeypatch.setattr(h100, "build_stage_a_action_transform", lambda paths: ("transform", "resolution"))
