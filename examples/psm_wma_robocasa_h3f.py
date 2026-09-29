@@ -56,9 +56,7 @@ H3F_WARMUP_STEPS = 500
 H3F_GROUP = "h3f_edge_local_h100"
 H3F_READINESS_GROUP = "h3f_edge_local_h100_readiness"
 H3F_READINESS_MAX_STEPS = 100
-H3F_BASE_CHECKPOINT_LINEAGE = Path(
-    "/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Cosmos3-Edge-Policy-DROID-dcp"
-)
+H3F_BASE_CHECKPOINT_LINEAGE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Cosmos3-Edge-Policy-DROID-dcp")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -251,7 +249,9 @@ def _validate_contract_env(output_root: Path) -> dict[str, Any]:
         if parsed_workers <= 0:
             raise ValueError("H3-F ROBOCASA_NUM_WORKERS 必须为正整数")
         observed["ROBOCASA_NUM_WORKERS"] = parsed_workers
-        observed["ROBOCASA_NUM_WORKERS_EFFECT"] = "contract-only; grouped planner/binder 同步物化，不驱动 DataLoader workers"
+        observed["ROBOCASA_NUM_WORKERS_EFFECT"] = (
+            "contract-only; grouped planner/binder 同步物化，不驱动 DataLoader workers"
+        )
 
     return observed
 
@@ -312,9 +312,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     if catalog.manifest_digest != MANIFEST_DIGEST:
         raise ValueError("H3-F manifest authority 漂移")
     digest = (
-        readiness_config_digest(readiness_steps, save_iter)
-        if readiness_steps is not None
-        else config_digest(save_iter)
+        readiness_config_digest(readiness_steps, save_iter) if readiness_steps is not None else config_digest(save_iter)
     )
     native = preflight_native_batch(dataset, catalog, paths, digest=digest)
     return {
@@ -444,11 +442,7 @@ class FormalObserver:
             return {"samples": 0, "min": None, "median": None, "max": None, "mean": None}
         values = sorted(self.step_wall_samples)
         midpoint = len(values) // 2
-        median = (
-            values[midpoint]
-            if len(values) % 2
-            else (values[midpoint - 1] + values[midpoint]) / 2
-        )
+        median = values[midpoint] if len(values) % 2 else (values[midpoint - 1] + values[midpoint]) / 2
         return {
             "samples": len(values),
             "min": values[0],
