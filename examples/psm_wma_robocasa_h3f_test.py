@@ -307,7 +307,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 22)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 33)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
-    ticks = iter((100.0, 112.5, 125.0))
+    ticks = iter((100.0, 112.5, 125.0, 137.5, 150.0))
     monkeypatch.setattr(h3f.time, "perf_counter", lambda: next(ticks))
 
     model = torch.nn.Module()
