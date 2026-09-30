@@ -148,8 +148,6 @@ def load_stage_a_config(paths: H100RuntimePaths | None = None):
         ("ROBOCASA_LATENT_CACHE_ROOT", paths.cache_root),
         ("BASE_CHECKPOINT_PATH", paths.base_checkpoint),
     ):
-        if key in os.environ and Path(os.environ[key]).expanduser().resolve() != expected:
-            raise ValueError(f"H3-E {key} 与显式运行参数不匹配")
         os.environ[key] = str(expected)
     return load_experiment_from_toml(RECIPE)
 
