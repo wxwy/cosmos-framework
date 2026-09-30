@@ -420,6 +420,7 @@ class FormalObserver:
         self.loss_sum: torch.Tensor | None = None
         self.loss_min: torch.Tensor | None = None
         self.loss_max: torch.Tensor | None = None
+        self.objective_sum: torch.Tensor | None = None
         self.metric_sums: dict[str, torch.Tensor] = {}
         self.metric_counts: dict[str, int] = {}
         self.completed = 0
@@ -541,7 +542,7 @@ class FormalObserver:
     def _format_console(self, record: dict[str, Any], target: int) -> str:
         parts = [
             f"[H3-F][train] iter={record['iteration']:06d}/{target:06d}",
-            f"outer={record['loss_mean']:.4f}",
+            f"outer={record['outer_loss']:.4f}",
         ]
         for key, label in (
             ("flow_matching_loss_action", "action"),
@@ -601,6 +602,11 @@ class FormalObserver:
             return
         if phase == "native_backward":
             self.backward += 1
+            if loss is not None:
+                if loss.ndim != 0 or not bool(torch.isfinite(loss)):
+                    raise FloatingPointError("H3-F weighted outer loss 非有限或非标量")
+                value = loss.detach().float()
+                self.objective_sum = value if self.objective_sum is None else self.objective_sum + value
             return
         if phase == "pre_optimizer":
             self.pre_optimizer += 1
@@ -635,6 +641,11 @@ class FormalObserver:
             "pre_optimizer": int(round(self._global_max(self.pre_optimizer))),
             "post_commit": 1,
             "loss_mean": self._global_mean(self.loss_sum, self.forward),
+            "outer_loss": (
+                self._global_mean(self.objective_sum, 1)
+                if self.objective_sum is not None
+                else self._global_mean(self.loss_sum, self.forward)
+            ),
             "loss_min": self._global_min(self.loss_min),
             "loss_max": self._global_max(self.loss_max),
             "frontier_epoch": trainer._grouped_window.live.frontier.epoch,
@@ -661,6 +672,7 @@ class FormalObserver:
         self.iteration = None
         self.forward = self.backward = self.pre_optimizer = 0
         self.loss_sum = self.loss_min = self.loss_max = None
+        self.objective_sum = None
         self.metric_sums.clear()
         self.metric_counts.clear()
         torch.cuda.reset_peak_memory_stats()
