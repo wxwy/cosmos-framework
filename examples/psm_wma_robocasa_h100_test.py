@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -81,6 +82,47 @@ def test_pair_lock_checks_both_heads_gitlink_and_dirty(
     values["dirty"] = " M production.py"
     with pytest.raises(ValueError, match="工作树"):
         h100.lock_pair(root, child, runtime)
+
+
+def test_load_stage_a_config_scopes_runtime_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime = _runtime(tmp_path)
+    keys = (
+        "EDGE_POLICY_CHECKPOINT",
+        "WAN_VAE_PATH",
+        "ROBOCASA_ROOT",
+        "ROBOCASA_LATENT_CACHE_ROOT",
+        "BASE_CHECKPOINT_PATH",
+    )
+    original = {
+        "EDGE_POLICY_CHECKPOINT": "/before/edge",
+        "WAN_VAE_PATH": "/before/vae",
+        "ROBOCASA_ROOT": "/before/robocasa",
+        "ROBOCASA_LATENT_CACHE_ROOT": "/before/cache",
+    }
+    for key, value in original.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("BASE_CHECKPOINT_PATH", raising=False)
+
+    observed: dict[str, str | None] = {}
+    sentinel = object()
+
+    def fake_loader(_recipe):
+        observed.update({key: os.environ.get(key) for key in keys})
+        return sentinel
+
+    monkeypatch.setattr(h100, "load_experiment_from_toml", fake_loader)
+    assert h100.load_stage_a_config(runtime) is sentinel
+    assert observed == {
+        "EDGE_POLICY_CHECKPOINT": str(runtime.edge),
+        "WAN_VAE_PATH": str(runtime.vae),
+        "ROBOCASA_ROOT": str(runtime.dataset_root),
+        "ROBOCASA_LATENT_CACHE_ROOT": str(runtime.cache_root),
+        "BASE_CHECKPOINT_PATH": str(runtime.base_checkpoint),
+    }
+    assert {key: os.environ.get(key) for key in original} == original
+    assert "BASE_CHECKPOINT_PATH" not in os.environ
 
 
 def test_h100_overlay_preserves_edge_and_stage_a_optimizer(tmp_path: Path) -> None:
