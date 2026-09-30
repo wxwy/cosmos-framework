@@ -410,7 +410,7 @@ def test_formal_observer_rejects_incomplete_iteration(tmp_path: Path) -> None:
 def test_owner_shell_facade_targets_h3f() -> None:
     script = (Path(__file__).parent / "launch_sft_action_policy_robocasa_edge_all_target_atomic.sh").read_text()
     assert "psm_wma_robocasa_h3f.py" in script
-    assert "SAVE_ITER:-500" in script
+    assert "SAVE_ITER:-100" in script
     assert "SAVE_ITER must be a positive integer" in script
     assert "TTT_TBPTT_STEPS:-16" in script
     assert "TTT_K_LOCAL:-4" in script
