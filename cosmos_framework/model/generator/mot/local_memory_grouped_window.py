@@ -74,6 +74,9 @@ class GroupedLocalMemoryWindow:
     def begin(self) -> GroupedWindowPlan:
         if self._candidate is not None:
             raise RuntimeError("已有 pending grouped window")
+        reset_telemetry = getattr(self.model.net.local_memory_runtime.core, "reset_telemetry", None)
+        if reset_telemetry is not None:
+            reset_telemetry()
         plan = self.planner.plan_window(self._live.frontier)
         sidecar = LocalMemorySegmentSidecar()
         sidecar._records = {
