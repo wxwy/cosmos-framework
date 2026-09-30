@@ -140,16 +140,25 @@ def validate_h100_asset_authority(paths: H100RuntimePaths | None = None) -> dict
 
 
 def load_stage_a_config(paths: H100RuntimePaths | None = None):
+    """Load the TOML with runtime asset paths without leaking env mutations."""
     paths = paths or runtime_paths()
-    for key, expected in (
-        ("EDGE_POLICY_CHECKPOINT", paths.edge),
-        ("WAN_VAE_PATH", paths.vae),
-        ("ROBOCASA_ROOT", paths.dataset_root),
-        ("ROBOCASA_LATENT_CACHE_ROOT", paths.cache_root),
-        ("BASE_CHECKPOINT_PATH", paths.base_checkpoint),
-    ):
-        os.environ[key] = str(expected)
-    return load_experiment_from_toml(RECIPE)
+    overrides = {
+        "EDGE_POLICY_CHECKPOINT": str(paths.edge),
+        "WAN_VAE_PATH": str(paths.vae),
+        "ROBOCASA_ROOT": str(paths.dataset_root),
+        "ROBOCASA_LATENT_CACHE_ROOT": str(paths.cache_root),
+        "BASE_CHECKPOINT_PATH": str(paths.base_checkpoint),
+    }
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        os.environ.update(overrides)
+        return load_experiment_from_toml(RECIPE)
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def parser() -> argparse.ArgumentParser:
