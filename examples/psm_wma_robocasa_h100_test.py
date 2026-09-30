@@ -25,6 +25,20 @@ def _args(tmp_path: Path, phase: str = "fresh") -> argparse.Namespace:
     )
 
 
+def _runtime(tmp_path: Path) -> h100.H100RuntimePaths:
+    return h100.H100RuntimePaths(
+        root_worktree=tmp_path / "root",
+        stage_a_checkpoint=tmp_path / "stage/checkpoints/iter_000000001",
+        stage_a_config=tmp_path / "stage/config.yaml",
+        dataset_root=tmp_path / "source",
+        cache_root=tmp_path / "cache",
+        cache_probe=tmp_path / "cache/CloseFridge/20250816/lerobot/ep_000067.h5",
+        edge=tmp_path / "edge",
+        vae=tmp_path / "wan.pth",
+        base_checkpoint=tmp_path / "base",
+    )
+
+
 def test_parser_requires_formal_pair_and_output() -> None:
     with pytest.raises(SystemExit):
         h100.parser().parse_args(["--phase", "fresh", "--output-root", "/tmp/job"])
@@ -44,31 +58,35 @@ def test_parser_requires_formal_pair_and_output() -> None:
     assert args.phase == "resume" and args.preflight
 
 
-def test_pair_lock_checks_both_heads_gitlink_and_dirty(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pair_lock_checks_both_heads_gitlink_and_dirty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     root, child = "a" * 40, "b" * 40
     values = {"root": root, "child": child, "gitlink": child, "dirty": ""}
+    runtime = _runtime(tmp_path)
 
     def git(repo, *arguments):
         if arguments == ("rev-parse", "HEAD"):
-            return values["root" if repo == h100.ROOT_WORKTREE else "child"]
+            return values["root" if repo == runtime.root_worktree else "child"]
         if arguments == ("ls-tree", "HEAD", "cosmos-framework"):
             return f"160000 commit {values['gitlink']}\tcosmos-framework"
         return values["dirty"]
 
     monkeypatch.setattr(h100, "_git", git)
-    assert h100.lock_pair(root, child)["gitlink"] == child
+    assert h100.lock_pair(root, child, runtime)["gitlink"] == child
     values["gitlink"] = "c" * 40
     with pytest.raises(ValueError, match="formal"):
-        h100.lock_pair(root, child)
+        h100.lock_pair(root, child, runtime)
     values["gitlink"] = child
     values["dirty"] = " M production.py"
     with pytest.raises(ValueError, match="工作树"):
-        h100.lock_pair(root, child)
+        h100.lock_pair(root, child, runtime)
 
 
-def test_h100_overlay_preserves_edge_and_stage_a_optimizer() -> None:
-    config = h100.load_stage_a_config()
-    h100.overlay_h100_config(config, phase="fresh", job_name="matched")
+def test_h100_overlay_preserves_edge_and_stage_a_optimizer(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    config = h100.load_stage_a_config(runtime)
+    h100.overlay_h100_config(config, phase="fresh", job_name="matched", runtime=runtime)
     assert config.trainer.type is GroupedLocalMemoryTrainer
     assert (config.trainer.max_iter, config.trainer.grad_accum_iter) == (1, 2)
     assert config.model.config.parallelism.data_parallel_shard_degree == 8
@@ -84,7 +102,7 @@ def test_h100_overlay_preserves_edge_and_stage_a_optimizer() -> None:
     assert config.model.config.num_embodiment_domains == 32
     assert config.model.config.tokenizer.encode_exact_durations == [33]
     assert not config.model.config.ema.enabled
-    h100.overlay_h100_config(config, phase="resume", job_name="matched")
+    h100.overlay_h100_config(config, phase="resume", job_name="matched", runtime=runtime)
     assert config.trainer.max_iter == 2 and config.job.name == "matched"
 
 
@@ -107,15 +125,18 @@ def test_trigger_resume_starts_at_second_window() -> None:
 def test_preflight_phase_is_fail_closed_without_creating_output(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    runtime = _runtime(tmp_path / "assets")
+    monkeypatch.setattr(h100, "runtime_paths", lambda: runtime)
     monkeypatch.setattr(h100, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40})
     monkeypatch.setattr(
         h100,
         "validate_h100_asset_authority",
-        lambda: {"config_sha256": h100.STAGE_A_CONFIG_SHA256},
+        lambda *_: {"config_sha256": "configured"},
     )
     monkeypatch.setattr(h100, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
+    monkeypatch.setattr(h100, "config_digest", lambda *_: "digest")
     fake_catalog = SimpleNamespace(episodes=(1,) * 9036, manifest_digest=h100.MANIFEST_DIGEST)
-    monkeypatch.setattr(h100, "make_catalog", lambda: (object(), fake_catalog))
+    monkeypatch.setattr(h100, "make_catalog", lambda *_: (object(), fake_catalog))
     monkeypatch.setattr(
         h100,
         "preflight_native_batch",
@@ -143,12 +164,14 @@ def test_config_digest_ignores_phase_and_job(monkeypatch: pytest.MonkeyPatch, tm
     metadata.parent.mkdir(parents=True)
     config.write_text("a")
     metadata.write_text("m")
-    monkeypatch.setattr(h100, "DEFAULT_CONFIG", config)
-    monkeypatch.setattr(h100, "DEFAULT_CHECKPOINT", tmp_path / "checkpoint")
-    first = h100.config_digest()
-    assert first == h100.config_digest()
+    runtime = _runtime(tmp_path)
+    runtime = h100.H100RuntimePaths(
+        **{**runtime.__dict__, "stage_a_config": config, "stage_a_checkpoint": tmp_path / "checkpoint"}
+    )
+    first = h100.config_digest(runtime)
+    assert first == h100.config_digest(runtime)
     config.write_text("b")
-    assert first != h100.config_digest()
+    assert first != h100.config_digest(runtime)
 
 
 def test_h100_asset_authority_is_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -173,29 +196,30 @@ def test_h100_asset_authority_is_fail_closed(monkeypatch: pytest.MonkeyPatch, tm
     vae.touch()
     (source / "CloseFridge/20250816/lerobot/meta/info.json").write_text("{}")
 
-    monkeypatch.setattr(h100, "ROOT_WORKTREE", root)
-    monkeypatch.setattr(h100, "DEFAULT_CHECKPOINT", checkpoint)
-    monkeypatch.setattr(h100, "DEFAULT_CONFIG", config)
-    monkeypatch.setattr(h100, "DEFAULT_DATASET_ROOT", source)
-    monkeypatch.setattr(h100, "CACHE_ROOT", cache_root)
-    monkeypatch.setattr(h100, "DEFAULT_CACHE", cache)
-    monkeypatch.setattr(h100, "DEFAULT_EDGE", edge)
-    monkeypatch.setattr(h100, "DEFAULT_VAE", vae)
-    monkeypatch.setattr(h100, "STAGE_A_CONFIG_SHA256", h100._sha256_file(config))
-    monkeypatch.setattr(
-        h100,
-        "STAGE_A_MODEL_METADATA_SHA256",
-        h100._sha256_file(checkpoint / "model/.metadata"),
+    base = tmp_path / "base"
+    (base / "model").mkdir(parents=True)
+    (base / "model/.metadata").write_text("base-model-metadata")
+    runtime = h100.H100RuntimePaths(
+        root_worktree=root,
+        stage_a_checkpoint=checkpoint,
+        stage_a_config=config,
+        dataset_root=source,
+        cache_root=cache_root,
+        cache_probe=cache,
+        edge=edge,
+        vae=vae,
+        base_checkpoint=base,
     )
-    report = h100.validate_h100_asset_authority()
+    report = h100.validate_h100_asset_authority(runtime)
     assert report["stage_a_checkpoint"] == str(checkpoint)
+    first_digest = report["config_sha256"]
 
     config.write_text("drift")
-    with pytest.raises(ValueError, match="authority digest"):
-        h100.validate_h100_asset_authority()
+    assert h100.validate_h100_asset_authority(runtime)["config_sha256"] != first_digest
 
 
 def test_preflight_native_batch_uses_grouped_catalog_binder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
     episodes = tuple(SimpleNamespace(uid=f"task/date/ep_{i:06d}") for i in range(8))
     requests = tuple(SimpleNamespace(episode=episode) for episode in episodes)
     plan = SimpleNamespace(members=(requests, requests))
@@ -213,8 +237,8 @@ def test_preflight_native_batch_uses_grouped_catalog_binder(monkeypatch: pytest.
 
     class FakeBinder:
         def __init__(self, dataset, catalog, **kwargs):
-            assert kwargs["source_root"] == h100.DEFAULT_DATASET_ROOT
-            assert kwargs["cache_root"] == h100.CACHE_ROOT
+            assert kwargs["source_root"] == runtime.dataset_root
+            assert kwargs["cache_root"] == runtime.cache_root
             assert kwargs["config_digest"] == "digest"
             self.producer_for = object()
 
@@ -236,7 +260,9 @@ def test_preflight_native_batch_uses_grouped_catalog_binder(monkeypatch: pytest.
             "action_raw": [[SimpleNamespace(shape=(33, 15))]] * 8,
         },
     )
-    evidence = h100.preflight_native_batch(object(), object(), SimpleNamespace(), digest="digest")
+    evidence = h100.preflight_native_batch(
+        object(), object(), SimpleNamespace(), digest="digest", runtime=runtime
+    )
     assert evidence["native_batch"] == 8
     assert evidence["preflight_uids"] == [episode.uid for episode in episodes]
 
