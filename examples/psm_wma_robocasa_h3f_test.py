@@ -27,9 +27,26 @@ def _args(
     )
 
 
-def test_overlay_freezes_30k_schedule() -> None:
-    config = h3f.load_stage_a_config()
-    h3f.overlay_h3f_config(config, phase="fresh", job_name="formal", save_iter=500)
+def _runtime(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        root_worktree=tmp_path / "root",
+        stage_a_checkpoint=tmp_path / "stage/checkpoints/iter_000000001",
+        stage_a_config=tmp_path / "stage/config.yaml",
+        dataset_root=tmp_path / "dataset",
+        cache_root=tmp_path / "cache",
+        cache_probe=tmp_path / "cache/probe.h5",
+        edge=tmp_path / "edge",
+        vae=tmp_path / "vae.pth",
+        base_checkpoint=tmp_path / "base",
+    )
+
+
+def test_overlay_freezes_30k_schedule(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    config = h3f.load_stage_a_config(runtime)
+    h3f.overlay_h3f_config(
+        config, phase="fresh", job_name="formal", save_iter=500, runtime=runtime
+    )
     assert config.trainer.max_iter == 30_000
     assert config.trainer.grad_accum_iter == 2
     assert config.scheduler.cycle_lengths == [30_000]
@@ -58,14 +75,34 @@ def test_overlay_freezes_30k_schedule() -> None:
     assert config.model.config.parallelism.data_parallel_shard_degree == 8
     assert config.model.config.parallelism.data_parallel_replicate_degree == 1
     assert config.job.group == h3f.H3F_GROUP
+    assert config.checkpoint.load_path == str(runtime.base_checkpoint)
+    assert not config.checkpoint.load_training_state
+    assert config.checkpoint.keys_to_skip_loading == ["net_ema.", "local_memory"]
     assert all(step % config.checkpoint.save_iter == 0 for step in h3f.H3F_FORMAL_CHECKPOINT_ITERS)
-    h3f.overlay_h3f_config(config, phase="fresh", job_name="formal", save_iter=1_000)
+    h3f.overlay_h3f_config(
+        config, phase="fresh", job_name="formal", save_iter=1_000, runtime=runtime
+    )
     assert config.checkpoint.save_iter == 1_000
+    resume = tmp_path / "job/checkpoints/iter_000001000"
+    h3f.overlay_h3f_config(
+        config,
+        phase="resume",
+        job_name="formal",
+        save_iter=1_000,
+        runtime=runtime,
+        resume_checkpoint=resume,
+    )
+    assert config.checkpoint.load_path == str(resume.resolve())
+    assert config.checkpoint.load_training_state
+    assert config.checkpoint.keys_to_skip_loading == ["net_ema."]
 
 
-def test_readiness_overlay_keeps_formal_scheduler_but_stops_early() -> None:
-    config = h3f.load_stage_a_config()
-    h3f.overlay_h3f_config(config, phase="fresh", job_name="timing", readiness_steps=10)
+def test_readiness_overlay_keeps_formal_scheduler_but_stops_early(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    config = h3f.load_stage_a_config(runtime)
+    h3f.overlay_h3f_config(
+        config, phase="fresh", job_name="timing", readiness_steps=10, runtime=runtime
+    )
     assert config.trainer.max_iter == 10
     assert config.scheduler.cycle_lengths == [30_000]
     assert config.scheduler.warm_up_steps == [500]
@@ -74,12 +111,16 @@ def test_readiness_overlay_keeps_formal_scheduler_but_stops_early() -> None:
 
 
 def test_readiness_preflight_is_separate_and_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {"SAVE_ITER": 500})
+    runtime = _runtime(tmp_path / "assets")
+    monkeypatch.setattr(h3f, "runtime_paths", lambda: runtime)
+    monkeypatch.setattr(h3f, "_validate_contract_env", lambda *_: {"SAVE_ITER": 500})
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
-    monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
+    monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda *_: {"config_sha256": "ok"})
     monkeypatch.setattr(h3f, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
+    monkeypatch.setattr(h3f, "config_digest", lambda *_: "formal-digest")
+    monkeypatch.setattr(h3f, "readiness_config_digest", lambda *_: "readiness-digest")
     fake_catalog = SimpleNamespace(episodes=(1,) * 9036, manifest_digest=h3f.MANIFEST_DIGEST)
-    monkeypatch.setattr(h3f, "make_catalog", lambda: (object(), fake_catalog))
+    monkeypatch.setattr(h3f, "make_catalog", lambda *_: (object(), fake_catalog))
     monkeypatch.setattr(
         h3f,
         "preflight_native_batch",
@@ -90,7 +131,7 @@ def test_readiness_preflight_is_separate_and_fail_closed(monkeypatch: pytest.Mon
     report = h3f.preflight(_args(tmp_path, readiness_steps=10))
     assert report["readiness_steps"] == report["target_iteration"] == report["save_iter"] == 10
     assert h3f.H3F_READINESS_GROUP in report["job"]
-    assert report["config_digest"] != h3f.config_digest()
+    assert report["config_digest"] == "readiness-digest"
     with pytest.raises(ValueError, match="2..100"):
         h3f.preflight(_args(tmp_path, readiness_steps=1))
     with pytest.raises(ValueError, match="仅允许 fresh"):
@@ -98,34 +139,33 @@ def test_readiness_preflight_is_separate_and_fail_closed(monkeypatch: pytest.Mon
 
 
 def test_output_root_allows_only_ignored_worktree_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    root.mkdir()
-    monkeypatch.setattr(h3f, "ROOT_WORKTREE", root)
-    h3f._validate_output_root(root / "outputs" / "formal")
+    runtime = _runtime(tmp_path)
+    runtime.root_worktree.mkdir()
+    h3f._validate_output_root(runtime.root_worktree / "outputs" / "formal", runtime)
     with pytest.raises(ValueError, match="outputs"):
-        h3f._validate_output_root(root / "checkpoints" / "formal")
+        h3f._validate_output_root(runtime.root_worktree / "checkpoints" / "formal", runtime)
     with pytest.raises(ValueError, match="root worktree"):
-        h3f._validate_output_root(root)
+        h3f._validate_output_root(runtime.root_worktree, runtime)
 
 
 def test_contract_env_validates_owner_launch_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     output = tmp_path / "out"
-    dataset = tmp_path / "dataset"
-    cache = tmp_path / "cache"
-    edge = tmp_path / "edge"
-    vae = tmp_path / "vae.pth"
-    base = tmp_path / "base"
-    dataset.mkdir()
-    cache.mkdir()
-    edge.mkdir()
-    vae.touch()
-    (base / "model").mkdir(parents=True)
-    (base / "model/.metadata").touch()
-    monkeypatch.setattr(h3f, "DEFAULT_DATASET_ROOT", dataset)
-    monkeypatch.setattr(h3f, "CACHE_ROOT", cache)
-    monkeypatch.setattr(h3f, "DEFAULT_EDGE", edge)
-    monkeypatch.setattr(h3f, "DEFAULT_VAE", vae)
-    monkeypatch.setattr(h3f, "H3F_BASE_CHECKPOINT_LINEAGE", base)
+    runtime = _runtime(tmp_path)
+    for directory in (
+        runtime.root_worktree,
+        runtime.stage_a_checkpoint,
+        runtime.dataset_root,
+        runtime.cache_root,
+        runtime.edge,
+        runtime.base_checkpoint / "model",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    runtime.stage_a_config.parent.mkdir(parents=True, exist_ok=True)
+    runtime.stage_a_config.touch()
+    runtime.cache_probe.parent.mkdir(parents=True, exist_ok=True)
+    runtime.cache_probe.touch()
+    runtime.vae.touch()
+    (runtime.base_checkpoint / "model/.metadata").touch()
     values = {
         "SAVE_ITER": "500",
         "TTT_TBPTT_STEPS": "16",
@@ -136,33 +176,38 @@ def test_contract_env_validates_owner_launch_values(monkeypatch: pytest.MonkeyPa
         "TTT_B_STREAM": "8",
         "TTT_ACTIVE_GA": "2",
         "ROBOCASA_NUM_WORKERS": "6",
-        "ROBOCASA_ROOT": str(dataset),
-        "ROBOCASA_LATENT_CACHE_ROOT": str(cache),
-        "BASE_CHECKPOINT_PATH": str(base),
-        "EDGE_POLICY_CHECKPOINT": str(edge),
-        "WAN_VAE_PATH": str(vae),
+        "PSM_WMA_ROOT": str(runtime.root_worktree),
+        "STAGE_A_CHECKPOINT_PATH": str(runtime.stage_a_checkpoint),
+        "STAGE_A_CONFIG_PATH": str(runtime.stage_a_config),
+        "ROBOCASA_ROOT": str(runtime.dataset_root),
+        "ROBOCASA_LATENT_CACHE_ROOT": str(runtime.cache_root),
+        "ROBOCASA_LATENT_CACHE_PROBE": str(runtime.cache_probe),
+        "BASE_CHECKPOINT_PATH": str(runtime.base_checkpoint),
+        "EDGE_POLICY_CHECKPOINT": str(runtime.edge),
+        "WAN_VAE_PATH": str(runtime.vae),
         "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
         "OUTPUT_ROOT": str(output),
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
-    report = h3f._validate_contract_env(output)
+    report = h3f._validate_contract_env(output, runtime)
     assert report["SAVE_ITER"] == 500
     assert report["TTT_K_LOCAL"] == 4
     assert report["ROBOCASA_NUM_WORKERS"] == 6
-    assert report["ROBOCASA_ROOT"] == str(dataset)
-    assert report["BASE_CHECKPOINT_PATH"] == str(base)
+    assert report["ROBOCASA_ROOT"] == str(runtime.dataset_root)
+    assert report["BASE_CHECKPOINT_PATH"] == str(runtime.base_checkpoint)
+    assert report["DIRECT_BASE_CHECKPOINT"] == str(runtime.base_checkpoint)
     assert report["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
     assert "contract-only" in report["ROBOCASA_NUM_WORKERS_EFFECT"]
 
     monkeypatch.setenv("TTT_K_LOCAL", "8")
     with pytest.raises(ValueError, match="冻结值"):
-        h3f._validate_contract_env(output)
+        h3f._validate_contract_env(output, runtime)
 
     monkeypatch.setenv("TTT_K_LOCAL", "4")
     monkeypatch.setenv("SAVE_ITER", "750")
     with pytest.raises(ValueError, match="primary eval"):
-        h3f._validate_contract_env(output)
+        h3f._validate_contract_env(output, runtime)
 
 
 def test_generation_local_profile_matches_v2_semantics_on_v3_names() -> None:
@@ -191,12 +236,15 @@ def test_resume_iteration_and_attempt_identity(tmp_path: Path) -> None:
 
 
 def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {"SAVE_ITER": 500})
+    runtime = _runtime(tmp_path / "assets")
+    monkeypatch.setattr(h3f, "runtime_paths", lambda: runtime)
+    monkeypatch.setattr(h3f, "_validate_contract_env", lambda *_: {"SAVE_ITER": 500})
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
-    monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
+    monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda *_: {"config_sha256": "ok"})
     monkeypatch.setattr(h3f, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
+    monkeypatch.setattr(h3f, "config_digest", lambda *_: "formal-digest")
     fake_catalog = SimpleNamespace(episodes=(1,) * 9036, manifest_digest=h3f.MANIFEST_DIGEST)
-    monkeypatch.setattr(h3f, "make_catalog", lambda: (object(), fake_catalog))
+    monkeypatch.setattr(h3f, "make_catalog", lambda *_: (object(), fake_catalog))
     monkeypatch.setattr(
         h3f,
         "preflight_native_batch",
@@ -217,6 +265,7 @@ def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.Monkey
     job = Path(report["job"])
     (job / "checkpoints").mkdir(parents=True)
     (job / "checkpoints/latest_checkpoint.txt").write_text("iter_000004000\n")
+    (job / "checkpoints/iter_000004000").mkdir()
     resume = _args(tmp_path, phase="resume", attempt=2)
     resumed = h3f.preflight(resume)
     assert resumed["start_iteration"] == 4_000
@@ -227,13 +276,16 @@ def test_preflight_is_read_only_and_phase_fail_closed(monkeypatch: pytest.Monkey
 
 
 def test_nonzero_rank_tolerates_rank0_startup_directory_race(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(h3f, "_validate_contract_env", lambda _: {"SAVE_ITER": 500})
+    runtime = _runtime(tmp_path / "assets")
+    monkeypatch.setattr(h3f, "runtime_paths", lambda: runtime)
+    monkeypatch.setattr(h3f, "_validate_contract_env", lambda *_: {"SAVE_ITER": 500})
     monkeypatch.setenv("RANK", "1")
     monkeypatch.setattr(h3f, "lock_pair", lambda *_: {"root": "a" * 40, "child": "b" * 40, "gitlink": "b" * 40})
-    monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda: {"config_sha256": "ok"})
+    monkeypatch.setattr(h3f, "validate_h100_asset_authority", lambda *_: {"config_sha256": "ok"})
     monkeypatch.setattr(h3f, "read_stage_a_contract", lambda *_: {"dcp_keys": 549})
+    monkeypatch.setattr(h3f, "config_digest", lambda *_: "formal-digest")
     fake_catalog = SimpleNamespace(episodes=(1,) * 9036, manifest_digest=h3f.MANIFEST_DIGEST)
-    monkeypatch.setattr(h3f, "make_catalog", lambda: (object(), fake_catalog))
+    monkeypatch.setattr(h3f, "make_catalog", lambda *_: (object(), fake_catalog))
     monkeypatch.setattr(
         h3f,
         "preflight_native_batch",
