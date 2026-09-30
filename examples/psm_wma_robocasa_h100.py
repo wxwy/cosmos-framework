@@ -439,7 +439,15 @@ class SmokeObserver:
         self.counts: dict[str, int] = {}
 
     def __call__(
-        self, *, phase: str, iteration: int, member: int, index: int | None, loss: torch.Tensor | None, trainer: Any
+        self,
+        *,
+        phase: str,
+        iteration: int,
+        member: int,
+        index: int | None,
+        loss: torch.Tensor | None,
+        metrics: dict[str, Any] | None = None,
+        trainer: Any,
     ) -> None:
         torch.cuda.synchronize()
         self.counts[phase] = self.counts.get(phase, 0) + 1
@@ -456,6 +464,12 @@ class SmokeObserver:
             if loss.ndim != 0 or not bool(torch.isfinite(loss)):
                 raise FloatingPointError("H3-E native loss 非有限或非标量")
             event["native_loss"] = float(loss.detach())
+        if metrics:
+            event["metrics"] = {
+                key: float(value.detach()) if isinstance(value, torch.Tensor) else float(value)
+                for key, value in metrics.items()
+                if (not isinstance(value, torch.Tensor) or value.ndim == 0)
+            }
         if phase == "pre_optimizer":
             selected = [
                 (name, _local(parameter.grad))
