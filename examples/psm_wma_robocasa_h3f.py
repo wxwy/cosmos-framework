@@ -483,9 +483,7 @@ class FormalObserver:
                 numel > 0 and norm > 0 for _, numel, norm in self.generation_grad_witness
             ),
             "action_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.action_grad_witness),
-            "action_grad_nonzero_shards": sum(
-                numel > 0 and norm > 0 for _, numel, norm in self.action_grad_witness
-            ),
+            "action_grad_nonzero_shards": sum(numel > 0 and norm > 0 for _, numel, norm in self.action_grad_witness),
         }
         with self.path.open("a") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -526,9 +524,7 @@ def _install_optimizer_inventory_check(model: torch.nn.Module, result: dict[str,
 
     def checked_optimizer(optimizer_config, scheduler_config):
         named = dict(model.named_parameters())
-        expected_names = {
-            name for name in named if _is_h3f_generation_parameter(name) or _is_h3f_local_parameter(name)
-        }
+        expected_names = {name for name in named if _is_h3f_generation_parameter(name) or _is_h3f_local_parameter(name)}
         generation_names = {name for name in expected_names if _is_h3f_generation_parameter(name)}
         local_names = {name for name in expected_names if _is_h3f_local_parameter(name)}
         if not generation_names:
@@ -561,6 +557,7 @@ def _install_optimizer_inventory_check(model: torch.nn.Module, result: dict[str,
         return optimizer, scheduler
 
     model.init_optimizer_scheduler = checked_optimizer
+
 
 def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
     if int(os.environ.get("WORLD_SIZE", "0")) != 8 or not torch.cuda.is_available():
