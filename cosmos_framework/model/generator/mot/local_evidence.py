@@ -106,6 +106,8 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         self.w0_fast_in_bias = nn.Parameter(torch.empty(fast_hidden_dim))
         self.w0_fast_out_weight = nn.Parameter(torch.empty(local_dim, fast_hidden_dim))
         self.w0_fast_out_bias = nn.Parameter(torch.empty(local_dim))
+        self._telemetry: dict[str, list[torch.Tensor]] = {}
+        self.reset_telemetry()
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -152,6 +154,47 @@ class ContinualTTTLocalMemoryCore(nn.Module):
     def detach_state(state: ContinualTTTFastState) -> ContinualTTTFastState:
         return ContinualTTTFastState(*(value.detach().clone() for value in state))
 
+    def reset_telemetry(self) -> None:
+        """Reset detached per-inner-update telemetry; does not affect training state."""
+        self._telemetry = {
+            "inner_loss": [],
+            "fast_state_norm": [],
+            "fast_update_norm": [],
+        }
+
+    @staticmethod
+    def _state_norm(state: ContinualTTTFastState) -> torch.Tensor:
+        total = None
+        for value in state:
+            term = value.detach().float().square().sum()
+            total = term if total is None else total + term
+        assert total is not None
+        return total.sqrt()
+
+    @staticmethod
+    def _state_delta_norm(
+        before: ContinualTTTFastState, after: ContinualTTTFastState
+    ) -> torch.Tensor:
+        total = None
+        for old, new in zip(before, after, strict=True):
+            term = (new.detach().float() - old.detach().float()).square().sum()
+            total = term if total is None else total + term
+        assert total is not None
+        return total.sqrt()
+
+    def drain_telemetry(self) -> dict[str, torch.Tensor]:
+        """Return detached scalar summaries for the current optimizer window and reset."""
+        if not self._telemetry["inner_loss"]:
+            return {}
+        result: dict[str, torch.Tensor] = {}
+        for key, values in self._telemetry.items():
+            stacked = torch.stack(values)
+            result[f"ttt_{key}_sum"] = stacked.sum()
+            result[f"ttt_{key}_max"] = stacked.max()
+            result[f"ttt_{key}_count"] = stacked.new_tensor(float(stacked.numel()))
+        self.reset_telemetry()
+        return result
+
     @staticmethod
     def _fast_mlp(value: torch.Tensor, state: ContinualTTTFastState) -> torch.Tensor:
         hidden = F.silu(torch.bmm(value, state.fast_in_weight.transpose(1, 2)) + state.fast_in_bias[:, None])
@@ -190,6 +233,9 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             candidate = ContinualTTTFastState(
                 *(value - self.inner_lr * grad for value, grad in zip(work, gradients, strict=True))
             )
+            self._telemetry["inner_loss"].append(inner_loss.detach())
+            self._telemetry["fast_state_norm"].append(self._state_norm(candidate))
+            self._telemetry["fast_update_norm"].append(self._state_delta_norm(work, candidate))
             tokens = self._fast_mlp(query[:, None] + self.slot_queries.float()[None], candidate)
         self.validate_state(candidate, evidence.shape[0])
         return tokens, candidate
