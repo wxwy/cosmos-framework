@@ -630,7 +630,6 @@ class FormalObserver:
         completed = trainer._grouped_completed_iteration + 1
         now = time.perf_counter()
         local_step_wall = now - self.last_commit_time
-        self.last_commit_time = now
         step_wall_seconds = self._global_max(local_step_wall)
         self.step_wall_samples.append(step_wall_seconds)
 
@@ -667,6 +666,7 @@ class FormalObserver:
             target = int(getattr(trainer_config, "max_iter", H3F_FORMAL_MAX_ITER))
             print(self._format_console(record, target), flush=True)
 
+        self.last_commit_time = time.perf_counter()
         self.completed += 1
         self.last_record = record
         self.iteration = None
