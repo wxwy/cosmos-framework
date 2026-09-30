@@ -505,7 +505,9 @@ def _install_optimizer_inventory_check(model: torch.nn.Module, result: dict[str,
         optimizer, scheduler = original(optimizer_config, scheduler_config)
         selected = _optimizer_parameter_ids(optimizer)
         selected_names = {name for name, parameter in named.items() if id(parameter) in selected}
-        forbidden_host = {name for name in selected_names if any(key in name for key in HOST_KEYS) or "_moe_gen" in name}
+        forbidden_host = {
+            name for name in selected_names if any(key in name for key in HOST_KEYS) or "_moe_gen" in name
+        }
         if (
             selected_names != expected_names
             or forbidden_host
