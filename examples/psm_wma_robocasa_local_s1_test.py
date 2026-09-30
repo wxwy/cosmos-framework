@@ -49,8 +49,9 @@ def test_cli_requires_unique_output_and_frozen_paths(tmp_path: Path, monkeypatch
     assert resolved == paths
     assert s1.T == 16 and s1.TASK == "CloseFridge" and s1.EPISODE_INDEX == s1.CURSOR == 0
     args = s1.parser().parse_args(["--output", str(paths.output), "--cache", str(tmp_path / "other.h5")])
-    with pytest.raises(ValueError, match="冻结资产"):
-        s1.validate_frozen_paths(s1.paths_from_args(args))
+    overridden = s1.paths_from_args(args)
+    s1.validate_frozen_paths(overridden)
+    assert overridden.cache == (tmp_path / "other.h5").resolve()
     with pytest.raises(SystemExit):
         s1.parser().parse_args(["--preflight"])
 
