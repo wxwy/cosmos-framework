@@ -625,9 +625,9 @@ class FormalObserver:
 
         record: dict[str, Any] = {
             "iteration": completed,
-            "native_forward": int(round(self._reduce_scalar(self.forward))),
-            "native_backward": int(round(self._reduce_scalar(self.backward))),
-            "pre_optimizer": int(round(self._reduce_scalar(self.pre_optimizer))),
+            "native_forward": int(round(self._global_max(self.forward))),
+            "native_backward": int(round(self._global_max(self.backward))),
+            "pre_optimizer": int(round(self._global_max(self.pre_optimizer))),
             "post_commit": 1,
             "loss_mean": self._global_mean(self.loss_sum, self.forward),
             "loss_min": self._global_min(self.loss_min),
