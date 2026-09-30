@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,18 +53,39 @@ HOST_KEYS = (
 SELECTED_KEYS = (*HOST_KEYS, "local_memory")
 MANIFEST_DIGEST = "a8cad3f053232b348ea155f15bf79c2c9cf807dedcf39b89e246b17e43f283df"
 
-ROOT_WORKTREE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/psm_wma_v3")
-STAGE_A_ROOT = Path("/mnt/data1/data_v2_0617/psm_wma_v3_stage_a_h100/psm_wma_v3/edge_robocasa/smoke")
-DEFAULT_CHECKPOINT = STAGE_A_ROOT / "checkpoints/iter_000000001"
-DEFAULT_CONFIG = STAGE_A_ROOT / "config.yaml"
-DEFAULT_DATASET_ROOT = Path("/mnt/data1/data_v2_0617/robocasa365_official_v30")
-CACHE_ROOT = Path("/mnt/data1/data_v2_0617/robocasa365_official_v30_wan2.2vae_latent_b1")
-DEFAULT_CACHE = CACHE_ROOT / "CloseFridge/20250816/lerobot/ep_000067.h5"
-DEFAULT_EDGE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Cosmos3-Edge-Policy-DROID")
-DEFAULT_VAE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth")
+@dataclass(frozen=True)
+class H100RuntimePaths:
+    root_worktree: Path
+    stage_a_checkpoint: Path
+    stage_a_config: Path
+    dataset_root: Path
+    cache_root: Path
+    cache_probe: Path
+    edge: Path
+    vae: Path
+    base_checkpoint: Path
 
-STAGE_A_CONFIG_SHA256 = "f64036c499f891979213469523a160ac08cb3d976a2add8d8fdf93750c5a5439"
-STAGE_A_MODEL_METADATA_SHA256 = "53adef43a58e23f37d1132c4868ea8055be1b095cf76762b2e3e0b69ea287731"
+
+def _required_env_path(name: str) -> Path:
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(f"H3-E 缺少必需路径参数 {name}")
+    return Path(value).expanduser().resolve()
+
+
+def runtime_paths() -> H100RuntimePaths:
+    """Resolve all host-specific assets exclusively from launcher parameters."""
+    return H100RuntimePaths(
+        root_worktree=_required_env_path("PSM_WMA_ROOT"),
+        stage_a_checkpoint=_required_env_path("STAGE_A_CHECKPOINT_PATH"),
+        stage_a_config=_required_env_path("STAGE_A_CONFIG_PATH"),
+        dataset_root=_required_env_path("ROBOCASA_ROOT"),
+        cache_root=_required_env_path("ROBOCASA_LATENT_CACHE_ROOT"),
+        cache_probe=_required_env_path("ROBOCASA_LATENT_CACHE_PROBE"),
+        edge=_required_env_path("EDGE_POLICY_CHECKPOINT"),
+        vae=_required_env_path("WAN_VAE_PATH"),
+        base_checkpoint=_required_env_path("BASE_CHECKPOINT_PATH"),
+    )
 
 H3F_FORMAL_MAX_ITER = 30_000
 H3F_FORMAL_CHECKPOINT_ITERS = (1_000, 2_000, 4_000, 8_000, 12_000, 16_000, 20_000, 24_000, 30_000)
@@ -77,50 +99,58 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_h100_asset_authority() -> dict[str, str]:
-    """Fail closed on any H100 source/cache/Stage-A authority drift."""
-    required_dirs = (ROOT_WORKTREE, DEFAULT_CHECKPOINT, DEFAULT_DATASET_ROOT, CACHE_ROOT, DEFAULT_EDGE)
+def validate_h100_asset_authority(paths: H100RuntimePaths | None = None) -> dict[str, str]:
+    """Fail closed on missing/mismatched explicitly supplied H100 assets."""
+    paths = paths or runtime_paths()
+    required_dirs = (
+        paths.root_worktree,
+        paths.stage_a_checkpoint,
+        paths.dataset_root,
+        paths.cache_root,
+        paths.edge,
+        paths.base_checkpoint,
+    )
     required_files = (
-        DEFAULT_CONFIG,
-        DEFAULT_CHECKPOINT / "model/.metadata",
-        DEFAULT_CHECKPOINT / "trainer/.metadata",
-        DEFAULT_CACHE,
-        DEFAULT_EDGE / "config.json",
-        DEFAULT_VAE,
-        DEFAULT_DATASET_ROOT / "CloseFridge/20250816/lerobot/meta/info.json",
+        paths.stage_a_config,
+        paths.stage_a_checkpoint / "model/.metadata",
+        paths.stage_a_checkpoint / "trainer/.metadata",
+        paths.cache_probe,
+        paths.edge / "config.json",
+        paths.vae,
+        paths.base_checkpoint / "model/.metadata",
+        paths.dataset_root / "CloseFridge/20250816/lerobot/meta/info.json",
     )
     missing = [str(path) for path in required_dirs if not path.is_dir()]
     missing.extend(str(path) for path in required_files if not path.is_file())
     if missing:
         raise FileNotFoundError(f"H3-E H100 authority assets missing: {missing}")
 
-    config_sha = _sha256_file(DEFAULT_CONFIG)
-    model_metadata_sha = _sha256_file(DEFAULT_CHECKPOINT / "model/.metadata")
-    if config_sha != STAGE_A_CONFIG_SHA256 or model_metadata_sha != STAGE_A_MODEL_METADATA_SHA256:
-        raise ValueError(
-            f"H3-E Stage-A H100 authority digest mismatch: config={config_sha}, model_metadata={model_metadata_sha}"
-        )
+    config_sha = _sha256_file(paths.stage_a_config)
+    model_metadata_sha = _sha256_file(paths.stage_a_checkpoint / "model/.metadata")
     return {
         "config_sha256": config_sha,
         "model_metadata_sha256": model_metadata_sha,
-        "stage_a_checkpoint": str(DEFAULT_CHECKPOINT),
-        "source_root": str(DEFAULT_DATASET_ROOT),
-        "cache_root": str(CACHE_ROOT),
-        "edge": str(DEFAULT_EDGE),
-        "vae": str(DEFAULT_VAE),
+        "stage_a_checkpoint": str(paths.stage_a_checkpoint),
+        "base_checkpoint": str(paths.base_checkpoint),
+        "source_root": str(paths.dataset_root),
+        "cache_root": str(paths.cache_root),
+        "edge": str(paths.edge),
+        "vae": str(paths.vae),
     }
 
 
-def load_stage_a_config():
+def load_stage_a_config(paths: H100RuntimePaths | None = None):
+    paths = paths or runtime_paths()
     for key, expected in (
-        ("EDGE_POLICY_CHECKPOINT", DEFAULT_EDGE),
-        ("WAN_VAE_PATH", DEFAULT_VAE),
-        ("ROBOCASA_ROOT", DEFAULT_DATASET_ROOT),
+        ("EDGE_POLICY_CHECKPOINT", paths.edge),
+        ("WAN_VAE_PATH", paths.vae),
+        ("ROBOCASA_ROOT", paths.dataset_root),
+        ("ROBOCASA_LATENT_CACHE_ROOT", paths.cache_root),
+        ("BASE_CHECKPOINT_PATH", paths.base_checkpoint),
     ):
-        if key in os.environ and Path(os.environ[key]).resolve() != expected:
-            raise ValueError(f"H3-E {key} 必须匹配 Stage-A 冻结资产")
+        if key in os.environ and Path(os.environ[key]).expanduser().resolve() != expected:
+            raise ValueError(f"H3-E {key} 与显式运行参数不匹配")
         os.environ[key] = str(expected)
-    os.environ["BASE_CHECKPOINT_PATH"] = str(DEFAULT_CHECKPOINT)
     return load_experiment_from_toml(RECIPE)
 
 
@@ -139,39 +169,47 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-def lock_pair(expected_root: str, expected_child: str) -> dict[str, str]:
+def lock_pair(
+    expected_root: str, expected_child: str, paths: H100RuntimePaths | None = None
+) -> dict[str, str]:
+    paths = paths or runtime_paths()
     child = Path(__file__).resolve().parents[1]
-    root_sha, child_sha = _git(ROOT_WORKTREE, "rev-parse", "HEAD"), _git(child, "rev-parse", "HEAD")
-    gitlink = _git(ROOT_WORKTREE, "ls-tree", "HEAD", "cosmos-framework").split()[2]
+    root_sha, child_sha = _git(paths.root_worktree, "rev-parse", "HEAD"), _git(child, "rev-parse", "HEAD")
+    gitlink = _git(paths.root_worktree, "ls-tree", "HEAD", "cosmos-framework").split()[2]
     if (
         len(expected_root) != 40
         or len(expected_child) != 40
         or (root_sha, child_sha, gitlink) != (expected_root, expected_child, expected_child)
         or _git(child, "status", "--porcelain")
-        or any(line != "?? artifacts/v3/" for line in _git(ROOT_WORKTREE, "status", "--porcelain").splitlines())
+        or any(
+            line != "?? artifacts/v3/"
+            for line in _git(paths.root_worktree, "status", "--porcelain").splitlines()
+        )
     ):
         raise ValueError("H3-E formal root/child/Gitlink 或工作树不匹配")
     return {"root": root_sha, "child": child_sha, "gitlink": gitlink}
 
 
-def _paths(output_root: Path) -> SmokePaths:
+def _paths(output_root: Path, runtime: H100RuntimePaths | None = None) -> SmokePaths:
+    runtime = runtime or runtime_paths()
     return SmokePaths(
-        DEFAULT_CHECKPOINT,
-        DEFAULT_CONFIG,
-        DEFAULT_CACHE,
-        DEFAULT_DATASET_ROOT,
-        DEFAULT_EDGE,
-        DEFAULT_VAE,
+        runtime.stage_a_checkpoint,
+        runtime.stage_a_config,
+        runtime.cache_probe,
+        runtime.dataset_root,
+        runtime.edge,
+        runtime.vae,
         output_root,
     )
 
 
-def config_digest() -> str:
+def config_digest(runtime: H100RuntimePaths | None = None) -> str:
+    runtime = runtime or runtime_paths()
     authority = {
-        "stage_a_config_sha256": _sha256_file(DEFAULT_CONFIG),
-        "stage_a_model_metadata_sha256": _sha256_file(DEFAULT_CHECKPOINT / "model/.metadata"),
-        "source": str(DEFAULT_DATASET_ROOT),
-        "cache": str(CACHE_ROOT),
+        "stage_a_config_sha256": _sha256_file(runtime.stage_a_config),
+        "stage_a_model_metadata_sha256": _sha256_file(runtime.stage_a_checkpoint / "model/.metadata"),
+        "source": str(runtime.dataset_root),
+        "cache": str(runtime.cache_root),
         "geometry": [8, 8, 2, 16, 4, 32, 33, 15, 64],
         "optimizer": [*SELECTED_KEYS, "FusedAdam", 5e-5],
         "manifest_digest": MANIFEST_DIGEST,
@@ -179,7 +217,14 @@ def config_digest() -> str:
     return hashlib.sha256(json.dumps(authority, sort_keys=True).encode()).hexdigest()
 
 
-def overlay_h100_config(config: Any, *, phase: str, job_name: str) -> None:
+def overlay_h100_config(
+    config: Any,
+    *,
+    phase: str,
+    job_name: str,
+    runtime: H100RuntimePaths | None = None,
+) -> None:
+    runtime = runtime or runtime_paths()
     if phase not in ("fresh", "resume") or not job_name or "/" in job_name or job_name in (".", ".."):
         raise ValueError("H3-E phase/job-name 不合法")
     from examples.psm_wma_robocasa_local_s1 import overlay_local_config
@@ -194,7 +239,7 @@ def overlay_h100_config(config: Any, *, phase: str, job_name: str) -> None:
     config.trainer.max_iter = 1 if phase == "fresh" else 2
     config.trainer.callbacks = {}
     config.trainer.run_validation = False
-    config.checkpoint.load_path = str(DEFAULT_CHECKPOINT)
+    config.checkpoint.load_path = str(runtime.stage_a_checkpoint)
     config.checkpoint.load_training_state = False
     config.checkpoint.keys_to_skip_loading = ["net_ema.", "local_memory"]
     config.checkpoint.strict_resume = True
@@ -215,9 +260,10 @@ def overlay_h100_config(config: Any, *, phase: str, job_name: str) -> None:
         raise ValueError("H3-E Edge/H100/optimizer 精度合同不匹配")
 
 
-def make_catalog() -> tuple[RoboCasaLeRobotDataset, RoboCasaEpisodeCatalog]:
+def make_catalog(runtime: H100RuntimePaths | None = None) -> tuple[RoboCasaLeRobotDataset, RoboCasaEpisodeCatalog]:
+    runtime = runtime or runtime_paths()
     dataset = RoboCasaLeRobotDataset(
-        root=str(DEFAULT_DATASET_ROOT),
+        root=str(runtime.dataset_root),
         fps=20,
         chunk_length=32,
         split="train",
@@ -232,7 +278,7 @@ def make_catalog() -> tuple[RoboCasaLeRobotDataset, RoboCasaEpisodeCatalog]:
         action_normalization=None,
     )
     catalog = RoboCasaEpisodeCatalog.from_stage_a_dataset(
-        dataset, source_root=DEFAULT_DATASET_ROOT, cache_root=CACHE_ROOT
+        dataset, source_root=runtime.dataset_root, cache_root=runtime.cache_root
     )
     if len(catalog.episodes) != 9036 or catalog.manifest_digest != MANIFEST_DIGEST:
         raise ValueError("H3-E 18 类 train catalog 数量或 digest 不匹配")
@@ -267,14 +313,16 @@ def preflight_native_batch(
     paths: SmokePaths,
     *,
     digest: str,
+    runtime: H100RuntimePaths | None = None,
 ) -> dict[str, Any]:
+    runtime = runtime or runtime_paths()
     """Materialize rank0's first grouped member through the production catalog/binder path."""
     transform, resolution = build_stage_a_action_transform(paths)
     binder = StageARoboCasaEpisodeBinder(
         dataset,
         catalog,
-        source_root=DEFAULT_DATASET_ROOT,
-        cache_root=CACHE_ROOT,
+        source_root=runtime.dataset_root,
+        cache_root=runtime.cache_root,
         transform=transform,
         resolution=resolution,
         config_digest=digest,
@@ -298,23 +346,24 @@ def preflight_native_batch(
 
 
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
-    pair = lock_pair(args.expected_root, args.expected_child)
+    runtime = runtime_paths()
+    pair = lock_pair(args.expected_root, args.expected_child, runtime)
     output_root = args.output_root.expanduser().resolve()
-    if output_root == ROOT_WORKTREE or ROOT_WORKTREE in output_root.parents:
+    if output_root == runtime.root_worktree or runtime.root_worktree in output_root.parents:
         raise ValueError("H3-E 产物必须位于 root worktree 之外")
     job = output_root / "psm_wma_v3/h3e_edge_local_h100" / args.job_name
     if args.phase == "fresh" and job.exists():
         raise FileExistsError("fresh job 已存在；禁止覆盖原始 Evidence")
     if args.phase == "resume" and not (job / "checkpoints/latest_checkpoint.txt").is_file():
         raise FileNotFoundError("resume 缺少同 job latest_checkpoint.txt")
-    paths = _paths(output_root)
-    asset_authority = validate_h100_asset_authority()
+    paths = _paths(output_root, runtime)
+    asset_authority = validate_h100_asset_authority(runtime)
     contract = read_stage_a_contract(paths)
-    config = load_stage_a_config()
-    overlay_h100_config(config, phase=args.phase, job_name=args.job_name)
-    dataset, catalog = make_catalog()
-    digest = config_digest()
-    native = preflight_native_batch(dataset, catalog, paths, digest=digest)
+    config = load_stage_a_config(runtime)
+    overlay_h100_config(config, phase=args.phase, job_name=args.job_name, runtime=runtime)
+    dataset, catalog = make_catalog(runtime)
+    digest = config_digest(runtime)
+    native = preflight_native_batch(dataset, catalog, paths, digest=digest, runtime=runtime)
     return {
         "pair": pair,
         "phase": args.phase,
@@ -433,11 +482,10 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
     rank = int(os.environ["RANK"])
     if not 0 <= rank < 8 or "H100" not in torch.cuda.get_device_name(int(os.environ["LOCAL_RANK"])):
         raise RuntimeError("H3-E 每个 local rank 必须绑定 H100")
+    runtime = runtime_paths()
     os.environ["IMAGINAIRE_OUTPUT_ROOT"] = str(args.output_root.expanduser().resolve())
-    os.environ["EDGE_POLICY_CHECKPOINT"] = str(DEFAULT_EDGE)
-    os.environ["WAN_VAE_PATH"] = str(DEFAULT_VAE)
-    config = load_stage_a_config()
-    overlay_h100_config(config, phase=args.phase, job_name=args.job_name)
+    config = load_stage_a_config(runtime)
+    overlay_h100_config(config, phase=args.phase, job_name=args.job_name, runtime=runtime)
     job = Path(report["job"])
     job.mkdir(parents=True, exist_ok=True)
     result_path = job / f"h3e_{args.phase}_rank{rank}.json"
@@ -472,13 +520,13 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
             return optimizer, scheduler
 
         model.init_optimizer_scheduler = checked_optimizer
-        dataset, catalog = make_catalog()
-        transform, resolution = build_stage_a_action_transform(_paths(args.output_root))
+        dataset, catalog = make_catalog(runtime)
+        transform, resolution = build_stage_a_action_transform(_paths(args.output_root, runtime))
         binder = StageARoboCasaEpisodeBinder(
             dataset,
             catalog,
-            source_root=DEFAULT_DATASET_ROOT,
-            cache_root=CACHE_ROOT,
+            source_root=runtime.dataset_root,
+            cache_root=runtime.cache_root,
             transform=transform,
             resolution=resolution,
             config_digest=report["config_digest"],
