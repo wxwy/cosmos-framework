@@ -35,8 +35,28 @@ def test_overlay_freezes_30k_schedule() -> None:
     assert config.scheduler.cycle_lengths == [30_000]
     assert config.scheduler.warm_up_steps == [500]
     assert config.checkpoint.save_iter == 500
-    assert config.optimizer.keys_to_select == ["language_model", "local_memory"]
-    assert config.optimizer.lr_multipliers == {}
+    assert config.optimizer.keys_to_select == list(h3f.H3F_OPTIMIZER_KEYS)
+    assert config.optimizer.keys_to_select == [
+        "moe_gen",
+        "time_embedder",
+        "vae2llm",
+        "llm2vae",
+        "action2llm",
+        "llm2action",
+        "action_modality_embed",
+        "local_memory_runtime.encoder.",
+        "local_memory_runtime.core.",
+        "local_memory2llm.",
+        "local_memory_modality_embed",
+    ]
+    assert config.optimizer.lr_multipliers == {
+        "action2llm": 5.0,
+        "llm2action": 5.0,
+        "action_modality_embed": 5.0,
+    }
+    assert config.model.config.local_memory_action_dim == 15
+    assert config.model.config.parallelism.data_parallel_shard_degree == 8
+    assert config.model.config.parallelism.data_parallel_replicate_degree == 1
     assert config.job.group == h3f.H3F_GROUP
     assert all(step % config.checkpoint.save_iter == 0 for step in h3f.H3F_FORMAL_CHECKPOINT_ITERS)
     h3f.overlay_h3f_config(config, phase="fresh", job_name="formal", save_iter=1_000)
@@ -145,34 +165,16 @@ def test_contract_env_validates_owner_launch_values(monkeypatch: pytest.MonkeyPa
         h3f._validate_contract_env(output)
 
 
-def test_reasoner_ttt_profile_excludes_generation_duplicates_and_action_heads() -> None:
-    assert h3f._is_h3f_reasoner_parameter("net.language_model.model.layers.0.weight")
-    assert h3f._is_h3f_reasoner_parameter("net.language_model.lm_head.weight")
-    assert not h3f._is_h3f_reasoner_parameter("net.language_model.model.layers.0_moe_gen.weight")
-    assert not h3f._is_h3f_reasoner_parameter("net.moe_gen.layers.0.weight")
-    assert not h3f._is_h3f_reasoner_parameter("net.action2llm.fc.weight")
-    assert h3f._is_h3f_local_parameter("net.local_memory.core.slot_queries")
-
-
-def test_configure_reasoner_ttt_trainables_is_exact() -> None:
-    class TinyModel(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.net = torch.nn.Module()
-            self.net.language_model = torch.nn.Module()
-            self.net.language_model.register_parameter("reason_weight", torch.nn.Parameter(torch.ones(2)))
-            self.net.language_model.register_parameter("reason_moe_gen", torch.nn.Parameter(torch.ones(2)))
-            self.net.local_memory = torch.nn.Module()
-            self.net.local_memory.register_parameter("weight", torch.nn.Parameter(torch.ones(2)))
-            self.net.action2llm = torch.nn.Linear(2, 2)
-
-    model = TinyModel()
-    named = h3f._configure_reasoner_ttt_trainables(model)
-    trainable = {name for name, parameter in named.items() if parameter.requires_grad}
-    assert trainable == {
-        "net.language_model.reason_weight",
-        "net.local_memory.weight",
-    }
+def test_generation_local_profile_matches_v2_semantics_on_v3_names() -> None:
+    assert h3f._is_h3f_generation_parameter("net.language_model.model.layers.0_moe_gen.weight")
+    assert h3f._is_h3f_generation_parameter("net.time_embedder.linear.weight")
+    assert h3f._is_h3f_generation_parameter("net.action2llm.fc.weight")
+    assert not h3f._is_h3f_generation_parameter("net.language_model.model.layers.0.weight")
+    assert h3f._is_h3f_local_parameter("net.local_memory_runtime.encoder.visual_proj.weight")
+    assert h3f._is_h3f_local_parameter("net.local_memory_runtime.core.slot_queries")
+    assert h3f._is_h3f_local_parameter("net.local_memory2llm.weight")
+    assert h3f._is_h3f_local_parameter("net.local_memory_modality_embed")
+    assert not h3f._is_h3f_local_parameter("net.language_model.model.layers.0.weight")
 
 
 def test_resume_iteration_and_attempt_identity(tmp_path: Path) -> None:
@@ -258,12 +260,15 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
 
     model = torch.nn.Module()
     model.net = torch.nn.Module()
-    model.net.language_model = torch.nn.Module()
-    model.net.language_model.register_parameter("reason_weight", torch.nn.Parameter(torch.tensor(1.0)))
-    model.net.local_memory = torch.nn.Module()
-    model.net.local_memory.register_parameter("weight", torch.nn.Parameter(torch.tensor(1.0)))
-    model.net.language_model.reason_weight.grad = torch.tensor(0.5)
-    model.net.local_memory.weight.grad = torch.tensor(0.25)
+    model.net.register_parameter("moe_gen_weight", torch.nn.Parameter(torch.tensor(1.0)))
+    model.net.action2llm = torch.nn.Module()
+    model.net.action2llm.register_parameter("weight", torch.nn.Parameter(torch.tensor(1.0)))
+    model.net.local_memory_runtime = torch.nn.Module()
+    model.net.local_memory_runtime.encoder = torch.nn.Module()
+    model.net.local_memory_runtime.encoder.register_parameter("weight", torch.nn.Parameter(torch.tensor(1.0)))
+    model.net.moe_gen_weight.grad = torch.tensor(0.5)
+    model.net.action2llm.weight.grad = torch.tensor(0.4)
+    model.net.local_memory_runtime.encoder.weight.grad = torch.tensor(0.25)
     observer = h3f.FormalObserver(tmp_path / "progress.jsonl", model)
     trainer = SimpleNamespace(
         _grouped_completed_iteration=7,
@@ -294,7 +299,8 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     assert observer.last_record["iteration"] == 8
     assert observer.last_record["native_forward"] == observer.last_record["native_backward"] == 32
     assert observer.last_record["local_grad_nonzero_shards"] == 1
-    assert observer.last_record["reasoner_grad_nonzero_shards"] == 1
+    assert observer.last_record["generation_grad_nonzero_shards"] == 1
+    assert observer.last_record["action_grad_nonzero_shards"] == 1
     assert observer.last_record["step_wall_seconds"] is None
 
     trainer._grouped_completed_iteration = 8
@@ -357,7 +363,9 @@ def test_owner_shell_facade_targets_h3f() -> None:
 def test_config_digest_is_long_run_specific(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(h3f, "h3e_config_digest", lambda: "base")
     first = h3f.config_digest(500)
-    assert h3f.H3F_TRAINABLE_PROFILE == "reasoner_without_moe_gen+local_memory"
+    assert h3f.H3F_TRAINABLE_PROFILE == "v2_semantic_generation+local_v3_raw15"
+    assert h3f.H3F_MESH_PROFILE == "dp_shard8_generation_and_local"
+    assert h3f.H3F_DATA_PROFILE == "official_v30_raw15"
     assert h3f.config_digest(1000) != first
     assert h3f.readiness_config_digest(10, 500) != first
     monkeypatch.setattr(h3f, "H3F_WARMUP_STEPS", 501)

@@ -1,4 +1,4 @@
-"""V3 H3-F：RoboCasa target-atomic 8×H100 Local-TTT 30k formal training launcher."""
+"""V3 H3-F：RoboCasa target-atomic 8×H100 generation+Local-TTT 30k formal training launcher."""
 
 from __future__ import annotations
 
@@ -56,8 +56,27 @@ H3F_GROUP = "h3f_edge_local_h100"
 H3F_READINESS_GROUP = "h3f_edge_local_h100_readiness"
 H3F_READINESS_MAX_STEPS = 100
 H3F_BASE_CHECKPOINT_LINEAGE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Cosmos3-Edge-Policy-DROID-dcp")
-H3F_OPTIMIZER_KEYS = ("language_model", "local_memory")
-H3F_TRAINABLE_PROFILE = "reasoner_without_moe_gen+local_memory"
+H3F_GENERATION_KEYS = (
+    "moe_gen",
+    "time_embedder",
+    "vae2llm",
+    "llm2vae",
+    "action2llm",
+    "llm2action",
+    "action_modality_embed",
+)
+H3F_LOCAL_KEYS = (
+    "local_memory_runtime.encoder.",
+    "local_memory_runtime.core.",
+    "local_memory2llm.",
+    "local_memory_modality_embed",
+)
+H3F_ACTION_KEYS = ("action2llm", "llm2action", "action_modality_embed")
+H3F_GENERATION_CORE_KEYS = ("moe_gen", "time_embedder", "vae2llm", "llm2vae")
+H3F_OPTIMIZER_KEYS = (*H3F_GENERATION_KEYS, *H3F_LOCAL_KEYS)
+H3F_TRAINABLE_PROFILE = "v2_semantic_generation+local_v3_raw15"
+H3F_MESH_PROFILE = "dp_shard8_generation_and_local"
+H3F_DATA_PROFILE = "official_v30_raw15"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -86,7 +105,7 @@ def overlay_h3f_config(
     overlay_h100_config(config, phase=phase, job_name=job_name)
     target_iteration = readiness_steps if readiness_steps is not None else H3F_FORMAL_MAX_ITER
     config.optimizer.keys_to_select = list(H3F_OPTIMIZER_KEYS)
-    config.optimizer.lr_multipliers = {}
+    config.optimizer.lr_multipliers = {key: 5.0 for key in H3F_ACTION_KEYS}
     config.trainer.max_iter = target_iteration
     config.trainer.logging_iter = 50
     config.scheduler.cycle_lengths = [H3F_FORMAL_MAX_ITER]
@@ -96,7 +115,12 @@ def overlay_h3f_config(
     config.job.name = job_name
     if (
         config.optimizer.keys_to_select != list(H3F_OPTIMIZER_KEYS)
-        or config.optimizer.lr_multipliers
+        or config.optimizer.lr_multipliers != {key: 5.0 for key in H3F_ACTION_KEYS}
+        or float(config.optimizer.lr) != 5e-5
+        or float(config.optimizer.weight_decay) != 0.05
+        or config.model.config.parallelism.data_parallel_shard_degree != 8
+        or config.model.config.parallelism.data_parallel_replicate_degree != 1
+        or config.model.config.local_memory_action_dim != 15
         or config.trainer.grad_accum_iter != 2
         or config.trainer.max_iter != target_iteration
         or config.scheduler.cycle_lengths != [30_000]
@@ -113,6 +137,10 @@ def config_digest(save_iter: int = H3F_SAVE_ITER) -> str:
         "h3e_runtime": h3e_config_digest(),
         "trainable_profile": H3F_TRAINABLE_PROFILE,
         "optimizer_keys": list(H3F_OPTIMIZER_KEYS),
+        "lr_multipliers": {key: 5.0 for key in H3F_ACTION_KEYS},
+        "mesh_profile": H3F_MESH_PROFILE,
+        "data_profile": H3F_DATA_PROFILE,
+        "local_memory_action_dim": 15,
         "max_iter": H3F_FORMAL_MAX_ITER,
         "save_iter": save_iter,
         "warmup_steps": H3F_WARMUP_STEPS,
@@ -339,6 +367,9 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "geometry": [8, 8, 2, 16, 4],
         "selector": list(H3F_OPTIMIZER_KEYS),
         "trainable_profile": H3F_TRAINABLE_PROFILE,
+        "mesh_profile": H3F_MESH_PROFILE,
+        "data_profile": H3F_DATA_PROFILE,
+        "local_memory_action_dim": 15,
         "formal_max_iter": H3F_FORMAL_MAX_ITER,
         "readiness_steps": readiness_steps,
         "target_iteration": readiness_steps if readiness_steps is not None else H3F_FORMAL_MAX_ITER,
@@ -394,26 +425,32 @@ class FormalObserver:
         if phase == "pre_optimizer":
             self.pre_optimizer += 1
             selected_local = []
-            selected_reasoner = []
+            selected_generation = []
+            selected_action = []
             for name, parameter in self.model.named_parameters():
                 if not parameter.requires_grad or parameter.grad is None:
                     continue
-                if not (_is_h3f_local_parameter(name) or _is_h3f_reasoner_parameter(name)):
+                if not (_is_h3f_generation_parameter(name) or _is_h3f_local_parameter(name)):
                     continue
                 gradient = _local(parameter.grad)
                 if not bool(torch.isfinite(gradient).all()):
-                    raise FloatingPointError("H3-F Reasoner/Local gradient 非有限")
+                    raise FloatingPointError("H3-F Generation/Local gradient 非有限")
                 witness = (name, int(gradient.numel()), float(gradient.float().norm()))
                 if _is_h3f_local_parameter(name):
                     selected_local.append(witness)
+                elif any(key in name for key in H3F_ACTION_KEYS):
+                    selected_action.append(witness)
                 else:
-                    selected_reasoner.append(witness)
-            if not selected_local:
-                raise FloatingPointError("H3-F 缺少 Local gradient witness")
-            if not any(numel > 0 and norm > 0 for _, numel, norm in selected_reasoner):
-                raise FloatingPointError("H3-F 缺少非零 Reasoner gradient witness")
+                    selected_generation.append(witness)
+            if not any(numel > 0 and norm > 0 for _, numel, norm in selected_local):
+                raise FloatingPointError("H3-F 缺少非零 Local gradient witness")
+            if not any(numel > 0 and norm > 0 for _, numel, norm in selected_generation):
+                raise FloatingPointError("H3-F 缺少非零 generation-core gradient witness")
+            if not any(numel > 0 and norm > 0 for _, numel, norm in selected_action):
+                raise FloatingPointError("H3-F 缺少非零 action-head gradient witness")
             self.local_grad_witness = selected_local
-            self.reasoner_grad_witness = selected_reasoner
+            self.generation_grad_witness = selected_generation
+            self.action_grad_witness = selected_action
             return
         if phase != "post_commit":
             raise ValueError(f"H3-F 未知 grouped observer phase: {phase}")
@@ -443,9 +480,13 @@ class FormalObserver:
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             "local_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.local_grad_witness),
             "local_grad_nonzero_shards": sum(numel > 0 and norm > 0 for _, numel, norm in self.local_grad_witness),
-            "reasoner_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.reasoner_grad_witness),
-            "reasoner_grad_nonzero_shards": sum(
-                numel > 0 and norm > 0 for _, numel, norm in self.reasoner_grad_witness
+            "generation_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.generation_grad_witness),
+            "generation_grad_nonzero_shards": sum(
+                numel > 0 and norm > 0 for _, numel, norm in self.generation_grad_witness
+            ),
+            "action_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.action_grad_witness),
+            "action_grad_nonzero_shards": sum(
+                numel > 0 and norm > 0 for _, numel, norm in self.action_grad_witness
             ),
         }
         with self.path.open("a") as handle:
@@ -474,56 +515,55 @@ class FormalObserver:
         }
 
 
-def _is_h3f_reasoner_parameter(name: str) -> bool:
-    return name.startswith("net.language_model.") and "_moe_gen" not in name
+
+def _is_h3f_generation_parameter(name: str) -> bool:
+    return any(key in name for key in H3F_GENERATION_KEYS)
 
 
 def _is_h3f_local_parameter(name: str) -> bool:
-    return name.startswith("net.local_memory")
-
-
-def _configure_reasoner_ttt_trainables(model: torch.nn.Module) -> dict[str, torch.nn.Parameter]:
-    named = dict(model.named_parameters())
-    for name, parameter in named.items():
-        parameter.requires_grad_(_is_h3f_reasoner_parameter(name) or _is_h3f_local_parameter(name))
-    return named
+    return any(key in name for key in H3F_LOCAL_KEYS)
 
 
 def _install_optimizer_inventory_check(model: torch.nn.Module, result: dict[str, Any]) -> None:
     original = model.init_optimizer_scheduler
 
     def checked_optimizer(optimizer_config, scheduler_config):
-        named = _configure_reasoner_ttt_trainables(model)
-        expected_names = {name for name in named if _is_h3f_reasoner_parameter(name) or _is_h3f_local_parameter(name)}
-        reasoner_names = {name for name in expected_names if _is_h3f_reasoner_parameter(name)}
+        named = dict(model.named_parameters())
+        expected_names = {
+            name for name in named if _is_h3f_generation_parameter(name) or _is_h3f_local_parameter(name)
+        }
+        generation_names = {name for name in expected_names if _is_h3f_generation_parameter(name)}
         local_names = {name for name in expected_names if _is_h3f_local_parameter(name)}
-        if not reasoner_names:
-            raise ValueError("H3-F reasoner inventory 为空")
+        if not generation_names:
+            raise ValueError("H3-F generation inventory 为空")
         if sum(named[name].numel() for name in local_names) != LOCAL_PARAMS:
-            raise ValueError("H3-F Local-TTT inventory 必须精确为 165312")
+            raise ValueError("H3-F raw15 Local-TTT inventory 必须精确为 165312")
 
         optimizer, scheduler = original(optimizer_config, scheduler_config)
         selected = _optimizer_parameter_ids(optimizer)
         selected_names = {name for name, parameter in named.items() if id(parameter) in selected}
-        forbidden_host = {
-            name for name in selected_names if any(key in name for key in HOST_KEYS) or "_moe_gen" in name
+        reasoner_names = {
+            name for name in selected_names if name.startswith("net.language_model.") and "_moe_gen" not in name
         }
         if (
             selected_names != expected_names
-            or forbidden_host
+            or reasoner_names
             or any(parameter.requires_grad != (name in expected_names) for name, parameter in named.items())
         ):
-            raise ValueError("H3-F optimizer 必须精确为 Reasoner + Local-TTT，generation/action 支路必须冻结")
+            raise ValueError("H3-F optimizer 必须精确为 V2 语义 generation + V3 raw15 Local-TTT；reasoner 必须冻结")
 
         result["selected_names"] = sorted(selected_names)
-        result["selected_reasoner_tensors"] = len(reasoner_names)
-        result["selected_reasoner_params"] = sum(named[name].numel() for name in reasoner_names)
+        result["selected_generation_tensors"] = len(generation_names)
+        result["selected_generation_params"] = sum(named[name].numel() for name in generation_names)
+        result["selected_local_tensors"] = len(local_names)
         result["selected_local_params"] = LOCAL_PARAMS
+        result["selected_reasoner_params"] = 0
         result["trainable_profile"] = H3F_TRAINABLE_PROFILE
+        result["mesh_profile"] = H3F_MESH_PROFILE
+        result["data_profile"] = H3F_DATA_PROFILE
         return optimizer, scheduler
 
     model.init_optimizer_scheduler = checked_optimizer
-
 
 def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
     if int(os.environ.get("WORLD_SIZE", "0")) != 8 or not torch.cuda.is_available():
