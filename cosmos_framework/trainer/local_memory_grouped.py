@@ -50,11 +50,39 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
     """保留上游 train loop；两次 training_step 是一个完整的 grouped optimizer window。"""
 
     def _observe_grouped(
-        self, phase: str, *, iteration: int, member: int, index: int | None = None, loss: torch.Tensor | None = None
+        self,
+        phase: str,
+        *,
+        iteration: int,
+        member: int,
+        index: int | None = None,
+        loss: torch.Tensor | None = None,
+        metrics: dict[str, Any] | None = None,
     ) -> None:
         observer = getattr(self, "grouped_observer", None)
         if observer is not None:
-            observer(phase=phase, iteration=iteration, member=member, index=index, loss=loss, trainer=self)
+            observer(
+                phase=phase,
+                iteration=iteration,
+                member=member,
+                index=index,
+                loss=loss,
+                metrics=metrics,
+                trainer=self,
+            )
+
+    @staticmethod
+    def _optimizer_lr_metrics(optimizer: Any) -> dict[str, float]:
+        optimizers = optimizer.optimizers if isinstance(optimizer, OptimizersContainer) else [optimizer]
+        lrs = [
+            float(group["lr"])
+            for inner in optimizers
+            for group in getattr(inner, "param_groups", ())
+            if "lr" in group
+        ]
+        if not lrs:
+            return {}
+        return {"lr_min": min(lrs), "lr_max": max(lrs)}
 
     def bind_grouped_stream(
         self,
@@ -196,7 +224,22 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 output, loss = model_ddp.training_step(batch, iteration, _local_memory_prefixes=prefixes)
             if "_backward_loss" in output:
                 raise ValueError("H3-C 禁止额外 surrogate backward loss")
-            self._observe_grouped("native_forward", iteration=iteration, member=grad_accum_iter, index=index, loss=loss)
+            scalar_metrics = {
+                key: value.detach()
+                for key, value in output.items()
+                if isinstance(value, torch.Tensor)
+                and value.ndim == 0
+                and "loss" in key
+                and bool(torch.isfinite(value))
+            }
+            self._observe_grouped(
+                "native_forward",
+                iteration=iteration,
+                member=grad_accum_iter,
+                index=index,
+                loss=loss,
+                metrics=scalar_metrics,
+            )
             self.callbacks.on_after_forward(iteration=iteration)
             return loss
 
@@ -221,7 +264,12 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             self.callbacks.on_before_optimizer_step(model, optimizer, scheduler, grad_scaler, iteration=iteration)
             model.on_before_optimizer_step(optimizer, scheduler, iteration=iteration)
             self._require_finite_gradients(optimizer)
-            self._observe_grouped("pre_optimizer", iteration=iteration, member=grad_accum_iter)
+            self._observe_grouped(
+                "pre_optimizer",
+                iteration=iteration,
+                member=grad_accum_iter,
+                metrics=self._optimizer_lr_metrics(optimizer),
+            )
             window.finish(lambda: self._optimizer_step_success(optimizer, scheduler, grad_scaler))
             self._observe_grouped("post_commit", iteration=iteration, member=grad_accum_iter)
             self._grouped_completed_iteration = iteration + 1
