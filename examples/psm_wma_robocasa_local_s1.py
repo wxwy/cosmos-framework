@@ -36,20 +36,24 @@ T = 16
 LOCAL_PARAMS = 165_312
 LR = 5e-5
 TRANSFORM_SEED = 0
-STAGE_A_ROOT = Path(
-    "/disk/rl/worktrees/psm_wma-v3/artifacts/v3/stage_a_edge_raw15_run02/psm_wma_v3/edge_robocasa/smoke"
-)
-DEFAULT_CHECKPOINT = STAGE_A_ROOT / "checkpoints/iter_000000001"
-DEFAULT_CONFIG = STAGE_A_ROOT / "config.yaml"
-DEFAULT_CACHE = Path(
-    "/disk/rl/starVLA/playground/Datasets/robocasa365_wan2.2_latent/v1.0/target/atomic/CloseFridge/20250816/lerobot/ep_000000.h5"
-)
-DEFAULT_DATASET_ROOT = Path("/disk/rl/data/robocasa_v30")
-DEFAULT_EDGE = Path("/disk/rl/models/Cosmos3-Edge-Policy-DROID")
-DEFAULT_VAE = Path("/disk/rl/models/wan22_vae/Wan2.2_VAE.pth")
-B2B_ROOT = "81fa515593e7cd8e2d4f7d226efb915b17be3b5b"
-B2B_CHILD = "bf6c80e679812b7d2881d6a54aa0b518299e3869"
-ROOT_WORKTREE = Path("/disk/rl/worktrees/psm_wma-v3")
+
+
+def _optional_env_path(name: str) -> Path | None:
+    value = os.environ.get(name)
+    return Path(value).expanduser().resolve() if value else None
+
+
+# Runtime assets are supplied by the launcher/environment. No host-specific paths
+# are embedded in the repository.
+DEFAULT_CHECKPOINT = _optional_env_path("STAGE_A_CHECKPOINT_PATH")
+DEFAULT_CONFIG = _optional_env_path("STAGE_A_CONFIG_PATH")
+DEFAULT_CACHE = _optional_env_path("ROBOCASA_LATENT_CACHE_PROBE")
+DEFAULT_DATASET_ROOT = _optional_env_path("ROBOCASA_ROOT")
+DEFAULT_EDGE = _optional_env_path("EDGE_POLICY_CHECKPOINT")
+DEFAULT_VAE = _optional_env_path("WAN_VAE_PATH")
+B2B_ROOT = os.environ.get("PSM_WMA_EXPECTED_ROOT")
+B2B_CHILD = os.environ.get("PSM_WMA_EXPECTED_CHILD")
+ROOT_WORKTREE = _optional_env_path("PSM_WMA_ROOT")
 
 
 @dataclass(frozen=True)
@@ -77,25 +81,17 @@ def parser() -> argparse.ArgumentParser:
 
 
 def paths_from_args(args: argparse.Namespace) -> SmokePaths:
-    return SmokePaths(
-        *(
-            getattr(args, key).expanduser().resolve()
-            for key in ("checkpoint", "config", "cache", "dataset_root", "edge", "vae", "output")
-        )
-    )
+    names = ("checkpoint", "config", "cache", "dataset_root", "edge", "vae", "output")
+    values: list[Path] = []
+    for key in names:
+        value = getattr(args, key)
+        if value is None:
+            raise ValueError(f"B2-C 缺少 --{key.replace('_', '-')}；必须由参数或环境变量显式传入")
+        values.append(Path(value).expanduser().resolve())
+    return SmokePaths(*values)
 
 
 def validate_frozen_paths(paths: SmokePaths) -> None:
-    for key, value, expected in (
-        ("checkpoint", paths.checkpoint, DEFAULT_CHECKPOINT),
-        ("config", paths.config, DEFAULT_CONFIG),
-        ("cache", paths.cache, DEFAULT_CACHE),
-        ("dataset_root", paths.dataset_root, DEFAULT_DATASET_ROOT),
-        ("edge", paths.edge, DEFAULT_EDGE),
-        ("vae", paths.vae, DEFAULT_VAE),
-    ):
-        if value != expected.resolve():
-            raise ValueError(f"B2-C 冻结资产路径不匹配：{key}={value}")
     if paths.checkpoint.parent.parent != paths.config.parent:
         raise ValueError("Stage-A DCP 与 config.yaml 必须属于同一 smoke run")
 
@@ -501,6 +497,8 @@ def overlay_local_config(config: Any) -> None:
 
 def lock_implementation_pair() -> dict[str, str]:
     """运行时核对 V3 root Gitlink 与当前 child 源码，禁止混用提交。"""
+    if ROOT_WORKTREE is None:
+        raise ValueError("B2-C 缺少 PSM_WMA_ROOT")
     child = Path(__file__).resolve().parents[1]
 
     def git(path: Path, *args: str) -> str:
@@ -514,6 +512,10 @@ def lock_implementation_pair() -> dict[str, str]:
     root_sha = git(ROOT_WORKTREE, "rev-parse", "HEAD")
     child_sha = git(child, "rev-parse", "HEAD")
     gitlink = git(ROOT_WORKTREE, "ls-tree", "HEAD", "cosmos-framework").split()[2]
+    if B2B_ROOT and root_sha != B2B_ROOT:
+        raise ValueError("B2-C root commit 与 PSM_WMA_EXPECTED_ROOT 不一致")
+    if B2B_CHILD and child_sha != B2B_CHILD:
+        raise ValueError("B2-C child commit 与 PSM_WMA_EXPECTED_CHILD 不一致")
     if child_sha != gitlink:
         raise ValueError("V3 root Gitlink 与 B2-C child 源码不一致")
     if git(child, "status", "--porcelain"):
