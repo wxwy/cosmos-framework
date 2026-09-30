@@ -407,7 +407,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 
 class FormalObserver:
-    """Aggregate 64 native events into one durable JSONL record per optimizer iteration."""
+    """Aggregate one global training record per committed optimizer iteration."""
 
     def __init__(self, path: Path, model: torch.nn.Module) -> None:
         self.path = path
@@ -416,12 +416,14 @@ class FormalObserver:
         self.forward = 0
         self.backward = 0
         self.pre_optimizer = 0
-        self.loss_sum = 0.0
-        self.loss_min = float("inf")
-        self.loss_max = float("-inf")
+        self.loss_sum: torch.Tensor | None = None
+        self.loss_min: torch.Tensor | None = None
+        self.loss_max: torch.Tensor | None = None
+        self.metric_sums: dict[str, torch.Tensor] = {}
+        self.metric_counts: dict[str, int] = {}
         self.completed = 0
         self.last_record: dict[str, Any] | None = None
-        self.last_commit_time: float | None = None
+        self.last_commit_time = time.perf_counter()
         self.step_wall_samples: list[float] = []
 
     def _bind_iteration(self, iteration: int) -> None:
@@ -430,97 +432,231 @@ class FormalObserver:
         elif self.iteration != iteration:
             raise RuntimeError("H3-F observer 跨 iteration 状态未提交")
 
+    @property
+    def _device(self) -> torch.device:
+        return next(self.model.parameters()).device
+
+    def _reduce_scalar(self, value: torch.Tensor | float | int, op: Any = None) -> float:
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().to(device=self._device, dtype=torch.float64)
+        else:
+            tensor = torch.tensor(float(value), device=self._device, dtype=torch.float64)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.SUM if op is None else op,
+            )
+        return float(tensor.cpu())
+
+    def _global_mean(self, total: torch.Tensor | float, count: int | float) -> float:
+        global_total = self._reduce_scalar(total)
+        global_count = self._reduce_scalar(count)
+        if global_count <= 0:
+            raise RuntimeError("H3-F global metric count 必须为正")
+        return global_total / global_count
+
+    def _global_max(self, value: torch.Tensor | float | int) -> float:
+        return self._reduce_scalar(value, torch.distributed.ReduceOp.MAX)
+
+    def _global_min(self, value: torch.Tensor | float | int) -> float:
+        return self._reduce_scalar(value, torch.distributed.ReduceOp.MIN)
+
+    def _accumulate_metrics(self, metrics: dict[str, Any] | None) -> None:
+        if not metrics:
+            return
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                if value.ndim != 0 or not bool(torch.isfinite(value)):
+                    continue
+                scalar = value.detach().float()
+            elif isinstance(value, (int, float)) and math.isfinite(float(value)):
+                scalar = torch.tensor(float(value), device=self._device, dtype=torch.float32)
+            else:
+                continue
+            self.metric_sums[key] = scalar if key not in self.metric_sums else self.metric_sums[key] + scalar
+            self.metric_counts[key] = self.metric_counts.get(key, 0) + 1
+
+    def _collect_grad_stats(self) -> dict[str, Any]:
+        categories = {
+            "local": {"sq": None, "nonempty": 0, "nonzero": 0},
+            "generation": {"sq": None, "nonempty": 0, "nonzero": 0},
+            "action": {"sq": None, "nonempty": 0, "nonzero": 0},
+        }
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            if not (_is_h3f_generation_parameter(name) or _is_h3f_local_parameter(name)):
+                continue
+            gradient = _local(parameter.grad)
+            if not bool(torch.isfinite(gradient).all()):
+                raise FloatingPointError("H3-F Generation/Local gradient 非有限")
+            if _is_h3f_local_parameter(name):
+                category = "local"
+            elif any(key in name for key in H3F_ACTION_KEYS):
+                category = "action"
+            else:
+                category = "generation"
+            stats = categories[category]
+            if gradient.numel() > 0:
+                sq = gradient.detach().float().square().sum()
+                stats["sq"] = sq if stats["sq"] is None else stats["sq"] + sq
+                stats["nonempty"] += 1
+                stats["nonzero"] += int(bool(sq > 0))
+        for category, stats in categories.items():
+            if stats["sq"] is None or stats["nonzero"] <= 0:
+                raise FloatingPointError(f"H3-F 缺少非零 {category} gradient witness")
+        return categories
+
+    def _global_grad_record(self, categories: dict[str, Any]) -> dict[str, float | int]:
+        result: dict[str, float | int] = {}
+        total_sq = 0.0
+        for category, stats in categories.items():
+            global_sq = self._reduce_scalar(stats["sq"])
+            total_sq += global_sq
+            result[f"{category}_grad_norm"] = math.sqrt(max(global_sq, 0.0))
+            result[f"{category}_grad_nonempty_shards"] = int(round(self._reduce_scalar(stats["nonempty"])))
+            result[f"{category}_grad_nonzero_shards"] = int(round(self._reduce_scalar(stats["nonzero"])))
+        result["grad_norm"] = math.sqrt(max(total_sq, 0.0))
+        return result
+
+    def _drain_ttt_telemetry(self) -> dict[str, float]:
+        core = self.model.net.local_memory_runtime.core
+        telemetry = core.drain_telemetry()
+        result: dict[str, float] = {}
+        for stem in ("inner_loss", "fast_state_norm", "fast_update_norm"):
+            sum_key = f"ttt_{stem}_sum"
+            count_key = f"ttt_{stem}_count"
+            max_key = f"ttt_{stem}_max"
+            if sum_key not in telemetry:
+                continue
+            result[f"ttt_{stem}_mean"] = self._global_mean(telemetry[sum_key], telemetry[count_key])
+            result[f"ttt_{stem}_max"] = self._global_max(telemetry[max_key])
+        return result
+
+    def _format_console(self, record: dict[str, Any], target: int) -> str:
+        parts = [
+            f"[H3-F][train] iter={record['iteration']:06d}/{target:06d}",
+            f"outer={record['loss_mean']:.4f}",
+        ]
+        for key, label in (
+            ("flow_matching_loss_action", "action"),
+            ("flow_matching_loss_vision", "vision"),
+            ("ttt_inner_loss_mean", "inner"),
+        ):
+            if key in record:
+                parts.append(f"{label}={record[key]:.4f}")
+        parts.extend(
+            [
+                f"gnorm={record['grad_norm']:.3f}",
+                f"gen={record['generation_grad_norm']:.3f}",
+                f"act={record['action_grad_norm']:.3f}",
+                f"local={record['local_grad_norm']:.3f}",
+            ]
+        )
+        if "ttt_fast_state_norm_mean" in record:
+            parts.append(f"fast={record['ttt_fast_state_norm_mean']:.3f}")
+        if "ttt_fast_update_norm_mean" in record:
+            parts.append(f"dFast={record['ttt_fast_update_norm_mean']:.3f}")
+        if "lr_min" in record:
+            if abs(record["lr_max"] - record["lr_min"]) < 1e-16:
+                parts.append(f"lr={record['lr_min']:.2e}")
+            else:
+                parts.append(f"lr={record['lr_min']:.2e}..{record['lr_max']:.2e}")
+        parts.extend(
+            [
+                f"step={record['step_wall_seconds']:.1f}s",
+                f"peak={record['peak_allocated_bytes'] / (1024**3):.1f}GB",
+                f"epoch={record['frontier_epoch']}",
+            ]
+        )
+        return " ".join(parts)
+
     def __call__(
-        self, *, phase: str, iteration: int, member: int, index: int | None, loss: torch.Tensor | None, trainer: Any
+        self,
+        *,
+        phase: str,
+        iteration: int,
+        member: int,
+        index: int | None,
+        loss: torch.Tensor | None,
+        metrics: dict[str, Any] | None = None,
+        trainer: Any,
     ) -> None:
         del member, index
         self._bind_iteration(iteration)
         if phase == "native_forward":
             if loss is None or loss.ndim != 0 or not bool(torch.isfinite(loss)):
                 raise FloatingPointError("H3-F native loss 非有限或非标量")
-            value = float(loss.detach())
+            value = loss.detach().float()
             self.forward += 1
-            self.loss_sum += value
-            self.loss_min = min(self.loss_min, value)
-            self.loss_max = max(self.loss_max, value)
+            self.loss_sum = value if self.loss_sum is None else self.loss_sum + value
+            self.loss_min = value if self.loss_min is None else torch.minimum(self.loss_min, value)
+            self.loss_max = value if self.loss_max is None else torch.maximum(self.loss_max, value)
+            self._accumulate_metrics(metrics)
             return
         if phase == "native_backward":
             self.backward += 1
             return
         if phase == "pre_optimizer":
             self.pre_optimizer += 1
-            selected_local = []
-            selected_generation = []
-            selected_action = []
-            for name, parameter in self.model.named_parameters():
-                if not parameter.requires_grad or parameter.grad is None:
-                    continue
-                if not (_is_h3f_generation_parameter(name) or _is_h3f_local_parameter(name)):
-                    continue
-                gradient = _local(parameter.grad)
-                if not bool(torch.isfinite(gradient).all()):
-                    raise FloatingPointError("H3-F Generation/Local gradient 非有限")
-                witness = (name, int(gradient.numel()), float(gradient.float().norm()))
-                if _is_h3f_local_parameter(name):
-                    selected_local.append(witness)
-                elif any(key in name for key in H3F_ACTION_KEYS):
-                    selected_action.append(witness)
-                else:
-                    selected_generation.append(witness)
-            if not any(numel > 0 and norm > 0 for _, numel, norm in selected_local):
-                raise FloatingPointError("H3-F 缺少非零 Local gradient witness")
-            if not any(numel > 0 and norm > 0 for _, numel, norm in selected_generation):
-                raise FloatingPointError("H3-F 缺少非零 generation-core gradient witness")
-            if not any(numel > 0 and norm > 0 for _, numel, norm in selected_action):
-                raise FloatingPointError("H3-F 缺少非零 action-head gradient witness")
-            self.local_grad_witness = selected_local
-            self.generation_grad_witness = selected_generation
-            self.action_grad_witness = selected_action
+            self.grad_categories = self._collect_grad_stats()
+            self._accumulate_metrics(metrics)
             return
         if phase != "post_commit":
             raise ValueError(f"H3-F 未知 grouped observer phase: {phase}")
-        if self.forward != 32 or self.backward != 32 or self.pre_optimizer != 1:
+        if (
+            self.forward != 32
+            or self.backward != 32
+            or self.pre_optimizer != 1
+            or self.loss_sum is None
+            or self.loss_min is None
+            or self.loss_max is None
+        ):
             raise RuntimeError(
                 f"H3-F iteration event count 错误: fwd={self.forward}, bwd={self.backward}, pre={self.pre_optimizer}"
             )
+
         completed = trainer._grouped_completed_iteration + 1
         now = time.perf_counter()
-        step_wall_seconds = None if self.last_commit_time is None else now - self.last_commit_time
+        local_step_wall = now - self.last_commit_time
         self.last_commit_time = now
-        if step_wall_seconds is not None:
-            self.step_wall_samples.append(step_wall_seconds)
-        record = {
+        step_wall_seconds = self._global_max(local_step_wall)
+        self.step_wall_samples.append(step_wall_seconds)
+
+        record: dict[str, Any] = {
             "iteration": completed,
-            "native_forward": self.forward,
-            "native_backward": self.backward,
-            "pre_optimizer": self.pre_optimizer,
+            "native_forward": int(round(self._reduce_scalar(self.forward))),
+            "native_backward": int(round(self._reduce_scalar(self.backward))),
+            "pre_optimizer": int(round(self._reduce_scalar(self.pre_optimizer))),
             "post_commit": 1,
-            "loss_mean": self.loss_sum / self.forward,
-            "loss_min": self.loss_min,
-            "loss_max": self.loss_max,
+            "loss_mean": self._global_mean(self.loss_sum, self.forward),
+            "loss_min": self._global_min(self.loss_min),
+            "loss_max": self._global_max(self.loss_max),
             "frontier_epoch": trainer._grouped_window.live.frontier.epoch,
             "step_wall_seconds": step_wall_seconds,
-            "allocated_bytes": torch.cuda.memory_allocated(),
-            "reserved_bytes": torch.cuda.memory_reserved(),
-            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-            "local_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.local_grad_witness),
-            "local_grad_nonzero_shards": sum(numel > 0 and norm > 0 for _, numel, norm in self.local_grad_witness),
-            "generation_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.generation_grad_witness),
-            "generation_grad_nonzero_shards": sum(
-                numel > 0 and norm > 0 for _, numel, norm in self.generation_grad_witness
-            ),
-            "action_grad_nonempty_shards": sum(numel > 0 for _, numel, _ in self.action_grad_witness),
-            "action_grad_nonzero_shards": sum(numel > 0 and norm > 0 for _, numel, norm in self.action_grad_witness),
+            "allocated_bytes": int(self._global_max(torch.cuda.memory_allocated())),
+            "reserved_bytes": int(self._global_max(torch.cuda.memory_reserved())),
+            "peak_allocated_bytes": int(self._global_max(torch.cuda.max_memory_allocated())),
         }
-        with self.path.open("a") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        for key, total in self.metric_sums.items():
+            record[key] = self._global_mean(total, self.metric_counts[key])
+        record.update(self._global_grad_record(self.grad_categories))
+        record.update(self._drain_ttt_telemetry())
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
+        if rank == 0:
+            with self.path.open("a") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            target = int(trainer.config.trainer.max_iter)
+            print(self._format_console(record, target), flush=True)
+
         self.completed += 1
         self.last_record = record
         self.iteration = None
         self.forward = self.backward = self.pre_optimizer = 0
-        self.loss_sum = 0.0
-        self.loss_min = float("inf")
-        self.loss_max = float("-inf")
+        self.loss_sum = self.loss_min = self.loss_max = None
+        self.metric_sums.clear()
+        self.metric_counts.clear()
         torch.cuda.reset_peak_memory_stats()
 
     def timing_summary(self) -> dict[str, float | int | None]:
