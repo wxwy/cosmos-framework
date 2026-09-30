@@ -102,3 +102,30 @@ def test_invalid_state_and_action_dimension_rejected():
         core.validate_state(ContinualTTTFastState(*(value.double() for value in core.initial_state(1))), 1)
     with torch.no_grad(), pytest.raises(RuntimeError):
         core.step_many(torch.zeros(1, 256), core.initial_state(1))
+
+
+def test_ttt_telemetry_is_detached_and_drains_per_window():
+    torch.manual_seed(7)
+    core = ContinualTTTLocalMemoryCore()
+    evidence = torch.randn(2, 256)
+    state = core.initial_state(2)
+    core.reset_telemetry()
+    core.step_many(evidence, state)
+    report = core.drain_telemetry()
+    assert set(report) == {
+        "ttt_inner_loss_sum",
+        "ttt_inner_loss_max",
+        "ttt_inner_loss_count",
+        "ttt_fast_state_norm_sum",
+        "ttt_fast_state_norm_max",
+        "ttt_fast_state_norm_count",
+        "ttt_fast_update_norm_sum",
+        "ttt_fast_update_norm_max",
+        "ttt_fast_update_norm_count",
+    }
+    assert report["ttt_inner_loss_count"].item() == 1
+    assert report["ttt_inner_loss_sum"].ndim == 0
+    assert report["ttt_fast_state_norm_sum"].ndim == 0
+    assert report["ttt_fast_update_norm_sum"].ndim == 0
+    assert all(not value.requires_grad for value in report.values())
+    assert core.drain_telemetry() == {}
