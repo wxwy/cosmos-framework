@@ -307,7 +307,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 22)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 33)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
-    ticks = iter((100.0, 112.5))
+    ticks = iter((100.0, 112.5, 125.0))
     monkeypatch.setattr(h3f.time, "perf_counter", lambda: next(ticks))
 
     model = torch.nn.Module()
@@ -317,6 +317,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     model.net.action2llm.register_parameter("weight", torch.nn.Parameter(torch.tensor(1.0)))
     model.net.local_memory_runtime = torch.nn.Module()
     model.net.local_memory_runtime.encoder = torch.nn.Module()
+    model.net.local_memory_runtime.core = SimpleNamespace(drain_telemetry=lambda: {})
     model.net.local_memory_runtime.encoder.register_parameter("weight", torch.nn.Parameter(torch.tensor(1.0)))
     model.net.moe_gen_weight.grad = torch.tensor(0.5)
     model.net.action2llm.weight.grad = torch.tensor(0.4)
@@ -325,6 +326,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     trainer = SimpleNamespace(
         _grouped_completed_iteration=7,
         _grouped_window=SimpleNamespace(live=SimpleNamespace(frontier=SimpleNamespace(epoch=2))),
+        config=SimpleNamespace(trainer=SimpleNamespace(max_iter=30_000)),
     )
 
     for index in range(32):
@@ -334,6 +336,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
             member=index // 16,
             index=index % 16,
             loss=torch.tensor(10.0 + index / 100),
+            metrics={"flow_matching_loss_action": torch.tensor(0.5 + index / 1000)},
             trainer=trainer,
         )
         observer(
@@ -353,7 +356,8 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     assert observer.last_record["local_grad_nonzero_shards"] == 1
     assert observer.last_record["generation_grad_nonzero_shards"] == 1
     assert observer.last_record["action_grad_nonzero_shards"] == 1
-    assert observer.last_record["step_wall_seconds"] is None
+    assert observer.last_record["flow_matching_loss_action"] == pytest.approx(0.5155)
+    assert observer.last_record["step_wall_seconds"] == 12.5
 
     trainer._grouped_completed_iteration = 8
     for index in range(32):
@@ -363,6 +367,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
             member=index // 16,
             index=index % 16,
             loss=torch.tensor(9.0 + index / 100),
+            metrics={"flow_matching_loss_action": torch.tensor(0.4 + index / 1000)},
             trainer=trainer,
         )
         observer(
@@ -379,7 +384,7 @@ def test_formal_observer_aggregates_one_record_per_iteration(monkeypatch: pytest
     assert observer.last_record["iteration"] == 9
     assert observer.last_record["step_wall_seconds"] == 12.5
     assert observer.timing_summary() == {
-        "samples": 1,
+        "samples": 2,
         "min": 12.5,
         "median": 12.5,
         "max": 12.5,
@@ -412,13 +417,14 @@ def test_owner_shell_facade_targets_h3f() -> None:
     assert "torchrun" in script
 
 
-def test_config_digest_is_long_run_specific(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(h3f, "h3e_config_digest", lambda: "base")
-    first = h3f.config_digest(500)
+def test_config_digest_is_long_run_specific(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    monkeypatch.setattr(h3f, "h3e_config_digest", lambda *_: "base")
+    first = h3f.config_digest(500, runtime)
     assert h3f.H3F_TRAINABLE_PROFILE == "v2_semantic_generation+local_v3_raw15"
     assert h3f.H3F_MESH_PROFILE == "dp_shard8_generation_and_local"
     assert h3f.H3F_DATA_PROFILE == "official_v30_raw15"
-    assert h3f.config_digest(1000) != first
-    assert h3f.readiness_config_digest(10, 500) != first
+    assert h3f.config_digest(1000, runtime) != first
+    assert h3f.readiness_config_digest(10, 500, runtime) != first
     monkeypatch.setattr(h3f, "H3F_WARMUP_STEPS", 501)
-    assert first != h3f.config_digest()
+    assert first != h3f.config_digest(500, runtime)
