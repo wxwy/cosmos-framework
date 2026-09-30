@@ -24,15 +24,10 @@ from cosmos_framework.utils import distributed
 from cosmos_framework.utils.context_managers import model_init
 from cosmos_framework.utils.lazy_config import instantiate
 from examples.psm_wma_robocasa_h100 import (
-    CACHE_ROOT,
-    DEFAULT_DATASET_ROOT,
-    DEFAULT_EDGE,
-    DEFAULT_VAE,
     H3F_FORMAL_CHECKPOINT_ITERS,
     H3F_FORMAL_MAX_ITER,
     LOCAL_PARAMS,
     MANIFEST_DIGEST,
-    ROOT_WORKTREE,
     GroupedTriggerLoader,
     _local,
     _optimizer_parameter_ids,
@@ -43,6 +38,7 @@ from examples.psm_wma_robocasa_h100 import (
     make_catalog,
     preflight_native_batch,
     read_stage_a_contract,
+    runtime_paths,
     validate_h100_asset_authority,
 )
 from examples.psm_wma_robocasa_h100 import (
@@ -54,7 +50,6 @@ H3F_WARMUP_STEPS = 500
 H3F_GROUP = "h3f_edge_local_h100"
 H3F_READINESS_GROUP = "h3f_edge_local_h100_readiness"
 H3F_READINESS_MAX_STEPS = 100
-H3F_BASE_CHECKPOINT_LINEAGE = Path("/mnt/data/shenzhen/szrobot/logs/.tmp_backup/models/Cosmos3-Edge-Policy-DROID-dcp")
 H3F_GENERATION_KEYS = (
     "moe_gen",
     "time_embedder",
@@ -97,10 +92,24 @@ def overlay_h3f_config(
     job_name: str,
     readiness_steps: int | None = None,
     save_iter: int = H3F_SAVE_ITER,
+    runtime=None,
+    resume_checkpoint: Path | None = None,
 ) -> None:
     from examples.psm_wma_robocasa_h100 import overlay_h100_config
 
-    overlay_h100_config(config, phase=phase, job_name=job_name)
+    runtime = runtime or runtime_paths()
+    overlay_h100_config(config, phase=phase, job_name=job_name, runtime=runtime)
+    if phase == "fresh":
+        config.checkpoint.load_path = str(runtime.base_checkpoint)
+        config.checkpoint.load_training_state = False
+        config.checkpoint.keys_to_skip_loading = ["net_ema.", "local_memory"]
+    else:
+        if resume_checkpoint is None:
+            raise ValueError("H3-F resume 必须显式提供 same-job checkpoint")
+        resume_checkpoint = resume_checkpoint.expanduser().resolve()
+        config.checkpoint.load_path = str(resume_checkpoint)
+        config.checkpoint.load_training_state = True
+        config.checkpoint.keys_to_skip_loading = ["net_ema."]
     target_iteration = readiness_steps if readiness_steps is not None else H3F_FORMAL_MAX_ITER
     config.optimizer.keys_to_select = list(H3F_OPTIMIZER_KEYS)
     config.optimizer.lr_multipliers = {key: 5.0 for key in H3F_ACTION_KEYS}
@@ -124,15 +133,19 @@ def overlay_h3f_config(
         or config.scheduler.cycle_lengths != [30_000]
         or config.scheduler.warm_up_steps != [500]
         or config.checkpoint.save_iter != (target_iteration if readiness_steps is not None else save_iter)
+        or config.checkpoint.load_path
+        != str(runtime.base_checkpoint if phase == "fresh" else resume_checkpoint)
+        or config.checkpoint.load_training_state != (phase == "resume")
         or save_iter <= 0
         or any(step % save_iter for step in H3F_FORMAL_CHECKPOINT_ITERS)
     ):
         raise ValueError("H3-F 30k/scheduler/checkpoint 合同不匹配")
 
 
-def config_digest(save_iter: int = H3F_SAVE_ITER) -> str:
+def config_digest(save_iter: int = H3F_SAVE_ITER, runtime=None) -> str:
+    runtime = runtime or runtime_paths()
     authority = {
-        "h3e_runtime": h3e_config_digest(),
+        "h3e_runtime": h3e_config_digest(runtime),
         "trainable_profile": H3F_TRAINABLE_PROFILE,
         "optimizer_keys": list(H3F_OPTIMIZER_KEYS),
         "lr_multipliers": {key: 5.0 for key in H3F_ACTION_KEYS},
@@ -148,9 +161,10 @@ def config_digest(save_iter: int = H3F_SAVE_ITER) -> str:
     return hashlib.sha256(json.dumps(authority, sort_keys=True).encode()).hexdigest()
 
 
-def readiness_config_digest(steps: int, save_iter: int = H3F_SAVE_ITER) -> str:
+def readiness_config_digest(steps: int, save_iter: int = H3F_SAVE_ITER, runtime=None) -> str:
+    runtime = runtime or runtime_paths()
     authority = {
-        "formal_config_digest": config_digest(save_iter),
+        "formal_config_digest": config_digest(save_iter, runtime),
         "readiness_steps": steps,
         "scheduler_cycle": [H3F_FORMAL_MAX_ITER],
         "scheduler_warmup": [H3F_WARMUP_STEPS],
@@ -186,16 +200,16 @@ def _authority_preflight_rank() -> bool:
     return rank is None or int(rank) == 0
 
 
-def _validate_output_root(output_root: Path) -> None:
-    if output_root == ROOT_WORKTREE:
+def _validate_output_root(output_root: Path, runtime) -> None:
+    if output_root == runtime.root_worktree:
         raise ValueError("H3-F 产物不能直接写入 root worktree")
-    if ROOT_WORKTREE in output_root.parents:
-        allowed = ROOT_WORKTREE / "outputs"
+    if runtime.root_worktree in output_root.parents:
+        allowed = runtime.root_worktree / "outputs"
         if output_root != allowed and allowed not in output_root.parents:
             raise ValueError("H3-F worktree 内只允许写入已忽略的 outputs/ 子树")
 
 
-def _validate_contract_env(output_root: Path) -> dict[str, Any]:
+def _validate_contract_env(output_root: Path, runtime) -> dict[str, Any]:
     exact_ints = {
         "TTT_TBPTT_STEPS": 16,
         "TTT_DIM": 64,
@@ -238,28 +252,29 @@ def _validate_contract_env(output_root: Path) -> dict[str, Any]:
         observed["TTT_INNER_LR"] = parsed_lr
 
     for name, expected in (
-        ("ROBOCASA_ROOT", DEFAULT_DATASET_ROOT),
-        ("ROBOCASA_LATENT_CACHE_ROOT", CACHE_ROOT),
-        ("EDGE_POLICY_CHECKPOINT", DEFAULT_EDGE),
-        ("WAN_VAE_PATH", DEFAULT_VAE),
+        ("PSM_WMA_ROOT", runtime.root_worktree),
+        ("STAGE_A_CHECKPOINT_PATH", runtime.stage_a_checkpoint),
+        ("STAGE_A_CONFIG_PATH", runtime.stage_a_config),
+        ("ROBOCASA_ROOT", runtime.dataset_root),
+        ("ROBOCASA_LATENT_CACHE_ROOT", runtime.cache_root),
+        ("ROBOCASA_LATENT_CACHE_PROBE", runtime.cache_probe),
+        ("EDGE_POLICY_CHECKPOINT", runtime.edge),
+        ("WAN_VAE_PATH", runtime.vae),
+        ("BASE_CHECKPOINT_PATH", runtime.base_checkpoint),
     ):
         value = os.environ.get(name)
         if value is None:
-            continue
+            raise ValueError(f"H3-F 缺少必需运行参数 {name}")
         resolved = Path(value).expanduser().resolve()
-        if resolved != expected.resolve():
-            raise ValueError(f"H3-F {name} 与冻结 authority 不匹配")
+        if resolved != expected:
+            raise ValueError(f"H3-F {name} 与解析后的运行参数不匹配")
         observed[name] = str(resolved)
 
-    base_env = os.environ.get("BASE_CHECKPOINT_PATH")
-    if base_env is not None:
-        base = Path(base_env).expanduser().resolve()
-        if base != H3F_BASE_CHECKPOINT_LINEAGE.resolve():
-            raise ValueError("H3-F BASE_CHECKPOINT_PATH 与冻结 Edge-DROID lineage 不匹配")
-        if not (base / "model/.metadata").is_file():
-            raise FileNotFoundError(f"H3-F BASE_CHECKPOINT_PATH 缺少 model/.metadata：{base}")
-        observed["BASE_CHECKPOINT_PATH"] = str(base)
-        observed["EFFECTIVE_WARMSTART"] = "frozen Stage-A H100 iter1 authority"
+    if not (runtime.base_checkpoint / "model/.metadata").is_file():
+        raise FileNotFoundError(
+            f"H3-F BASE_CHECKPOINT_PATH 缺少 model/.metadata：{runtime.base_checkpoint}"
+        )
+    observed["DIRECT_BASE_CHECKPOINT"] = str(runtime.base_checkpoint)
 
     cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cuda is not None and cuda != "0,1,2,3,4,5,6,7":
@@ -297,9 +312,10 @@ def _disk_free_bytes(output_root: Path) -> int:
 
 
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
-    pair = lock_pair(args.expected_root, args.expected_child)
+    runtime = runtime_paths()
+    pair = lock_pair(args.expected_root, args.expected_child, runtime)
     output_root = args.output_root.expanduser().resolve()
-    _validate_output_root(output_root)
+    _validate_output_root(output_root, runtime)
     if not args.job_name or "/" in args.job_name or args.job_name in (".", ".."):
         raise ValueError("H3-F job-name 不合法")
     if type(args.attempt) is not int or args.attempt <= 0:
@@ -319,35 +335,43 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         if job.exists() and authority_rank:
             raise FileExistsError("H3-F fresh job 已存在；禁止覆盖")
         start_iteration = 0
+        resume_checkpoint = None
     else:
         if args.attempt < 2:
             raise ValueError("H3-F resume 必须使用 attempt>=2")
         start_iteration = _resume_iteration(job)
+        resume_checkpoint = job / "checkpoints" / f"iter_{start_iteration:09d}"
+        if not resume_checkpoint.is_dir():
+            raise FileNotFoundError(f"H3-F same-job resume checkpoint 不存在：{resume_checkpoint}")
 
     evidence = _evidence_dir(job, phase=args.phase, attempt=args.attempt, start_iteration=start_iteration)
     if evidence.exists() and authority_rank:
         raise FileExistsError("H3-F evidence attempt 已存在；禁止覆盖")
 
-    contract_env = _validate_contract_env(output_root)
+    contract_env = _validate_contract_env(output_root, runtime)
     save_iter = int(contract_env["SAVE_ITER"])
-    paths = _paths(output_root)
-    asset_authority = validate_h100_asset_authority()
+    paths = _paths(output_root, runtime)
+    asset_authority = validate_h100_asset_authority(runtime)
     contract = read_stage_a_contract(paths)
-    config = load_stage_a_config()
+    config = load_stage_a_config(runtime)
     overlay_h3f_config(
         config,
         phase=args.phase,
         job_name=args.job_name,
         readiness_steps=readiness_steps,
         save_iter=save_iter,
+        runtime=runtime,
+        resume_checkpoint=resume_checkpoint,
     )
-    dataset, catalog = make_catalog()
+    dataset, catalog = make_catalog(runtime)
     if catalog.manifest_digest != MANIFEST_DIGEST:
         raise ValueError("H3-F manifest authority 漂移")
     digest = (
-        readiness_config_digest(readiness_steps, save_iter) if readiness_steps is not None else config_digest(save_iter)
+        readiness_config_digest(readiness_steps, save_iter, runtime)
+        if readiness_steps is not None
+        else config_digest(save_iter, runtime)
     )
-    native = preflight_native_batch(dataset, catalog, paths, digest=digest)
+    native = preflight_native_batch(dataset, catalog, paths, digest=digest, runtime=runtime)
     return {
         "pair": pair,
         "phase": args.phase,
@@ -361,6 +385,9 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "stage_a_dcp_keys": contract["dcp_keys"],
         "asset_authority": asset_authority,
         "contract_env": contract_env,
+        "checkpoint_load_path": config.checkpoint.load_path,
+        "checkpoint_load_training_state": config.checkpoint.load_training_state,
+        "initialization_source": "direct BASE_CHECKPOINT_PATH" if args.phase == "fresh" else "same-job checkpoint",
         **native,
         "geometry": [8, 8, 2, 16, 4],
         "selector": list(H3F_OPTIMIZER_KEYS),
@@ -567,16 +594,18 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
     if not 0 <= rank < 8 or "H100" not in torch.cuda.get_device_name(local_rank):
         raise RuntimeError("H3-F 每个 local rank 必须绑定 H100")
 
+    runtime = runtime_paths()
     os.environ["IMAGINAIRE_OUTPUT_ROOT"] = str(args.output_root.expanduser().resolve())
-    os.environ["EDGE_POLICY_CHECKPOINT"] = str(DEFAULT_EDGE)
-    os.environ["WAN_VAE_PATH"] = str(DEFAULT_VAE)
-    config = load_stage_a_config()
+    config = load_stage_a_config(runtime)
+    resume_checkpoint = Path(report["checkpoint_load_path"]) if args.phase == "resume" else None
     overlay_h3f_config(
         config,
         phase=args.phase,
         job_name=args.job_name,
         readiness_steps=report["readiness_steps"],
         save_iter=int(report["contract_env"]["SAVE_ITER"]),
+        runtime=runtime,
+        resume_checkpoint=resume_checkpoint,
     )
 
     job = Path(report["job"])
@@ -599,13 +628,13 @@ def execute(args: argparse.Namespace, report: dict[str, Any]) -> None:
             model = instantiate(config.model)
         _install_optimizer_inventory_check(model, result)
 
-        dataset, catalog = make_catalog()
-        transform, resolution = build_stage_a_action_transform(_paths(args.output_root))
+        dataset, catalog = make_catalog(runtime)
+        transform, resolution = build_stage_a_action_transform(_paths(args.output_root, runtime))
         binder = StageARoboCasaEpisodeBinder(
             dataset,
             catalog,
-            source_root=DEFAULT_DATASET_ROOT,
-            cache_root=CACHE_ROOT,
+            source_root=runtime.dataset_root,
+            cache_root=runtime.cache_root,
             transform=transform,
             resolution=resolution,
             config_digest=report["config_digest"],
