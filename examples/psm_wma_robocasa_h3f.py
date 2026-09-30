@@ -46,7 +46,7 @@ from examples.psm_wma_robocasa_h100 import (
     config_digest as h3e_config_digest,
 )
 
-H3F_SAVE_ITER = 500
+H3F_SAVE_ITER = 100
 H3F_WARMUP_STEPS = 500
 H3F_GROUP = "h3f_edge_local_h100"
 H3F_READINESS_GROUP = "h3f_edge_local_h100_readiness"
