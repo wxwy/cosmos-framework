@@ -249,7 +249,13 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             with self.training_timer("backward"):
                 grad_scaler.scale(weighted_loss).backward(retain_graph=retain_graph)
                 model.on_after_backward()
-            self._observe_grouped("native_backward", iteration=iteration, member=grad_accum_iter, index=backward_index)
+            self._observe_grouped(
+                "native_backward",
+                iteration=iteration,
+                member=grad_accum_iter,
+                index=backward_index,
+                loss=weighted_loss.detach(),
+            )
             backward_index += 1
             self.callbacks.on_after_backward(model, iteration=iteration)
 
