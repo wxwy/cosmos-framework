@@ -88,8 +88,13 @@ fi
 
 echo "H3-F launch: phase=$PHASE attempt=$ATTEMPT job=$JOB_NAME output=$OUTPUT_ROOT"
 echo "H3-F pair: root=$EXPECTED_ROOT child=$EXPECTED_CHILD"
-echo "H3-F fresh initialization: BASE_CHECKPOINT_PATH=$BASE_CHECKPOINT_PATH"
+if [[ "$PHASE" == "fresh" ]]; then
+  echo "H3-F effective checkpoint source: direct BASE_CHECKPOINT_PATH=$BASE_CHECKPOINT_PATH"
+else
+  echo "H3-F effective checkpoint source: same-job $(cat "$LATEST")"
+fi
 echo "H3-F Stage-A preflight only: checkpoint=$STAGE_A_CHECKPOINT_PATH config=$STAGE_A_CONFIG_PATH"
+echo "H3-F contract: save_iter=$SAVE_ITER T=$TTT_TBPTT_STEPS dim=$TTT_DIM fast_hidden=$TTT_FAST_HIDDEN_DIM K=$TTT_K_LOCAL inner_lr=$TTT_INNER_LR B_stream=$TTT_B_STREAM active_GA=$TTT_ACTIVE_GA workers=$ROBOCASA_NUM_WORKERS"
 echo "NOTE: ROBOCASA_NUM_WORKERS=$ROBOCASA_NUM_WORKERS is contract metadata; grouped planner/binder materialization is synchronous."
 
 export PYTHONPATH="$CHILD${PYTHONPATH:+:$PYTHONPATH}"
