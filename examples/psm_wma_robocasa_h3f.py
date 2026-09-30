@@ -30,7 +30,6 @@ from examples.psm_wma_robocasa_h100 import (
     DEFAULT_VAE,
     H3F_FORMAL_CHECKPOINT_ITERS,
     H3F_FORMAL_MAX_ITER,
-    HOST_KEYS,
     LOCAL_PARAMS,
     MANIFEST_DIGEST,
     ROOT_WORKTREE,
@@ -71,8 +70,7 @@ H3F_LOCAL_KEYS = (
     "local_memory2llm.",
     "local_memory_modality_embed",
 )
-H3F_ACTION_KEYS = ("action2llm", "llm2action", "action_modality_embed")
-H3F_GENERATION_CORE_KEYS = ("moe_gen", "time_embedder", "vae2llm", "llm2vae")
+H3F_ACTION_KEYS = ("action2llm", "action_modality_embed", "llm2action")
 H3F_OPTIMIZER_KEYS = (*H3F_GENERATION_KEYS, *H3F_LOCAL_KEYS)
 H3F_TRAINABLE_PROFILE = "v2_semantic_generation+local_v3_raw15"
 H3F_MESH_PROFILE = "dp_shard8_generation_and_local"
@@ -513,7 +511,6 @@ class FormalObserver:
             "max": values[-1],
             "mean": sum(values) / len(values),
         }
-
 
 
 def _is_h3f_generation_parameter(name: str) -> bool:
