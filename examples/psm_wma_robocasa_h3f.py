@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -520,8 +521,12 @@ class FormalObserver:
         return result
 
     def _drain_ttt_telemetry(self) -> dict[str, float]:
-        core = self.model.net.local_memory_runtime.core
-        telemetry = core.drain_telemetry()
+        runtime = getattr(getattr(self.model, "net", None), "local_memory_runtime", None)
+        core = getattr(runtime, "core", None)
+        drain = getattr(core, "drain_telemetry", None)
+        if drain is None:
+            return {}
+        telemetry = drain()
         result: dict[str, float] = {}
         for stem in ("inner_loss", "fast_state_norm", "fast_update_norm"):
             sum_key = f"ttt_{stem}_sum"
@@ -647,7 +652,8 @@ class FormalObserver:
         if rank == 0:
             with self.path.open("a") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            target = int(trainer.config.trainer.max_iter)
+            trainer_config = getattr(getattr(trainer, "config", None), "trainer", None)
+            target = int(getattr(trainer_config, "max_iter", H3F_FORMAL_MAX_ITER))
             print(self._format_console(record, target), flush=True)
 
         self.completed += 1
