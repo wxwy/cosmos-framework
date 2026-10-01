@@ -202,6 +202,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                         iteration=iteration,
                         config_digest=self._grouped_config_digest,
                     )
+                    self._grouped_completed_iteration = iteration
                 except Exception:
                     self._grouped_restore_failed = True
                     raise
