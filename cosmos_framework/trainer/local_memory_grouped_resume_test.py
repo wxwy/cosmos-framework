@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import cosmos_framework.trainer.local_memory_grouped as grouped_module
+
 from cosmos_framework.checkpoint.dcp import _DataloaderWrapper
 from cosmos_framework.model.generator.mot.local_memory_grouped_window_test import _backward, _segments, _setup
 from cosmos_framework.trainer.local_memory_grouped_resume import (
@@ -17,7 +19,7 @@ from cosmos_framework.trainer.local_memory_grouped_resume import (
     restore_grouped_local_state,
     snapshot_grouped_local_state,
 )
-from cosmos_framework.trainer.local_memory_grouped_test import _trainer
+from cosmos_framework.trainer.local_memory_grouped_test import _Model, _trainer
 
 
 def _owned_segments(window, member):
@@ -186,6 +188,34 @@ def test_dcp_dataloader_wrapper_selects_grouped_callback_and_stages_restore(comm
         other._grouped_window, other._pending_grouped_resume, iteration=1, config_digest="config"
     )
     assert other._grouped_window.live.frontier == trainer._grouped_window.live.frontier
+
+
+def test_resume_restores_completed_iteration_before_first_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _trainer()
+    trainer._resume_required = True
+    trainer._pending_grouped_resume = {"iteration": 100}
+    model = _Model()
+    observed: dict[str, int] = {}
+
+    def fake_restore(window, state, *, iteration, config_digest):
+        assert state["iteration"] == iteration == 100
+        assert config_digest == "config"
+        observed["iteration"] = iteration
+
+    def stop_after_restore(self):
+        raise RuntimeError("stop after resume restore")
+
+    monkeypatch.setattr(grouped_module, "restore_grouped_local_state", fake_restore)
+    monkeypatch.setattr(grouped_module.GroupedLocalMemoryWindow, "begin", stop_after_restore)
+
+    with pytest.raises(RuntimeError, match="stop after resume restore"):
+        trainer.training_step(model, None, None, None, {}, 100, 0)
+
+    assert observed["iteration"] == 100
+    assert trainer._grouped_completed_iteration == 100
+    assert trainer._pending_grouped_resume is None
 
 
 def test_missing_callback_state_blocks_first_resumed_training_step() -> None:
