@@ -627,7 +627,12 @@ class FormalObserver:
                 f"H3-F iteration event count 错误: fwd={self.forward}, bwd={self.backward}, pre={self.pre_optimizer}"
             )
 
-        completed = trainer._grouped_completed_iteration + 1
+        if trainer._grouped_completed_iteration != iteration:
+            raise RuntimeError(
+                "H3-F grouped completed iteration 与 train-loop iteration 漂移: "
+                f"completed={trainer._grouped_completed_iteration} iteration={iteration}"
+            )
+        completed = iteration + 1
         now = time.perf_counter()
         local_step_wall = now - self.last_commit_time
         step_wall_seconds = self._global_max(local_step_wall)
