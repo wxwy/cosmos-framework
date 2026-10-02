@@ -17,6 +17,7 @@ def test_reasoner_only_setup_skips_vision_tokenizer(monkeypatch: pytest.MonkeyPa
     config = SimpleNamespace(
         load_vision_tokenizer=False,
         lidar_tokenizer=None,
+        radar_tokenizer=None,
         sound_gen=False,
         tokenizer=vision_config,
         vlm_config=vlm_config,
@@ -49,6 +50,7 @@ def test_default_setup_loads_vision_tokenizer(monkeypatch: pytest.MonkeyPatch) -
     config = SimpleNamespace(
         load_vision_tokenizer=True,
         lidar_tokenizer=None,
+        radar_tokenizer=None,
         sound_gen=False,
         state_ch=48,
         tokenizer=vision_config,
