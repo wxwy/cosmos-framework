@@ -254,7 +254,13 @@ def two_way_attention(
     # on causal_q_offsets and causal_k_offsets being the same tensor.
     use_dont_care_mask = causal_q_offsets is causal_k_offsets
 
-    use_varlen = _use_varlen(get_num_real_samples(packed_query_states), has_caption_offsets=False)
+    # A Local Memory prefix is represented as per-sample K/V rows with explicit
+    # sample offsets. The dense single-sample shortcut has no offset fence, so it
+    # cannot safely inject those rows. Keep the native dense fast path when no
+    # prefix is present, but force varlen whenever Local K/V is supplied.
+    use_varlen = _use_varlen(
+        get_num_real_samples(packed_query_states), has_caption_offsets=False
+    ) or memory_prefix_key_states is not None
 
     if use_varlen:
         # The attention stack re-derives these quantities from the tensors it is handed and guards
