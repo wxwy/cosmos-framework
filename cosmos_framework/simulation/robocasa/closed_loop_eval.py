@@ -8,10 +8,11 @@ MUJOCO_GL=egl PYTHONPATH=. python cosmos_framework/simulation/robocasa/closed_lo
   --dataset-dir /path/to/robocasa/datasets/v1.0/target/atomic/CloseFridge/<date>/lerobot \
   --output-dir results/robocasa_closed_loop/CloseFridge \
   --num-test-episodes 50 \
-  --action-horizon 32 \
+  --action-horizon 16 \
   --camera-set left_wrist \
   --use-state \
   --use-base-action --base-encoding raw \
+  --local-memory-mode required \
   --success-latch 1 --seed 0 --image-size 256 --cam-size 256
 
 TWO PYTHON ENVIRONMENTS ARE REQUIRED. robosuite/robocasa and cosmos-framework cannot share one
