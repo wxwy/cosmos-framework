@@ -450,6 +450,51 @@ def test_use_varlen_stays_varlen_for_caption_offsets_without_grad() -> None:
 
 
 @pytest.mark.L0
+
+@pytest.mark.L0
+@pytest.mark.CPU
+def test_single_sample_local_prefix_forces_varlen_without_changing_native_dense_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(5)
+    heads, head_dim = 2, 4
+    real_len = 8
+    qkv = torch.randn(3, real_len, heads, head_dim)
+    packs = tuple(
+        _two_way_pack(value, (3,), (5,), full_seq_alignment=1, causal_seq_alignment=1)
+        for value in qkv
+    )
+    calls: list[tuple[torch.Size, torch.Size, dict[str, object]]] = []
+
+    def fake_attention(query, key, value, **kwargs):
+        calls.append((query.shape, key.shape, dict(kwargs)))
+        return query
+
+    monkeypatch.setattr(attention, "attention", fake_attention)
+
+    with torch.no_grad():
+        attention.two_way_attention(*packs)
+    assert len(calls) == 2
+    assert all("cumulative_seqlen_Q" not in kwargs for _, _, kwargs in calls)
+
+    calls.clear()
+    memory_k = torch.randn(4, heads, head_dim)
+    memory_v = torch.randn_like(memory_k)
+    memory_offsets = torch.tensor([0, 4], dtype=torch.int32)
+    with torch.no_grad():
+        attention.two_way_attention(
+            *packs,
+            memory_prefix_key_states=memory_k,
+            memory_prefix_value_states=memory_v,
+            memory_prefix_sample_offsets=memory_offsets,
+            memory_prefix_max_len=4,
+        )
+    assert len(calls) == 2
+    assert all("cumulative_seqlen_Q" in kwargs for _, _, kwargs in calls)
+    # Local K/V is prepended only to the generator's full-attention pass.
+    native_full_k, _, _ = get_all_seq(packs[1])
+    assert calls[1][1][1] == native_full_k.shape[0] + 4
+
 def test_und_self_attention_passes_caption_boundaries_during_single_sample_inference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
