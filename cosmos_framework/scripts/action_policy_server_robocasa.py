@@ -1114,6 +1114,19 @@ class ActionModelService:
         All action dimensions are returned. Video is the decoded predicted rollout as base64 PNGs.
         """
         t0 = time.monotonic()
+        command = req.get("_local_memory_command")
+        if command is not None:
+            if command != "reset":
+                raise ValueError("unsupported _local_memory_command")
+            session_id = req.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                raise ValueError("Local-TTT reset requires session_id")
+            self.local_memory_adapter.reset(session_id)
+            return {
+                "action": [],
+                "video": [],
+                "local_memory": {"status": "reset", "session_id": session_id},
+            }
 
         # Get or assign request ID
         injected_id = req.get("request_id", None)
@@ -1170,72 +1183,88 @@ class ActionModelService:
             f"img={tuple(img_chw_uint8.shape)} steps={self.cfg.num_steps} guidance={self.cfg.guidance}"
         )
 
-        # Run inference
-        t_inf0 = time.monotonic()
-        with self._lock:
-            with torch.inference_mode():
-                samples = self.model.generate_samples_from_batch(
-                    batch,
-                    guidance=self.cfg.guidance,
-                    seed=[self.cfg.seed],
-                    num_steps=self.cfg.num_steps,
-                    has_negative_prompt=False,
-                )
-                pred_action = samples["action"][0]  # [T,D] or [1,T,D]
+        local_update = self.local_memory_adapter.prepare(req)
+        try:
+            # Run inference. Local prefix is detached and fixed for this complete
+            # diffusion request; online fast-state adaptation already happened above.
+            t_inf0 = time.monotonic()
+            with self._lock:
+                with torch.inference_mode():
+                    samples = self.model.generate_samples_from_batch(
+                        batch,
+                        guidance=self.cfg.guidance,
+                        seed=[self.cfg.seed],
+                        num_steps=self.cfg.num_steps,
+                        has_negative_prompt=False,
+                        _local_memory_prefixes=self.local_memory_adapter.prefixes(local_update),
+                    )
+                    pred_action = samples["action"][0]  # [T,D] or [1,T,D]
 
-                # Decode vision for rollout video (samples["vision"] is a list; take first sample)
-                pred_video_c_t_h_w = self.model.decode(samples["vision"][0]).squeeze(0)  # [C,T,H,W]
+                    # Decode vision for rollout video (samples["vision"] is a list; take first sample)
+                    pred_video_c_t_h_w = self.model.decode(samples["vision"][0]).squeeze(0)  # [C,T,H,W]
 
-                # Remove reflection padding so the reported video matches the original resolution
-                pred_video_c_t_h_w = remove_reflection_padding(pred_video_c_t_h_w, padded_image_size)
-        t_inf1 = time.monotonic()
+                    # Remove reflection padding so the reported video matches the original resolution
+                    pred_video_c_t_h_w = remove_reflection_padding(pred_video_c_t_h_w, padded_image_size)
+            t_inf1 = time.monotonic()
 
-        # Extract actions: return all dimensions — (T, D) or (1, T, D)
-        pred_action = pred_action.float().squeeze(0)  # [T,D]
-        pred_action = self._denormalize_action(pred_action)
-        if prep["state_token"] is not None:
-            pred_action = pred_action[1:]  # drop the prepended clean state-conditioning frame
-        pred_action_np = pred_action.detach().cpu().numpy()  # [T,D]
-        pred_action_list = pred_action_np.tolist()  # List of [a0, a1, ..., aD]
+            # Extract actions: return all dimensions — (T, D) or (1, T, D)
+            pred_action = pred_action.float().squeeze(0)  # [T,D]
+            pred_action = self._denormalize_action(pred_action)
+            if prep["state_token"] is not None:
+                pred_action = pred_action[1:]  # drop the prepended clean state-conditioning frame
+            if not torch.isfinite(pred_action).all():
+                raise FloatingPointError("policy produced non-finite actions; Local-TTT state not committed")
+            pred_action_np = pred_action.detach().cpu().numpy()  # [T,D]
+            pred_action_list = pred_action_np.tolist()  # List of [a0, a1, ..., aD]
 
-        # Convert video to base64-encoded PNG frames
-        pred_video_frames = _video_tensor_to_pil_images(pred_video_c_t_h_w)
-        pred_video_b64: list[str] = []
-        for frame in pred_video_frames:
-            buf = io.BytesIO()
-            frame.save(buf, format="PNG")
-            pred_video_b64.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+            # Convert video to base64-encoded PNG frames
+            pred_video_frames = _video_tensor_to_pil_images(pred_video_c_t_h_w)
+            pred_video_b64: list[str] = []
+            for frame in pred_video_frames:
+                buf = io.BytesIO()
+                frame.save(buf, format="PNG")
+                pred_video_b64.append(base64.b64encode(buf.getvalue()).decode("ascii"))
 
-        # Optional offline debug dump
-        if self._should_dump(request_id):
-            dump_dir = self.cfg.dump_dir
-            assert dump_dir is not None
-            dump_root = Path(dump_dir)
-            dump_root.mkdir(parents=True, exist_ok=True)
-            try:
-                log.info(f"[action-server] request_id={request_id} dumping to {str(dump_root)}")
-                _save_policy_request_dump(
-                    dump_root=dump_root,
-                    request_id=request_id,
-                    request_json=req,
-                    obs_chw_uint8=img_chw_uint8,
-                    pred_action=pred_action_list,
-                    pred_video_c_t_h_w=pred_video_c_t_h_w,
-                    fps=int(self.cfg.fps),
-                )
-            except Exception as e:
-                # Never fail serving a request due to dump failures
-                log.error(f"[action-server] dump failed for request_id={request_id}: {e}")
+            # Optional offline debug dump
+            if self._should_dump(request_id):
+                dump_dir = self.cfg.dump_dir
+                assert dump_dir is not None
+                dump_root = Path(dump_dir)
+                dump_root.mkdir(parents=True, exist_ok=True)
+                try:
+                    log.info(f"[action-server] request_id={request_id} dumping to {str(dump_root)}")
+                    _save_policy_request_dump(
+                        dump_root=dump_root,
+                        request_id=request_id,
+                        request_json=req,
+                        obs_chw_uint8=img_chw_uint8,
+                        pred_action=pred_action_list,
+                        pred_video_c_t_h_w=pred_video_c_t_h_w,
+                        fps=int(self.cfg.fps),
+                    )
+                except Exception as e:
+                    # Never fail serving a request due to dump failures
+                    log.error(f"[action-server] dump failed for request_id={request_id}: {e}")
 
-        dt_total_ms = (time.monotonic() - t0) * 1000.0
-        dt_decode_ms = (t_decode1 - t_decode0) * 1000.0
-        dt_inf_ms = (t_inf1 - t_inf0) * 1000.0
-        log.info(
-            f"[action-server] request_id={request_id} done action_steps={len(pred_action_list)} "
-            f"video_frames={len(pred_video_b64)} "
-            f"ms_total={dt_total_ms:.1f} ms_decode={dt_decode_ms:.1f} ms_infer={dt_inf_ms:.1f}"
-        )
-        return {"action": pred_action_list, "video": pred_video_b64}
+            status = self.local_memory_adapter.status(local_update)
+            response = {"action": pred_action_list, "video": pred_video_b64}
+            if status is not None:
+                response["local_memory"] = status
+            self.local_memory_adapter.commit(local_update)
+
+            dt_total_ms = (time.monotonic() - t0) * 1000.0
+            dt_decode_ms = (t_decode1 - t_decode0) * 1000.0
+            dt_inf_ms = (t_inf1 - t_inf0) * 1000.0
+            log.info(
+                f"[action-server] request_id={request_id} done action_steps={len(pred_action_list)} "
+                f"video_frames={len(pred_video_b64)} "
+                f"local_memory={status} "
+                f"ms_total={dt_total_ms:.1f} ms_decode={dt_decode_ms:.1f} ms_infer={dt_inf_ms:.1f}"
+            )
+            return response
+        except Exception:
+            self.local_memory_adapter.abort(local_update)
+            raise
 
     # ------------------------------------------------------------------
     # Developer validation (optional, --run-validation)
