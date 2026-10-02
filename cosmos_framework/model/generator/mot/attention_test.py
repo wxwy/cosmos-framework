@@ -450,8 +450,6 @@ def test_use_varlen_stays_varlen_for_caption_offsets_without_grad() -> None:
 
 
 @pytest.mark.L0
-
-@pytest.mark.L0
 @pytest.mark.CPU
 def test_single_sample_local_prefix_forces_varlen_without_changing_native_dense_path(
     monkeypatch: pytest.MonkeyPatch,
@@ -495,6 +493,8 @@ def test_single_sample_local_prefix_forces_varlen_without_changing_native_dense_
     native_full_k, _, _ = get_all_seq(packs[1])
     assert calls[1][1][1] == native_full_k.shape[0] + 4
 
+
+@pytest.mark.L0
 def test_und_self_attention_passes_caption_boundaries_during_single_sample_inference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
