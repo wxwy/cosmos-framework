@@ -3377,6 +3377,7 @@ class OmniMoTModel(ImaginaireModel):
             is_image_batch=is_image_batch,
             raw_state_vision=gen_data_clean.raw_state_vision,
             x0_tokens_vision=noise_x_vision,
+            x0_tokens_local_memory=gen_data_clean.x0_tokens_local_memory,
             fps_vision=gen_data_clean.fps_vision,
             temporal_positions_vision=gen_data_clean.temporal_positions_vision,
             # Action fields
