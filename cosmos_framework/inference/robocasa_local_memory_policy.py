@@ -21,6 +21,9 @@ class _VisualRecord:
     consumer_step: int
     left_frames: tuple[torch.Tensor, ...]
     wrist_frames: tuple[torch.Tensor, ...]
+    last_source_steps: tuple[int, ...] = ()
+    last_visual_summary: torch.Tensor | None = None
+    last_executed_action: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +169,50 @@ class RoboCasaLocalMemoryPolicyAdapter:
 
         if previous.episode_id != episode_id:
             raise ValueError("Local-TTT episode changed without reset")
+
+        # A response may be lost after the server has already committed the
+        # staged fast-state update. In that case the client retries the exact
+        # same completed-evidence frontier. Preserve exactly-once semantics by
+        # admitting only a byte-equivalent replay of the last committed batch;
+        # changed or partial retries remain fail-closed.
+        if consumer_step == previous.consumer_step:
+            expected_steps = previous.last_source_steps
+            if not expected_steps or len(rows) != len(expected_steps):
+                raise ValueError("stale Local-TTT request does not match the last committed evidence batch")
+            replay_actions = []
+            for expected, row in zip(expected_steps, rows, strict=True):
+                if not isinstance(row, dict) or row.get("source_step") != expected:
+                    raise ValueError("Local-TTT replay source steps changed")
+                left_frame = self._validate_frame(self.decode_image(row.get("left_image")), "left_image")
+                wrist_frame = self._validate_frame(self.decode_image(row.get("wrist_image")), "wrist_image")
+                if expected >= len(previous.left_frames) or expected >= len(previous.wrist_frames):
+                    raise RuntimeError("Local-TTT replay references evidence outside committed visual history")
+                if not torch.equal(left_frame, previous.left_frames[expected]) or not torch.equal(
+                    wrist_frame, previous.wrist_frames[expected]
+                ):
+                    raise ValueError("Local-TTT replay visual evidence changed after commit")
+                action = torch.as_tensor(row.get("executed_action"), dtype=torch.float32).flatten()
+                if tuple(action.shape) != (15,) or not torch.isfinite(action).all():
+                    raise ValueError("Local-TTT replay executed_action must be finite raw15")
+                replay_actions.append(action)
+            action_tensor = torch.stack(replay_actions)
+            if previous.last_executed_action is None or not torch.equal(
+                action_tensor, previous.last_executed_action
+            ):
+                raise ValueError("Local-TTT replay action evidence changed after commit")
+            if previous.last_visual_summary is None:
+                raise RuntimeError("Local-TTT committed replay is missing cached visual summary")
+            request = OnlineMemoryRequest(
+                session_id,
+                episode_id,
+                consumer_step,
+                expected_steps,
+                previous.last_visual_summary.detach().clone(),
+                action_tensor,
+                False,
+            )
+            return request, previous, previous
+
         expected_steps = tuple(range(previous.consumer_step, consumer_step))
         if len(rows) != len(expected_steps):
             raise ValueError("Local-TTT completed evidence count does not match consumer frontier")
@@ -189,7 +236,15 @@ class RoboCasaLocalMemoryPolicyAdapter:
         source_steps = tuple(actual_steps)
         visual = self._visual96(tuple(left), tuple(wrist), source_steps)
         action_tensor = torch.stack(actions) if actions else torch.empty(0, 15)
-        replacement = _VisualRecord(episode_id, consumer_step, tuple(left), tuple(wrist))
+        replacement = _VisualRecord(
+            episode_id,
+            consumer_step,
+            tuple(left),
+            tuple(wrist),
+            source_steps,
+            visual.detach().clone(),
+            action_tensor.detach().clone(),
+        )
         request = OnlineMemoryRequest(
             session_id,
             episode_id,
