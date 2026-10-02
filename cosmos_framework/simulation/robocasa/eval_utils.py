@@ -123,12 +123,21 @@ def b64_png(img: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def predict(server_url: str, composite: np.ndarray, prompt: str, image_size: int, timeout: float,
-            state: list[float] | None = None) -> dict:
+def predict(
+    server_url: str,
+    composite: np.ndarray,
+    prompt: str,
+    image_size: int,
+    timeout: float,
+    state: list[float] | None = None,
+    local_memory: dict | None = None,
+) -> dict:
     payload = {"image": b64_png(composite), "prompt": prompt,
                "domain_name": "robocasa", "image_size": image_size}
     if state is not None:
-        payload["state"] = state  # 10D eef proprioception -> clean conditioning token
+        payload["state"] = state
+    if local_memory is not None:
+        payload["local_memory"] = local_memory
     resp = requests.post(f"{server_url}/predict", json=payload,
                          headers={"Content-Type": "application/json"}, timeout=timeout)
     resp.raise_for_status()
