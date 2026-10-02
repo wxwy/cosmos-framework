@@ -61,9 +61,13 @@ class RoboCasaLocalMemoryPolicyAdapter:
                 raise ValueError("V3 RoboCasa online Local-TTT requires raw15 evidence")
             if runtime.core.ttt_tbptt_steps != 16 or runtime.core.k_local != 4 or runtime.core.local_dim != 32:
                 raise ValueError("V3 RoboCasa Local-TTT runtime contract drift")
+            scan = getattr(service.model.net, "scan_local_memory", None)
+            if not callable(scan):
+                raise ValueError("required V3 Local-TTT needs model-owned scan_local_memory")
             self.memory = OnlineLocalMemory(
                 runtime.encoder,
                 runtime.core,
+                scan_local_memory=scan,
                 max_sessions=max_sessions,
                 max_evidence_steps=max_evidence_steps,
             )
