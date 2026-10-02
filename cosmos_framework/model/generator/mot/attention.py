@@ -391,7 +391,7 @@ def two_way_attention(
         )
     else:
         if memory_prefix_key_states is not None:
-            raise ValueError("Memory Prefix requires varlen training attention")
+            raise ValueError("Memory Prefix requires varlen attention")
         # This branch takes the unpadded stream, and has to.
         #
         # A padded stream is only safe next to offsets that fence the padding off, and the
