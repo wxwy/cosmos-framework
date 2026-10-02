@@ -53,7 +53,9 @@ from cosmos_framework.simulation.robocasa.eval_utils import (
     decode_20d_to_env12,
     decode_pred_video,
     predict,
+    reset_local_memory,
 )
+from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
 
 CAMS = ["robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"]
 
@@ -229,8 +231,11 @@ def check_success(env) -> bool:
 
 def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                latch, timeout, use_state=False, save_png=None, save_video=None,
-               gen_video_path=None, video_fps=20) -> tuple[bool, int, str]:
+               gen_video_path=None, video_fps=20,
+               local_memory_client: RoboCasaLocalMemoryClient | None = None) -> tuple[bool, int, str]:
     obs = env.reset()  # a freshly sampled held-out scene
+    if local_memory_client is not None:
+        local_memory_client.begin(0)
     # Read the language annotation AFTER reset: get_ep_meta() describes the scene currently
     # loaded, so reading it before reset returns the previous episode's metadata (and nothing
     # at all on the first rollout, leaving the policy unconditioned).
@@ -248,7 +253,21 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
         if not queue:
             comp = compose(obs)
             state_token = build_state_token(obs) if use_state else None
-            result = predict(server_url, comp, prompt, image_size, timeout, state=state_token)
+            local_payload = local_memory_client.payload(0) if local_memory_client is not None else None
+            result = predict(
+                server_url,
+                comp,
+                prompt,
+                image_size,
+                timeout,
+                state=state_token,
+                local_memory=local_payload,
+            )
+            if local_memory_client is not None:
+                status = result.get("local_memory")
+                if not isinstance(status, dict):
+                    raise RuntimeError("required Local-TTT server response is missing local_memory status")
+                local_memory_client.acknowledge(0, status)
             # Accumulate the generated video from EVERY inference chunk (one clip per re-plan),
             # so the saved gen video covers the whole rollout, not just the first chunk.
             if gen_video_path is not None and result.get("video"):
@@ -277,6 +296,12 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                     f"{a.shape[-1]}D; pass --use-base-action (and --base-encoding)."
                 )
             env_action = decode_10d_to_env12(a, False)
+        if local_memory_client is not None:
+            if a.shape[-1] != 15:
+                raise ValueError("V3 online Local-TTT requires executed raw15 policy actions")
+            left = _upright(obs[f"{CAMS[0]}_image"]).copy()
+            wrist = _upright(obs[f"{CAMS[2]}_image"]).copy()
+            local_memory_client.record_executed(0, left, wrist, a)
         obs, _, _, _ = env.step(env_action)
         frames.append(compose(obs).astype(np.uint8))
         if check_success(env):
@@ -290,6 +315,10 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
         imageio.mimwrite(save_video, frames, fps=video_fps, macro_block_size=None)
     if gen_video_path is not None and gen_frames:
         imageio.mimwrite(gen_video_path, gen_frames, fps=video_fps, macro_block_size=None)
+    if local_memory_client is not None:
+        session_id = local_memory_client.end(0)
+        if session_id is not None:
+            reset_local_memory(server_url, session_id, timeout)
     return success, done_steps, prompt
 
 
@@ -323,6 +352,8 @@ def main() -> None:
                     help="send EEF proprioception (robot0_base_to_eef_pos/quat + gripper_qpos) as the "
                          "clean conditioning token; MUST match a use_state=True trained checkpoint")
     ap.add_argument("--timeout", type=float, default=600)
+    ap.add_argument("--local-memory-mode", choices=("off", "required"), default="off",
+                    help="V3 online Local-TTT. Formal iter500 evaluation must use required.")
     ap.add_argument("--output-dir", default=".")
     args = ap.parse_args()
 
@@ -330,6 +361,15 @@ def main() -> None:
     CAMERA_SET = args.camera_set
     USE_BASE_ACTION = args.use_base_action
     BASE_ENCODING = args.base_encoding
+    if args.local_memory_mode == "required":
+        if args.camera_set != "left_wrist":
+            raise ValueError("V3 Local-TTT requires --camera-set left_wrist")
+        if not args.use_base_action or args.base_encoding != "raw":
+            raise ValueError("V3 Local-TTT requires --use-base-action --base-encoding raw")
+        if not args.use_state:
+            raise ValueError("V3 Local-TTT formal checkpoint requires --use-state")
+        if args.action_horizon != 16:
+            raise ValueError("V3 Local-TTT requires --action-horizon 16 to match T=16")
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -353,8 +393,15 @@ def main() -> None:
     t0 = time.time()
     while time.time() - t0 < args.timeout:
         try:
-            if requests.get(f"{args.server_url}/info", timeout=5).ok:
-                print(f"[train-scene] server ready at {args.server_url}", flush=True)
+            info_response = requests.get(f"{args.server_url}/info", timeout=5)
+            if info_response.ok:
+                info = info_response.json()
+                server_mode = (info.get("local_memory") or {}).get("mode", "off")
+                if server_mode != args.local_memory_mode:
+                    raise RuntimeError(
+                        f"eval/server Local-TTT mode mismatch: eval={args.local_memory_mode} server={server_mode}"
+                    )
+                print(f"[train-scene] server ready at {args.server_url} local_memory={server_mode}", flush=True)
                 break
         except requests.RequestException:
             time.sleep(3)
@@ -362,6 +409,11 @@ def main() -> None:
         raise RuntimeError("server not ready")
 
     results = []
+    local_memory_client = (
+        RoboCasaLocalMemoryClient(enabled=True)
+        if args.local_memory_mode == "required"
+        else None
+    )
 
     # Official protocol: rollouts in freshly sampled held-out scenes.
     for t in range(args.num_test_episodes):
@@ -370,6 +422,7 @@ def main() -> None:
             image_size=args.image_size, action_horizon=args.action_horizon,
             max_steps=eff_max_steps, latch=args.success_latch,
             timeout=args.timeout, use_state=args.use_state,
+            local_memory_client=local_memory_client,
             save_png=str(out / f"rollout{t:02d}_init.png"),
             save_video=str(out / f"rollout{t:02d}.mp4"),
             gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if args.save_gen_video else None)
