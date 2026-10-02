@@ -85,6 +85,7 @@ from cosmos_framework.inference.common.args import CheckpointOverrides, ConfigFi
 from cosmos_framework.inference.common.config import deserialize_config_dict
 from cosmos_framework.inference.common.init import init_output_dir
 from cosmos_framework.inference.inference import OmniInference
+from cosmos_framework.inference.robocasa_local_memory_policy import RoboCasaLocalMemoryPolicyAdapter
 from cosmos_framework.scripts.action_policy_server_utils import (
     DEFAULT_FALLBACK_OUTPUT_DIR,
     disable_runtime_ema_for_frozen_config,
@@ -515,6 +516,12 @@ class ActionServerArgs(pydantic.BaseModel):
     """Action normalization to invert. ``auto`` reads ``action_normalization``
     from the experiment config (default ``minmax`` if unspecified)."""
 
+    # ----- online Local-TTT ---------------------------------------------------
+    local_memory_mode: Literal["off", "required"] = "off"
+    """Online V3 Local-TTT mode. Formal Local-TTT evaluation must use ``required``."""
+    local_memory_max_sessions: int = 64
+    """Maximum concurrent online Local-TTT episode sessions."""
+
     # ----- prompt format ------------------------------------------------------
     format_prompt_as_json: bool | None = None
     """Serve prompts as structured JSON (matching training ``format_prompt_as_json``).
@@ -751,6 +758,13 @@ class ActionModelService:
             f"[action-server] effective raw_action_dim={self.raw_action_dim} "
             f"(from {self.raw_action_dim_source})"
         )
+        self.local_memory_adapter = RoboCasaLocalMemoryPolicyAdapter(
+            self,
+            mode=args.local_memory_mode,
+            decode_image=lambda value: _decode_base64_png_to_rgb_uint8(value),
+            max_sessions=int(args.local_memory_max_sessions),
+        )
+        log.info(f"[action-server] local_memory={self.local_memory_adapter.info()}")
 
         if args.run_validation:
             self._run_developer_validation()
@@ -895,6 +909,7 @@ class ActionModelService:
             "raw_action_dim_source": self.raw_action_dim_source,
             "requires_state": self.requires_state,
             "action_stats_path": str(self.cfg.action_stats_path) if self.cfg.action_stats_path else None,
+            "local_memory": self.local_memory_adapter.info(),
         }
 
     # ------------------------------------------------------------------
@@ -1026,9 +1041,13 @@ class ActionModelService:
         return action_t_d
 
     def predict_policy_batch(self, reqs: list[dict[str, Any]]) -> dict[str, Any]:
-        """Batched policy inference: N requests -> ONE diffusion forward (batch_size=N)
-        -> N denormalized action chunks. Skips vision decode (the vectorized eval client
-        only needs actions), so it is ~N x faster than N serial /predict calls."""
+        """Batched policy inference: N requests -> ONE diffusion forward (batch_size=N).
+        
+        The first V3 online Local-TTT gate deliberately supports only serial /predict so
+        every session has an unambiguous transactional completed-evidence frontier.
+        """
+        if self.local_memory_adapter.mode == "required":
+            raise ValueError("required Local-TTT currently supports serial /predict only")
         t0 = time.monotonic()
         if not isinstance(reqs, list) or not reqs:
             raise ValueError("'items' must be a non-empty list of policy requests")
