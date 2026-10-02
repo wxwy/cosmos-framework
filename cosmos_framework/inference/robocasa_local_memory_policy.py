@@ -91,8 +91,15 @@ class RoboCasaLocalMemoryPolicyAdapter:
             )
         if tuple(latent.shape[-2:]) != (16, 16) or not torch.isfinite(latent).all():
             raise FloatingPointError("online causal VAE produced invalid RoboCasa latent")
-        # Training cache persists fp16 and B1 computes visual96 from that persisted value.
-        return latent[0].detach().to(device="cpu", dtype=torch.float16).contiguous()
+        # Match tools/v3/build_robocasa_b1_h5_cache.py exactly:
+        # [1,48,N,16,16] -> [N,48,16,16] -> persisted fp16.
+        return (
+            latent.squeeze(0)
+            .permute(1, 0, 2, 3)
+            .detach()
+            .to(device="cpu", dtype=torch.float16)
+            .contiguous()
+        )
 
     def _visual96(
         self,
