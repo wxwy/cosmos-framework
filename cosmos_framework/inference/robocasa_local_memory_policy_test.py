@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -126,3 +127,39 @@ def test_visual96_uses_four_frame_causal_endpoint_groups() -> None:
         if start:
             assert not torch.equal(summary[start], summary[start - 1])
     assert model.encode_calls == 2
+
+
+def test_committed_evidence_retry_is_idempotent_and_changed_retry_fails() -> None:
+    model = _FakeModel()
+    images = {}
+    for index in range(16):
+        images[f"left-{index}"] = _frame(index)
+        images[f"wrist-{index}"] = _frame(100 + index)
+    service = SimpleNamespace(model=model)
+    adapter = RoboCasaLocalMemoryPolicyAdapter(
+        service,
+        mode="required",
+        decode_image=lambda key: images[key],
+    )
+
+    cold = adapter.prepare(_payload(0, 0, reset=True))
+    adapter.commit(cold)
+
+    first = adapter.prepare(_payload(16, 0))
+    first_prefix = adapter.prefixes(first)[0]
+    assert first_prefix is not None
+    adapter.commit(first)
+    encode_calls_after_commit = model.encode_calls
+
+    replay = adapter.prepare(_payload(16, 0))
+    replay_prefix = adapter.prefixes(replay)[0]
+    assert replay_prefix is not None
+    assert adapter.status(replay)["replay"] is True
+    torch.testing.assert_close(replay_prefix, first_prefix)
+    assert model.encode_calls == encode_calls_after_commit
+    adapter.commit(replay)
+
+    changed = _payload(16, 0)
+    changed["local_memory"]["evidence"][-1]["executed_action"][0] += 1.0
+    with pytest.raises(ValueError, match="replay action evidence changed"):
+        adapter.prepare(changed)
