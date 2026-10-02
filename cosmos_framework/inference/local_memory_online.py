@@ -38,7 +38,7 @@ class OnlineMemoryRequest:
 class _Record:
     episode_id: str
     consumer_step: int
-    state: ContinualTTTFastState
+    state: ContinualTTTFastState | None
     token: torch.Tensor | None
     fingerprint: str
 
@@ -94,7 +94,9 @@ class OnlineLocalMemory:
         return ContinualTTTFastState(*(value.detach().float().clone() for value in state))
 
     @staticmethod
-    def _state_norm(state: ContinualTTTFastState) -> float:
+    def _state_norm(state: ContinualTTTFastState | None) -> float:
+        if state is None:
+            return 0.0
         total = sum(float(value.detach().float().square().sum().cpu()) for value in state)
         return total**0.5
 
@@ -150,11 +152,13 @@ class OnlineLocalMemory:
                 new_pending = sum(update.previous is None for update in self._pending.values())
                 if previous is None and len(self._records) + new_pending >= self.max_sessions:
                     raise RuntimeError("online Local-TTT session limit reached")
-                state = self._detach_state(self.core.initial_state(1))
+                # No evidence exists at consumer step0, so keep fast state lazy.
+                # The model-owned scan will materialize W0 safely on the first update.
+                state = None
                 token = None
                 telemetry = {
                     "adapted_steps": 0.0,
-                    "fast_state_norm": self._state_norm(state),
+                    "fast_state_norm": 0.0,
                     "fast_update_norm": 0.0,
                 }
             else:
@@ -169,7 +173,6 @@ class OnlineLocalMemory:
                 action = action.to(device)
                 state = previous.state
                 token = previous.token
-                initial_state = self._detach_state(state)
                 self.core.reset_telemetry()
                 if self.scan_local_memory is not None:
                     valid = torch.ones(1, len(expected), dtype=torch.bool, device=device)
@@ -186,6 +189,8 @@ class OnlineLocalMemory:
                     state = self._detach_state(candidate)
                     token = tokens[0, -1].detach().float().clone()
                 else:
+                    if state is None:
+                        state = self._detach_state(self.core.initial_state(1))
                     with torch.no_grad():
                         evidence = self.encoder.encode_segment(visual.unsqueeze(0), action.unsqueeze(0)).squeeze(0)
                     for index in range(len(expected)):
@@ -197,17 +202,19 @@ class OnlineLocalMemory:
                             )
                         state = self._detach_state(candidate)
                         token = tokens[0].detach().float().clone()
-                fast_delta_sq = sum(
-                    float((after - before).float().square().sum().cpu())
-                    for before, after in zip(initial_state, state, strict=True)
-                )
                 inner = self.core.drain_telemetry()
                 inner_sum = inner.get("ttt_inner_loss_sum")
                 inner_count = inner.get("ttt_inner_loss_count")
+                update_sum = inner.get("ttt_fast_update_norm_sum")
+                update_count = inner.get("ttt_fast_update_norm_count")
                 telemetry = {
                     "adapted_steps": float(len(expected)),
                     "fast_state_norm": self._state_norm(state),
-                    "fast_update_norm": fast_delta_sq**0.5,
+                    "fast_update_norm": (
+                        float((update_sum / update_count).cpu())
+                        if update_sum is not None and update_count is not None and float(update_count) > 0
+                        else 0.0
+                    ),
                     "inner_loss_mean": (
                         float((inner_sum / inner_count).cpu())
                         if inner_sum is not None and inner_count is not None and float(inner_count) > 0
