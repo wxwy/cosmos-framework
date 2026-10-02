@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -65,6 +66,7 @@ class OnlineLocalMemory:
         encoder: LocalEvidenceEncoder,
         core: ContinualTTTLocalMemoryCore,
         *,
+        scan_local_memory: Callable[..., tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]] | None = None,
         max_sessions: int = 64,
         max_evidence_steps: int = 256,
     ) -> None:
@@ -79,6 +81,7 @@ class OnlineLocalMemory:
             raise ValueError("online Local-TTT could not resolve evidence action width")
         self.encoder = encoder
         self.core = core
+        self.scan_local_memory = scan_local_memory
         self.action_dim = action_dim
         self.max_sessions = int(max_sessions)
         self.max_evidence_steps = int(max_evidence_steps)
@@ -164,21 +167,36 @@ class OnlineLocalMemory:
                     raise ValueError("completed Local-TTT evidence must be contiguous and exactly-once")
                 visual = visual.to(device)
                 action = action.to(device)
-                with torch.no_grad():
-                    evidence = self.encoder.encode_segment(visual.unsqueeze(0), action.unsqueeze(0)).squeeze(0)
                 state = previous.state
                 token = previous.token
                 initial_state = self._detach_state(state)
                 self.core.reset_telemetry()
-                for index in range(len(expected)):
+                if self.scan_local_memory is not None:
+                    valid = torch.ones(1, len(expected), dtype=torch.bool, device=device)
                     with torch.enable_grad():
-                        tokens, candidate = self.core.step_many(
-                            evidence[index : index + 1],
+                        tokens, candidate, present = self.scan_local_memory(
+                            visual.unsqueeze(0),
+                            action.unsqueeze(0),
+                            valid,
                             state,
                             create_graph=False,
                         )
+                    if not bool(present.all()):
+                        raise RuntimeError("online model-owned Local scan dropped completed evidence")
                     state = self._detach_state(candidate)
-                    token = tokens[0].detach().float().clone()
+                    token = tokens[0, -1].detach().float().clone()
+                else:
+                    with torch.no_grad():
+                        evidence = self.encoder.encode_segment(visual.unsqueeze(0), action.unsqueeze(0)).squeeze(0)
+                    for index in range(len(expected)):
+                        with torch.enable_grad():
+                            tokens, candidate = self.core.step_many(
+                                evidence[index : index + 1],
+                                state,
+                                create_graph=False,
+                            )
+                        state = self._detach_state(candidate)
+                        token = tokens[0].detach().float().clone()
                 fast_delta_sq = sum(
                     float((after - before).float().square().sum().cpu())
                     for before, after in zip(initial_state, state, strict=True)
