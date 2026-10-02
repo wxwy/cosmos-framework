@@ -392,11 +392,11 @@ def test_cp_rejected_before_native_encoding() -> None:
         Cosmos3VFMNetwork.forward(holder, SimpleNamespace(local_memory_tokens=(torch.zeros(4, 32),)))
 
 
-@pytest.mark.parametrize("override", ["disabled", "inference", "cuda_graphs", "multiview"])
+@pytest.mark.parametrize("override", ["disabled", "cuda_graphs", "multiview"])
 def test_unsupported_forward_rejected_before_encoding(override: str) -> None:
     holder = SimpleNamespace(
         config=SimpleNamespace(local_memory_enabled=override != "disabled", local_memory_k_local=4),
-        training=override != "inference",
+        training=True,
         parallel_dims=SimpleNamespace(cp_enabled=False),
         pad_for_cuda_graphs=override == "cuda_graphs",
         flex_backend=object() if override == "multiview" else None,
@@ -404,10 +404,43 @@ def test_unsupported_forward_rejected_before_encoding(override: str) -> None:
     )
     with pytest.raises(ValueError, match="Local Memory"):
         Cosmos3VFMNetwork.forward(holder, SimpleNamespace(local_memory_tokens=(torch.zeros(4, 32),)))
-    if override == "inference":
-        holder.training = True
-        with torch.no_grad(), pytest.raises(ValueError, match="native training"):
-            Cosmos3VFMNetwork.forward(holder, SimpleNamespace(local_memory_tokens=(torch.zeros(4, 32),)))
+
+
+def test_detached_inference_prefix_passes_local_guard() -> None:
+    def stop_after_guard(_):
+        raise RuntimeError("passed-local-guard")
+
+    holder = SimpleNamespace(
+        config=SimpleNamespace(local_memory_enabled=True, local_memory_k_local=4),
+        training=False,
+        parallel_dims=SimpleNamespace(cp_enabled=False),
+        pad_for_cuda_graphs=False,
+        flex_backend=None,
+        multiview_backend=None,
+        _encode_text=stop_after_guard,
+    )
+    with torch.inference_mode(), pytest.raises(RuntimeError, match="passed-local-guard"):
+        Cosmos3VFMNetwork.forward(holder, SimpleNamespace(local_memory_tokens=(torch.zeros(4, 32),)))
+
+
+def test_inference_prefix_with_grad_or_text_kv_memory_is_rejected() -> None:
+    holder = SimpleNamespace(
+        config=SimpleNamespace(local_memory_enabled=True, local_memory_k_local=4),
+        training=False,
+        parallel_dims=SimpleNamespace(cp_enabled=False),
+        pad_for_cuda_graphs=False,
+        flex_backend=None,
+        multiview_backend=None,
+    )
+    token = torch.zeros(4, 32, requires_grad=True)
+    with pytest.raises(ValueError, match="detached"):
+        Cosmos3VFMNetwork.forward(holder, SimpleNamespace(local_memory_tokens=(token,)))
+    with pytest.raises(ValueError, match="no inference text-KV"):
+        Cosmos3VFMNetwork.forward(
+            holder,
+            SimpleNamespace(local_memory_tokens=(torch.zeros(4, 32),)),
+            memory=object(),
+        )
 
 
 def test_three_way_dispatch_rejected_before_attention() -> None:
