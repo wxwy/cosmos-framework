@@ -123,6 +123,21 @@ def b64_png(img: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def reset_local_memory(server_url: str, session_id: str, timeout: float) -> None:
+    payload = {"_local_memory_command": "reset", "session_id": session_id}
+    resp = requests.post(
+        f"{server_url}/predict",
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    status = result.get("local_memory")
+    if not isinstance(status, dict) or status.get("status") != "reset" or status.get("session_id") != session_id:
+        raise RuntimeError("Local-TTT reset was not acknowledged by the server")
+
+
 def predict(
     server_url: str,
     composite: np.ndarray,
