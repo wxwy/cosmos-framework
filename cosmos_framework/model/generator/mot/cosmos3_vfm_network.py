@@ -365,13 +365,25 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         executed_action: torch.Tensor,
         valid: torch.Tensor,
         state_in: ContinualTTTFastState | None,
+        *,
+        create_graph: bool = True,
     ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
-        """通过模型持有的 encoder/core 扫描，使 root FSDP 可管理参数生命周期。"""
+        """Model-owned Local scan shared by training and online inference.
+
+        The model-owned route keeps FSDP parameter materialization correct. Training
+        keeps create_graph=True for outer gradients; online fast-weight adaptation
+        explicitly uses create_graph=False.
+        """
         if not self.config.local_memory_enabled:
             raise RuntimeError("Local Memory is disabled")
         runtime = self.local_memory_runtime
         return runtime.core.scan_segment_masked_encoded_many(
-            runtime.encoder, visual_summary, executed_action, valid, state_in
+            runtime.encoder,
+            visual_summary,
+            executed_action,
+            valid,
+            state_in,
+            create_graph=create_graph,
         )
 
     def init_weights(self, buffer_device: torch.device | None):
