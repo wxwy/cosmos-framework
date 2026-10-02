@@ -95,3 +95,37 @@ def test_slow_parameters_never_receive_grad_buffers() -> None:
     assert all(parameter.grad is None for parameter in memory.encoder.parameters())
     assert all(parameter.grad is None for parameter in memory.core.parameters())
     memory.commit(update)
+
+
+def test_online_sequential_update_matches_training_core_scan() -> None:
+    torch.manual_seed(11)
+    encoder = LocalEvidenceEncoder(action_dim=15)
+    core = ContinualTTTLocalMemoryCore()
+    reference_encoder = copy.deepcopy(encoder)
+    reference_core = copy.deepcopy(core)
+    memory = OnlineLocalMemory(encoder, core)
+
+    cold = memory.prepare(
+        OnlineMemoryRequest("s", "e", 0, (), torch.empty(0, 96), torch.empty(0, 15), True)
+    )
+    memory.commit(cold)
+    visual = torch.randn(16, 96)
+    action = torch.randn(16, 15)
+    update = memory.prepare(
+        OnlineMemoryRequest("s", "e", 16, tuple(range(16)), visual, action, False)
+    )
+
+    valid = torch.ones(1, 16, dtype=torch.bool)
+    reference_core.reset_telemetry()
+    tokens, state, present = reference_core.scan_segment_masked_encoded_many(
+        reference_encoder,
+        visual.unsqueeze(0),
+        action.unsqueeze(0),
+        valid,
+        state_in=None,
+        create_graph=False,
+    )
+    assert present.all()
+    torch.testing.assert_close(update.token, tokens[0, -1].detach(), rtol=2e-5, atol=2e-6)
+    for actual, expected in zip(update.replacement.state, state, strict=True):
+        torch.testing.assert_close(actual, expected.detach(), rtol=2e-5, atol=2e-6)
