@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from cosmos_framework.inference.local_memory_online import OnlineLocalMemory, OnlineMemoryRequest, OnlineMemoryUpdate
 from cosmos_framework.model.generator.mot.robocasa_latent_evidence import latent_to_visual96
@@ -64,6 +65,10 @@ class RoboCasaLocalMemoryPolicyAdapter:
             scan = getattr(service.model.net, "scan_local_memory", None)
             if not callable(scan):
                 raise ValueError("required V3 Local-TTT needs model-owned scan_local_memory")
+            if any(isinstance(parameter, DTensor) for parameter in runtime.parameters()) and not getattr(
+                service.model.net, "_local_memory_scan_fsdp_registered", False
+            ):
+                raise RuntimeError("sharded V3 Local-TTT requires FSDP-registered model-owned scan")
             self.memory = OnlineLocalMemory(
                 runtime.encoder,
                 runtime.core,
