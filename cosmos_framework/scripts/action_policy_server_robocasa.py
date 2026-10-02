@@ -758,6 +758,11 @@ class ActionModelService:
             f"[action-server] effective raw_action_dim={self.raw_action_dim} "
             f"(from {self.raw_action_dim_source})"
         )
+        if args.local_memory_mode == "required":
+            if self.raw_action_dim != 15:
+                raise ValueError("required V3 RoboCasa Local-TTT needs raw_action_dim=15")
+            if not self.requires_state:
+                raise ValueError("required V3 RoboCasa Local-TTT formal checkpoint must use_state=True")
         self.local_memory_adapter = RoboCasaLocalMemoryPolicyAdapter(
             self,
             mode=args.local_memory_mode,
