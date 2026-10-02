@@ -15,6 +15,19 @@ class _FakeModel(nn.Module):
         self.anchor = nn.Parameter(torch.tensor(0.0))
         self.net = nn.Module()
         self.net.local_memory_runtime = LocalMemoryRuntime(action_dim=15)
+        runtime = self.net.local_memory_runtime
+
+        def scan(visual, action, valid, state, *, create_graph=True):
+            return runtime.core.scan_segment_masked_encoded_many(
+                runtime.encoder,
+                visual,
+                action,
+                valid,
+                state,
+                create_graph=create_graph,
+            )
+
+        self.net.scan_local_memory = scan
         self.encode_calls = 0
 
     def _encode_vision_item(self, clip: torch.Tensor, *, num_views: int) -> torch.Tensor:
