@@ -54,8 +54,7 @@ def test_abort_does_not_publish_candidate_state() -> None:
     after = memory._records["session"]
     assert after.consumer_step == before.consumer_step == 0
     assert after.token is before.token is None
-    for left, right in zip(after.state, before.state, strict=True):
-        torch.testing.assert_close(left, right)
+    assert after.state is before.state is None
 
 
 def test_chronology_and_episode_identity_fail_closed() -> None:
