@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -238,6 +237,7 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
     obs = env.reset()
     if local_memory_client is not None:
         local_memory_client.begin(0)
+    rollout_error: BaseException | None = None
     try:
         try:
             prompt = env.get_ep_meta().get("lang", "") or ""
@@ -312,6 +312,9 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
         if gen_video_path is not None and gen_frames:
             imageio.mimwrite(gen_video_path, gen_frames, fps=video_fps, macro_block_size=None)
         return success, done_steps, prompt
+    except BaseException as error:
+        rollout_error = error
+        raise
     finally:
         if local_memory_client is not None:
             session_id = local_memory_client.end(0)
@@ -319,7 +322,7 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                 try:
                     reset_local_memory(server_url, session_id, timeout)
                 except Exception as cleanup_error:
-                    if sys.exc_info()[0] is None:
+                    if rollout_error is None:
                         raise
                     print(
                         f"[eval] WARNING: Local-TTT cleanup failed after rollout error: {cleanup_error}",
