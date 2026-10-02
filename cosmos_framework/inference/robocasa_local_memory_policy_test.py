@@ -116,8 +116,8 @@ def test_visual96_uses_four_frame_causal_endpoint_groups() -> None:
         mode="required",
         decode_image=lambda _: _frame(0),
     )
-    left = tuple(_frame(index).permute(2, 0, 1) for index in range(16))
-    wrist = tuple(_frame(100 + index).permute(2, 0, 1) for index in range(16))
+    left = tuple(_frame(index) for index in range(16))
+    wrist = tuple(_frame(100 + index) for index in range(16))
     summary = adapter._visual96(left, wrist, tuple(range(16)))
     assert summary.shape == (16, 96)
     for start in (0, 4, 8, 12):
