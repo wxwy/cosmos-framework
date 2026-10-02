@@ -1188,12 +1188,13 @@ class ActionModelService:
             f"img={tuple(img_chw_uint8.shape)} steps={self.cfg.num_steps} guidance={self.cfg.guidance}"
         )
 
-        local_update = self.local_memory_adapter.prepare(req)
+        local_update = None
         try:
-            # Run inference. Local prefix is detached and fixed for this complete
-            # diffusion request; online fast-state adaptation already happened above.
+            # Serialize every operation that touches the model: causal VAE evidence
+            # encoding, model-owned Local scan, and diffusion generation.
             t_inf0 = time.monotonic()
             with self._lock:
+                local_update = self.local_memory_adapter.prepare(req)
                 with torch.inference_mode():
                     samples = self.model.generate_samples_from_batch(
                         batch,
