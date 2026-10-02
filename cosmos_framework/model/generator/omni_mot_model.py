@@ -3724,6 +3724,7 @@ class OmniMoTModel(ImaginaireModel):
         upsample_repetition_penalty: float = 1.0,
         upsample_presence_penalty: float = 0.0,
         upsample_seed: int | None = None,
+        _local_memory_prefixes: tuple[torch.Tensor | None, ...] | None = None,
         **kwargs,
     ) -> dict[str, list[torch.Tensor]]:
         """
@@ -3878,6 +3879,27 @@ class OmniMoTModel(ImaginaireModel):
             has_noisy_actions,
         ) = self._prepare_inference_data(data_batch, seed, has_negative_prompt)
 
+        has_local_prefixes = _local_memory_prefixes is not None and any(
+            token is not None for token in _local_memory_prefixes
+        )
+        if _local_memory_prefixes is not None:
+            if not self.config.local_memory_enabled or len(_local_memory_prefixes) != gen_data_clean.batch_size:
+                raise ValueError("inference Local Memory requires enabled model and one prefix entry per sample")
+            from cosmos_framework.model.generator.mot.memory_prefix import attach_local_prefixes
+
+            sequence_plans, gen_data_clean = attach_local_prefixes(
+                sequence_plans,
+                gen_data_clean,
+                _local_memory_prefixes,
+                k_local=self.config.local_memory_k_local,
+                local_dim=self.config.local_memory_dim,
+            )
+        if has_local_prefixes:
+            # First V3 online gate is correctness-first. Local prefix remains fixed for
+            # the whole diffusion request; disable inference fast paths whose cache
+            # contracts do not yet include Local K/V.
+            use_batched_cfg = False
+
         if n_sample is not None:
             assert n_sample == len(initial_noise), (
                 f"Number of samples {n_sample} must match number of noise tensors {len(initial_noise)}"
@@ -3960,7 +3982,11 @@ class OmniMoTModel(ImaginaireModel):
             _align_device,
         )
 
-        reuse_pack_templates = self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
+        reuse_pack_templates = (
+            False
+            if has_local_prefixes
+            else self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
+        )
         cond_packed_sequence_template: PackedSequence | None = None
         uncond_packed_sequence_template: PackedSequence | None = None
         batched_packed_sequence_template: PackedSequence | None = None
@@ -4032,7 +4058,7 @@ class OmniMoTModel(ImaginaireModel):
         # process group whose model-forward sequence is at risk). Text-KV
         # eligibility must additionally agree across CFG-parallel peers before
         # either peer installs the request-local attention dispatch.
-        reuse_text_kv = self._can_reuse_inference_text_kv(
+        reuse_text_kv = False if has_local_prefixes else self._can_reuse_inference_text_kv(
             sequence_plans,
             gen_data_clean,
             reuse_pack_templates=reuse_pack_templates,
@@ -4054,7 +4080,7 @@ class OmniMoTModel(ImaginaireModel):
         # Request-scoped: install only for this generate call and restore afterward so we
         # never permanently shadow another dispatch_attention_fn on the model.
         previous_attention_dispatch = None
-        diffusion_cache = getattr(self, "_diffusion_cache", None)
+        diffusion_cache = None if has_local_prefixes else getattr(self, "_diffusion_cache", None)
         cache_step_index: int | None = None
         try:
             if reuse_text_kv:
