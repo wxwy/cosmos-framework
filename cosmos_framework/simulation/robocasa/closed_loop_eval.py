@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -234,94 +235,96 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                latch, timeout, use_state=False, save_png=None, save_video=None,
                gen_video_path=None, video_fps=20,
                local_memory_client: RoboCasaLocalMemoryClient | None = None) -> tuple[bool, int, str]:
-    obs = env.reset()  # a freshly sampled held-out scene
+    obs = env.reset()
     if local_memory_client is not None:
         local_memory_client.begin(0)
-    # Read the language annotation AFTER reset: get_ep_meta() describes the scene currently
-    # loaded, so reading it before reset returns the previous episode's metadata (and nothing
-    # at all on the first rollout, leaving the policy unconditioned).
     try:
-        prompt = env.get_ep_meta().get("lang", "") or ""
-    except Exception:
-        prompt = ""
-    init_comp = compose(obs).astype(np.uint8)
-    if save_png is not None:
-        Image.fromarray(init_comp).save(save_png)
-    frames = [init_comp]  # composite (what the policy sees + third-person robot view)
-    gen_frames = []  # model's GENERATED video (flow-matching vision branch), accumulated over ALL chunks
-    streak, queue, success, done_steps = 0, [], False, max_steps
-    for step in range(max_steps):
-        if not queue:
-            comp = compose(obs)
-            state_token = build_state_token(obs) if use_state else None
-            local_payload = local_memory_client.payload(0) if local_memory_client is not None else None
-            result = predict(
-                server_url,
-                comp,
-                prompt,
-                image_size,
-                timeout,
-                state=state_token,
-                local_memory=local_payload,
-            )
-            if local_memory_client is not None:
-                status = result.get("local_memory")
-                if not isinstance(status, dict):
-                    raise RuntimeError("required Local-TTT server response is missing local_memory status")
-                local_memory_client.acknowledge(0, status)
-            # Accumulate the generated video from EVERY inference chunk (one clip per re-plan),
-            # so the saved gen video covers the whole rollout, not just the first chunk.
-            if gen_video_path is not None and result.get("video"):
-                gen_frames.extend(decode_pred_video(result["video"]))
-            acts = result["action"]
-            queue = acts[:action_horizon] if action_horizon > 0 else list(acts)
-        a = np.asarray(queue.pop(0))
-        # Decoder is chosen by --base-encoding (explicit), not by guessing from the width:
-        #   raw -> 15D [base_motion(4), control_mode(1), arm(10)]  (identity base round-trip)
-        #   ego -> 20D [base_pos(3), base_rot6d(6), control_mode(1), arm(10)]
-        # Without --use-base-action it is the 10D fixed-base contract. The width the server
-        # returned is asserted against that choice so a mismatched flag fails loudly instead
-        # of silently decoding garbage.
-        if USE_BASE_ACTION:
-            want = _ACTION_DIM_BY_ENCODING[BASE_ENCODING]
-            if a.shape[-1] != want:
-                raise ValueError(
-                    f"--base-encoding={BASE_ENCODING} expects {want}D actions but the server "
-                    f"returned {a.shape[-1]}D. Check that the flag matches the checkpoint."
+        try:
+            prompt = env.get_ep_meta().get("lang", "") or ""
+        except Exception:
+            prompt = ""
+        init_comp = compose(obs).astype(np.uint8)
+        if save_png is not None:
+            Image.fromarray(init_comp).save(save_png)
+        frames = [init_comp]
+        gen_frames = []
+        streak, queue, success, done_steps = 0, [], False, max_steps
+        for step in range(max_steps):
+            if not queue:
+                comp = compose(obs)
+                state_token = build_state_token(obs) if use_state else None
+                local_payload = local_memory_client.payload(0) if local_memory_client is not None else None
+                result = predict(
+                    server_url,
+                    comp,
+                    prompt,
+                    image_size,
+                    timeout,
+                    state=state_token,
+                    local_memory=local_payload,
                 )
-            env_action = (decode_15d_to_env12 if BASE_ENCODING == "raw" else decode_20d_to_env12)(a, False)
-        else:
-            if a.shape[-1] != 10:
-                raise ValueError(
-                    f"expected the 10D fixed-base contract but the server returned "
-                    f"{a.shape[-1]}D; pass --use-base-action (and --base-encoding)."
-                )
-            env_action = decode_10d_to_env12(a, False)
-        if local_memory_client is not None:
-            if a.shape[-1] != 15:
-                raise ValueError("V3 online Local-TTT requires executed raw15 policy actions")
-            left = _upright(obs[f"{CAMS[0]}_image"]).copy()
-            wrist = _upright(obs[f"{CAMS[2]}_image"]).copy()
-            local_memory_client.record_executed(0, left, wrist, a)
-        obs, _, _, _ = env.step(env_action)
-        frames.append(compose(obs).astype(np.uint8))
-        if check_success(env):
-            streak += 1
-            if streak >= latch:
-                success, done_steps = True, step + 1
-                break
-        else:
-            streak = 0
-    if save_video is not None:
-        imageio.mimwrite(save_video, frames, fps=video_fps, macro_block_size=None)
-    if gen_video_path is not None and gen_frames:
-        imageio.mimwrite(gen_video_path, gen_frames, fps=video_fps, macro_block_size=None)
-    if local_memory_client is not None:
-        session_id = local_memory_client.end(0)
-        if session_id is not None:
-            reset_local_memory(server_url, session_id, timeout)
-    return success, done_steps, prompt
+                if local_memory_client is not None:
+                    status = result.get("local_memory")
+                    if not isinstance(status, dict):
+                        raise RuntimeError("required Local-TTT server response is missing local_memory status")
+                    local_memory_client.acknowledge(0, status)
+                if gen_video_path is not None and result.get("video"):
+                    gen_frames.extend(decode_pred_video(result["video"]))
+                acts = result["action"]
+                queue = acts[:action_horizon] if action_horizon > 0 else list(acts)
 
+            a = np.asarray(queue.pop(0))
+            if USE_BASE_ACTION:
+                want = _ACTION_DIM_BY_ENCODING[BASE_ENCODING]
+                if a.shape[-1] != want:
+                    raise ValueError(
+                        f"--base-encoding={BASE_ENCODING} expects {want}D actions but the server "
+                        f"returned {a.shape[-1]}D. Check that the flag matches the checkpoint."
+                    )
+                env_action = (decode_15d_to_env12 if BASE_ENCODING == "raw" else decode_20d_to_env12)(a, False)
+            else:
+                if a.shape[-1] != 10:
+                    raise ValueError(
+                        f"expected the 10D fixed-base contract but the server returned "
+                        f"{a.shape[-1]}D; pass --use-base-action (and --base-encoding)."
+                    )
+                env_action = decode_10d_to_env12(a, False)
+
+            if local_memory_client is not None:
+                if a.shape[-1] != 15:
+                    raise ValueError("V3 online Local-TTT requires executed raw15 policy actions")
+                left = _upright(obs[f"{CAMS[0]}_image"]).copy()
+                wrist = _upright(obs[f"{CAMS[2]}_image"]).copy()
+                local_memory_client.record_executed(0, left, wrist, a)
+
+            obs, _, _, _ = env.step(env_action)
+            frames.append(compose(obs).astype(np.uint8))
+            if check_success(env):
+                streak += 1
+                if streak >= latch:
+                    success, done_steps = True, step + 1
+                    break
+            else:
+                streak = 0
+
+        if save_video is not None:
+            imageio.mimwrite(save_video, frames, fps=video_fps, macro_block_size=None)
+        if gen_video_path is not None and gen_frames:
+            imageio.mimwrite(gen_video_path, gen_frames, fps=video_fps, macro_block_size=None)
+        return success, done_steps, prompt
+    finally:
+        if local_memory_client is not None:
+            session_id = local_memory_client.end(0)
+            if session_id is not None:
+                try:
+                    reset_local_memory(server_url, session_id, timeout)
+                except Exception as cleanup_error:
+                    if sys.exc_info()[0] is None:
+                        raise
+                    print(
+                        f"[eval] WARNING: Local-TTT cleanup failed after rollout error: {cleanup_error}",
+                        flush=True,
+                    )
 
 def main() -> None:
     ap = argparse.ArgumentParser()
