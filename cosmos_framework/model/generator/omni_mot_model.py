@@ -3882,9 +3882,11 @@ class OmniMoTModel(ImaginaireModel):
         has_local_prefixes = _local_memory_prefixes is not None and any(
             token is not None for token in _local_memory_prefixes
         )
-        if _local_memory_prefixes is not None:
-            if not self.config.local_memory_enabled or len(_local_memory_prefixes) != gen_data_clean.batch_size:
-                raise ValueError("inference Local Memory requires enabled model and one prefix entry per sample")
+        if _local_memory_prefixes is not None and len(_local_memory_prefixes) != gen_data_clean.batch_size:
+            raise ValueError("inference Local Memory requires one prefix entry per sample")
+        if has_local_prefixes:
+            if not self.config.local_memory_enabled:
+                raise ValueError("inference Local Memory requires local_memory_enabled")
             from cosmos_framework.model.generator.mot.memory_prefix import attach_local_prefixes
 
             sequence_plans, gen_data_clean = attach_local_prefixes(
