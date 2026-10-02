@@ -411,7 +411,7 @@ def test_detached_inference_prefix_passes_local_guard() -> None:
         raise RuntimeError("passed-local-guard")
 
     holder = SimpleNamespace(
-        config=SimpleNamespace(local_memory_enabled=True, local_memory_k_local=4),
+        config=SimpleNamespace(local_memory_enabled=True, local_memory_k_local=4, local_memory_dim=32),
         training=False,
         parallel_dims=SimpleNamespace(cp_enabled=False),
         pad_for_cuda_graphs=False,
