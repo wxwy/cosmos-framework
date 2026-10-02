@@ -93,3 +93,23 @@ def test_off_mode_rejects_hidden_evidence() -> None:
         assert "off" in str(error)
     else:
         raise AssertionError("off mode must reject supplied Local-TTT evidence")
+
+
+def test_visual96_uses_four_frame_causal_endpoint_groups() -> None:
+    model = _FakeModel()
+    service = SimpleNamespace(model=model)
+    adapter = RoboCasaLocalMemoryPolicyAdapter(
+        service,
+        mode="required",
+        decode_image=lambda _: _frame(0),
+    )
+    left = tuple(_frame(index).permute(2, 0, 1) for index in range(16))
+    wrist = tuple(_frame(100 + index).permute(2, 0, 1) for index in range(16))
+    summary = adapter._visual96(left, wrist, tuple(range(16)))
+    assert summary.shape == (16, 96)
+    for start in (0, 4, 8, 12):
+        for index in range(start + 1, start + 4):
+            torch.testing.assert_close(summary[index], summary[start])
+        if start:
+            assert not torch.equal(summary[start], summary[start - 1])
+    assert model.encode_calls == 2
