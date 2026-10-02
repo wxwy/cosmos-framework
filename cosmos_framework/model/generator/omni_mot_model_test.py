@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 
 def test_reasoner_only_setup_skips_vision_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -71,3 +72,40 @@ def test_default_setup_loads_vision_tokenizer(monkeypatch: pytest.MonkeyPatch) -
 
     assert model.tokenizer_vision_gen is vision_tokenizer
     vision_tokenizer.reset_dtype.assert_called_once_with()
+
+
+def test_velocity_repack_preserves_local_memory_tokens() -> None:
+    from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
+    from cosmos_framework.model.generator.utils.data_and_condition import GenerationDataClean
+
+    local = torch.randn(4, 32)
+    clean = GenerationDataClean(
+        batch_size=1,
+        is_image_batch=False,
+        x0_tokens_vision=[torch.zeros(1, 1, 1, 1)],
+        x0_tokens_local_memory=[local],
+    )
+    captured = {}
+
+    def stop_at_pack(sequence_plans, text_tokens, repacked, *args, **kwargs):
+        captured["local"] = repacked.x0_tokens_local_memory
+        raise RuntimeError("captured-repack")
+
+    holder = SimpleNamespace(
+        config=SimpleNamespace(action_gen=False, sound_gen=False),
+        _pack_input_sequence=stop_at_pack,
+        _derive_include_end_of_generation_token=lambda: False,
+    )
+    plan = SimpleNamespace(has_action=False)
+    with pytest.raises(RuntimeError, match="captured-repack"):
+        OmniMoTModel._get_velocity(
+            holder,
+            noise_x=[torch.zeros(1)],
+            timestep=torch.tensor([[0.5]]),
+            text_tokens=[[1]],
+            sequence_plans=[plan],
+            gen_data_clean=clean,
+            has_noisy_actions=False,
+        )
+    assert captured["local"] is clean.x0_tokens_local_memory
+    torch.testing.assert_close(captured["local"][0], local)
