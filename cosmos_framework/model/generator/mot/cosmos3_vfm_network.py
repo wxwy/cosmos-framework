@@ -1509,18 +1509,16 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         local_tokens = packed_seq.local_memory_tokens
         has_local_tokens = local_tokens is not None and any(token is not None for token in local_tokens)
         if has_local_tokens:
-            if (
-                not self.config.local_memory_enabled
-                or not self.training
-                or not torch.is_grad_enabled()
-                or torch.is_inference_mode_enabled()
-                or memory is not None
-            ):
-                raise ValueError("Local Memory is limited to enabled native training without KV cache")
+            if not self.config.local_memory_enabled or memory is not None:
+                raise ValueError("Local Memory requires enabled model and no inference text-KV memory")
             if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
                 raise ValueError("Local Memory does not support context parallelism")
             if self.pad_for_cuda_graphs or self.flex_backend is not None or self.multiview_backend is not None:
                 raise ValueError("Local Memory does not support CUDA graphs or multiview")
+            if not self.training and any(
+                token is not None and token.requires_grad for token in local_tokens
+            ):
+                raise ValueError("inference Local Memory prefixes must be detached")
             if any(
                 token is not None and token.shape != (self.config.local_memory_k_local, self.config.local_memory_dim)
                 for token in local_tokens
