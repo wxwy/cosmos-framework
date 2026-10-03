@@ -10,8 +10,8 @@ import numpy as np
 
 from cosmos_framework.simulation.robocasa.eval_utils import b64_png
 
-_EVIDENCE_VERSION = "causal_visual96_executed_action15_v3"
-_EVIDENCE_FORMAT = "robocasa_left_wrist_raw15_v1"
+_EVIDENCE_VERSION = "current_frame_visual96_executed_action15_v4"
+_EVIDENCE_FORMAT = "robocasa_current_left_wrist_raw15_v2"
 
 
 @dataclass

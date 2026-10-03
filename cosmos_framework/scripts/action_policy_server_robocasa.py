@@ -1190,7 +1190,7 @@ class ActionModelService:
 
         local_update = None
         try:
-            # Serialize every operation that touches the model: causal VAE evidence
+            # Serialize every operation that touches the model: current-frame VAE evidence
             # encoding, model-owned Local scan, and diffusion generation.
             t_inf0 = time.monotonic()
             with self._lock:

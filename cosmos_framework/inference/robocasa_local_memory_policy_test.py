@@ -30,15 +30,15 @@ class _FakeModel(nn.Module):
 
         self.net.scan_local_memory = scan
         self.encode_calls = 0
+        self.encode_shapes: list[tuple[int, ...]] = []
 
     def _encode_vision_item(self, clip: torch.Tensor, *, num_views: int) -> torch.Tensor:
-        assert num_views == 1 and clip.shape[:2] == (1, 3)
+        assert num_views == 1
+        assert clip.ndim == 5 and clip.shape[1:3] == (3, 1)
         self.encode_calls += 1
-        n = (clip.shape[2] - 1) // 4 + 1
-        latent = torch.empty(1, 48, n, 16, 16, device=clip.device)
-        for index in range(n):
-            latent[:, :, index].fill_(float(index + 1))
-        return latent
+        self.encode_shapes.append(tuple(clip.shape))
+        values = clip[:, 0, 0, 0, 0].float()
+        return values[:, None, None, None, None].expand(-1, 48, 1, 16, 16).clone()
 
 
 def _frame(value: int) -> torch.Tensor:
@@ -68,10 +68,10 @@ def _payload(step: int, start: int, *, reset: bool = False) -> dict:
     }
 
 
-def test_required_mode_cold_start_then_one_prefix_encode_per_camera() -> None:
+def _adapter(count: int) -> tuple[_FakeModel, RoboCasaLocalMemoryPolicyAdapter, dict[str, torch.Tensor]]:
     model = _FakeModel()
-    images = {}
-    for index in range(16):
+    images: dict[str, torch.Tensor] = {}
+    for index in range(count):
         images[f"left-{index}"] = _frame(index)
         images[f"wrist-{index}"] = _frame(100 + index)
     service = SimpleNamespace(model=model)
@@ -80,6 +80,11 @@ def test_required_mode_cold_start_then_one_prefix_encode_per_camera() -> None:
         mode="required",
         decode_image=lambda key: images[key],
     )
+    return model, adapter, images
+
+
+def test_required_mode_cold_start_then_current_frame_batch_encode() -> None:
+    model, adapter, _ = _adapter(16)
 
     cold = adapter.prepare(_payload(0, 0, reset=True))
     assert adapter.prefixes(cold) == (None,)
@@ -88,59 +93,59 @@ def test_required_mode_cold_start_then_one_prefix_encode_per_camera() -> None:
     update = adapter.prepare(_payload(16, 0))
     prefix = adapter.prefixes(update)[0]
     assert prefix is not None and prefix.shape == (4, 32)
-    assert model.encode_calls == 2
+    assert model.encode_calls == 1
+    assert model.encode_shapes == [(32, 3, 1, 256, 256)]
     status = adapter.status(update)
     assert status["consumer_step"] == 16
     assert status["adapted_steps"] == 16
     assert status["fast_update_norm"] > 0
     adapter.commit(update)
-    assert len(adapter._visual_records["s"].left_frames) == 16
+    record = adapter._visual_records["s"]
+    assert record.last_source_steps == tuple(range(16))
+    assert record.last_visual_summary is not None and record.last_visual_summary.shape == (16, 96)
+    assert record.last_visual_digest is not None
+
+
+@pytest.mark.parametrize("count", [4, 8, 16])
+def test_replan_horizon_updates_only_completed_current_frames(count: int) -> None:
+    model, adapter, _ = _adapter(count)
+    cold = adapter.prepare(_payload(0, 0, reset=True))
+    adapter.commit(cold)
+
+    update = adapter.prepare(_payload(count, 0))
+    status = adapter.status(update)
+    assert status["consumer_step"] == count
+    assert status["adapted_steps"] == count
+    assert model.encode_shapes == [(2 * count, 3, 1, 256, 256)]
 
 
 def test_off_mode_rejects_hidden_evidence() -> None:
     service = SimpleNamespace(model=_FakeModel())
     adapter = RoboCasaLocalMemoryPolicyAdapter(service, mode="off", decode_image=lambda _: _frame(0))
     assert adapter.prepare({}) is None
-    try:
+    with pytest.raises(ValueError, match="off"):
         adapter.prepare(_payload(0, 0, reset=True))
-    except ValueError as error:
-        assert "off" in str(error)
-    else:
-        raise AssertionError("off mode must reject supplied Local-TTT evidence")
 
 
-def test_visual96_uses_four_frame_causal_endpoint_groups() -> None:
-    model = _FakeModel()
-    service = SimpleNamespace(model=model)
-    adapter = RoboCasaLocalMemoryPolicyAdapter(
-        service,
-        mode="required",
-        decode_image=lambda _: _frame(0),
-    )
-    left = tuple(_frame(index) for index in range(16))
-    wrist = tuple(_frame(100 + index) for index in range(16))
-    summary = adapter._visual96(left, wrist, tuple(range(16)))
-    assert summary.shape == (16, 96)
-    for start in (0, 4, 8, 12):
-        for index in range(start + 1, start + 4):
-            torch.testing.assert_close(summary[index], summary[start])
-        if start:
-            assert not torch.equal(summary[start], summary[start - 1])
-    assert model.encode_calls == 2
+def test_visual96_rows_depend_only_on_their_current_frames() -> None:
+    model, adapter, _ = _adapter(4)
+    left = tuple(_frame(index) for index in range(4))
+    wrist = tuple(_frame(100 + index) for index in range(4))
+
+    first = adapter._visual96_current_frames(left, wrist)
+    changed_left = list(left)
+    changed_left[2] = _frame(42)
+    second = adapter._visual96_current_frames(tuple(changed_left), wrist)
+
+    assert first.shape == second.shape == (4, 96)
+    assert model.encode_shapes == [(8, 3, 1, 256, 256), (8, 3, 1, 256, 256)]
+    torch.testing.assert_close(first[:2], second[:2])
+    assert not torch.equal(first[2], second[2])
+    torch.testing.assert_close(first[3:], second[3:])
 
 
 def test_committed_evidence_retry_is_idempotent_and_changed_retry_fails() -> None:
-    model = _FakeModel()
-    images = {}
-    for index in range(16):
-        images[f"left-{index}"] = _frame(index)
-        images[f"wrist-{index}"] = _frame(100 + index)
-    service = SimpleNamespace(model=model)
-    adapter = RoboCasaLocalMemoryPolicyAdapter(
-        service,
-        mode="required",
-        decode_image=lambda key: images[key],
-    )
+    model, adapter, images = _adapter(16)
 
     cold = adapter.prepare(_payload(0, 0, reset=True))
     adapter.commit(cold)
@@ -159,7 +164,15 @@ def test_committed_evidence_retry_is_idempotent_and_changed_retry_fails() -> Non
     assert model.encode_calls == encode_calls_after_commit
     adapter.commit(replay)
 
-    changed = _payload(16, 0)
-    changed["local_memory"]["evidence"][-1]["executed_action"][0] += 1.0
+    changed_action = _payload(16, 0)
+    changed_action["local_memory"]["evidence"][-1]["executed_action"][0] += 1.0
     with pytest.raises(ValueError, match="replay action evidence changed"):
-        adapter.prepare(changed)
+        adapter.prepare(changed_action)
+    assert model.encode_calls == encode_calls_after_commit
+
+    images["left-changed"] = _frame(77)
+    changed_visual = _payload(16, 0)
+    changed_visual["local_memory"]["evidence"][-1]["left_image"] = "left-changed"
+    with pytest.raises(ValueError, match="replay visual evidence changed"):
+        adapter.prepare(changed_visual)
+    assert model.encode_calls == encode_calls_after_commit
