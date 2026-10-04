@@ -18,8 +18,8 @@ from cosmos_framework.inference.robocasa_causal_evidence import (
 )
 from cosmos_framework.simulation.robocasa.local_memory_protocol import (
     EVIDENCE_ACTION_DIM,
-    EVIDENCE_FORMAT,
-    EVIDENCE_VERSION,
+    EVIDENCE_FORMAT as WIRE_EVIDENCE_FORMAT,
+    EVIDENCE_VERSION as WIRE_EVIDENCE_VERSION,
 )
 
 LocalMemoryMode = Literal["off", "required"]
@@ -46,8 +46,8 @@ class _PreparedUpdate:
 class RoboCasaLocalMemoryPolicyAdapter:
     """Bridge completed RoboCasa evidence to the frozen V3 B1 Local-TTT ABI."""
 
-    EVIDENCE_VERSION = EVIDENCE_VERSION
-    EVIDENCE_FORMAT = EVIDENCE_FORMAT
+    EVIDENCE_VERSION = WIRE_EVIDENCE_VERSION
+    EVIDENCE_FORMAT = WIRE_EVIDENCE_FORMAT
 
     def __init__(
         self,
