@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cosmos_framework.simulation.robocasa.closed_loop_eval import validate_local_memory_eval_contract
+from cosmos_framework.simulation.robocasa.local_memory_protocol import validate_local_memory_eval_contract
 
 
 @pytest.mark.parametrize("action_horizon", [1, 4, 8, 16])
