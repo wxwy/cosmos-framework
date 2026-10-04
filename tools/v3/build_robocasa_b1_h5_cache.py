@@ -43,11 +43,12 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-LEFT_CAMERA = "observation.images.robot0_agentview_left"
-WRIST_CAMERA = "observation.images.robot0_eye_in_hand"
-CAMERAS = (LEFT_CAMERA, WRIST_CAMERA)
-TEMPORAL_COMPRESSION_FACTOR = 4
-SOURCE_FRAME_TO_LATENT_POLICY = "causal_endpoint"
+from cosmos_framework.model.generator.mot.robocasa_latent_evidence import (
+    CAMERAS,
+    SOURCE_FRAME_TO_LATENT_POLICY,
+    TEMPORAL_COMPRESSION_FACTOR,
+    endpoint_vector,
+)
 
 # Frozen Stage-A loader contract; identical to the Route-B Stage-2 acceptance.
 
@@ -84,16 +85,6 @@ class EpisodeSpec:
     def full_id(self) -> str:
         """Globally-unique identity: episode_index is shard-local, task/date disambiguate."""
         return f"{self.task}/{self.date}/ep_{self.episode_index:06d}"
-
-
-def endpoint_vector(frame_count: int) -> list[int]:
-    """0,4,8,... plus a terminal `frame_count - 1` when the grid misses it."""
-    if not isinstance(frame_count, int) or isinstance(frame_count, bool) or frame_count <= 0:
-        raise ValueError(f"frame_count must be a positive int, got {frame_count!r}")
-    endpoints = list(range(0, frame_count, TEMPORAL_COMPRESSION_FACTOR))
-    if endpoints[-1] != frame_count - 1:
-        endpoints.append(frame_count - 1)
-    return endpoints
 
 
 def episode_output_path(output_root: Path, task: str, date: str, episode_index: int) -> Path:
@@ -224,7 +215,7 @@ def encode_episode(vae: object, frames_uint8: torch.Tensor, device: torch.device
     if frames_uint8.ndim != 4 or frames_uint8.dtype != torch.uint8:
         raise ValueError("frames_uint8 must be uint8 [F, 3, H, W]")
     frame_count = int(frames_uint8.shape[0])
-    endpoints = endpoint_vector(frame_count)
+    endpoints = list(endpoint_vector(frame_count))
     x = frames_uint8.permute(1, 0, 2, 3).unsqueeze(0).to(device)  # [1,3,F,H,W]
     x = x.to(torch.float32).div_(127.5).sub_(1.0)
     if (frame_count - 1) % TEMPORAL_COMPRESSION_FACTOR != 0:
@@ -260,7 +251,7 @@ def write_episode_h5(
     """Atomic write: temp -> validate -> rename."""
     if set(latents) != set(CAMERAS) or set(endpoints) != set(CAMERAS):
         raise ValueError("both cameras must provide latents/endpoints")
-    canonical = endpoint_vector(frame_count)
+    canonical = list(endpoint_vector(frame_count))
     for cam in CAMERAS:
         if endpoints[cam] != canonical:
             raise ValueError(f"{cam} endpoints differ from canonical 4-grid+terminal")
@@ -306,7 +297,7 @@ def verify_episode_h5(path: Path, *, episode_id: str, frame_count: int) -> None:
         expected_episode_id=episode_id,
         expected_source_frames=frame_count,
     )
-    expected = endpoint_vector(frame_count)
+    expected = list(endpoint_vector(frame_count))
     if tuple(reader.endpoint_indices) != tuple(expected):
         raise ValueError(f"reader endpoint mismatch: {path}")
     if reader._summaries.shape != (len(expected), 96):
