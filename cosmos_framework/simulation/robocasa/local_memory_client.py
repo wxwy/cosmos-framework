@@ -10,7 +10,7 @@ import numpy as np
 
 from cosmos_framework.simulation.robocasa.eval_utils import b64_png
 
-from cosmos_framework.simulation.robocasa.local_memory_protocol import (
+from cosmos_framework.inference.robocasa_local_memory_contract import (
     CAMERA_HEIGHT,
     CAMERA_WIDTH,
     EVIDENCE_ACTION_DIM,
