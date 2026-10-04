@@ -16,7 +16,7 @@ from cosmos_framework.model.generator.mot.robocasa_latent_evidence import (
     latent_to_visual96,
     stream_endpoint_step,
 )
-from cosmos_framework.simulation.robocasa.local_memory_protocol import CAMERA_HEIGHT, CAMERA_WIDTH
+from cosmos_framework.inference.robocasa_local_memory_contract import CAMERA_HEIGHT, CAMERA_WIDTH
 
 
 @dataclass(frozen=True)
