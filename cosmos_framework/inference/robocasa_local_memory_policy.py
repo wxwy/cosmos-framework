@@ -16,7 +16,7 @@ from cosmos_framework.inference.robocasa_causal_evidence import (
     completed_visual_digest,
     validate_b1_rgb_frame,
 )
-from cosmos_framework.simulation.robocasa.local_memory_protocol import (
+from cosmos_framework.inference.robocasa_local_memory_contract import (
     EVIDENCE_ACTION_DIM,
     EVIDENCE_FORMAT as WIRE_EVIDENCE_FORMAT,
     EVIDENCE_VERSION as WIRE_EVIDENCE_VERSION,
