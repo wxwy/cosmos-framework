@@ -49,6 +49,7 @@ from cosmos_framework.model.generator.mot.robocasa_latent_evidence import (
     TEMPORAL_COMPRESSION_FACTOR,
     endpoint_vector,
 )
+from cosmos_framework.model.generator.vision_encoder import normalize_uint8_item
 
 # Frozen Stage-A loader contract; identical to the Route-B Stage-2 acceptance.
 
@@ -216,8 +217,8 @@ def encode_episode(vae: object, frames_uint8: torch.Tensor, device: torch.device
         raise ValueError("frames_uint8 must be uint8 [F, 3, H, W]")
     frame_count = int(frames_uint8.shape[0])
     endpoints = list(endpoint_vector(frame_count))
-    x = frames_uint8.permute(1, 0, 2, 3).unsqueeze(0).to(device)  # [1,3,F,H,W]
-    x = x.to(torch.float32).div_(127.5).sub_(1.0)
+    x = frames_uint8.permute(1, 0, 2, 3).unsqueeze(0)  # [1,3,F,H,W]
+    x = normalize_uint8_item(x, {"device": device, "dtype": torch.float32})
     if (frame_count - 1) % TEMPORAL_COMPRESSION_FACTOR != 0:
         padded = TEMPORAL_COMPRESSION_FACTOR * ((frame_count - 1) // TEMPORAL_COMPRESSION_FACTOR + 1) + 1
         x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, padded - frame_count))
