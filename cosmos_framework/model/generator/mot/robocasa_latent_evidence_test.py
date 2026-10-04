@@ -10,14 +10,14 @@ from cosmos_framework.model.generator.mot.robocasa_latent_evidence import (
     WRIST_CAMERA,
     RoboCasaLatentReader,
     causal_endpoint_index,
+    endpoint_vector,
     latent_to_visual96,
+    stream_endpoint_step,
 )
 
 
 def write_cache(path, frames=67, episode_id="CloseFridge/shard0/episode0"):
-    indices = np.arange(0, frames, 4, dtype=np.int64)
-    if indices[-1] != frames - 1:
-        indices = np.append(indices, frames - 1)
+    indices = np.asarray(endpoint_vector(frames), dtype=np.int64)
     with h5py.File(path, "w") as cache:
         cache.attrs["episode_id"] = episode_id
         cache.attrs["frame_count"] = frames
@@ -40,6 +40,28 @@ def read_cache(path, frames=67, episode_id="CloseFridge/shard0/episode0"):
         expected_episode_id=episode_id,
         expected_source_frames=frames,
     )
+
+
+@pytest.mark.parametrize(
+    ("frames", "expected"),
+    [
+        (1, (0,)),
+        (5, (0, 4)),
+        (6, (0, 4, 5)),
+        (11, (0, 4, 8, 10)),
+    ],
+)
+def test_endpoint_vector_is_single_offline_b1_authority(frames, expected):
+    assert endpoint_vector(frames) == expected
+
+
+@pytest.mark.parametrize(
+    ("source_step", "endpoint"),
+    [(0, 0), (1, 0), (3, 0), (4, 4), (7, 4), (8, 8), (15, 12), (16, 16)],
+)
+def test_stream_endpoint_has_no_terminal_tail(source_step, endpoint):
+    assert stream_endpoint_step(source_step) == endpoint
+
 
 
 @pytest.mark.parametrize(
