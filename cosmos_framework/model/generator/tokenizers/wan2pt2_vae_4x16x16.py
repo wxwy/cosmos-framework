@@ -3,6 +3,7 @@
 
 import os
 import time
+from dataclasses import dataclass
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Literal
@@ -24,6 +25,18 @@ from cosmos_framework.utils.generator.data_utils import get_vision_data_resoluti
 
 # For sequential decoding, CACHE_T is the number of frames to cache.
 CACHE_T = 2
+
+
+@dataclass(frozen=True)
+class WanEncoderStreamState:
+    """Immutable handle to one causal encoder frontier.
+
+    The encoder shallow-copies its cache list and publishes replacement cache tensors,
+    so an already-published state can be restored after a speculative encode.
+    """
+
+    cache: tuple[torch.Tensor | None, ...]
+    stream_shape: tuple[int, int, int, torch.device, torch.dtype] | None
 
 
 def _contiguous_clone(t: torch.Tensor, memory_format: torch.memory_format = torch.contiguous_format) -> torch.Tensor:
@@ -797,6 +810,23 @@ class WanVAE_(nn.Module):
         """Fresh per-layer cache for the decoder (one slot per CausalConv3d)."""
         return [None] * self._dec_conv_num
 
+    def new_encoder_stream_state(self) -> WanEncoderStreamState:
+        """Create a fresh causal encoder frontier without mutating live state."""
+        return WanEncoderStreamState(tuple(self._new_enc_cache()), None)
+
+    def snapshot_encoder_stream_state(self) -> WanEncoderStreamState:
+        """Snapshot the current causal encoder frontier for a transactional caller."""
+        return WanEncoderStreamState(tuple(self._enc_cache), self._enc_stream_shape)
+
+    def restore_encoder_stream_state(self, state: WanEncoderStreamState) -> None:
+        """Restore a previously captured causal encoder frontier."""
+        if not isinstance(state, WanEncoderStreamState) or len(state.cache) != self._enc_conv_num:
+            raise ValueError("invalid Wan encoder stream state")
+        if state.stream_shape is None and any(value is not None for value in state.cache):
+            raise ValueError("fresh Wan encoder stream state must have an empty cache")
+        self._enc_cache = list(state.cache)
+        self._enc_stream_shape = state.stream_shape
+
     def forward(self, x, scale):
         mu = self.encode(x, scale)
         x_recon = self.decode(mu, scale, clear_decoder_cache=True)
@@ -1337,6 +1367,15 @@ class WanVAE:
     def clear_encoder_cache(self) -> None:
         """Clear retained causal encoder state."""
         self.model.clear_encoder_cache()
+
+    def new_encoder_stream_state(self) -> WanEncoderStreamState:
+        return self.model.new_encoder_stream_state()
+
+    def snapshot_encoder_stream_state(self) -> WanEncoderStreamState:
+        return self.model.snapshot_encoder_stream_state()
+
+    def restore_encoder_stream_state(self, state: WanEncoderStreamState) -> None:
+        self.model.restore_encoder_stream_state(state)
 
     @torch.no_grad()
     def decode(self, zs: torch.Tensor, clear_decoder_cache: bool = True) -> torch.Tensor:
