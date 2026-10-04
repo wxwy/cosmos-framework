@@ -519,7 +519,7 @@ class ActionServerArgs(pydantic.BaseModel):
     # ----- online Local-TTT ---------------------------------------------------
     local_memory_mode: Literal["off", "required"] = "off"
     """Online V3 Local-TTT mode. Formal Local-TTT evaluation must use ``required``."""
-    local_memory_max_sessions: int = 64
+    local_memory_max_sessions: int = 1
     """Maximum concurrent online Local-TTT episode sessions."""
 
     # ----- prompt format ------------------------------------------------------
@@ -1190,8 +1190,8 @@ class ActionModelService:
 
         local_update = None
         try:
-            # Serialize every operation that touches the model: current-frame VAE evidence
-            # encoding, model-owned Local scan, and diffusion generation.
+            # Serialize every operation that touches the model: transactional B1 causal
+            # evidence streaming, model-owned Local scan, and diffusion generation.
             t_inf0 = time.monotonic()
             with self._lock:
                 local_update = self.local_memory_adapter.prepare(req)
