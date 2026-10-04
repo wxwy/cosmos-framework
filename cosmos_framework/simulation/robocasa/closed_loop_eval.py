@@ -329,6 +329,29 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                         flush=True,
                     )
 
+
+def validate_local_memory_eval_contract(
+    *,
+    local_memory_mode: str,
+    camera_set: str,
+    use_base_action: bool,
+    base_encoding: str,
+    use_state: bool,
+    action_horizon: int,
+) -> None:
+    """Fail closed on the V3 RoboCasa Local-TTT evaluator/checkpoint ABI."""
+    if local_memory_mode != "required":
+        return
+    if camera_set != "left_wrist":
+        raise ValueError("V3 Local-TTT requires --camera-set left_wrist")
+    if not use_base_action or base_encoding != "raw":
+        raise ValueError("V3 Local-TTT requires --use-base-action --base-encoding raw")
+    if not use_state:
+        raise ValueError("V3 Local-TTT formal checkpoint requires --use-state")
+    if type(action_horizon) is not int or not 1 <= action_horizon <= 16:
+        raise ValueError("V3 Local-TTT requires 1 <= --action-horizon <= 16 (Local TBPTT T=16)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server-url", default="http://127.0.0.1:8912")
@@ -368,15 +391,14 @@ def main() -> None:
     CAMERA_SET = args.camera_set
     USE_BASE_ACTION = args.use_base_action
     BASE_ENCODING = args.base_encoding
-    if args.local_memory_mode == "required":
-        if args.camera_set != "left_wrist":
-            raise ValueError("V3 Local-TTT requires --camera-set left_wrist")
-        if not args.use_base_action or args.base_encoding != "raw":
-            raise ValueError("V3 Local-TTT requires --use-base-action --base-encoding raw")
-        if not args.use_state:
-            raise ValueError("V3 Local-TTT formal checkpoint requires --use-state")
-        if args.action_horizon != 16:
-            raise ValueError("V3 Local-TTT requires --action-horizon 16 to match T=16")
+    validate_local_memory_eval_contract(
+        local_memory_mode=args.local_memory_mode,
+        camera_set=args.camera_set,
+        use_base_action=args.use_base_action,
+        base_encoding=args.base_encoding,
+        use_state=args.use_state,
+        action_horizon=args.action_horizon,
+    )
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
