@@ -11,6 +11,8 @@ import numpy as np
 from cosmos_framework.simulation.robocasa.eval_utils import b64_png
 
 from cosmos_framework.simulation.robocasa.local_memory_protocol import (
+    CAMERA_HEIGHT,
+    CAMERA_WIDTH,
     EVIDENCE_ACTION_DIM,
     EVIDENCE_FORMAT,
     EVIDENCE_VERSION,
@@ -60,8 +62,10 @@ class RoboCasaLocalMemoryClient:
     @staticmethod
     def _image(value: np.ndarray, name: str) -> np.ndarray:
         image = np.asarray(value)
-        if image.shape != (256, 256, 3) or image.dtype != np.uint8:
-            raise ValueError(f"{name} must be uint8 [256,256,3], got {image.shape} {image.dtype}")
+        if image.shape != (CAMERA_HEIGHT, CAMERA_WIDTH, 3) or image.dtype != np.uint8:
+            raise ValueError(
+                f"{name} must be uint8 [{CAMERA_HEIGHT},{CAMERA_WIDTH},3], got {image.shape} {image.dtype}"
+            )
         return np.ascontiguousarray(image)
 
     def record_executed(
