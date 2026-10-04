@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -14,6 +13,13 @@ from cosmos_framework.inference.local_memory_online import OnlineLocalMemory, On
 from cosmos_framework.inference.robocasa_causal_evidence import (
     RoboCasaCausalEvidenceStream,
     RoboCasaVisualStreamState,
+    completed_visual_digest,
+    validate_b1_rgb_frame,
+)
+from cosmos_framework.simulation.robocasa.local_memory_protocol import (
+    EVIDENCE_ACTION_DIM,
+    EVIDENCE_FORMAT,
+    EVIDENCE_VERSION,
 )
 
 LocalMemoryMode = Literal["off", "required"]
@@ -40,8 +46,8 @@ class _PreparedUpdate:
 class RoboCasaLocalMemoryPolicyAdapter:
     """Bridge completed RoboCasa evidence to the frozen V3 B1 Local-TTT ABI."""
 
-    EVIDENCE_VERSION = "b1_causal_endpoint_visual96_executed_action15_v4"
-    EVIDENCE_FORMAT = "robocasa_dual_camera_rgb_raw15_v2"
+    EVIDENCE_VERSION = EVIDENCE_VERSION
+    EVIDENCE_FORMAT = EVIDENCE_FORMAT
 
     def __init__(
         self,
@@ -66,7 +72,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
             runtime = getattr(getattr(service.model, "net", None), "local_memory_runtime", None)
             if runtime is None:
                 raise ValueError("required Local-TTT checkpoint has no net.local_memory_runtime")
-            if runtime.encoder.action_proj.in_features != 15:
+            if runtime.encoder.action_proj.in_features != EVIDENCE_ACTION_DIM:
                 raise ValueError("V3 RoboCasa online Local-TTT requires raw15 evidence")
             if runtime.core.ttt_tbptt_steps != 16 or runtime.core.k_local != 4 or runtime.core.local_dim != 32:
                 raise ValueError("V3 RoboCasa Local-TTT runtime contract drift")
@@ -85,30 +91,6 @@ class RoboCasaLocalMemoryPolicyAdapter:
                 max_evidence_steps=max_evidence_steps,
             )
             self.visual_stream = RoboCasaCausalEvidenceStream(service.model)
-
-    @staticmethod
-    def _validate_frame(frame: torch.Tensor, name: str) -> torch.Tensor:
-        value = frame.detach().to("cpu").contiguous()
-        if value.ndim != 3 or value.shape[0] != 3 or value.dtype != torch.uint8:
-            raise ValueError(f"{name} must decode to uint8 [3,H,W]")
-        if value.shape[-2:] != (256, 256):
-            raise ValueError(f"{name} must match training B1 camera size 256x256, got {tuple(value.shape[-2:])}")
-        return value.clone()
-
-    @staticmethod
-    def _visual_digest(
-        source_steps: tuple[int, ...],
-        left_frames: tuple[torch.Tensor, ...],
-        wrist_frames: tuple[torch.Tensor, ...],
-    ) -> str:
-        if len(source_steps) != len(left_frames) or len(source_steps) != len(wrist_frames):
-            raise ValueError("Local-TTT visual evidence lengths must match")
-        digest = hashlib.sha256()
-        for step, left, wrist in zip(source_steps, left_frames, wrist_frames, strict=True):
-            digest.update(f"{step}:".encode("ascii"))
-            digest.update(left.numpy().tobytes(order="C"))
-            digest.update(wrist.numpy().tobytes(order="C"))
-        return digest.hexdigest()
 
     def _parse(self, req: dict[str, Any]) -> tuple[OnlineMemoryRequest, _VisualRecord | None, _VisualRecord]:
         if self.memory is None or self.visual_stream is None:
@@ -141,7 +123,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
                 0,
                 (),
                 torch.empty(0, 96),
-                torch.empty(0, 15),
+                torch.empty(0, EVIDENCE_ACTION_DIM),
                 True,
             )
             return request, previous, replacement
@@ -159,14 +141,14 @@ class RoboCasaLocalMemoryPolicyAdapter:
             for expected, row in zip(expected_steps, rows, strict=True):
                 if not isinstance(row, dict) or row.get("source_step") != expected:
                     raise ValueError("Local-TTT replay source steps changed")
-                replay_left.append(self._validate_frame(self.decode_image(row.get("left_image")), "left_image"))
-                replay_wrist.append(self._validate_frame(self.decode_image(row.get("wrist_image")), "wrist_image"))
+                replay_left.append(validate_b1_rgb_frame(self.decode_image(row.get("left_image")), "left_image"))
+                replay_wrist.append(validate_b1_rgb_frame(self.decode_image(row.get("wrist_image")), "wrist_image"))
                 action = torch.as_tensor(row.get("executed_action"), dtype=torch.float32).flatten()
-                if tuple(action.shape) != (15,) or not torch.isfinite(action).all():
+                if tuple(action.shape) != (EVIDENCE_ACTION_DIM,) or not torch.isfinite(action).all():
                     raise ValueError("Local-TTT replay executed_action must be finite raw15")
                 replay_actions.append(action)
             action_tensor = torch.stack(replay_actions)
-            visual_digest = self._visual_digest(expected_steps, tuple(replay_left), tuple(replay_wrist))
+            visual_digest = completed_visual_digest(expected_steps, tuple(replay_left), tuple(replay_wrist))
             if previous.last_visual_digest is None or visual_digest != previous.last_visual_digest:
                 raise ValueError("Local-TTT replay visual evidence changed after commit")
             if previous.last_executed_action is None or not torch.equal(action_tensor, previous.last_executed_action):
@@ -191,10 +173,10 @@ class RoboCasaLocalMemoryPolicyAdapter:
         for expected, row in zip(expected_steps, rows, strict=True):
             if not isinstance(row, dict) or row.get("source_step") != expected:
                 raise ValueError("Local-TTT source steps must be contiguous and exactly-once")
-            left.append(self._validate_frame(self.decode_image(row.get("left_image")), "left_image"))
-            wrist.append(self._validate_frame(self.decode_image(row.get("wrist_image")), "wrist_image"))
+            left.append(validate_b1_rgb_frame(self.decode_image(row.get("left_image")), "left_image"))
+            wrist.append(validate_b1_rgb_frame(self.decode_image(row.get("wrist_image")), "wrist_image"))
             action = torch.as_tensor(row.get("executed_action"), dtype=torch.float32).flatten()
-            if tuple(action.shape) != (15,) or not torch.isfinite(action).all():
+            if tuple(action.shape) != (EVIDENCE_ACTION_DIM,) or not torch.isfinite(action).all():
                 raise ValueError("Local-TTT executed_action must be finite raw15")
             actions.append(action)
             actual_steps.append(expected)
@@ -207,7 +189,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
             left_frames,
             wrist_frames,
         )
-        action_tensor = torch.stack(actions) if actions else torch.empty(0, 15)
+        action_tensor = torch.stack(actions) if actions else torch.empty(0, EVIDENCE_ACTION_DIM)
         replacement = _VisualRecord(
             episode_id,
             consumer_step,
@@ -215,7 +197,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
             source_steps,
             visual.detach().clone(),
             action_tensor.detach().clone(),
-            self._visual_digest(source_steps, left_frames, wrist_frames),
+            completed_visual_digest(source_steps, left_frames, wrist_frames),
         )
         request = OnlineMemoryRequest(
             session_id,
