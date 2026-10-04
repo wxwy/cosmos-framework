@@ -431,17 +431,59 @@ def main() -> None:
 
     # Official protocol: rollouts in freshly sampled held-out scenes.
     for t in range(args.num_test_episodes):
+        prediction_records: list[dict[str, object]] = []
+
+        def record_prediction(result: dict, latency_ms: float) -> None:
+            status = result.get("local_memory") if isinstance(result, dict) else None
+            row: dict[str, object] = {"latency_ms": float(latency_ms)}
+            if isinstance(status, dict):
+                for key in (
+                    "consumer_step",
+                    "prefix_present",
+                    "replay",
+                    "adapted_steps",
+                    "fast_state_norm",
+                    "fast_update_norm",
+                    "inner_loss_mean",
+                    "visual_endpoint_step",
+                    "visual_tail_frames",
+                ):
+                    if key in status:
+                        row[key] = status[key]
+            prediction_records.append(row)
+
         pol_ok, pol_steps, prompt = run_policy(
             env, server_url=args.server_url,
             image_size=args.image_size, action_horizon=args.action_horizon,
             max_steps=eff_max_steps, latch=args.success_latch,
             timeout=args.timeout, use_state=args.use_state,
             local_memory_client=local_memory_client,
+            on_prediction=record_prediction,
             save_png=str(out / f"rollout{t:02d}_init.png"),
             save_video=str(out / f"rollout{t:02d}.mp4"),
             gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if args.save_gen_video else None)
         print(f"[eval] rollout {t:02d} success={pol_ok} steps={pol_steps} prompt={prompt!r}", flush=True)
-        results.append({"ep": t, "policy": pol_ok, "steps": pol_steps, "prompt": prompt})
+        local_rows = [row for row in prediction_records if "consumer_step" in row]
+        results.append(
+            {
+                "ep": t,
+                "policy": pol_ok,
+                "steps": pol_steps,
+                "prompt": prompt,
+                "replans": len(prediction_records),
+                "prediction_latency_ms_mean": (
+                    float(sum(float(row["latency_ms"]) for row in prediction_records) / len(prediction_records))
+                    if prediction_records
+                    else None
+                ),
+                "post_cold_prefix_all": (
+                    all(bool(row.get("prefix_present")) for row in local_rows[1:])
+                    if len(local_rows) > 1
+                    else None
+                ),
+                "local_memory_predictions": prediction_records,
+            }
+        )
 
     env.close()
     n_ok = sum(1 for r in results if r["policy"])
