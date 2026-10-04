@@ -11,7 +11,10 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from cosmos_framework.inference.local_memory_online import OnlineLocalMemory, OnlineMemoryRequest, OnlineMemoryUpdate
-from cosmos_framework.model.generator.mot.robocasa_latent_evidence import latent_to_visual96
+from cosmos_framework.inference.robocasa_causal_evidence import (
+    RoboCasaCausalEvidenceStream,
+    RoboCasaVisualStreamState,
+)
 
 LocalMemoryMode = Literal["off", "required"]
 
@@ -20,6 +23,7 @@ LocalMemoryMode = Literal["off", "required"]
 class _VisualRecord:
     episode_id: str
     consumer_step: int
+    stream_state: RoboCasaVisualStreamState
     last_source_steps: tuple[int, ...] = ()
     last_visual_summary: torch.Tensor | None = None
     last_executed_action: torch.Tensor | None = None
@@ -34,10 +38,10 @@ class _PreparedUpdate:
 
 
 class RoboCasaLocalMemoryPolicyAdapter:
-    """Bridge HTTP completed evidence to canonical V3 Local-TTT prefixes."""
+    """Bridge completed RoboCasa evidence to the frozen V3 B1 Local-TTT ABI."""
 
-    EVIDENCE_VERSION = "current_frame_visual96_executed_action15_v4"
-    EVIDENCE_FORMAT = "robocasa_current_left_wrist_raw15_v2"
+    EVIDENCE_VERSION = "b1_causal_endpoint_visual96_executed_action15_v4"
+    EVIDENCE_FORMAT = "robocasa_dual_camera_rgb_raw15_v2"
 
     def __init__(
         self,
@@ -45,7 +49,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
         *,
         mode: LocalMemoryMode,
         decode_image: Callable[[str], torch.Tensor],
-        max_sessions: int = 64,
+        max_sessions: int = 1,
         max_evidence_steps: int = 256,
     ) -> None:
         if mode not in ("off", "required"):
@@ -57,6 +61,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
         self._visual_pending: dict[str, _PreparedUpdate] = {}
         self._lock = threading.RLock()
         self.memory: OnlineLocalMemory | None = None
+        self.visual_stream: RoboCasaCausalEvidenceStream | None = None
         if mode == "required":
             runtime = getattr(getattr(service.model, "net", None), "local_memory_runtime", None)
             if runtime is None:
@@ -79,6 +84,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
                 max_sessions=max_sessions,
                 max_evidence_steps=max_evidence_steps,
             )
+            self.visual_stream = RoboCasaCausalEvidenceStream(service.model)
 
     @staticmethod
     def _validate_frame(frame: torch.Tensor, name: str) -> torch.Tensor:
@@ -86,7 +92,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
         if value.ndim != 3 or value.shape[0] != 3 or value.dtype != torch.uint8:
             raise ValueError(f"{name} must decode to uint8 [3,H,W]")
         if value.shape[-2:] != (256, 256):
-            raise ValueError(f"{name} must match training cache camera size 256x256, got {tuple(value.shape[-2:])}")
+            raise ValueError(f"{name} must match training B1 camera size 256x256, got {tuple(value.shape[-2:])}")
         return value.clone()
 
     @staticmethod
@@ -104,49 +110,8 @@ class RoboCasaLocalMemoryPolicyAdapter:
             digest.update(wrist.numpy().tobytes(order="C"))
         return digest.hexdigest()
 
-    def _visual96_current_frames(
-        self,
-        left_frames: tuple[torch.Tensor, ...],
-        wrist_frames: tuple[torch.Tensor, ...],
-    ) -> torch.Tensor:
-        """Encode completed evidence as independent current-frame observations.
-
-        The model _encode_vision_item method is the single VAE preprocessing/encoding
-        authority shared with normal policy training/inference. Local-TTT must not
-        reconstruct training-only future latent labels or re-encode an episode prefix.
-        Each completed step contributes exactly its pre-action current frame.
-
-        All current frames are batched on B with temporal length T=1, so the VAE work
-        stays bounded by the replan horizon (4/8/16 in evaluation), not episode length.
-        """
-        if len(left_frames) != len(wrist_frames):
-            raise ValueError("left/wrist Local-TTT evidence lengths must match")
-        count = len(left_frames)
-        if count == 0:
-            return torch.empty(0, 96, dtype=torch.float32)
-
-        # [2N,3,1,256,256]: left rows followed by wrist rows. T is deliberately
-        # one; batching is across independent observations, never across time.
-        pixel_batch = torch.stack((*left_frames, *wrist_frames), dim=0).unsqueeze(2)
-        device = next(self.service.model.parameters()).device
-        with torch.inference_mode():
-            latent = self.service.model._encode_vision_item(pixel_batch.to(device), num_views=1)
-        expected_shape = (2 * count, 48, 1, 16, 16)
-        if tuple(latent.shape) != expected_shape:
-            raise ValueError(
-                f"current-frame VAE shape mismatch: got {tuple(latent.shape)}, expected {expected_shape}"
-            )
-        if not torch.isfinite(latent).all():
-            raise FloatingPointError("current-frame VAE produced invalid RoboCasa latent")
-
-        current = latent[:, :, 0].detach().to(device="cpu", dtype=torch.float16).contiguous()
-        left_latent, wrist_latent = current[:count], current[count:]
-        return torch.stack(
-            [latent_to_visual96(left, wrist) for left, wrist in zip(left_latent, wrist_latent, strict=True)]
-        )
-
     def _parse(self, req: dict[str, Any]) -> tuple[OnlineMemoryRequest, _VisualRecord | None, _VisualRecord]:
-        if self.memory is None:
+        if self.memory is None or self.visual_stream is None:
             raise RuntimeError("Local-TTT adapter is disabled")
         payload = req.get("local_memory")
         if not isinstance(payload, dict):
@@ -169,7 +134,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
         if reset or previous is None:
             if consumer_step != 0 or rows:
                 raise ValueError("fresh Local-TTT episode must start at consumer_step=0 with no evidence")
-            replacement = _VisualRecord(episode_id, 0)
+            replacement = _VisualRecord(episode_id, 0, self.visual_stream.fresh())
             request = OnlineMemoryRequest(
                 session_id,
                 episode_id,
@@ -184,18 +149,13 @@ class RoboCasaLocalMemoryPolicyAdapter:
         if previous.episode_id != episode_id:
             raise ValueError("Local-TTT episode changed without reset")
 
-        # A response may be lost after the server has already committed the
-        # staged fast-state update. In that case the client retries the exact
-        # same completed-evidence frontier. Preserve exactly-once semantics by
-        # admitting only a byte-equivalent replay of the last committed batch;
-        # changed or partial retries remain fail-closed.
+        # Lost-response replay: validate raw bytes/actions against the last committed
+        # batch, then reuse its already-materialized visual96. Never advance VAE twice.
         if consumer_step == previous.consumer_step:
             expected_steps = previous.last_source_steps
             if not expected_steps or len(rows) != len(expected_steps):
                 raise ValueError("stale Local-TTT request does not match the last committed evidence batch")
-            replay_left = []
-            replay_wrist = []
-            replay_actions = []
+            replay_left, replay_wrist, replay_actions = [], [], []
             for expected, row in zip(expected_steps, rows, strict=True):
                 if not isinstance(row, dict) or row.get("source_step") != expected:
                     raise ValueError("Local-TTT replay source steps changed")
@@ -209,9 +169,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
             visual_digest = self._visual_digest(expected_steps, tuple(replay_left), tuple(replay_wrist))
             if previous.last_visual_digest is None or visual_digest != previous.last_visual_digest:
                 raise ValueError("Local-TTT replay visual evidence changed after commit")
-            if previous.last_executed_action is None or not torch.equal(
-                action_tensor, previous.last_executed_action
-            ):
+            if previous.last_executed_action is None or not torch.equal(action_tensor, previous.last_executed_action):
                 raise ValueError("Local-TTT replay action evidence changed after commit")
             if previous.last_visual_summary is None:
                 raise RuntimeError("Local-TTT committed replay is missing cached visual summary")
@@ -229,10 +187,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
         expected_steps = tuple(range(previous.consumer_step, consumer_step))
         if len(rows) != len(expected_steps):
             raise ValueError("Local-TTT completed evidence count does not match consumer frontier")
-        left = []
-        wrist = []
-        actions = []
-        actual_steps = []
+        left, wrist, actions, actual_steps = [], [], [], []
         for expected, row in zip(expected_steps, rows, strict=True):
             if not isinstance(row, dict) or row.get("source_step") != expected:
                 raise ValueError("Local-TTT source steps must be contiguous and exactly-once")
@@ -246,11 +201,17 @@ class RoboCasaLocalMemoryPolicyAdapter:
 
         source_steps = tuple(actual_steps)
         left_frames, wrist_frames = tuple(left), tuple(wrist)
-        visual = self._visual96_current_frames(left_frames, wrist_frames)
+        visual, stream_state = self.visual_stream.advance(
+            previous.stream_state,
+            source_steps,
+            left_frames,
+            wrist_frames,
+        )
         action_tensor = torch.stack(actions) if actions else torch.empty(0, 15)
         replacement = _VisualRecord(
             episode_id,
             consumer_step,
+            stream_state,
             source_steps,
             visual.detach().clone(),
             action_tensor.detach().clone(),
@@ -321,12 +282,15 @@ class RoboCasaLocalMemoryPolicyAdapter:
         if update is None:
             return None
         replacement = update.memory.replacement
+        stream = update.visual_replacement.stream_state
         return {
             "session_id": update.memory.session_id,
             "episode_id": replacement.episode_id,
             "consumer_step": replacement.consumer_step,
             "prefix_present": replacement.token is not None,
             "replay": update.memory.replay,
+            "visual_endpoint_step": stream.last_endpoint_step,
+            "visual_tail_frames": len(stream.pending_left),
             **update.memory.telemetry,
         }
 
@@ -338,5 +302,6 @@ class RoboCasaLocalMemoryPolicyAdapter:
             "mode": "required",
             "evidence_version": self.EVIDENCE_VERSION,
             "evidence_format": self.EVIDENCE_FORMAT,
+            "visual_evidence": "b1_dual_camera_causal_endpoint_streaming_v1",
             **self.memory.info(),
         }
