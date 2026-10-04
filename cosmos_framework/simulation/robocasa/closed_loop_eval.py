@@ -58,7 +58,7 @@ from cosmos_framework.simulation.robocasa.eval_utils import (
     reset_local_memory,
 )
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
-from cosmos_framework.simulation.robocasa.local_memory_protocol import validate_local_memory_eval_contract
+from cosmos_framework.inference.robocasa_local_memory_contract import validate_local_memory_eval_contract
 
 CAMS = ["robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"]
 
