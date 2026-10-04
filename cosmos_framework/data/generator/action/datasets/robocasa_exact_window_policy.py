@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 import torch
+from omegaconf import DictConfig, OmegaConf
 
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
@@ -155,9 +156,13 @@ class CorrectedRoboCasaPolicyContract:
             _exact(config, name, getattr(self, name))
         self.validate_replan_steps(config.get("replan_steps"))
 
-    def resolved_tokenizer_config(self) -> dict[str, Any]:
-        tokenizer = deepcopy(EDGE_MODEL_CONFIG["tokenizer"])
+    def resolve_tokenizer_config(self, candidate_config: Mapping[str, Any]) -> dict[str, Any]:
+        candidate = deepcopy(_mapping(candidate_config, "candidate tokenizer config"))
+        tokenizer = (
+            OmegaConf.to_container(candidate, resolve=False) if isinstance(candidate, DictConfig) else dict(candidate)
+        )
         tokenizer["encode_exact_durations"] = deepcopy(self.vae_encode_contract["encode_exact_durations"])
+        self.validate_tokenizer_config(tokenizer)
         return tokenizer
 
     def validate_tokenizer_config(self, config: Mapping[str, Any]) -> None:

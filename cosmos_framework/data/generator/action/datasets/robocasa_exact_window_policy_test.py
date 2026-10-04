@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_robocasa_edge import (
     action_policy_robocasa_edge,
@@ -276,11 +277,21 @@ def test_manifest_contract_preserves_full_authority_and_resolves_edge(tmp_path: 
         16,
     )
     assert contract.vae_encode_contract == catalog.vae_encode_contract
-    assert (
-        contract.resolved_tokenizer_config()["encode_exact_durations"]
-        == catalog.vae_encode_contract["encode_exact_durations"]
-    )
-    contract.validate_tokenizer_config(contract.resolved_tokenizer_config())
+    candidate = action_policy_robocasa_edge["model"]["config"]["tokenizer"]
+    original = OmegaConf.to_container(candidate, resolve=False)
+    assert original["vae_path"] == "${oc.env:WAN_VAE_PATH}"
+    assert original["encode_exact_durations"] == [33]
+    resolved = contract.resolve_tokenizer_config(candidate)
+    assert resolved["encode_exact_durations"] == catalog.vae_encode_contract["encode_exact_durations"]
+    assert OmegaConf.to_container(candidate, resolve=False) == original
+    assert resolved is not candidate
+    assert resolved["encode_chunk_frames"] is not original["encode_chunk_frames"]
+    assert {key: value for key, value in resolved.items() if key != "encode_exact_durations"} == {
+        key: value for key, value in original.items() if key != "encode_exact_durations"
+    }
+    contract.validate_tokenizer_config(resolved)
+    with pytest.raises(TypeError):
+        contract.resolve_tokenizer_config()
     contract.validate_replan_steps(1)
     contract.validate_replan_steps(16)
     with pytest.raises(ValueError, match="replan_steps"):
@@ -307,8 +318,9 @@ def test_fixed_edge_extra_capability_key_allowed(tmp_path: Path) -> None:
     catalog = _catalog(tmp_path, mutate=lambda m: m["vae_encode_contract"].update(encode_chunk_frames={"256": 68}))
     contract = policy.CorrectedRoboCasaPolicyContract.from_cache_catalog(catalog)
     assert contract.vae_encode_contract["encode_chunk_frames"] == {"256": 68}
-    assert "480" in contract.resolved_tokenizer_config()["encode_chunk_frames"]
-    contract.validate_tokenizer_config(contract.resolved_tokenizer_config())
+    resolved = contract.resolve_tokenizer_config(action_policy_robocasa_edge["model"]["config"]["tokenizer"])
+    assert "480" in resolved["encode_chunk_frames"]
+    contract.validate_tokenizer_config(resolved)
 
 
 @pytest.mark.level(0)
@@ -332,7 +344,9 @@ def test_legacy_nano_edge_and_runtime32_rejected() -> None:
             {"action_horizon": 16, "chunk_length": 32, "observation_frames": 17, "replan_steps": 16}
         )
     with pytest.raises(ValueError, match="encode_exact_durations"):
-        contract.validate_tokenizer_config({**contract.resolved_tokenizer_config(), "encode_exact_durations": [17]})
+        contract.validate_tokenizer_config(
+            {**contract.resolve_tokenizer_config(edge_tokenizer), "encode_exact_durations": [17]}
+        )
 
 
 @pytest.mark.level(0)
@@ -357,15 +371,20 @@ def test_resolved_dataset_runtime_and_tokenizer_must_match_manifest() -> None:
     contract.validate_runtime_config(
         {"action_horizon": 16, "chunk_length": 16, "observation_frames": 17, "replan_steps": 8}
     )
-    resolved = contract.resolved_tokenizer_config()
+    candidate = action_policy_robocasa_edge["model"]["config"]["tokenizer"]
+    resolved = contract.resolve_tokenizer_config(candidate)
     resolved["encode_chunk_frames"]["256"] = 64
     with pytest.raises(ValueError, match="encode_chunk_frames"):
         contract.validate_tokenizer_config(resolved)
-    resolved = contract.resolved_tokenizer_config()
+    resolved = contract.resolve_tokenizer_config(candidate)
     resolved["encode_chunk_frames"]["480"] = 28
     with pytest.raises(ValueError, match="fixed Edge"):
         contract.validate_tokenizer_config(resolved)
-    resolved = contract.resolved_tokenizer_config()
+    resolved = contract.resolve_tokenizer_config(candidate)
     resolved["compute_dtype"] = "torch.float32"
     with pytest.raises(ValueError, match="compute_dtype"):
         contract.validate_tokenizer_config(resolved)
+    invalid_candidate = OmegaConf.to_container(candidate, resolve=False)
+    invalid_candidate["encode_chunk_frames"] = {"480": 28}
+    with pytest.raises(ValueError, match="fixed Edge"):
+        contract.resolve_tokenizer_config(invalid_candidate)
