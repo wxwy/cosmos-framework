@@ -519,7 +519,7 @@ class ActionServerArgs(pydantic.BaseModel):
     # ----- online Local-TTT ---------------------------------------------------
     local_memory_mode: Literal["off", "required"] = "off"
     """Online V3 Local-TTT mode. Formal Local-TTT evaluation must use ``required``."""
-    local_memory_max_sessions: int = 1
+    local_memory_max_sessions: int = 64
     """Maximum concurrent online Local-TTT episode sessions."""
 
     # ----- prompt format ------------------------------------------------------
