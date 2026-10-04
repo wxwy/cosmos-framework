@@ -196,6 +196,13 @@ def test_real_official_nonvisual_reader_without_video_and_exact_window(roots: tu
         assert result.task_class == "Pick Mug"
         assert reader.read_at(2).start_frame == 2
         assert reader.summary()["offline_only"] is True
+        assert reader.summary()["mismatch_counters"] == {
+            "missing": 0,
+            "ambiguous": 0,
+            "task_mismatch": 0,
+            "frame_mismatch": 0,
+            "row_mismatch": 0,
+        }
         pull.assert_not_called()
         download.assert_not_called()
         query.assert_not_called()
