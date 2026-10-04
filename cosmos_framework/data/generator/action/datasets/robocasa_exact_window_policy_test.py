@@ -324,6 +324,58 @@ def test_fixed_edge_extra_capability_key_allowed(tmp_path: Path) -> None:
 
 
 @pytest.mark.level(0)
+def test_manifest_duration_authority_survives_public_and_source_mutation() -> None:
+    source = {
+        "compute_dtype": "torch.bfloat16",
+        "encode_exact_durations": [17, 61],
+        "encode_chunk_frames": {"256": 68},
+    }
+    contract = policy.CorrectedRoboCasaPolicyContract(vae_encode_contract=source)
+    source["encode_exact_durations"][:] = [33]
+    source["compute_dtype"] = "torch.float32"
+    contract.vae_encode_contract["encode_exact_durations"][:] = [33]
+    contract.vae_encode_contract["compute_dtype"] = "torch.float32"
+    candidate = action_policy_robocasa_edge["model"]["config"]["tokenizer"]
+    original_candidate = OmegaConf.to_container(candidate, resolve=False)
+    resolved = contract.resolve_tokenizer_config(candidate)
+    assert type(resolved["encode_exact_durations"]) is list
+    assert resolved["encode_exact_durations"] == [17, 61]
+    assert OmegaConf.to_container(candidate, resolve=False) == original_candidate
+    assert {key: value for key, value in resolved.items() if key != "encode_exact_durations"} == {
+        key: value for key, value in original_candidate.items() if key != "encode_exact_durations"
+    }
+    contract.validate_tokenizer_config(resolved)
+    with pytest.raises(ValueError, match="encode_exact_durations"):
+        contract.validate_tokenizer_config({**resolved, "encode_exact_durations": [33]})
+    with pytest.raises(ValueError, match="compute_dtype"):
+        contract.validate_tokenizer_config({**resolved, "compute_dtype": "torch.float32"})
+
+
+@pytest.mark.level(0)
+def test_manifest_chunk_authority_survives_public_and_source_mutation() -> None:
+    source = {
+        "compute_dtype": "torch.bfloat16",
+        "encode_exact_durations": [17, 61],
+        "encode_chunk_frames": {"256": 68},
+    }
+    contract = policy.CorrectedRoboCasaPolicyContract(vae_encode_contract=source)
+    source["encode_chunk_frames"].clear()
+    source["encode_chunk_frames"]["480"] = 24
+    contract.vae_encode_contract["encode_chunk_frames"].clear()
+    contract.vae_encode_contract["encode_chunk_frames"]["480"] = 24
+    candidate = action_policy_robocasa_edge["model"]["config"]["tokenizer"]
+    resolved = contract.resolve_tokenizer_config(candidate)
+    assert resolved["encode_chunk_frames"]["256"] == 68
+    contract.validate_tokenizer_config(resolved)
+    missing_required = deepcopy(resolved)
+    del missing_required["encode_chunk_frames"]["256"]
+    with pytest.raises(ValueError, match="manifest"):
+        contract.validate_tokenizer_config(missing_required)
+    with pytest.raises(ValueError, match="manifest"):
+        contract.resolve_tokenizer_config(missing_required)
+
+
+@pytest.mark.level(0)
 def test_legacy_nano_edge_and_runtime32_rejected() -> None:
     contract = _contract()
     dataset = action_policy_robocasa_nano["dataloader_train"]["dataloader"]["datasets"]["robocasa"]["dataset"]

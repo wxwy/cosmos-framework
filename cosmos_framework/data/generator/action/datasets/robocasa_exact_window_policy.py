@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import torch
@@ -62,6 +62,9 @@ class CorrectedRoboCasaPolicyContract:
     """Phase2 resolved geometry and manifest VAE authority; T is independent."""
 
     vae_encode_contract: Mapping[str, Any]
+    _vae_compute_dtype: str = field(init=False, repr=False)
+    _vae_exact_durations: tuple[int, ...] = field(init=False, repr=False)
+    _vae_chunk_frames: tuple[tuple[str, int], ...] = field(init=False, repr=False)
     fps: float = 20.0
     action_horizon: int = 16
     chunk_length: int = 16
@@ -119,6 +122,9 @@ class CorrectedRoboCasaPolicyContract:
         for key, value in chunks.items():
             if key not in fixed or fixed[key] != value:
                 raise ValueError(f"fixed Edge tokenizer 不支持 encode_chunk_frames[{key!r}]={value}")
+        object.__setattr__(self, "_vae_compute_dtype", contract["compute_dtype"])
+        object.__setattr__(self, "_vae_exact_durations", tuple(durations))
+        object.__setattr__(self, "_vae_chunk_frames", tuple(chunks.items()))
         object.__setattr__(self, "vae_encode_contract", deepcopy(dict(contract)))
 
     @classmethod
@@ -161,25 +167,25 @@ class CorrectedRoboCasaPolicyContract:
         tokenizer = (
             OmegaConf.to_container(candidate, resolve=False) if isinstance(candidate, DictConfig) else dict(candidate)
         )
-        tokenizer["encode_exact_durations"] = deepcopy(self.vae_encode_contract["encode_exact_durations"])
+        tokenizer["encode_exact_durations"] = list(self._vae_exact_durations)
         self.validate_tokenizer_config(tokenizer)
         return tokenizer
 
     def validate_tokenizer_config(self, config: Mapping[str, Any]) -> None:
         config = _mapping(config, "tokenizer config")
         durations = config.get("encode_exact_durations")
-        if type(durations) is not list or durations != self.vae_encode_contract["encode_exact_durations"]:
+        if type(durations) is not list or durations != list(self._vae_exact_durations):
             raise ValueError("resolved tokenizer encode_exact_durations 与 manifest 完整列表不一致")
         chunks = _mapping(config.get("encode_chunk_frames"), "resolved tokenizer encode_chunk_frames")
         fixed = EDGE_MODEL_CONFIG["tokenizer"]["encode_chunk_frames"]
         for key, value in chunks.items():
             if key not in fixed or type(value) is not type(fixed[key]) or value != fixed[key]:
                 raise ValueError(f"resolved tokenizer encode_chunk_frames[{key!r}] 不属于 fixed Edge 能力")
-        for key, value in self.vae_encode_contract["encode_chunk_frames"].items():
+        for key, value in self._vae_chunk_frames:
             if key not in chunks or chunks[key] != value:
                 raise ValueError(f"resolved tokenizer encode_chunk_frames[{key!r}] 与 manifest 不一致")
         if "compute_dtype" in config:
-            _exact(config, "compute_dtype", "torch.bfloat16")
+            _exact(config, "compute_dtype", self._vae_compute_dtype)
 
 
 class OfficialRoboCasaPolicyAdapter:
