@@ -228,6 +228,44 @@ def test_encode_layout_and_normalizer_spy() -> None:
     assert calls == {"normalize": 3, "encode": 3}
 
 
+def test_prepare_tokenizer_moves_model_and_both_scales_without_cuda() -> None:
+    calls = []
+    device = torch.device("cuda:1")
+
+    class Scale:
+        def __init__(self, name):
+            self.name = name
+
+        def to(self, target):
+            calls.append((self.name, target))
+            return (self.name, target)
+
+    class Model:
+        def to(self, target):
+            calls.append(("model", target))
+            return self
+
+        def eval(self):
+            calls.append(("eval", None))
+            return self
+
+    tokenizer = SimpleNamespace(
+        use_streaming_encode=False,
+        _keep_encoder_cache=False,
+        model=SimpleNamespace(model=Model(), scale=(Scale("mean"), Scale("inv_std"))),
+    )
+    probe.prepare_tokenizer_device(tokenizer, device)
+    assert calls == [("model", device), ("mean", device), ("inv_std", device), ("eval", None)]
+    assert tokenizer.model.scale == (("mean", device), ("inv_std", device))
+    for flag in ("use_streaming_encode", "_keep_encoder_cache"):
+        calls.clear()
+        setattr(tokenizer, flag, True)
+        with pytest.raises(ValueError, match="normal full encode"):
+            probe.prepare_tokenizer_device(tokenizer, device)
+        assert calls == []
+        setattr(tokenizer, flag, False)
+
+
 def test_metrics_crop_and_z0_spy() -> None:
     calls = Counter()
 
@@ -334,7 +372,7 @@ def test_dry_run_and_observational_fake_cpu(tmp_path: Path, monkeypatch: pytest.
         def __init__(self, **kwargs):
             calls["factory"] += 1
             assert kwargs["encode_exact_durations"] == [17, 61, 73]
-            self.model = SimpleNamespace(model=Model())
+            self.model = SimpleNamespace(model=Model(), scale=(torch.zeros(1), torch.ones(1)))
 
         def encode(self, video):
             calls["encode"] += 1

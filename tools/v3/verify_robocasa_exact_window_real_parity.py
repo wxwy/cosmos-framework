@@ -346,6 +346,16 @@ def encode_window(
     return model.squeeze(0).permute(1, 0, 2, 3).contiguous().cpu()
 
 
+def prepare_tokenizer_device(tokenizer: Any, device: torch.device) -> None:
+    if tokenizer.use_streaming_encode or tokenizer._keep_encoder_cache:
+        raise ValueError("Wan tokenizer 必须使用 normal full encode")
+    wan = tokenizer.model
+    scale_mean, scale_inv_std = wan.scale
+    wan.model.to(device)
+    wan.scale = (scale_mean.to(device), scale_inv_std.to(device))
+    wan.model.eval()
+
+
 def gate_result(windows: list[dict[str, Any]], threshold: float | None, dry_run: bool) -> tuple[str, bool | None]:
     if dry_run:
         return "DRY_RUN_PASS", None
@@ -438,9 +448,7 @@ def run(
         if not deps.allow_cpu_for_test and (device.type != "cuda" or not torch.cuda.is_available()):
             raise ValueError("真实 encode 需要可用 CUDA；dry-run 不需要")
         tokenizer = deps.tokenizer_factory(**config)
-        tokenizer.model.model.to(device).eval()
-        if tokenizer.use_streaming_encode or tokenizer._keep_encoder_cache:
-            raise ValueError("Wan tokenizer 必须使用 normal full encode")
+        prepare_tokenizer_device(tokenizer, device)
         with torch.inference_mode():
             for record, starts, timestamps, paths in prepared:
                 video, geometry = reconstruct_episode(
