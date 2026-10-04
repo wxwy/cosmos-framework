@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -234,7 +235,8 @@ def check_success(env) -> bool:
 def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                latch, timeout, use_state=False, save_png=None, save_video=None,
                gen_video_path=None, video_fps=20,
-               local_memory_client: RoboCasaLocalMemoryClient | None = None) -> tuple[bool, int, str]:
+               local_memory_client: RoboCasaLocalMemoryClient | None = None,
+               on_prediction: Callable[[dict, float], None] | None = None) -> tuple[bool, int, str]:
     obs = env.reset()
     if local_memory_client is not None:
         local_memory_client.begin(0)
@@ -255,6 +257,7 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                 comp = compose(obs)
                 state_token = build_state_token(obs) if use_state else None
                 local_payload = local_memory_client.payload(0) if local_memory_client is not None else None
+                prediction_t0 = time.monotonic()
                 result = predict(
                     server_url,
                     comp,
@@ -264,6 +267,9 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                     state=state_token,
                     local_memory=local_payload,
                 )
+                prediction_ms = (time.monotonic() - prediction_t0) * 1000.0
+                if on_prediction is not None:
+                    on_prediction(result, prediction_ms)
                 if local_memory_client is not None:
                     status = result.get("local_memory")
                     if not isinstance(status, dict):
