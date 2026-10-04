@@ -316,6 +316,22 @@ def is_complete_episode(path: Path, *, episode_id: str, frame_count: int) -> boo
         return False
 
 
+def load_wan_vae(vae_path: Path, device: torch.device) -> object:
+    """Instantiate the frozen Wan2.2 VAE exactly once for B1 build/parity tools."""
+    from cosmos_framework.model.generator.tokenizers.wan2pt2_vae_4x16x16 import (
+        Wan2pt2VAEInterface,
+    )
+
+    vae = Wan2pt2VAEInterface(
+        vae_path=str(vae_path),
+        encode_chunk_frames={"256": 68, "480": 24, "720": 8, "768": 8},
+    )
+    vae.model.model.to(device)
+    scale_mean, scale_inv_std = vae.model.scale
+    vae.model.scale = (scale_mean.to(device), scale_inv_std.to(device))
+    return vae
+
+
 def build_cache(
     source_root: Path,
     output_root: Path,
@@ -353,17 +369,8 @@ def build_cache(
         raise SystemExit(f"--device {device} but no CUDA available")
     torch_device = torch.device(device)
     if vae is None and mode == "build":
-        from cosmos_framework.model.generator.tokenizers.wan2pt2_vae_4x16x16 import (
-            Wan2pt2VAEInterface,
-        )
-
-        vae = Wan2pt2VAEInterface(
-            vae_path=str(vae_path),
-            encode_chunk_frames={"256": 68, "480": 24, "720": 8, "768": 8},
-        )
-        vae.model.model.to(torch_device)
-        scale_mean, scale_inv_std = vae.model.scale
-        vae.model.scale = (scale_mean.to(torch_device), scale_inv_std.to(torch_device))
+        assert vae_path is not None
+        vae = load_wan_vae(vae_path, torch_device)
     meta_cache: dict[Path, dict[int, dict]] = {}
     built_count = 0
     selected_full_ids: set[str] = set()
