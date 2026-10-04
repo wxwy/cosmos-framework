@@ -16,6 +16,7 @@ from cosmos_framework.model.generator.mot.robocasa_latent_evidence import (
     latent_to_visual96,
     stream_endpoint_step,
 )
+from cosmos_framework.simulation.robocasa.local_memory_protocol import CAMERA_HEIGHT, CAMERA_WIDTH
 
 
 @dataclass(frozen=True)
@@ -32,8 +33,8 @@ class RoboCasaVisualStreamState:
 
 def validate_b1_rgb_frame(frame: torch.Tensor, name: str) -> torch.Tensor:
     value = frame.detach().to(device="cpu").contiguous()
-    if value.shape != (3, 256, 256) or value.dtype != torch.uint8:
-        raise ValueError(f"{name} must be uint8 [3,256,256]")
+    if value.shape != (3, CAMERA_HEIGHT, CAMERA_WIDTH) or value.dtype != torch.uint8:
+        raise ValueError(f"{name} must be uint8 [3,{CAMERA_HEIGHT},{CAMERA_WIDTH}]")
     return value.clone()
 
 
