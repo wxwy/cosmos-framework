@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,28 @@ class RoboCasaVisualStreamState:
     pending_left: tuple[torch.Tensor, ...]
     pending_wrist: tuple[torch.Tensor, ...]
     encoder_state: Any
+
+
+def validate_b1_rgb_frame(frame: torch.Tensor, name: str) -> torch.Tensor:
+    value = frame.detach().to(device="cpu").contiguous()
+    if value.shape != (3, 256, 256) or value.dtype != torch.uint8:
+        raise ValueError(f"{name} must be uint8 [3,256,256]")
+    return value.clone()
+
+
+def completed_visual_digest(
+    source_steps: tuple[int, ...],
+    left_frames: tuple[torch.Tensor, ...],
+    wrist_frames: tuple[torch.Tensor, ...],
+) -> str:
+    if len(source_steps) != len(left_frames) or len(source_steps) != len(wrist_frames):
+        raise ValueError("Local-TTT visual evidence lengths must match")
+    digest = hashlib.sha256()
+    for step, left, wrist in zip(source_steps, left_frames, wrist_frames, strict=True):
+        digest.update(f"{step}:".encode("ascii"))
+        digest.update(left.numpy().tobytes(order="C"))
+        digest.update(wrist.numpy().tobytes(order="C"))
+    return digest.hexdigest()
 
 
 class RoboCasaCausalEvidenceStream:
@@ -57,13 +80,6 @@ class RoboCasaCausalEvidenceStream:
             pending_wrist=(),
             encoder_state=self.tokenizer.new_encoder_stream_state(),
         )
-
-    @staticmethod
-    def _validate_frame(frame: torch.Tensor, name: str) -> torch.Tensor:
-        value = frame.detach().to(device="cpu").contiguous()
-        if value.shape != (3, 256, 256) or value.dtype != torch.uint8:
-            raise ValueError(f"{name} must be uint8 [3,256,256]")
-        return value.clone()
 
     @staticmethod
     def _pixel_chunk(
@@ -128,8 +144,8 @@ class RoboCasaCausalEvidenceStream:
         outputs: list[torch.Tensor] = []
         try:
             for source_step, left_frame, wrist_frame in zip(source_steps, left_frames, wrist_frames, strict=True):
-                left = self._validate_frame(left_frame, "left_frame")
-                wrist = self._validate_frame(wrist_frame, "wrist_frame")
+                left = validate_b1_rgb_frame(left_frame, "left_frame")
+                wrist = validate_b1_rgb_frame(wrist_frame, "wrist_frame")
                 if source_step == 0:
                     if current is not None or pending_left or pending_wrist:
                         raise ValueError("source step0 must prime a fresh RoboCasa visual stream")
