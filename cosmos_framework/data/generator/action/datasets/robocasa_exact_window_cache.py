@@ -73,6 +73,15 @@ class ExactWindowEpisodeRecord:
 
 
 @dataclass(frozen=True)
+class ExactWindowIdentity:
+    key: ExactWindowEpisodeKey
+    start_frame: int
+    global_row_indices: tuple[int, ...] | None
+    window_frame_indices: tuple[int, ...]
+    latent_source_frame_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class ExactWindowTaskStats:
     task_class: str
     task_slug: str
@@ -409,3 +418,35 @@ class RoboCasaExactWindowEpisodeReader:
             elif rows.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
                 raise ValueError(f"cache global_row_indices dtype 无效：{key}, start_frame={start_frame}")
         return latent.contiguous()
+
+    def read_identity(self, key: ExactWindowEpisodeKey, start_frame: int) -> ExactWindowIdentity:
+        """Read the exact cache witness without changing the Phase1A latent API."""
+        record = self.catalog.record_for(key)
+        if type(start_frame) is not int or start_frame not in record.window_starts:
+            raise KeyError(f"cache window 不存在：{key}, start_frame={start_frame!r}")
+        window = _mapping(self._episode(record)["windows"].get(str(start_frame)), f"window {key}/{start_frame}")
+        expected_frames = torch.arange(start_frame, start_frame + _WINDOW_FRAMES)
+        expected_anchors = expected_frames[::_ANCHOR_STRIDE]
+        for name, expected in (
+            ("window_frame_indices", expected_frames),
+            ("latent_source_frame_indices", expected_anchors),
+        ):
+            value = window.get(name)
+            if not isinstance(value, torch.Tensor) or value.dtype != torch.long or not torch.equal(value, expected):
+                raise ValueError(f"cache {name} 无效：{key}, start_frame={start_frame}")
+        rows = window.get("global_row_indices")
+        if rows is not None:
+            if not isinstance(rows, torch.Tensor) or rows.shape != (_WINDOW_FRAMES,) or rows.dtype == torch.bool:
+                raise ValueError(f"cache global_row_indices 无效：{key}, start_frame={start_frame}")
+            if rows.is_floating_point():
+                if not bool(torch.isfinite(rows).all()) or not bool(torch.equal(rows, rows.trunc())):
+                    raise ValueError(f"cache global_row_indices 非整数：{key}, start_frame={start_frame}")
+            elif rows.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+                raise ValueError(f"cache global_row_indices dtype 无效：{key}, start_frame={start_frame}")
+        return ExactWindowIdentity(
+            key,
+            start_frame,
+            tuple(int(value) for value in rows.tolist()) if rows is not None else None,
+            tuple(int(value) for value in expected_frames.tolist()),
+            tuple(int(value) for value in expected_anchors.tolist()),
+        )
