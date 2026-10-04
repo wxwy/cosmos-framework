@@ -4933,6 +4933,29 @@ class OmniMoTModel(ImaginaireModel):
         # Do camera-major repacking for now (instead of timestamp-major).
         return torch.cat(encoded_views, dim=temporal_dim)  # [...,C_latent,V*T_latent_v,H_latent,W_latent]
 
+    def _encode_vision_item_streaming(
+        self,
+        state: torch.Tensor,
+        *,
+        num_views: int,
+    ) -> torch.Tensor:
+        """Encode one causal vision chunk through the normal model preprocessing authority.
+
+        uint8 normalization stays centralized here exactly as in _encode_vision_item;
+        the causal tokenizer owns temporal stream state. RoboCasa Local evidence batches
+        its two cameras on B, so this entry point intentionally supports one view per row.
+        """
+        if num_views != 1:
+            raise ValueError("streaming vision encode currently requires num_views=1")
+        tokenizer = self.tokenizer_vision_gen
+        if tokenizer is None or not tokenizer.is_causal:
+            raise ValueError("streaming vision encode requires a loaded causal vision tokenizer")
+        encode_streaming = getattr(tokenizer, "encode_streaming", None)
+        if not callable(encode_streaming):
+            raise ValueError("causal vision tokenizer does not expose encode_streaming")
+        encode_input = state if torch.is_floating_point(state) else self._normalize_uint8_vision_item(state)
+        return encode_streaming(encode_input).contiguous().float()
+
     def _vision_encoder(self) -> VisionEncoder:
         """Build the encoder for the current tokenizer, mesh and encode entry point.
 
