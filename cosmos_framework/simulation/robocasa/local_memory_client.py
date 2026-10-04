@@ -10,8 +10,8 @@ import numpy as np
 
 from cosmos_framework.simulation.robocasa.eval_utils import b64_png
 
-_EVIDENCE_VERSION = "current_frame_visual96_executed_action15_v4"
-_EVIDENCE_FORMAT = "robocasa_current_left_wrist_raw15_v2"
+_EVIDENCE_VERSION = "b1_causal_endpoint_visual96_executed_action15_v4"
+_EVIDENCE_FORMAT = "robocasa_dual_camera_rgb_raw15_v2"
 
 
 @dataclass
@@ -24,7 +24,11 @@ class _Episode:
 
 
 class RoboCasaLocalMemoryClient:
-    """Track pre-action cameras and the exact raw15 action actually executed."""
+    """Track completed pre-action dual-camera RGB and the exact raw15 action executed.
+
+    The server materializes the frozen B1 causal-endpoint visual96. Predicted-but-
+    unexecuted action chunk members are never recorded as Local-TTT evidence.
+    """
 
     def __init__(self, *, enabled: bool = True, max_evidence_steps: int = 256) -> None:
         self.enabled = bool(enabled)
