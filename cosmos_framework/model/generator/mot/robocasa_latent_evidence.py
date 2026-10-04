@@ -14,6 +14,26 @@ import torch
 
 LEFT_CAMERA = "observation.images.robot0_agentview_left"
 WRIST_CAMERA = "observation.images.robot0_eye_in_hand"
+CAMERAS = (LEFT_CAMERA, WRIST_CAMERA)
+TEMPORAL_COMPRESSION_FACTOR = 4
+SOURCE_FRAME_TO_LATENT_POLICY = "causal_endpoint"
+
+
+def endpoint_vector(frame_count: int) -> tuple[int, ...]:
+    """Return the frozen B1 4-grid plus a terminal endpoint when the grid misses F-1."""
+    if type(frame_count) is not int or frame_count <= 0:
+        raise ValueError("frame_count must be a positive int")
+    endpoints = tuple(range(0, frame_count, TEMPORAL_COMPRESSION_FACTOR))
+    if endpoints[-1] != frame_count - 1:
+        endpoints += (frame_count - 1,)
+    return endpoints
+
+
+def stream_endpoint_step(source_step: int) -> int:
+    """Endpoint used by an unbounded online stream; there is no offline terminal tail."""
+    if type(source_step) is not int or source_step < 0:
+        raise ValueError("source_step must be a non-negative int")
+    return source_step - source_step % TEMPORAL_COMPRESSION_FACTOR
 
 
 def causal_endpoint_index(endpoint_indices: tuple[int, ...], source_step: int) -> int:
@@ -82,13 +102,15 @@ class RoboCasaLatentReader:
                 or frames != expected_source_frames
             ):
                 raise ValueError("cache/source video 帧数不匹配")
-            if not isinstance(compression, (int, np.integer)) or compression != 4 or policy != "causal_endpoint":
-                raise ValueError("缓存必须声明 temporal_compression_factor=4 和 causal_endpoint")
-            indices = tuple(range(0, expected_source_frames, 4))
-            if indices[-1] != expected_source_frames - 1:
-                indices += (expected_source_frames - 1,)
+            if (
+                not isinstance(compression, (int, np.integer))
+                or compression != TEMPORAL_COMPRESSION_FACTOR
+                or policy != SOURCE_FRAME_TO_LATENT_POLICY
+            ):
+                raise ValueError("缓存必须声明 frozen temporal compression 和 causal_endpoint")
+            indices = endpoint_vector(expected_source_frames)
             latents = []
-            for camera in (LEFT_CAMERA, WRIST_CAMERA):
+            for camera in CAMERAS:
                 latent = cache[f"latents/{camera}"]
                 endpoints = cache[f"indices/latent_source_frame_indices/{camera}"]
                 valid = cache[f"valid/{camera}"]
