@@ -388,7 +388,7 @@ def build_cache(
         entry = meta_cache[spec.shard][spec.episode_index]
         try:
             if mode == "static":
-                endpoints = endpoint_vector(spec.frame_count)
+                endpoints = list(endpoint_vector(spec.frame_count))
                 n = len(endpoints)
                 latents = static_latents(spec.full_id, n)
                 ep_endpoints = {cam: endpoints for cam in CAMERAS}
