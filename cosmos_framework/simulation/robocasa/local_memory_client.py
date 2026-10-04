@@ -10,8 +10,11 @@ import numpy as np
 
 from cosmos_framework.simulation.robocasa.eval_utils import b64_png
 
-_EVIDENCE_VERSION = "b1_causal_endpoint_visual96_executed_action15_v4"
-_EVIDENCE_FORMAT = "robocasa_dual_camera_rgb_raw15_v2"
+from cosmos_framework.simulation.robocasa.local_memory_protocol import (
+    EVIDENCE_ACTION_DIM,
+    EVIDENCE_FORMAT,
+    EVIDENCE_VERSION,
+)
 
 
 @dataclass
@@ -74,7 +77,7 @@ class RoboCasaLocalMemoryClient:
         left = self._image(left_image, "left_image")
         wrist = self._image(wrist_image, "wrist_image")
         action = np.asarray(executed_action15, dtype=np.float32).reshape(-1)
-        if action.shape != (15,) or not np.isfinite(action).all():
+        if action.shape != (EVIDENCE_ACTION_DIM,) or not np.isfinite(action).all():
             raise ValueError("executed Local-TTT evidence action must be finite raw15")
         if len(episode.evidence) >= self.max_evidence_steps:
             raise RuntimeError("too many unacknowledged Local-TTT evidence steps")
@@ -97,8 +100,8 @@ class RoboCasaLocalMemoryClient:
             "episode_id": episode.episode_id,
             "consumer_step": episode.consumer_step,
             "reset": episode.first_request,
-            "evidence_version": _EVIDENCE_VERSION,
-            "evidence_format": _EVIDENCE_FORMAT,
+            "evidence_version": EVIDENCE_VERSION,
+            "evidence_format": EVIDENCE_FORMAT,
             "evidence": [dict(row) for row in episode.evidence],
         }
 
