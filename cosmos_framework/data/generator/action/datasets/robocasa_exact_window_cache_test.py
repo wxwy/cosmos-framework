@@ -277,6 +277,19 @@ def test_extra_recognized_payload_is_visible_and_strictly_rejected(cache: tuple[
 
 
 @pytest.mark.level(0)
+@pytest.mark.parametrize("name", ["episode_bad.pt", "episode_7.pt", "foo.pt"])
+def test_unexpected_pt_payload_is_visible_and_strictly_rejected(cache: tuple[Path, dict, dict], name: str) -> None:
+    root, _, payload = cache
+    unexpected = _episode_path(root).parent / name
+    torch.save(payload, unexpected)
+    with pytest.raises(ValueError, match=f"extra=1.*{name}"):
+        RoboCasaExactWindowCacheCatalog(root)
+    stats = RoboCasaExactWindowCacheCatalog(root, strict=False).stats.as_dict()
+    assert (stats["declared_episode_count"], stats["discovered_episode_count"]) == (1, 2)
+    assert (stats["accepted_episode_count"], stats["rejected_episode_count"], stats["extra_episode_count"]) == (1, 1, 1)
+
+
+@pytest.mark.level(0)
 def test_undeclared_task_payload_is_extra_and_fails_strict(cache: tuple[Path, dict, dict]) -> None:
     root, _, payload = cache
     unexpected = _episode_path(root, slug="Unknown_Task", index=3)

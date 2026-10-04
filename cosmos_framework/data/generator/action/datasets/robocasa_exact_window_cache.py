@@ -23,7 +23,6 @@ import torch
 
 _WINDOW_FRAMES = 17
 _ANCHOR_STRIDE = 4
-_EPISODE_FILE = re.compile(r"episode_[0-9]{6,}\.pt")
 
 
 def _positive_int(value: object, name: str, *, allow_zero: bool = False) -> int:
@@ -292,9 +291,7 @@ class RoboCasaExactWindowCacheCatalog:
         expected = {record.relative_path for record in self._records.values()}
         missing = [str(path) for path in sorted(expected) if not (self.cache_root / path).is_file()]
         discovered: set[Path] = set()
-        for path in (self.cache_root / "tasks").glob("*/episodes/episode_*.pt"):
-            if not _EPISODE_FILE.fullmatch(path.name):
-                continue
+        for path in (self.cache_root / "tasks").glob("*/episodes/*.pt"):
             relative = path.relative_to(self.cache_root)
             if not path.resolve().is_relative_to(self.cache_root.resolve()) or not path.is_file():
                 raise ValueError(f"cache episode 路径越界或非文件：{relative}")
