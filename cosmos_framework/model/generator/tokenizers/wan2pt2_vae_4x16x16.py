@@ -3,9 +3,9 @@
 
 import os
 import time
-from dataclasses import dataclass
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
