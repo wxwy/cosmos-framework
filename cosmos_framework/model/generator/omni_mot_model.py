@@ -5207,6 +5207,28 @@ class OmniMoTModel(ImaginaireModel):
                 over the whole group: only training, which every rank enters in lockstep,
                 may turn it on.
         """
+        cache_marker = data_batch.get("cached_latent_required")
+        if "cached_latent_required" in data_batch or "video_latent" in data_batch:
+            video_count = len(data_batch.get(self.input_video_key, []))
+            if (
+                not isinstance(cache_marker, (list, tuple))
+                or len(cache_marker) != video_count
+                or not video_count
+                or any(
+                    not isinstance(value, torch.Tensor)
+                    or value.shape != (1,)
+                    or value.dtype != torch.bool
+                    or not bool(value.item())
+                    for value in cache_marker
+                )
+            ):
+                raise ValueError("Cached video_latent requires a true cached_latent_required marker per sample.")
+            if "video_latent" not in data_batch:
+                raise ValueError("Required cached video_latent is missing; online VAE fallback is forbidden.")
+        if "video_latent" in data_batch and not self.training:
+            raise ValueError("Cached video_latent is only supported during training.")
+        if "video_latent" in data_batch and not self._has_vision_stream(data_batch):
+            raise ValueError("Cached video_latent requires a video stream.")
         if not self._has_vision_stream(data_batch):
             return self._get_lidar_only_data_and_condition(data_batch)
 
@@ -5216,6 +5238,26 @@ class OmniMoTModel(ImaginaireModel):
         media_key = self.input_video_key if not is_image_batch else self.input_image_key
 
         sample_vision_list = data_batch[media_key]
+        cached_vision = "video_latent" in data_batch
+        if cached_vision:
+            if is_image_batch or vision_condition_indexes is not None or "enable_per_camera_vae_encoding" in data_batch:
+                raise ValueError("Cached video_latent only supports standard training single-view video batches.")
+            if (
+                data_batch.get("num_vision_items_per_sample") is not None
+                or data_batch.get("num_views_per_vision_item") is not None
+            ):
+                raise ValueError("Cached video_latent does not support multi-vision or per-camera metadata.")
+            if not isinstance(sample_vision_list, (list, tuple)) or not sample_vision_list:
+                raise ValueError("Cached video_latent requires a nonempty packed video list.")
+            cached_latents = data_batch["video_latent"]
+            frame_size = data_batch.get("image_size")
+            if not isinstance(cached_latents, (list, tuple)) or len(cached_latents) != len(sample_vision_list):
+                raise ValueError("Cached video_latent must contain exactly one tensor per video sample.")
+            if not isinstance(frame_size, (list, tuple)) or len(frame_size) != len(sample_vision_list):
+                raise ValueError("Cached video_latent requires image_size for every video sample.")
+            spatial_factor = self.tokenizer_vision_gen.spatial_compression_factor
+            if type(spatial_factor) is not int or spatial_factor <= 0:
+                raise ValueError("Cached video_latent requires a positive spatial compression factor.")
 
         # NOTE: as we assume that the vision items will be passed as a List[List[Tensor]],
         # we should always get this information here during training. If we can read this field
@@ -5266,7 +5308,53 @@ class OmniMoTModel(ImaginaireModel):
         )
 
         # Vision (image/video) raw state and tokenized latent state.
-        if num_views_per_vision_item is None:
+        if cached_vision:
+            if num_vision_items_per_sample is not None or num_views_per_vision_item is not None:
+                raise ValueError("Cached video_latent requires one composite item per sample.")
+            raw_state_vision = []
+            x0_tokens_vision = []
+            for index, (sample_video, latent, size) in enumerate(
+                zip(sample_vision_list, cached_latents, frame_size, strict=True)
+            ):
+                if not isinstance(sample_video, (list, tuple)) or len(sample_video) != 1:
+                    raise ValueError(f"Cached video sample {index} must contain exactly one placeholder.")
+                placeholder = self._unwrap_vision_item(sample_video)
+                if (
+                    not isinstance(placeholder, torch.Tensor)
+                    or placeholder.ndim != 4
+                    or placeholder.shape[:2] != (3, 17)
+                    or placeholder.dtype != torch.uint8
+                ):
+                    raise ValueError(f"Cached video sample {index} placeholder must be uint8 [3,17,H,W].")
+                if (
+                    not isinstance(latent, torch.Tensor)
+                    or latent.ndim != 5
+                    or latent.shape[:3] != (1, 5, 48)
+                    or latent.dtype != torch.float32
+                    or not bool(torch.isfinite(latent).all())
+                ):
+                    raise ValueError(f"Cached video_latent sample {index} must be finite fp32 [1,5,48,H,W].")
+                if not isinstance(size, torch.Tensor) or size.numel() != 4:
+                    raise ValueError(f"Cached image_size sample {index} must be a four-element tensor.")
+                dimensions = size.reshape(-1)
+                if not bool(torch.isfinite(dimensions).all()) or not bool(torch.equal(dimensions, dimensions.trunc())):
+                    raise ValueError(f"Cached image_size sample {index} has invalid dimensions.")
+                target_h, target_w, content_h, content_w = (int(value) for value in dimensions.tolist())
+                if (
+                    min(target_h, target_w, content_h, content_w) <= 0
+                    or content_h > target_h
+                    or content_w > target_w
+                    or tuple(placeholder.shape[-2:]) != (target_h, target_w)
+                    or target_h % spatial_factor
+                    or target_w % spatial_factor
+                    or tuple(latent.shape[-2:]) != (target_h // spatial_factor, target_w // spatial_factor)
+                ):
+                    raise ValueError(f"Cached video_latent sample {index} disagrees with padded image_size/canvas.")
+                raw_state_vision.append(placeholder.unsqueeze(0))
+                x0_tokens_vision.append(
+                    latent.squeeze(0).permute(1, 0, 2, 3).unsqueeze(0).to(**self.tensor_kwargs_fp32).contiguous()
+                )
+        elif num_views_per_vision_item is None:
             # Legacy VFM/image path: normalize the complete input when needed and
             # preserve the existing image batch-dimension handling.
             self._normalize_video_databatch_inplace(data_batch)
@@ -5288,13 +5376,14 @@ class OmniMoTModel(ImaginaireModel):
                     )
                 raw_state_vision.append(item)
 
-        x0_tokens_vision = self._encode_vision_x0_tokens(
-            raw_state_vision,
-            num_vision_items_per_sample,
-            vision_condition_indexes,
-            num_views_per_vision_item,
-            balance_vae_encode=balance_vae_encode,
-        )
+        if not cached_vision:
+            x0_tokens_vision = self._encode_vision_x0_tokens(
+                raw_state_vision,
+                num_vision_items_per_sample,
+                vision_condition_indexes,
+                num_views_per_vision_item,
+                balance_vae_encode=balance_vae_encode,
+            )
 
         frame_size = data_batch.get("image_size", None)
         if frame_size is not None:
