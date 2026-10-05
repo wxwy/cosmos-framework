@@ -76,8 +76,6 @@ from cosmos_framework.data.generator.action.utils.domain_utils import get_domain
 from cosmos_framework.data.generator.action.utils.json_formatter import ActionPromptJsonFormatter
 from cosmos_framework.data.generator.action.utils.transforms import (
     build_sequence_plan_from_mode,
-    find_closest_target_size,
-    reflection_pad_to_target,
     remove_reflection_padding,
 )
 from cosmos_framework.inference.args import OmniSetupArgs, OmniSetupOverrides
@@ -85,6 +83,7 @@ from cosmos_framework.inference.common.args import CheckpointOverrides, ConfigFi
 from cosmos_framework.inference.common.config import deserialize_config_dict
 from cosmos_framework.inference.common.init import init_output_dir
 from cosmos_framework.inference.inference import OmniInference
+from cosmos_framework.inference.robocasa_composite_visual import prepare_robocasa_composite_frame
 from cosmos_framework.inference.robocasa_local_memory_policy import RoboCasaLocalMemoryPolicyAdapter
 from cosmos_framework.scripts.action_policy_server_utils import (
     DEFAULT_FALLBACK_OUTPUT_DIR,
@@ -94,7 +93,6 @@ from cosmos_framework.scripts.action_policy_server_utils import (
 )
 from cosmos_framework.utils import log
 from cosmos_framework.utils.lazy_config import instantiate
-from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 
 _DEFAULT_ACTION_CHUNK_SIZE = 32  # RoboCasa recipe chunk_length; only a fallback when the config omits it
 ActionNormalization = Literal["auto", "meanstd", "minmax", "quantile", "quantile_rot"]
@@ -754,10 +752,7 @@ class ActionModelService:
                 "given. Pass --raw-action-dim explicitly (15 for the default recipe: "
                 "use_base_action=True, base_encoding='raw')."
             )
-        log.info(
-            f"[action-server] effective raw_action_dim={self.raw_action_dim} "
-            f"(from {self.raw_action_dim_source})"
-        )
+        log.info(f"[action-server] effective raw_action_dim={self.raw_action_dim} (from {self.raw_action_dim_source})")
         if args.local_memory_mode == "required":
             if self.raw_action_dim != 15:
                 raise ValueError("required V3 RoboCasa Local-TTT needs raw_action_dim=15")
@@ -980,28 +975,13 @@ class ActionModelService:
         if raw_state is not None:
             state_token = torch.as_tensor(raw_state, dtype=torch.float32).reshape(-1)
             if self.raw_action_dim is not None and state_token.shape[0] != self.raw_action_dim:
-                raise ValueError(
-                    f"'state' has width {state_token.shape[0]} but raw_action_dim={self.raw_action_dim}"
-                )
+                raise ValueError(f"'state' has width {state_token.shape[0]} but raw_action_dim={self.raw_action_dim}")
 
-        img_chw_uint8 = _decode_base64_png_to_rgb_uint8(image_b64)
-        img_h, img_w = img_chw_uint8.shape[-2:]
-        # Multi-view (non-square) images: scale proportionally, matching height to image_size.
-        if img_h != image_size:
-            scale = image_size / img_h
-            new_w = int(round(img_w * scale))
-            hwc = img_chw_uint8.permute(1, 2, 0).cpu().numpy()
-            resized = Image.fromarray(hwc).resize((new_w, image_size), resample=Image.Resampling.BILINEAR)
-            arr = np.asarray(resized, dtype=np.uint8).copy()
-            img_chw_uint8 = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-
+        prepared = prepare_robocasa_composite_frame(_decode_base64_png_to_rgb_uint8(image_b64), image_size)
+        img_chw_uint8 = prepared.source_uint8
         t_frames = self.cfg.action_chunk_size + 1
         _, final_h, final_w = img_chw_uint8.shape
-        video_c_t_h_w_uint8 = img_chw_uint8.unsqueeze(1).repeat(1, t_frames, 1, 1)  # [3,T,H,W]
-        resolution = get_vision_data_resolution((final_h, final_w))
-        target_w, target_h = find_closest_target_size(final_h, final_w, resolution)
-        pad_dict: dict[str, Any] = {"video": video_c_t_h_w_uint8}
-        reflection_pad_to_target(pad_dict, ["video"], True, target_w, target_h)
+        video_padded = prepared.padded_single_frame.repeat(1, t_frames, 1, 1)
         action_length = self.cfg.action_chunk_size + (1 if state_token is not None else 0)
         sequence_plan = build_sequence_plan_from_mode(
             mode="wam",
@@ -1011,7 +991,7 @@ class ActionModelService:
         )
         if self._prompt_json_formatter is not None:
             augmented_prompt = self._build_json_prompt(
-                prompt, video=pad_dict["video"], image_size=pad_dict["image_size"]
+                prompt, video=video_padded, image_size=prepared.padded_image_size
             )
         else:
             augmented_prompt = _augment_prompt_with_metadata(
@@ -1025,8 +1005,8 @@ class ActionModelService:
             )
         return {
             "img_chw_uint8": img_chw_uint8,
-            "video_padded": pad_dict["video"],
-            "padded_image_size": pad_dict["image_size"],
+            "video_padded": video_padded,
+            "padded_image_size": prepared.padded_image_size,
             "augmented_prompt": augmented_prompt,
             "sequence_plan": sequence_plan,
             "domain_name": domain_name,
@@ -1047,7 +1027,7 @@ class ActionModelService:
 
     def predict_policy_batch(self, reqs: list[dict[str, Any]]) -> dict[str, Any]:
         """Batched policy inference: N requests -> ONE diffusion forward (batch_size=N).
-        
+
         The first V3 online Local-TTT gate deliberately supports only serial /predict so
         every session has an unambiguous transactional completed-evidence frontier.
         """
@@ -1190,8 +1170,7 @@ class ActionModelService:
 
         local_update = None
         try:
-            # Serialize every operation that touches the model: transactional B1 causal
-            # evidence streaming, model-owned Local scan, and diffusion generation.
+            # Serialize model-owned Local scan and diffusion generation for the session transaction.
             t_inf0 = time.monotonic()
             with self._lock:
                 local_update = self.local_memory_adapter.prepare(req)

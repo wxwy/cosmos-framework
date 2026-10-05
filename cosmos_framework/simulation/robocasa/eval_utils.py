@@ -9,16 +9,14 @@ Imported by ``closed_loop_eval.py``; not a script.
 
 import base64
 import io
-import json
 
 import numpy as np
 import requests
 from PIL import Image
 from scipy.spatial.transform import Rotation as R
 
-
-
 # ----------------------------- action decode -----------------------------
+
 
 def rot6d_to_matrix(r6: np.ndarray) -> np.ndarray:
     """6D rotation (first two columns, Zhou 2019) -> 3x3 via Gram-Schmidt."""
@@ -40,8 +38,8 @@ def decode_10d_to_env12(a10: np.ndarray, gripper_flip: bool) -> np.ndarray:
     env[0:3] = pos
     env[3:6] = rotvec
     env[6] = float(np.clip(grip, -1.0, 1.0))
-    env[7:11] = 0.0        # base_motion (fixed base)
-    env[11] = -1.0         # control_mode = arm
+    env[7:11] = 0.0  # base_motion (fixed base)
+    env[11] = -1.0  # control_mode = arm
     return env
 
 
@@ -113,8 +111,26 @@ def decode_15d_to_env12(a15: np.ndarray, gripper_flip: bool) -> np.ndarray:
     return env
 
 
-# ----------------------------- observation -----------------------------
+def canonicalize_raw15_for_env(predicted_raw15: np.ndarray, gripper_flip: bool) -> tuple[np.ndarray, np.ndarray]:
+    """以实际提交给环境的命令为准，返回可重新 decode 的 raw15。"""
+    predicted = np.asarray(predicted_raw15, dtype=np.float64).reshape(-1)
+    if predicted.shape != (15,) or not np.isfinite(predicted).all():
+        raise ValueError("predicted_raw15 必须是有限 15D")
+    submitted = decode_15d_to_env12(predicted, gripper_flip)
+    rotation = R.from_rotvec(submitted[3:6]).as_matrix()
+    canonical = np.zeros(15, dtype=np.float32)
+    canonical[:4] = submitted[7:11]
+    canonical[4] = submitted[11]
+    canonical[5:8] = submitted[:3]
+    canonical[8:11] = rotation[:, 0]
+    canonical[11:14] = rotation[:, 1]
+    canonical[14] = -submitted[6] if gripper_flip else submitted[6]
+    if not np.allclose(decode_15d_to_env12(canonical, gripper_flip), submitted, rtol=0, atol=2e-6):
+        raise ValueError("canonical raw15 无法重现 submitted env12")
+    return submitted, canonical
 
+
+# ----------------------------- observation -----------------------------
 
 
 def b64_png(img: np.ndarray) -> str:
@@ -147,14 +163,14 @@ def predict(
     state: list[float] | None = None,
     local_memory: dict | None = None,
 ) -> dict:
-    payload = {"image": b64_png(composite), "prompt": prompt,
-               "domain_name": "robocasa", "image_size": image_size}
+    payload = {"image": b64_png(composite), "prompt": prompt, "domain_name": "robocasa", "image_size": image_size}
     if state is not None:
         payload["state"] = state
     if local_memory is not None:
         payload["local_memory"] = local_memory
-    resp = requests.post(f"{server_url}/predict", json=payload,
-                         headers={"Content-Type": "application/json"}, timeout=timeout)
+    resp = requests.post(
+        f"{server_url}/predict", json=payload, headers={"Content-Type": "application/json"}, timeout=timeout
+    )
     resp.raise_for_status()
     result = resp.json()
     if result.get("error"):
@@ -171,8 +187,3 @@ def decode_pred_video(video_b64_list) -> list[np.ndarray]:
 
 
 # ----------------------------- rollout -----------------------------
-
-
-
-
-

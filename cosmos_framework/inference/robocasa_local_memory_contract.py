@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
-EVIDENCE_VERSION = "b1_causal_endpoint_visual96_executed_action15_v5"
-EVIDENCE_FORMAT = "robocasa_dual_camera_rgb_raw15_v2"
+EVIDENCE_VERSION = "corrected_composite_current_executed_raw15_v1"
+EVIDENCE_FORMAT = "robocasa_composite_rgb_canonical_raw15_v1"
+PREPROCESS_PROFILE = "left_wrist_reflection_pad_v1"
 EVIDENCE_ACTION_DIM = 15
 CAMERA_HEIGHT = 256
-CAMERA_WIDTH = 256
+COMPOSITE_WIDTH = 512
 
 
 def validate_local_memory_eval_contract(
@@ -31,4 +32,4 @@ def validate_local_memory_eval_contract(
     if not use_state:
         raise ValueError("V3 Local-TTT formal checkpoint requires --use-state")
     if type(action_horizon) is not int or not 1 <= action_horizon <= 16:
-        raise ValueError("V3 Local-TTT requires 1 <= --action-horizon <= 16 (Local TBPTT T=16)")
+        raise ValueError("V3 Local-TTT requires 1 <= --action-horizon <= H_pred=16")

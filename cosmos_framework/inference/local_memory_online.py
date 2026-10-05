@@ -175,19 +175,21 @@ class OnlineLocalMemory:
                 token = previous.token
                 self.core.reset_telemetry()
                 if self.scan_local_memory is not None:
-                    valid = torch.ones(1, len(expected), dtype=torch.bool, device=device)
-                    with torch.enable_grad():
-                        tokens, candidate, present = self.scan_local_memory(
-                            visual.unsqueeze(0),
-                            action.unsqueeze(0),
-                            valid,
-                            state,
-                            create_graph=False,
-                        )
-                    if not bool(present.all()):
-                        raise RuntimeError("online model-owned Local scan dropped completed evidence")
-                    state = self._detach_state(candidate)
-                    token = tokens[0, -1].detach().float().clone()
+                    for start in range(0, len(expected), self.core.ttt_tbptt_steps):
+                        end = min(start + self.core.ttt_tbptt_steps, len(expected))
+                        valid = torch.ones(1, end - start, dtype=torch.bool, device=device)
+                        with torch.enable_grad():
+                            tokens, candidate, present = self.scan_local_memory(
+                                visual[start:end].unsqueeze(0),
+                                action[start:end].unsqueeze(0),
+                                valid,
+                                state,
+                                create_graph=False,
+                            )
+                        if not bool(present.all()):
+                            raise RuntimeError("online model-owned Local scan dropped completed evidence")
+                        state = self._detach_state(candidate)
+                        token = tokens[0, -1].detach().float().clone()
                 else:
                     if state is None:
                         state = self._detach_state(self.core.initial_state(1))

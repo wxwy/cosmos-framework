@@ -42,14 +42,15 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-import numpy as np
 import imageio.v2 as imageio
+import numpy as np
+import robocasa  # noqa: F401  (registers RoboCasa envs like CloseToasterOvenDoor; does NOT pull lerobot)
+import robosuite
 from PIL import Image
 
-import robosuite
-import robocasa  # noqa: F401  (registers RoboCasa envs like CloseToasterOvenDoor; does NOT pull lerobot)
-
+from cosmos_framework.inference.robocasa_local_memory_contract import validate_local_memory_eval_contract
 from cosmos_framework.simulation.robocasa.eval_utils import (
+    canonicalize_raw15_for_env,
     decode_10d_to_env12,
     decode_15d_to_env12,
     decode_20d_to_env12,
@@ -58,26 +59,13 @@ from cosmos_framework.simulation.robocasa.eval_utils import (
     reset_local_memory,
 )
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
-from cosmos_framework.inference.robocasa_local_memory_contract import validate_local_memory_eval_contract
 
 CAMS = ["robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"]
-
-
 
 
 def get_env_metadata(dsdir: str) -> dict:
     with open(Path(dsdir) / "extras" / "dataset_meta.json") as f:
         return json.load(f)["env_args"]
-
-
-
-
-
-
-
-
-
-
 
 
 CAMERA_SET = "wrist_lr"  # set from --camera-set in main(); switches compose layout
@@ -130,6 +118,7 @@ def build_state_token(obs) -> list[float]:
     gripper_qpos = robot0_gripper_qpos. So these obs are already in the (base) frame the model
     was trained on — no manual transform needed."""
     import robosuite.utils.transform_utils as T
+
     pos = np.asarray(obs["robot0_base_to_eef_pos"], dtype=np.float32).reshape(3)
     quat = np.asarray(obs["robot0_base_to_eef_quat"], dtype=np.float32).reshape(4)  # xyzw
     m = T.quat2mat(quat)  # [3,3]; robosuite quat is xyzw
@@ -145,7 +134,6 @@ def build_state_token(obs) -> list[float]:
         pad = _ACTION_DIM_BY_ENCODING[BASE_ENCODING] - 10
         token = np.concatenate([np.zeros(pad, dtype=np.float32), token])
     return token.tolist()
-
 
 
 # RoboCasa365 "Atomic-Seen" split (leaderboard protocol). Authoritative source is the
@@ -184,6 +172,7 @@ def official_horizon(task: str):
     reported instead."""
     try:
         from robocasa.utils.dataset_registry_utils import get_task_horizon
+
         return int(get_task_horizon(task))
     except Exception as exc:
         print(
@@ -222,7 +211,6 @@ def make_env(dataset_dir: str, cam_size: int, *, obj_split=None, layout_style=No
     return robosuite.make(**ek)
 
 
-
 def check_success(env) -> bool:
     try:
         return bool(env._check_success())
@@ -230,16 +218,26 @@ def check_success(env) -> bool:
         return False
 
 
-
-
-def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
-               latch, timeout, use_state=False, save_png=None, save_video=None,
-               gen_video_path=None, video_fps=20,
-               local_memory_client: RoboCasaLocalMemoryClient | None = None,
-               on_prediction: Callable[[dict, float], None] | None = None) -> tuple[bool, int, str]:
+def run_policy(
+    env,
+    *,
+    server_url,
+    image_size,
+    action_horizon,
+    max_steps,
+    latch,
+    timeout,
+    use_state=False,
+    save_png=None,
+    save_video=None,
+    gen_video_path=None,
+    video_fps=20,
+    local_memory_client: RoboCasaLocalMemoryClient | None = None,
+    on_prediction: Callable[[dict, float], None] | None = None,
+) -> tuple[bool, int, str]:
     obs = env.reset()
     if local_memory_client is not None:
-        local_memory_client.begin(0)
+        local_memory_client.begin(0, image_size=image_size)
     rollout_error: BaseException | None = None
     try:
         try:
@@ -281,6 +279,7 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                 queue = acts[:action_horizon] if action_horizon > 0 else list(acts)
 
             a = np.asarray(queue.pop(0))
+            pre_composite = compose(obs).astype(np.uint8) if local_memory_client is not None else None
             if USE_BASE_ACTION:
                 want = _ACTION_DIM_BY_ENCODING[BASE_ENCODING]
                 if a.shape[-1] != want:
@@ -288,7 +287,10 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                         f"--base-encoding={BASE_ENCODING} expects {want}D actions but the server "
                         f"returned {a.shape[-1]}D. Check that the flag matches the checkpoint."
                     )
-                env_action = (decode_15d_to_env12 if BASE_ENCODING == "raw" else decode_20d_to_env12)(a, False)
+                if local_memory_client is not None:
+                    env_action, canonical_raw15 = canonicalize_raw15_for_env(a, False)
+                else:
+                    env_action = (decode_15d_to_env12 if BASE_ENCODING == "raw" else decode_20d_to_env12)(a, False)
             else:
                 if a.shape[-1] != 10:
                     raise ValueError(
@@ -297,14 +299,10 @@ def run_policy(env, *, server_url, image_size, action_horizon, max_steps,
                     )
                 env_action = decode_10d_to_env12(a, False)
 
-            if local_memory_client is not None:
-                if a.shape[-1] != 15:
-                    raise ValueError("V3 online Local-TTT requires executed raw15 policy actions")
-                left = _upright(obs[f"{CAMS[0]}_image"]).copy()
-                wrist = _upright(obs[f"{CAMS[2]}_image"]).copy()
-                local_memory_client.record_executed(0, left, wrist, a)
-
             obs, _, _, _ = env.step(env_action)
+            if local_memory_client is not None:
+                assert pre_composite is not None
+                local_memory_client.record_completed(0, pre_composite, canonical_raw15)
             frames.append(compose(obs).astype(np.uint8))
             if check_success(env):
                 streak += 1
@@ -341,34 +339,65 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server-url", default="http://127.0.0.1:8912")
     ap.add_argument("--dataset-dir", required=True, help="v2.1 lerobot dir WITH extras/")
-    ap.add_argument("--num-test-episodes", type=int, default=0, help="test-scene episodes (random reset, same env_args)")
+    ap.add_argument(
+        "--num-test-episodes", type=int, default=0, help="test-scene episodes (random reset, same env_args)"
+    )
     ap.add_argument("--max-steps", type=int, default=400)
-    ap.add_argument("--save-gen-video", action="store_true",
-                    help="save the model's GENERATED video (flow-matching vision branch, from the "
-                         "first inference) per rollout, for comparing video-generation quality")
+    ap.add_argument(
+        "--save-gen-video",
+        action="store_true",
+        help="save the model's GENERATED video (flow-matching vision branch, from the "
+        "first inference) per rollout, for comparing video-generation quality",
+    )
     ap.add_argument("--action-horizon", type=int, default=16)
     ap.add_argument("--image-size", type=int, default=256)
     ap.add_argument("--cam-size", type=int, default=256)
-    ap.add_argument("--success-latch", type=int, default=1,
-                    help="consecutive _check_success() steps to declare success; 1 = official "
-                         "run_random_rollouts (first success). Higher only to reject transient flukes.")
-    ap.add_argument("--seed", type=int, default=None,
-                    help="fixed env seed for reproducible test scenes (same scenes across checkpoints); "
-                         "omit for official nondeterministic sampling")
-    ap.add_argument("--camera-set", default="wrist_lr", choices=["wrist_lr", "left_wrist", "lrw"],
-                    help="wrist_lr = 3-cam squished (384x256); left_wrist = LIBERO-style [left|wrist] 256x512; "
-                         "lrw = 3-cam full-res side by side [left|right|wrist] 256x768")
-    ap.add_argument("--base-encoding", choices=("ego", "raw"), default="ego",
-                    help="mobile-base action contract: 'ego' (20D state-derived pose delta, "
-                         "the original) or 'raw' (15D native base_motion command)")
-    ap.add_argument("--use-base-action", action="store_true",
-                    help="20D mobile-base checkpoint: widen the state token and decode base_motion")
-    ap.add_argument("--use-state", action="store_true",
-                    help="send EEF proprioception (robot0_base_to_eef_pos/quat + gripper_qpos) as the "
-                         "clean conditioning token; MUST match a use_state=True trained checkpoint")
+    ap.add_argument(
+        "--success-latch",
+        type=int,
+        default=1,
+        help="consecutive _check_success() steps to declare success; 1 = official "
+        "run_random_rollouts (first success). Higher only to reject transient flukes.",
+    )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="fixed env seed for reproducible test scenes (same scenes across checkpoints); "
+        "omit for official nondeterministic sampling",
+    )
+    ap.add_argument(
+        "--camera-set",
+        default="wrist_lr",
+        choices=["wrist_lr", "left_wrist", "lrw"],
+        help="wrist_lr = 3-cam squished (384x256); left_wrist = LIBERO-style [left|wrist] 256x512; "
+        "lrw = 3-cam full-res side by side [left|right|wrist] 256x768",
+    )
+    ap.add_argument(
+        "--base-encoding",
+        choices=("ego", "raw"),
+        default="ego",
+        help="mobile-base action contract: 'ego' (20D state-derived pose delta, "
+        "the original) or 'raw' (15D native base_motion command)",
+    )
+    ap.add_argument(
+        "--use-base-action",
+        action="store_true",
+        help="20D mobile-base checkpoint: widen the state token and decode base_motion",
+    )
+    ap.add_argument(
+        "--use-state",
+        action="store_true",
+        help="send EEF proprioception (robot0_base_to_eef_pos/quat + gripper_qpos) as the "
+        "clean conditioning token; MUST match a use_state=True trained checkpoint",
+    )
     ap.add_argument("--timeout", type=float, default=600)
-    ap.add_argument("--local-memory-mode", choices=("off", "required"), default="off",
-                    help="V3 online Local-TTT. Formal iter500 evaluation must use required.")
+    ap.add_argument(
+        "--local-memory-mode",
+        choices=("off", "required"),
+        default="off",
+        help="V3 online Local-TTT. Formal iter500 evaluation must use required.",
+    )
     ap.add_argument("--output-dir", default=".")
     args = ap.parse_args()
 
@@ -389,7 +418,8 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     env = make_env(
-        args.dataset_dir, args.cam_size,
+        args.dataset_dir,
+        args.cam_size,
         obj_split=ATOMIC_SEEN_OBJ_SPLIT,
         layout_style=ATOMIC_SEEN_LAYOUT_STYLE,
         seed=args.seed,
@@ -404,6 +434,7 @@ def main() -> None:
 
     # wait for server
     import requests
+
     t0 = time.time()
     while time.time() - t0 < args.timeout:
         try:
@@ -423,11 +454,7 @@ def main() -> None:
         raise RuntimeError("server not ready")
 
     results = []
-    local_memory_client = (
-        RoboCasaLocalMemoryClient(enabled=True)
-        if args.local_memory_mode == "required"
-        else None
-    )
+    local_memory_client = RoboCasaLocalMemoryClient(enabled=True) if args.local_memory_mode == "required" else None
 
     # Official protocol: rollouts in freshly sampled held-out scenes.
     for t in range(args.num_test_episodes):
@@ -453,15 +480,20 @@ def main() -> None:
             prediction_records.append(row)
 
         pol_ok, pol_steps, prompt = run_policy(
-            env, server_url=args.server_url,
-            image_size=args.image_size, action_horizon=args.action_horizon,
-            max_steps=eff_max_steps, latch=args.success_latch,
-            timeout=args.timeout, use_state=args.use_state,
+            env,
+            server_url=args.server_url,
+            image_size=args.image_size,
+            action_horizon=args.action_horizon,
+            max_steps=eff_max_steps,
+            latch=args.success_latch,
+            timeout=args.timeout,
+            use_state=args.use_state,
             local_memory_client=local_memory_client,
             on_prediction=record_prediction,
             save_png=str(out / f"rollout{t:02d}_init.png"),
             save_video=str(out / f"rollout{t:02d}.mp4"),
-            gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if args.save_gen_video else None)
+            gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if args.save_gen_video else None,
+        )
         print(f"[eval] rollout {t:02d} success={pol_ok} steps={pol_steps} prompt={prompt!r}", flush=True)
         local_rows = [row for row in prediction_records if "consumer_step" in row]
         results.append(
@@ -477,9 +509,7 @@ def main() -> None:
                     else None
                 ),
                 "post_cold_prefix_all": (
-                    all(bool(row.get("prefix_present")) for row in local_rows[1:])
-                    if len(local_rows) > 1
-                    else None
+                    all(bool(row.get("prefix_present")) for row in local_rows[1:]) if len(local_rows) > 1 else None
                 ),
                 "local_memory_predictions": prediction_records,
             }

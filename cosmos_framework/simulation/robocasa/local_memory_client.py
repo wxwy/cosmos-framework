@@ -8,32 +8,30 @@ from typing import Any
 
 import numpy as np
 
-from cosmos_framework.simulation.robocasa.eval_utils import b64_png
-
 from cosmos_framework.inference.robocasa_local_memory_contract import (
     CAMERA_HEIGHT,
-    CAMERA_WIDTH,
+    COMPOSITE_WIDTH,
     EVIDENCE_ACTION_DIM,
     EVIDENCE_FORMAT,
     EVIDENCE_VERSION,
+    PREPROCESS_PROFILE,
 )
+from cosmos_framework.simulation.robocasa.eval_utils import b64_png
 
 
 @dataclass
 class _Episode:
     session_id: str
     episode_id: str
+    image_size: int
+    preprocess_profile: str
     consumer_step: int = 0
     first_request: bool = True
     evidence: list[dict[str, Any]] = field(default_factory=list)
 
 
 class RoboCasaLocalMemoryClient:
-    """Track completed pre-action dual-camera RGB and the exact raw15 action executed.
-
-    The server materializes the frozen B1 causal-endpoint visual96. Predicted-but-
-    unexecuted action chunk members are never recorded as Local-TTT evidence.
-    """
+    """Track unacknowledged completed composite RGB and canonical raw15 commands."""
 
     def __init__(self, *, enabled: bool = True, max_evidence_steps: int = 256) -> None:
         self.enabled = bool(enabled)
@@ -43,14 +41,18 @@ class RoboCasaLocalMemoryClient:
         self.client_id = uuid.uuid4().hex
         self._episodes: dict[int, _Episode] = {}
 
-    def begin(self, slot: int = 0) -> None:
+    def begin(self, slot: int = 0, *, image_size: int = 256, preprocess_profile: str = PREPROCESS_PROFILE) -> None:
         if not self.enabled:
             return
         if slot in self._episodes:
             raise RuntimeError("close the preceding Local-TTT episode before reusing an environment slot")
+        if type(image_size) is not int or image_size <= 0 or preprocess_profile != PREPROCESS_PROFILE:
+            raise ValueError("Local-TTT image_size/preprocess_profile 不合法")
         self._episodes[slot] = _Episode(
-            session_id=f"{self.client_id}:{slot}",
+            session_id=f"{self.client_id}:{slot}:{uuid.uuid4().hex}",
             episode_id=uuid.uuid4().hex,
+            image_size=image_size,
+            preprocess_profile=preprocess_profile,
         )
 
     def _get(self, slot: int) -> _Episode:
@@ -62,24 +64,22 @@ class RoboCasaLocalMemoryClient:
     @staticmethod
     def _image(value: np.ndarray, name: str) -> np.ndarray:
         image = np.asarray(value)
-        if image.shape != (CAMERA_HEIGHT, CAMERA_WIDTH, 3) or image.dtype != np.uint8:
+        if image.shape != (CAMERA_HEIGHT, COMPOSITE_WIDTH, 3) or image.dtype != np.uint8:
             raise ValueError(
-                f"{name} must be uint8 [{CAMERA_HEIGHT},{CAMERA_WIDTH},3], got {image.shape} {image.dtype}"
+                f"{name} must be uint8 [{CAMERA_HEIGHT},{COMPOSITE_WIDTH},3], got {image.shape} {image.dtype}"
             )
         return np.ascontiguousarray(image)
 
-    def record_executed(
+    def record_completed(
         self,
         slot: int,
-        left_image: np.ndarray,
-        wrist_image: np.ndarray,
+        composite_image: np.ndarray,
         executed_action15: np.ndarray | list[float],
     ) -> None:
         if not self.enabled:
             return
         episode = self._get(slot)
-        left = self._image(left_image, "left_image")
-        wrist = self._image(wrist_image, "wrist_image")
+        composite = self._image(composite_image, "composite_image")
         action = np.asarray(executed_action15, dtype=np.float32).reshape(-1)
         if action.shape != (EVIDENCE_ACTION_DIM,) or not np.isfinite(action).all():
             raise ValueError("executed Local-TTT evidence action must be finite raw15")
@@ -88,8 +88,7 @@ class RoboCasaLocalMemoryClient:
         episode.evidence.append(
             {
                 "source_step": episode.consumer_step,
-                "left_image": b64_png(left),
-                "wrist_image": b64_png(wrist),
+                "composite_image": b64_png(composite),
                 "executed_action": action.tolist(),
             }
         )
@@ -104,6 +103,8 @@ class RoboCasaLocalMemoryClient:
             "episode_id": episode.episode_id,
             "consumer_step": episode.consumer_step,
             "reset": episode.first_request,
+            "image_size": episode.image_size,
+            "preprocess_profile": episode.preprocess_profile,
             "evidence_version": EVIDENCE_VERSION,
             "evidence_format": EVIDENCE_FORMAT,
             "evidence": [dict(row) for row in episode.evidence],

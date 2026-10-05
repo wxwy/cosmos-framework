@@ -104,15 +104,11 @@ def test_online_sequential_update_matches_training_core_scan() -> None:
     reference_core = copy.deepcopy(core)
     memory = OnlineLocalMemory(encoder, core)
 
-    cold = memory.prepare(
-        OnlineMemoryRequest("s", "e", 0, (), torch.empty(0, 96), torch.empty(0, 15), True)
-    )
+    cold = memory.prepare(OnlineMemoryRequest("s", "e", 0, (), torch.empty(0, 96), torch.empty(0, 15), True))
     memory.commit(cold)
     visual = torch.randn(16, 96)
     action = torch.randn(16, 15)
-    update = memory.prepare(
-        OnlineMemoryRequest("s", "e", 16, tuple(range(16)), visual, action, False)
-    )
+    update = memory.prepare(OnlineMemoryRequest("s", "e", 16, tuple(range(16)), visual, action, False))
 
     valid = torch.ones(1, 16, dtype=torch.bool)
     reference_core.reset_telemetry()
@@ -128,3 +124,47 @@ def test_online_sequential_update_matches_training_core_scan() -> None:
     torch.testing.assert_close(update.token, tokens[0, -1].detach(), rtol=2e-5, atol=2e-6)
     for actual, expected in zip(update.replacement.state, state, strict=True):
         torch.testing.assert_close(actual, expected.detach(), rtol=2e-5, atol=2e-6)
+
+
+def test_model_owned_n20_t8_chunks_match_scalar_reference_and_telemetry() -> None:
+    torch.manual_seed(23)
+    encoder = LocalEvidenceEncoder(evidence_dim=16, action_dim=15)
+    core = ContinualTTTLocalMemoryCore(
+        evidence_dim=16, local_dim=4, ttt_dim=8, fast_hidden_dim=16, ttt_tbptt_steps=8, k_local=2
+    )
+    ref_encoder, ref_core = copy.deepcopy(encoder), copy.deepcopy(core)
+    calls: list[tuple[int, bool]] = []
+
+    def scan(visual, action, valid, state, *, create_graph=False):
+        calls.append((visual.shape[1], state is not None))
+        return core.scan_segment_masked_encoded_many(encoder, visual, action, valid, state, create_graph=create_graph)
+
+    memory = OnlineLocalMemory(encoder, core, scan_local_memory=scan)
+    cold = memory.prepare(OnlineMemoryRequest("s", "e", 0, (), torch.empty(0, 96), torch.empty(0, 15), True))
+    memory.commit(cold)
+    visual, action = torch.randn(20, 96), torch.randn(20, 15)
+    update = memory.prepare(OnlineMemoryRequest("s", "e", 20, tuple(range(20)), visual, action))
+    assert calls == [(8, False), (8, True), (4, True)]
+    assert update.telemetry["adapted_steps"] == 20
+
+    ref_core.reset_telemetry()
+    state = ref_core.initial_state(1)
+    for index in range(20):
+        evidence = ref_encoder.encode_segment(
+            visual[index : index + 1].unsqueeze(0), action[index : index + 1].unsqueeze(0)
+        ).squeeze(1)
+        with torch.enable_grad():
+            tokens, state = ref_core.step_many(evidence, state, create_graph=False)
+        state = OnlineLocalMemory._detach_state(state)
+    expected = ref_core.drain_telemetry()
+    torch.testing.assert_close(update.token, tokens[0].detach(), rtol=2e-5, atol=2e-6)
+    for actual, reference in zip(update.replacement.state, state, strict=True):
+        torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-6)
+    assert update.telemetry["fast_update_norm"] == pytest.approx(
+        float(expected["ttt_fast_update_norm_sum"] / expected["ttt_fast_update_norm_count"]), rel=2e-5
+    )
+    assert update.telemetry["inner_loss_mean"] == pytest.approx(
+        float(expected["ttt_inner_loss_sum"] / expected["ttt_inner_loss_count"]), rel=2e-5
+    )
+    memory.commit(update)
+    assert memory._records["s"].consumer_step == 20
