@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-"""H3-C 原生 trainer GA2 接线；数据入口与 checkpoint 留给后续 Gate。"""
+"""Corrected exact-window Local trainer 接线；resume 由后续 Gate 处理。"""
 
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -16,10 +15,10 @@ from torch.distributed.tensor import DTensor
 
 from cosmos_framework.data.generator.joint_dataloader import JointDataLoader, custom_collate_fn
 from cosmos_framework.model.generator.mot.local_memory_grouped_window import GroupedLocalMemoryWindow
-from cosmos_framework.model.generator.mot.robocasa_grouped_segment import (
-    CatalogEpisode,
-    RankLocalGroupedPlanner,
-    materialize_member,
+from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
+    ExactWindowLocalCatalog,
+    ExactWindowRankPlanner,
+    ExactWindowSegmentProducer,
 )
 from cosmos_framework.trainer import ImaginaireTrainer
 from cosmos_framework.trainer.local_memory_grouped_resume import (
@@ -33,8 +32,8 @@ from cosmos_framework.utils.generator.optimizer import OptimizersContainer
 
 def collate_grouped_native_batch(payloads: tuple[dict[str, Any], ...]) -> dict[str, Any]:
     """复用 JointDataLoader 的 per-sample ABI，把同一 index 的有效 slot 封装为原生 batch。"""
-    if not 1 <= len(payloads) <= 8 or not all(isinstance(payload, dict) for payload in payloads):
-        raise ValueError("grouped native batch 要求1..8个 Stage-A payload")
+    if not payloads or not all(isinstance(payload, dict) for payload in payloads):
+        raise ValueError("grouped native batch 要求非空 dict payload tuple")
     loader = object.__new__(JointDataLoader)
     loader.buffers = [deque()]
     loader.dataloaders = [iter((custom_collate_fn(list(payloads)),))]
@@ -47,7 +46,7 @@ def collate_grouped_native_batch(payloads: tuple[dict[str, Any], ...]) -> dict[s
 
 
 class GroupedLocalMemoryTrainer(ImaginaireTrainer):
-    """保留上游 train loop；两次 training_step 是一个完整的 grouped optimizer window。"""
+    """保留上游 train loop；active_ga 次 training_step 是一个 grouped optimizer window。"""
 
     def _observe_grouped(
         self,
@@ -75,10 +74,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
     def _optimizer_lr_metrics(optimizer: Any) -> dict[str, float]:
         optimizers = optimizer.optimizers if isinstance(optimizer, OptimizersContainer) else [optimizer]
         lrs = [
-            float(group["lr"])
-            for inner in optimizers
-            for group in getattr(inner, "param_groups", ())
-            if "lr" in group
+            float(group["lr"]) for inner in optimizers for group in getattr(inner, "param_groups", ()) if "lr" in group
         ]
         if not lrs:
             return {}
@@ -86,23 +82,33 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
 
     def bind_grouped_stream(
         self,
-        planner: RankLocalGroupedPlanner,
-        producer_for: Callable[[CatalogEpisode], Any],
+        planner: ExactWindowRankPlanner,
+        producer: ExactWindowSegmentProducer,
         *,
         config_digest: str,
     ) -> None:
         if (
             hasattr(self, "_grouped_planner")
             or getattr(self, "_grouped_window", None) is not None
-            or not callable(producer_for)
+            or not isinstance(planner, ExactWindowRankPlanner)
+            or not isinstance(producer, ExactWindowSegmentProducer)
             or not config_digest
         ):
-            raise RuntimeError("grouped stream 已绑定或 producer_for/config_digest 不合法")
+            raise RuntimeError("grouped stream 已绑定或 planner/producer/config_digest 不合法")
+        if producer.catalog is not planner.catalog:
+            raise ValueError("grouped planner/producer catalog 不一致")
+        if (
+            not isinstance(planner.catalog, ExactWindowLocalCatalog)
+            or planner.b_stream <= 0
+            or planner.active_ga != self.config.trainer.grad_accum_iter
+            or producer.config_digest != config_digest
+        ):
+            raise ValueError("grouped catalog/B/GA/config_digest 与 trainer 不匹配")
         if not hasattr(self.callbacks, "_callbacks") or any(
             getattr(callback, "checkpoint_component", None) == "dataloader" for callback in self.callbacks._callbacks
         ):
             raise ValueError("H3-D 要求独占 DCP dataloader state callback")
-        self._grouped_planner, self._grouped_producer_for = planner, producer_for
+        self._grouped_planner, self._grouped_producer = planner, producer
         self._grouped_config_digest = config_digest
         self._grouped_completed_iteration = 0
         self._pending_grouped_resume = None
@@ -141,23 +147,22 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
     def _require_finite_gradients(optimizer: Any) -> None:
         parameters = GroupedLocalMemoryTrainer._optimizer_parameters(optimizer)
         local_bad = 0
-        present = False
+        local_present = 0
         for parameter in parameters:
             gradient = parameter.grad
             if gradient is None:
                 continue
-            present = True
+            local_present = 1
             if isinstance(gradient, DTensor):
                 gradient = gradient.to_local()
             if gradient.is_sparse or not bool(torch.isfinite(gradient).all()):
                 local_bad = 1
-        if not present:
-            local_bad = 1
         if dist.is_available() and dist.is_initialized():
-            flag = torch.tensor(local_bad, device=parameters[0].device, dtype=torch.int32)
-            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-            local_bad = int(flag)
-        if local_bad:
+            flags = torch.tensor([local_bad, local_present], device=parameters[0].device, dtype=torch.int32)
+            dist.all_reduce(flags[:1], op=dist.ReduceOp.MAX)
+            dist.all_reduce(flags[1:], op=dist.ReduceOp.SUM)
+            local_bad, local_present = flags.tolist()
+        if local_bad or not local_present:
             raise FloatingPointError("H3-C 选中参数梯度缺失或非有限；optimizer/fast state 均不发布")
 
     @staticmethod
@@ -180,11 +185,14 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         iteration: int = 0,
         grad_accum_iter: int = 0,
     ) -> tuple[dict[str, Any], torch.Tensor, int]:
-        del data  # H3-F 的 dataloader 只驱动两次 GA 调用；raw/RGB 由冻结 H3-B binder 提供。
-        if self.config.trainer.grad_accum_iter != 2 or grad_accum_iter not in (0, 1):
-            raise ValueError("H3-C 要求 trainer GA2 和 grad_accum_iter 0/1")
+        del data  # dataloader 驱动 GA 调用；raw/RGB 由 exact-window producer 提供。
         if not hasattr(self, "_grouped_planner"):
             raise RuntimeError("必须先 bind_grouped_stream")
+        active_ga = self._grouped_planner.active_ga
+        if self.config.trainer.grad_accum_iter != active_ga or not 0 <= grad_accum_iter < active_ga:
+            raise ValueError("trainer GA 与 corrected planner active_ga 不匹配")
+        if getattr(getattr(self.config, "model_parallel", None), "context_parallel_size", 1) != 1:
+            raise ValueError("Phase5A grouped trainer 要求 context_parallel_size=1")
         if self._grouped_restore_failed:
             raise RuntimeError("Local 恢复失败后不得继续使用该 trainer 实例")
         model = model_ddp.module if self.config.trainer.distributed_parallelism == "ddp" else model_ddp
@@ -211,7 +219,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         if grad_accum_iter == 0:
             window.begin()
         elif window.plan is None:
-            raise RuntimeError("第二次 GA 调用缺少 pending grouped window")
+            raise RuntimeError("后续 GA 调用缺少 pending grouped window")
         assert window.plan is not None
         output: dict[str, Any] = {}
         backward_index = 0
@@ -228,10 +236,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             scalar_metrics = {
                 key: value.detach()
                 for key, value in output.items()
-                if isinstance(value, torch.Tensor)
-                and value.ndim == 0
-                and "loss" in key
-                and bool(torch.isfinite(value))
+                if isinstance(value, torch.Tensor) and value.ndim == 0 and "loss" in key and bool(torch.isfinite(value))
             }
             self._observe_grouped(
                 "native_forward",
@@ -261,10 +266,12 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             self.callbacks.on_after_backward(model, iteration=iteration)
 
         try:
-            segments = materialize_member(window.plan.members[grad_accum_iter], self._grouped_producer_for)
+            segments = tuple(
+                self._grouped_producer.produce(request) for request in window.plan.members[grad_accum_iter]
+            )
             member_loss = window.run_member(segments, native_loss, backward)
-            if grad_accum_iter == 0:
-                return output, member_loss, 1
+            if grad_accum_iter + 1 < active_ga:
+                return output, member_loss, grad_accum_iter + 1
             if grad_scaler.is_enabled():
                 grad_scaler.unscale_(optimizer)
             self._require_finite_gradients(optimizer)

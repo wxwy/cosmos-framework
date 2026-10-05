@@ -1,7 +1,8 @@
-"""H3-C ImaginaireTrainer GA2/optimizer 生命周期与原生 batch ABI CPU 合同。"""
+"""Phase5A corrected trainer 动态 GA/optimizer 生命周期与原生 batch ABI CPU 合同。"""
 
 from __future__ import annotations
 
+import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -10,9 +11,12 @@ import torch
 from torch import nn
 
 import cosmos_framework.trainer.local_memory_grouped as grouped_module
-from cosmos_framework.model.generator.mot.local_memory_grouped_window_test import _rank_catalog, _segments
-from cosmos_framework.model.generator.mot.memory_prefix import LocalMemoryRuntime
-from cosmos_framework.model.generator.mot.robocasa_grouped_segment import RankLocalGroupedPlanner
+from cosmos_framework.model.generator.mot.local_memory_grouped_window_test import _Net
+from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
+    ExactWindowRankPlanner,
+    ExactWindowSegmentProducer,
+)
+from cosmos_framework.model.generator.mot.robocasa_exact_window_local_test import _setup as _exact_setup
 from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrainer, collate_grouped_native_batch
 from cosmos_framework.utils.generator.optimizer import OptimizersContainer
 
@@ -30,11 +34,9 @@ class _Hooks:
 
 
 class _Model(nn.Module):
-    def __init__(self):
+    def __init__(self, t=2):
         super().__init__()
-        self.net = nn.Module()
-        self.net.local_memory_runtime = LocalMemoryRuntime()
-        self.net.moe_gen = nn.Parameter(torch.tensor(2.0))
+        self.net = _Net(t)
 
     def training_step(self, batch, iteration, *, _local_memory_prefixes):
         assert batch["count"] == len(_local_memory_prefixes)
@@ -52,62 +54,116 @@ class _Model(nn.Module):
         pass
 
 
-def _trainer() -> GroupedLocalMemoryTrainer:
+def _trainer(active_ga=2, b_stream=8) -> GroupedLocalMemoryTrainer:
     trainer = object.__new__(GroupedLocalMemoryTrainer)
-    trainer.config = SimpleNamespace(trainer=SimpleNamespace(grad_accum_iter=2, distributed_parallelism="fsdp"))
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(grad_accum_iter=active_ga, distributed_parallelism="fsdp"))
     trainer.callbacks = _Hooks()
     trainer.training_timer = lambda name: nullcontext()
+    _, _, catalog, producer = _exact_setup((5,) * 16, t=2)
     trainer.bind_grouped_stream(
-        RankLocalGroupedPlanner(_rank_catalog(16, frames=64), rank=0), lambda _: None, config_digest="config"
+        ExactWindowRankPlanner(catalog, rank=0, world_size=1, b_stream=b_stream, active_ga=active_ga),
+        producer,
+        config_digest="config",
     )
     return trainer
 
 
-def test_collate_uses_native_joint_dataloader_multi_sample_abi() -> None:
+@pytest.mark.parametrize("size", [1, 3, 8])
+def test_collate_uses_native_joint_dataloader_multi_sample_abi(size: int) -> None:
     payloads = tuple(
         {
-            "video": torch.zeros(3, 33, 2, 4),
-            "action": torch.zeros(33, 64),
+            "video": torch.zeros(3, 17, 2, 4),
+            "video_latent": torch.zeros(5, 48, 2, 2),
+            "cached_latent_required": True,
+            "action": torch.zeros(17, 64),
+            "action_raw": torch.zeros(17, 15),
             "text_token_ids": torch.tensor([1, 2, index]),
             "sequence_plan": f"plan-{index}",
         }
-        for index in range(3)
+        for index in range(size)
     )
     batch = collate_grouped_native_batch(payloads)
-    assert len(batch["video"]) == len(batch["action"]) == len(batch["sequence_plan"]) == 3
-    assert batch["sequence_plan"] == ["plan-0", "plan-1", "plan-2"]
+    assert len(batch["video"]) == len(batch["action"]) == len(batch["sequence_plan"]) == size
+    assert batch["sequence_plan"] == [f"plan-{index}" for index in range(size)]
     assert all(len(items) == 1 for items in batch["video"])
+    assert len(batch["video_latent"]) == size
+    assert batch["cached_latent_required"] == [True] * size
+    assert all(len(item) == 1 and item[0].shape == (17, 64) for item in batch["action"])
+    assert all(len(item) == 1 and item[0].shape == (17, 15) for item in batch["action_raw"])
 
 
-def test_trainer_ga2_runs_one_optimizer_then_publishes_and_zeros_grad(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_collate_rejects_empty_or_non_dict_payloads() -> None:
+    with pytest.raises(ValueError, match="非空"):
+        collate_grouped_native_batch(())
+    with pytest.raises(ValueError, match="dict"):
+        collate_grouped_native_batch((None,))
+
+
+def test_exact_binding_rejects_catalog_ga_digest_and_duplicate() -> None:
+    trainer = _trainer(active_ga=2, b_stream=3)
+    with pytest.raises(RuntimeError, match="已绑定"):
+        trainer.bind_grouped_stream(trainer._grouped_planner, trainer._grouped_producer, config_digest="config")
+    fresh = object.__new__(GroupedLocalMemoryTrainer)
+    fresh.config = SimpleNamespace(trainer=SimpleNamespace(grad_accum_iter=2))
+    fresh.callbacks = _Hooks()
+    _, _, catalog, producer = _exact_setup((5,) * 16, t=2)
+    planner = ExactWindowRankPlanner(catalog, rank=0, world_size=1, b_stream=3, active_ga=2)
+    _, _, other_catalog, _ = _exact_setup((5,) * 16, t=2)
+    with pytest.raises(ValueError, match="catalog"):
+        fresh.bind_grouped_stream(
+            planner, ExactWindowSegmentProducer(other_catalog, config_digest="config"), config_digest="config"
+        )
+    with pytest.raises(ValueError, match="GA"):
+        fresh.bind_grouped_stream(
+            ExactWindowRankPlanner(catalog, rank=0, world_size=1, b_stream=3, active_ga=3),
+            producer,
+            config_digest="config",
+        )
+    with pytest.raises(ValueError, match="config_digest"):
+        fresh.bind_grouped_stream(planner, producer, config_digest="other")
+    assert not hasattr(fresh, "_grouped_planner")
+
+
+def test_trainer_has_no_historical_grouped_import_or_materializer() -> None:
+    source = inspect.getsource(grouped_module)
+    assert "robocasa_grouped_segment" not in source
+    assert "materialize_member" not in source
+
+
+@pytest.mark.parametrize("active_ga", [1, 2, 3])
+def test_trainer_dynamic_ga_runs_one_optimizer_then_publishes_and_zeros_grad(
+    monkeypatch: pytest.MonkeyPatch, active_ga: int
+) -> None:
     torch.manual_seed(19)
     model = _Model()
-    trainer = _trainer()
+    trainer = _trainer(active_ga)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     scaler = torch.amp.GradScaler("cpu", enabled=False)
-    monkeypatch.setattr(
-        grouped_module,
-        "materialize_member",
-        lambda *_: _segments(trainer._grouped_window, trainer._grouped_window._member_index),
-    )
     monkeypatch.setattr(grouped_module, "collate_grouped_native_batch", lambda payloads: {"count": len(payloads)})
     monkeypatch.setattr(grouped_module.misc, "to", lambda value, **kwargs: value)
-
-    output, first, accum = trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, 0)
-    before = trainer._grouped_window.live
-    assert accum == 1 and output["count"] == 8 and trainer._grouped_window.live is before
-    assert model.net.moe_gen.grad is not None and first.isfinite()
+    accum = 0
+    before = None
     old_weight = model.net.moe_gen.detach().clone()
-
-    output, second, accum = trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, accum)
-    assert accum == 0 and output["count"] == 8 and second.isfinite()
+    for member in range(active_ga):
+        output, loss, accum = trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, accum)
+        assert output["count"] == 8 and loss.isfinite()
+        if member == 0:
+            before = trainer._grouped_window.live if active_ga > 1 else None
+        if member + 1 < active_ga:
+            assert accum == member + 1 and trainer._grouped_window.live is before
+            assert model.net.moe_gen.grad is not None
+            torch.testing.assert_close(model.net.moe_gen.detach(), old_weight)
+            assert scheduler.last_epoch == 0
+    assert accum == 0
     assert model.net.moe_gen.item() != old_weight.item()
-    assert trainer._grouped_window.live is not before
+    if before is not None:
+        assert trainer._grouped_window.live is not before
     assert len(trainer._grouped_window.live.scheduler._committed) == 8
     assert all(parameter.grad is None for parameter in model.parameters())
-    assert trainer.callbacks.events.count("on_before_forward") == 32
-    assert trainer.callbacks.events.count("on_before_backward") == 32
+    expected_calls = sum(min(2, 5 - 2 * member) for member in range(active_ga))
+    assert trainer.callbacks.events.count("on_before_forward") == expected_calls
+    assert trainer.callbacks.events.count("on_before_backward") == expected_calls
     assert trainer.callbacks.events.count("on_before_optimizer_step") == 1
     assert scheduler.last_epoch == 1
 
@@ -134,6 +190,62 @@ def test_scaler_skip_does_not_advance_scheduler() -> None:
 
     assert GroupedLocalMemoryTrainer._optimizer_step_success(optimizer, scheduler, SkippingScaler()) is False
     assert scheduler.last_epoch == 0
+
+
+def test_bind_rejects_catalog_mismatch_and_existing_dataloader_authority() -> None:
+    trainer = _trainer()
+    _, _, other_catalog, other_producer = _exact_setup((5,) * 16, t=2)
+    assert other_catalog is not trainer._grouped_planner.catalog
+    fresh = object.__new__(GroupedLocalMemoryTrainer)
+    fresh.config = SimpleNamespace(trainer=SimpleNamespace(grad_accum_iter=2))
+    fresh.callbacks = _Hooks()
+    with pytest.raises(ValueError, match="catalog"):
+        fresh.bind_grouped_stream(trainer._grouped_planner, other_producer, config_digest="config")
+    fresh.callbacks._callbacks.append(SimpleNamespace(checkpoint_component="dataloader"))
+    with pytest.raises(ValueError, match="dataloader"):
+        fresh.bind_grouped_stream(
+            trainer._grouped_planner,
+            ExactWindowSegmentProducer(trainer._grouped_planner.catalog, config_digest="config"),
+            config_digest="config",
+        )
+
+
+def test_exact_producer_materializes_planned_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    trainer = _trainer(active_ga=1, b_stream=3)
+    model = _Model()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    producer = trainer._grouped_producer
+    seen = []
+    original = producer.produce
+
+    def record(request):
+        segment = original(request)
+        seen.append((request, segment))
+        return segment
+
+    monkeypatch.setattr(producer, "produce", record)
+    monkeypatch.setattr(grouped_module, "collate_grouped_native_batch", lambda payloads: {"count": len(payloads)})
+    monkeypatch.setattr(grouped_module.misc, "to", lambda value, **kwargs: value)
+    trainer.training_step(model, optimizer, scheduler, torch.amp.GradScaler("cpu", enabled=False), {}, 0, 0)
+    assert len(seen) == 3
+    assert tuple(int(segment.slot_id[0]) for _, segment in seen) == (0, 1, 2)
+    assert all(segment.segment_provenance.config_digest == "config" for _, segment in seen)
+
+
+def test_ga_and_context_parallel_must_match_planner() -> None:
+    trainer = _trainer(active_ga=3)
+    model = _Model()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    trainer.config.trainer.grad_accum_iter = 2
+    with pytest.raises(ValueError, match="active_ga"):
+        trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, 0)
+    trainer.config.trainer.grad_accum_iter = 3
+    trainer.config.model_parallel = SimpleNamespace(context_parallel_size=2)
+    with pytest.raises(ValueError, match="context_parallel_size"):
+        trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, 0)
 
 
 def test_optimizer_parameters_supports_container_and_plain_optimizer() -> None:
@@ -188,40 +300,35 @@ def test_nonfinite_selected_gradient_fails_before_optimizer() -> None:
         GroupedLocalMemoryTrainer._require_finite_gradients(optimizer)
 
 
+def test_absent_w0_gradient_is_legal_when_another_selected_gradient_is_present() -> None:
+    absent = nn.Parameter(torch.tensor(1.0))
+    present = nn.Parameter(torch.tensor(2.0))
+    present.grad = torch.tensor(0.5)
+    optimizer = torch.optim.SGD([absent, present], lr=0.1)
+    GroupedLocalMemoryTrainer._require_finite_gradients(optimizer)
+    present.grad = None
+    with pytest.raises(FloatingPointError, match="缺失"):
+        GroupedLocalMemoryTrainer._require_finite_gradients(optimizer)
+
+
 def test_trainer_scaler_skip_aborts_pending_window_without_publish(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _Model()
-    trainer = _trainer()
+    trainer = _trainer(b_stream=1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
 
-    class PendingWindow:
-        def __init__(self):
-            self.plan = SimpleNamespace(members=((), ()))
-            self.aborted = False
-            self.published = False
-
-        def run_member(self, segments, native_loss, backward):
-            model.net.moe_gen.grad = torch.ones_like(model.net.moe_gen)
-            return torch.tensor(1.0)
-
-        def finish(self, optimizer_step):
-            if not optimizer_step():
-                self.abort()
-                raise RuntimeError("optimizer skipped")
-            self.published = True
-
-        def abort(self):
-            self.aborted = True
-
     class SkippingScaler:
         def __init__(self):
-            self.scale = 8.0
+            self.current_scale = 8.0
 
         def is_enabled(self):
             return True
 
         def get_scale(self):
-            return self.scale
+            return self.current_scale
+
+        def scale(self, loss):
+            return loss
 
         def unscale_(self, optimizer):
             pass
@@ -230,11 +337,16 @@ def test_trainer_scaler_skip_aborts_pending_window_without_publish(monkeypatch: 
             pass
 
         def update(self):
-            self.scale = 4.0
+            self.current_scale = 4.0
 
-    pending = PendingWindow()
-    trainer._grouped_window = pending
-    monkeypatch.setattr(grouped_module, "materialize_member", lambda *_: ())
-    with pytest.raises(RuntimeError, match="skipped"):
-        trainer.training_step(model, optimizer, scheduler, SkippingScaler(), {}, 0, 1)
-    assert pending.aborted and not pending.published and scheduler.last_epoch == 0
+    monkeypatch.setattr(grouped_module, "collate_grouped_native_batch", lambda payloads: {"count": len(payloads)})
+    monkeypatch.setattr(grouped_module.misc, "to", lambda value, **kwargs: value)
+    scaler = SkippingScaler()
+    _, _, next_ga = trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, 0)
+    live_before = trainer._grouped_window.live
+    with pytest.raises(RuntimeError, match="optimizer 未执行成功"):
+        trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, next_ga)
+    assert trainer._grouped_window.live is live_before
+    assert trainer._grouped_window.plan is None
+    assert scheduler.last_epoch == 0
+    assert trainer._grouped_completed_iteration == 0
