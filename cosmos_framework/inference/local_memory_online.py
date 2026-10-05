@@ -140,7 +140,13 @@ class OnlineLocalMemory:
                 raise RuntimeError("session already has a pending Local-TTT prediction")
             previous = self._records.get(request.session_id)
             if previous is not None and previous.fingerprint == fingerprint:
-                update = OnlineMemoryUpdate(self, request.session_id, previous, previous, True, {})
+                telemetry = {
+                    "adapted_steps": 0.0,
+                    "inner_loss_mean": 0.0,
+                    "fast_state_norm": self._state_norm(previous.state),
+                    "fast_update_norm": 0.0,
+                }
+                update = OnlineMemoryUpdate(self, request.session_id, previous, previous, True, telemetry)
                 self._pending[request.session_id] = update
                 return update
 
@@ -158,6 +164,7 @@ class OnlineLocalMemory:
                 token = None
                 telemetry = {
                     "adapted_steps": 0.0,
+                    "inner_loss_mean": 0.0,
                     "fast_state_norm": 0.0,
                     "fast_update_norm": 0.0,
                 }

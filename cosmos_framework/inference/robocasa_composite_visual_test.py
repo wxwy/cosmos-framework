@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
 import torch
+from PIL import Image
 from torch import nn
 
 from cosmos_framework.data.generator.action.utils.transforms import find_closest_target_size, reflection_pad_to_target
@@ -29,14 +32,22 @@ def _prepared() -> visual.PreparedCompositeFrame:
     return visual.prepare_robocasa_composite_frame(frame, 256)
 
 
-def test_shared_spatial_repeat_before_after_pad_identical() -> None:
-    prepared = _prepared()
-    source = prepared.source_uint8
+@pytest.mark.parametrize("image_size", [128, 192, 256, 320])
+def test_shared_spatial_repeat_before_after_pad_identical(image_size: int) -> None:
+    composite = torch.arange(3 * 256 * 512, dtype=torch.int64).reshape(3, 256, 512).to(torch.uint8)
+    prepared = visual.prepare_robocasa_composite_frame(composite, image_size)
+    source = composite
+    if image_size != 256:
+        resized = Image.fromarray(source.permute(1, 2, 0).numpy()).resize(
+            (int(round(512 * image_size / 256)), image_size), resample=Image.Resampling.BILINEAR
+        )
+        source = torch.from_numpy(np.asarray(resized, dtype=np.uint8).copy()).permute(2, 0, 1).contiguous()
     _, height, width = source.shape
     resolution = get_vision_data_resolution((height, width))
     target_w, target_h = find_closest_target_size(height, width, resolution)
     old = {"video": source.unsqueeze(1).repeat(1, 17, 1, 1)}
     reflection_pad_to_target(old, ["video"], True, target_w, target_h)
+    assert torch.equal(source, prepared.source_uint8)
     assert torch.equal(old["video"], prepared.padded_single_frame.repeat(1, 17, 1, 1))
     assert torch.equal(old["image_size"], prepared.padded_image_size)
     assert torch.equal(old["video"][:, :1], prepared.padded_single_frame)

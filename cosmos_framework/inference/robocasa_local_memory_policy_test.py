@@ -79,7 +79,15 @@ def adapter(monkeypatch):
 def _cold(adapter, *, session="s", episode="e"):
     update = adapter.prepare(_request(0, 0, reset=True, session=session, episode=episode))
     assert adapter.prefixes(update) == (None,)
-    assert adapter.status(update)["adapted_steps"] == 0
+    assert {
+        key: adapter.status(update)[key]
+        for key in ("adapted_steps", "inner_loss_mean", "fast_state_norm", "fast_update_norm")
+    } == {
+        "adapted_steps": 0.0,
+        "inner_loss_mean": 0.0,
+        "fast_state_norm": 0.0,
+        "fast_update_norm": 0.0,
+    }
     adapter.commit(update)
 
 
@@ -134,6 +142,12 @@ def test_lost_response_replay_is_exact_and_does_not_encode(adapter):
     replay = memory.prepare(deepcopy(first_request))
     assert memory.status(replay)["replay"] is True
     assert memory.status(replay)["encoded_steps"] == 0
+    assert {key: memory.status(replay)[key] for key in ("adapted_steps", "inner_loss_mean", "fast_update_norm")} == {
+        "adapted_steps": 0.0,
+        "inner_loss_mean": 0.0,
+        "fast_update_norm": 0.0,
+    }
+    assert memory.status(replay)["fast_state_norm"] == pytest.approx(memory.status(first)["fast_state_norm"])
     torch.testing.assert_close(memory.prefixes(replay)[0], token)
     assert len(encoded) == 2 and model.scan_calls == [(2, False)]
     memory.commit(replay)
