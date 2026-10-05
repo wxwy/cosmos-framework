@@ -13,9 +13,11 @@ from typing import Any
 import torch
 
 from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
+from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import RoboCasaExactWindowCacheCatalog
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cached_sft import (
     get_action_robocasa_exact_window_cached_sft_dataset,
 )
+from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_policy import CorrectedRoboCasaPolicyContract
 from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
     ExactWindowLocalCatalog,
     ExactWindowRankPlanner,
@@ -150,7 +152,29 @@ def install_optimizer_inventory_check(model: torch.nn.Module, report: dict[str, 
     model.init_optimizer_scheduler = checked
 
 
-def config_digest(catalog: ExactWindowLocalCatalog, config: Any, *, b_stream: int, active_ga: int) -> str:
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def model_witnesses(edge: Path, base_checkpoint: Path) -> dict[str, str]:
+    return {
+        "edge_config_sha256": _file_sha256(edge / "config.json"),
+        "base_model_metadata_sha256": _file_sha256(base_checkpoint / "model/.metadata"),
+    }
+
+
+def config_digest(
+    catalog: ExactWindowLocalCatalog,
+    config: Any,
+    *,
+    b_stream: int,
+    active_ga: int,
+    witnesses: dict[str, str],
+) -> str:
     model = config.model.config
     local = {
         key: getattr(model, f"local_memory_{key}")
@@ -161,6 +185,7 @@ def config_digest(catalog: ExactWindowLocalCatalog, config: Any, *, b_stream: in
         "cache_corpus_digest": catalog.cache_corpus_digest,
         "source_binding_digest": catalog.source_binding_digest,
         "model": "Cosmos3-Edge-Policy-DROID/corrected-exact-window-v1",
+        "model_witnesses": witnesses,
         "raw_action_dim": 15,
         "state_dim": 15,
         "h_pred": 16,
@@ -193,14 +218,21 @@ def config_digest(catalog: ExactWindowLocalCatalog, config: Any, *, b_stream: in
     return hashlib.sha256(json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def overlay_config(config: Any, args: argparse.Namespace, *, resume_checkpoint: Path | None = None) -> None:
+def overlay_config(
+    config: Any,
+    args: argparse.Namespace,
+    contract: CorrectedRoboCasaPolicyContract,
+    *,
+    resume_checkpoint: Path | None = None,
+) -> None:
     from examples.psm_wma_robocasa_local_s1 import overlay_local_config
 
     overlay_local_config(config)
     model = config.model.config
     model.local_memory_ttt_tbptt_steps = args.t
     model.local_memory_k_local = args.k
-    model.tokenizer.encode_exact_durations = [17]
+    model.tokenizer = contract.resolve_tokenizer_config(model.tokenizer)
+    contract.validate_tokenizer_config(model.tokenizer)
     model.parallelism.data_parallel_shard_degree = args.world_size
     model.parallelism.data_parallel_replicate_degree = 1
     config.trainer.type = GroupedLocalMemoryTrainer
@@ -300,13 +332,22 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         raise FileNotFoundError("WAN VAE 文件缺失")
     resume = _resume_checkpoint(args)
     config = _load_config(args)
-    overlay_config(config, args, resume_checkpoint=resume)
+    cache = RoboCasaExactWindowCacheCatalog(args.cache_root)
+    contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(cache)
+    overlay_config(config, args, contract, resume_checkpoint=resume)
     tokenizer = config.model.config.vlm_config.tokenizer
     dataset = get_action_robocasa_exact_window_cached_sft_dataset(
         cache_root=args.cache_root, source_root=args.source_root, tokenizer_config=tokenizer
     )
     catalog = ExactWindowLocalCatalog(dataset, ttt_tbptt_steps=args.t)
-    digest = config_digest(catalog, config, b_stream=args.b, active_ga=args.ga)
+    if (
+        catalog.manifest_digest != cache.manifest_sha256
+        or catalog.raw.contract.vae_encode_contract != contract.vae_encode_contract
+    ):
+        raise ValueError("预检期间 cache VAE authority 漂移")
+    contract.validate_tokenizer_config(config.model.config.tokenizer)
+    witnesses = model_witnesses(args.edge, args.base_checkpoint)
+    digest = config_digest(catalog, config, b_stream=args.b, active_ga=args.ga, witnesses=witnesses)
     planner = ExactWindowRankPlanner(catalog, rank=0, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     plan = planner.plan_window(planner.initial_frontier())
     if args.snapshot10:
@@ -331,6 +372,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
             "cache_manifest_sha256": catalog.manifest_digest,
             "cache_corpus_digest": catalog.cache_corpus_digest,
             "source_binding_digest": catalog.source_binding_digest,
+            "model_witnesses": witnesses,
             "episodes": len(catalog.episodes),
             "checkpoint_load_path": str(resume or args.base_checkpoint),
         },

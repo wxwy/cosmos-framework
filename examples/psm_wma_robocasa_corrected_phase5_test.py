@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +11,9 @@ import pytest
 import torch
 from torch import nn
 
+from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
+from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_policy import CorrectedRoboCasaPolicyContract
+from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_policy_test import _catalog
 from examples import psm_wma_robocasa_corrected_phase5 as phase5
 
 
@@ -52,7 +57,9 @@ def _config(path: Path, *, t: int = 16, b: int = 8, ga: int = 2, k: int = 4):
         local_memory_dim=32,
         local_memory_evidence_dim=256,
         local_memory_inner_lr=0.1,
+        local_memory_action_dim=15,
         max_action_dim=64,
+        tokenizer=deepcopy(EDGE_MODEL_CONFIG["tokenizer"]),
         parallelism=SimpleNamespace(data_parallel_shard_degree=8, data_parallel_replicate_degree=1),
         cache_root=path / "cache",
         source_root=path / "source",
@@ -70,16 +77,43 @@ def _config(path: Path, *, t: int = 16, b: int = 8, ga: int = 2, k: int = 4):
         trainer=SimpleNamespace(max_iter=30000, grad_accum_iter=ga),
         scheduler=SimpleNamespace(cycle_lengths=[30000], warm_up_steps=[500]),
         checkpoint=SimpleNamespace(save_iter=100, load_path=str(path / "dcp")),
+        job=SimpleNamespace(),
     )
     catalog = SimpleNamespace(manifest_digest="manifest", cache_corpus_digest="corpus", source_binding_digest="source")
     return catalog, config, b, ga
 
 
 def test_digest_path_invariance_and_semantic_sensitivity(tmp_path: Path) -> None:
+    def witnesses(root: Path) -> dict[str, str]:
+        edge, base = root / "edge", root / "base"
+        (base / "model").mkdir(parents=True)
+        edge.mkdir()
+        (edge / "config.json").write_bytes(b"edge config")
+        (base / "model/.metadata").write_bytes(b"base model metadata")
+        return phase5.model_witnesses(edge, base)
+
+    base_witnesses = witnesses(tmp_path / "host_a")
     catalog, config, b, ga = _config(tmp_path / "host_a")
-    base = phase5.config_digest(catalog, config, b_stream=b, active_ga=ga)
+    base = phase5.config_digest(catalog, config, b_stream=b, active_ga=ga, witnesses=base_witnesses)
     moved_catalog, moved_config, _, _ = _config(tmp_path / "host_b")
-    assert phase5.config_digest(moved_catalog, moved_config, b_stream=b, active_ga=ga) == base
+    moved_witnesses = witnesses(tmp_path / "host_b")
+    assert (
+        phase5.config_digest(moved_catalog, moved_config, b_stream=b, active_ga=ga, witnesses=moved_witnesses) == base
+    )
+    for path in (tmp_path / "host_b/edge/config.json", tmp_path / "host_b/base/model/.metadata"):
+        original = path.read_bytes()
+        path.write_bytes(original + b" changed")
+        assert (
+            phase5.config_digest(
+                catalog,
+                config,
+                b_stream=b,
+                active_ga=ga,
+                witnesses=phase5.model_witnesses(tmp_path / "host_b/edge", tmp_path / "host_b/base"),
+            )
+            != base
+        )
+        path.write_bytes(original)
     for field, value in (
         ("manifest_digest", "changed"),
         ("cache_corpus_digest", "changed"),
@@ -87,12 +121,97 @@ def test_digest_path_invariance_and_semantic_sensitivity(tmp_path: Path) -> None
     ):
         changed = SimpleNamespace(**vars(catalog))
         setattr(changed, field, value)
-        assert phase5.config_digest(changed, config, b_stream=b, active_ga=ga) != base
+        assert phase5.config_digest(changed, config, b_stream=b, active_ga=ga, witnesses=base_witnesses) != base
     for kwargs in ({"t": 32}, {"b": 3}, {"ga": 3}, {"k": 1}, {"k": 8}):
         changed, changed_config, changed_b, changed_ga = _config(tmp_path, **kwargs)
-        assert phase5.config_digest(changed, changed_config, b_stream=changed_b, active_ga=changed_ga) != base
+        assert (
+            phase5.config_digest(
+                changed, changed_config, b_stream=changed_b, active_ga=changed_ga, witnesses=base_witnesses
+            )
+            != base
+        )
+    config.model.config.local_memory_evidence_dim = 128
+    assert phase5.config_digest(catalog, config, b_stream=b, active_ga=ga, witnesses=base_witnesses) != base
+    config.model.config.local_memory_evidence_dim = 256
     config.optimizer.weight_decay = 0.1
-    assert phase5.config_digest(catalog, config, b_stream=b, active_ga=ga) != base
+    assert phase5.config_digest(catalog, config, b_stream=b, active_ga=ga, witnesses=base_witnesses) != base
+
+
+def test_overlay_installs_full_manifest_tokenizer_contract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cache = _catalog(tmp_path / "cache")
+    contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(cache)
+    assert contract.vae_encode_contract["encode_exact_durations"] == [17, 61, 73]
+    catalog, config, _, _ = _config(tmp_path)
+    del catalog
+    from examples import psm_wma_robocasa_local_s1
+
+    monkeypatch.setattr(psm_wma_robocasa_local_s1, "overlay_local_config", lambda _: None)
+    args = SimpleNamespace(
+        t=16,
+        k=4,
+        world_size=8,
+        ga=2,
+        max_iter=30000,
+        warmup=500,
+        save_iter=100,
+        base_checkpoint=tmp_path / "base",
+        job_name="test",
+    )
+    phase5.overlay_config(config, args, contract)
+    assert config.model.config.tokenizer["encode_exact_durations"] == [17, 61, 73]
+    assert config.model.config.tokenizer["encode_chunk_frames"] == EDGE_MODEL_CONFIG["tokenizer"]["encode_chunk_frames"]
+    contract.validate_tokenizer_config(config.model.config.tokenizer)
+    with pytest.raises(ValueError, match="encode_exact_durations"):
+        contract.validate_tokenizer_config({**config.model.config.tokenizer, "encode_exact_durations": [17]})
+
+
+@pytest.mark.skipif(
+    not all(
+        os.environ.get(key)
+        for key in (
+            "PSM_PHASE4A_CACHE_ROOT",
+            "PSM_PHASE4A_SOURCE_ROOT",
+            "EDGE_POLICY_CHECKPOINT",
+            "BASE_CHECKPOINT_PATH",
+            "WAN_VAE_PATH",
+        )
+    ),
+    reason="未提供真实 exact-window cache/source/Edge/base/VAE 路径",
+)
+def test_optional_real_strict_snapshot10_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        phase5, "verify_root_child_lock", lambda _: {"root": "test", "child": "test", "gitlink": "test"}
+    )
+    args = SimpleNamespace(
+        phase="fresh",
+        t=16,
+        b=2,
+        ga=1,
+        k=4,
+        world_size=1,
+        max_iter=10,
+        save_iter=10,
+        warmup=1,
+        output_root=tmp_path,
+        root_worktree=tmp_path,
+        expected_root="test",
+        expected_child="test",
+        cache_root=Path(os.environ["PSM_PHASE4A_CACHE_ROOT"]),
+        source_root=Path(os.environ["PSM_PHASE4A_SOURCE_ROOT"]),
+        edge=Path(os.environ["EDGE_POLICY_CHECKPOINT"]),
+        base_checkpoint=Path(os.environ["BASE_CHECKPOINT_PATH"]),
+        vae=Path(os.environ["WAN_VAE_PATH"]),
+        job_name="snapshot10",
+        snapshot10=True,
+    )
+    report, config, catalog, dataset = phase5.preflight(args)
+    summary = dataset._dataset.summary()
+    assert summary["cached_latent_required"] is True
+    assert summary["online_vae_fallback"] is False
+    assert summary["model_cache_hit_required"] is True
+    assert dataset._dataset[0]["cached_latent_required"] is True
+    catalog.raw.contract.validate_tokenizer_config(config.model.config.tokenizer)
+    assert report["cache_manifest_sha256"] == catalog.manifest_digest
 
 
 class _Net(nn.Module):
@@ -114,6 +233,11 @@ class _Net(nn.Module):
         self.local_memory2llm = nn.Linear(2, 2)
         self.local_memory_modality_embed = nn.Parameter(torch.ones(2))
         self.reasoner = nn.Linear(2, 2)
+        self.tokenizer = nn.Linear(2, 2)
+        self.vae = nn.Linear(2, 2)
+        self.language_model = nn.Module()
+        self.language_model.reasoner = nn.Linear(2, 2)
+        self.language_model.block_moe_gen = nn.Linear(2, 2)
 
 
 @pytest.mark.parametrize("k", (1, 4, 8))
@@ -127,8 +251,12 @@ def test_exact_actual_k_inventory_and_missing_extra_fail(k: int) -> None:
     optimizer = torch.optim.AdamW(allowed)
     report = phase5.validate_optimizer_inventory(model, optimizer)
     assert report["local_params"] == 4 * k + 20
-    assert report["generation_tensors"] == 13
+    assert report["generation_tensors"] == 15
     assert not model.net.reasoner.weight.requires_grad
+    assert not model.net.language_model.reasoner.weight.requires_grad
+    assert model.net.language_model.block_moe_gen.weight.requires_grad
+    assert not model.net.tokenizer.weight.requires_grad
+    assert not model.net.vae.weight.requires_grad
     missing = torch.optim.AdamW(allowed[:-1])
     with pytest.raises(ValueError, match="inventory"):
         phase5.validate_optimizer_inventory(model, missing)
