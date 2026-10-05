@@ -10,11 +10,18 @@ from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
-from cosmos_framework.utils import log
 from cosmos_framework.configs.base.defaults.joint_attention import packing_layout
 from cosmos_framework.configs.base.defaults.multiview_attention import (
     MultiviewAttentionConfig,
     ResolvedBackend,
+)
+from cosmos_framework.data.generator.sequence_packing import ModalityData, PackedSequence
+from cosmos_framework.data.generator.sequence_packing.natten import verify_natten_parameter_list
+from cosmos_framework.data.generator.sequence_packing.runtime import (
+    SequencePack,
+    get_caption_seq_offsets,
+    get_causal_seq,
+    get_full_only_seq,
 )
 from cosmos_framework.model.generator.mot.action_io_projector import (
     ACTION_IO_PROJECTOR_DOMAIN_AWARE,
@@ -46,14 +53,7 @@ from cosmos_framework.model.generator.mot.multiview_maskless_attention import (
 )
 from cosmos_framework.model.generator.utils.memory import MemoryState
 from cosmos_framework.model.generator.utils.rig_view_embedding import add_view_embeddings
-from cosmos_framework.data.generator.sequence_packing import ModalityData, PackedSequence
-from cosmos_framework.data.generator.sequence_packing.natten import verify_natten_parameter_list
-from cosmos_framework.data.generator.sequence_packing.runtime import (
-    SequencePack,
-    get_caption_seq_offsets,
-    get_causal_seq,
-    get_full_only_seq,
-)
+from cosmos_framework.utils import log
 from cosmos_framework.utils.generator.spatial_patch import normalize_spatial_patch_hw
 
 
@@ -366,6 +366,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         valid: torch.Tensor,
         state_in: ContinualTTTFastState | None,
         *,
+        continuation_mask: torch.Tensor | None = None,
         create_graph: bool = True,
     ) -> tuple[torch.Tensor, ContinualTTTFastState, torch.Tensor]:
         """Model-owned Local scan shared by training and online inference.
@@ -377,6 +378,24 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         if not self.config.local_memory_enabled:
             raise RuntimeError("Local Memory is disabled")
         runtime = self.local_memory_runtime
+        if continuation_mask is not None:
+            batch = visual_summary.shape[0]
+            if state_in is None or continuation_mask.shape != (batch,) or continuation_mask.dtype != torch.bool:
+                raise ValueError("mixed Local scan 需要 [B] bool mask 和 batched state")
+            if (
+                continuation_mask.device != visual_summary.device
+                or not bool(continuation_mask.any())
+                or bool(continuation_mask.all())
+            ):
+                raise ValueError("continuation_mask 必须同设备且同时包含 fresh/continuation")
+            runtime.core.validate_state(state_in, batch)
+            fresh = runtime.core.initial_state(batch)
+            state_in = ContinualTTTFastState(
+                *(
+                    torch.where(continuation_mask.reshape(batch, *((1,) * (value.ndim - 1))), value.detach(), w0)
+                    for value, w0 in zip(state_in, fresh, strict=True)
+                )
+            )
         return runtime.core.scan_segment_masked_encoded_many(
             runtime.encoder,
             visual_summary,
@@ -1527,9 +1546,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
                 raise ValueError("Local Memory does not support context parallelism")
             if self.pad_for_cuda_graphs or self.flex_backend is not None or self.multiview_backend is not None:
                 raise ValueError("Local Memory does not support CUDA graphs or multiview")
-            if not self.training and any(
-                token is not None and token.requires_grad for token in local_tokens
-            ):
+            if not self.training and any(token is not None and token.requires_grad for token in local_tokens):
                 raise ValueError("inference Local Memory prefixes must be detached")
             if any(
                 token is not None and token.shape != (self.config.local_memory_k_local, self.config.local_memory_dim)

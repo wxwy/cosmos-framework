@@ -1,18 +1,26 @@
 """B0 pending capability、提交原子性和跨段连续性测试。"""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from cosmos_framework.model.generator.mot.local_evidence import ContinualTTTLocalMemoryCore, LocalEvidenceEncoder
+from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork
+from cosmos_framework.model.generator.mot.local_evidence import (
+    ContinualTTTFastState,
+    ContinualTTTLocalMemoryCore,
+    LocalEvidenceEncoder,
+)
 from cosmos_framework.model.generator.mot.local_memory_segment import (
     GAWindowPlan,
     LocalMemoryTransaction,
     RankLocalSegmentScheduler,
     SegmentIdentity,
+    SegmentProvenance,
 )
 from cosmos_framework.model.generator.mot.local_memory_segment_adapter import (
+    BatchedLocalMemorySegmentAdapter,
     CanonicalLocalMemorySegmentAdapter,
     LocalMemorySegmentSidecar,
 )
@@ -193,3 +201,89 @@ def test_stale_source_and_nonfinite_candidate_do_not_commit():
     bad = SegmentIdentity(0, "episode", "robocasa", 1, 1, "other-source")
     with pytest.raises(ValueError):
         scheduler.validate(bad)
+
+
+def test_batched_adapter_mixed_rows_keep_independent_capabilities():
+    torch.manual_seed(41)
+    encoder = LocalEvidenceEncoder(evidence_dim=8)
+    core = ContinualTTTLocalMemoryCore(
+        evidence_dim=8, local_dim=4, ttt_dim=6, fast_hidden_dim=8, ttt_tbptt_steps=16, k_local=1
+    )
+    sidecar, scheduler = LocalMemorySegmentSidecar(), RankLocalSegmentScheduler()
+    previous = SegmentIdentity(0, "episode", "robocasa", 0, 0, "source")
+    provenance = SegmentProvenance("manifest", "config", "source", 0)
+    sidecar._records[0] = previous, provenance, core.detach_state(core.initial_state(1))
+    scheduler._committed[0] = previous
+    identities = (
+        SegmentIdentity(0, "episode", "robocasa", 1, 1, "source"),
+        SegmentIdentity(1, "fresh", "robocasa", 0, 0, "source"),
+    )
+    segments = (make_segment(cursor=1, slot=0), make_segment(cursor=0, slot=1, episode="fresh"))
+    transactions = tuple(
+        LocalMemoryTransaction(GAWindowPlan((identity.member,), (16,)), scheduler) for identity in identities
+    )
+    net = SimpleNamespace(
+        config=SimpleNamespace(local_memory_enabled=True),
+        local_memory_runtime=SimpleNamespace(encoder=encoder, core=core),
+    )
+    calls = []
+
+    def scan(visual, action, valid, state, *, continuation_mask):
+        calls.append((visual.shape, action.shape, valid.shape, continuation_mask.clone()))
+        return Cosmos3VFMNetwork.scan_local_memory(
+            net, visual, action, valid, state, continuation_mask=continuation_mask
+        )
+
+    adapter = BatchedLocalMemorySegmentAdapter(encoder, core, sidecar, scan)
+    results = adapter.scan(segments, identities=identities, transactions=transactions)
+    assert len(calls) == 1
+    assert calls[0][:3] == ((2, 16, 96), (2, 16, 15), (2, 16))
+    assert torch.equal(calls[0][3], torch.tensor([True, False]))
+    assert len(results) == 2 and results[0].identities[0] != results[1].identities[0]
+    assert results[0].locals[0] is not None and results[1].locals[0] is None
+    with pytest.raises(RuntimeError):
+        adapter.commit(0, identities[1], results[0], transaction=transactions[0])
+    for row, (identity, transaction, result) in enumerate(zip(identities, transactions, results, strict=True)):
+        transaction.successful_backward(identity, result)
+        adapter.commit(row, identity, result, transaction=transaction)
+    assert [record[0].slot_id for record in sidecar.snapshot()] == [0, 1]
+    assert scheduler._committed == {0: identities[0], 1: identities[1]}
+
+
+def test_batched_adapter_all_fresh_and_all_continuation_never_read_w0(monkeypatch):
+    encoder = LocalEvidenceEncoder(evidence_dim=8)
+    core = ContinualTTTLocalMemoryCore(
+        evidence_dim=8, local_dim=4, ttt_dim=6, fast_hidden_dim=8, ttt_tbptt_steps=16, k_local=1
+    )
+    sidecar, scheduler = LocalMemorySegmentSidecar(), RankLocalSegmentScheduler()
+    seen = []
+
+    def forbidden(batch):
+        raise AssertionError("batched adapter 不得调用 core.initial_state")
+
+    monkeypatch.setattr(core, "initial_state", forbidden)
+
+    def scan(visual, action, valid, state, *, continuation_mask):
+        seen.append((state, continuation_mask))
+        candidate = state or ContinualTTTFastState(
+            torch.zeros(2, 8, 6), torch.zeros(2, 8), torch.zeros(2, 4, 8), torch.zeros(2, 4)
+        )
+        return torch.zeros(2, 16, 1, 4), candidate, valid
+
+    for cursor in (0, 1):
+        adapter = BatchedLocalMemorySegmentAdapter(encoder, core, sidecar, scan)
+        identities = tuple(
+            SegmentIdentity(slot, f"episode{slot}", "robocasa", cursor, cursor, "source") for slot in (0, 1)
+        )
+        segments = tuple(make_segment(cursor=cursor, slot=slot, episode=f"episode{slot}") for slot in (0, 1))
+        transactions = tuple(
+            LocalMemoryTransaction(GAWindowPlan((identity.member,), (16,)), scheduler) for identity in identities
+        )
+        results = adapter.scan(segments, identities=identities, transactions=transactions)
+        for row, (identity, transaction, result) in enumerate(zip(identities, transactions, results, strict=True)):
+            transaction.successful_backward(identity, result)
+            adapter.commit(row, identity, result, transaction=transaction)
+    assert len(seen) == 2
+    assert seen[0] == (None, None)
+    assert seen[1][0] is not None and seen[1][1] is None
+    assert all(not value.requires_grad for value in seen[1][0])

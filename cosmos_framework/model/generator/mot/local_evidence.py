@@ -119,7 +119,10 @@ class ContinualTTTLocalMemoryCore(nn.Module):
         nn.init.uniform_(
             self.w0_fast_out_bias, -1 / math.sqrt(self.fast_hidden_dim), 1 / math.sqrt(self.fast_hidden_dim)
         )
-        nn.init.normal_(self.slot_queries, std=1 / math.sqrt(self.ttt_dim))
+        if self.k_local == 1:
+            nn.init.zeros_(self.slot_queries)
+        else:
+            nn.init.normal_(self.slot_queries, std=1 / math.sqrt(self.ttt_dim))
 
     def initial_state(self, batch: int) -> ContinualTTTFastState:
         _positive_dim("batch", batch)
@@ -166,18 +169,16 @@ class ContinualTTTLocalMemoryCore(nn.Module):
     def _state_norm(state: ContinualTTTFastState) -> torch.Tensor:
         total = None
         for value in state:
-            term = value.detach().float().square().sum()
+            term = value.detach().float().flatten(1).square().sum(dim=1)
             total = term if total is None else total + term
         assert total is not None
         return total.sqrt()
 
     @staticmethod
-    def _state_delta_norm(
-        before: ContinualTTTFastState, after: ContinualTTTFastState
-    ) -> torch.Tensor:
+    def _state_delta_norm(before: ContinualTTTFastState, after: ContinualTTTFastState) -> torch.Tensor:
         total = None
         for old, new in zip(before, after, strict=True):
-            term = (new.detach().float() - old.detach().float()).square().sum()
+            term = (new.detach().float() - old.detach().float()).flatten(1).square().sum(dim=1)
             total = term if total is None else total + term
         assert total is not None
         return total.sqrt()
@@ -188,7 +189,7 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             return {}
         result: dict[str, torch.Tensor] = {}
         for key, values in self._telemetry.items():
-            stacked = torch.stack(values)
+            stacked = torch.cat(values)
             result[f"ttt_{key}_sum"] = stacked.sum()
             result[f"ttt_{key}_max"] = stacked.max()
             result[f"ttt_{key}_count"] = stacked.new_tensor(float(stacked.numel()))
@@ -228,12 +229,13 @@ class ContinualTTTLocalMemoryCore(nn.Module):
             )
             prediction = self._fast_mlp(key[:, None], work).squeeze(1)
             # 每 row 独立 MSE 均值后求和，绝不除 B，保持原 inner_lr。
-            inner_loss = (prediction - target).square().mean(dim=-1).sum()
+            row_inner_loss = (prediction - target).square().mean(dim=-1)
+            inner_loss = row_inner_loss.sum()
             gradients = torch.autograd.grad(inner_loss, work, create_graph=create_graph)
             candidate = ContinualTTTFastState(
                 *(value - self.inner_lr * grad for value, grad in zip(work, gradients, strict=True))
             )
-            self._telemetry["inner_loss"].append(inner_loss.detach())
+            self._telemetry["inner_loss"].append(row_inner_loss.detach())
             self._telemetry["fast_state_norm"].append(self._state_norm(candidate))
             self._telemetry["fast_update_norm"].append(self._state_delta_norm(work, candidate))
             tokens = self._fast_mlp(query[:, None] + self.slot_queries.float()[None], candidate)
