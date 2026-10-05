@@ -201,6 +201,90 @@ def test_overlay_validates_actual_dictconfig_tokenizer(monkeypatch: pytest.Monke
         phase5._validate_runtime_tokenizer(contract, config.model.config.tokenizer)
 
 
+def _checkpoint_args(tmp_path: Path, phase: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        phase=phase,
+        output_root=tmp_path,
+        job_name="resume_contract",
+        world_size=2,
+        max_iter=10,
+        t=16,
+        k=4,
+        ga=2,
+        warmup=1,
+        save_iter=5,
+        base_checkpoint=tmp_path / "official_base_dcp",
+    )
+
+
+def _write_same_job_checkpoint(
+    args: SimpleNamespace, *, missing: str | None = None, name: str = "iter_000000007"
+) -> Path:
+    directory = args.output_root / "psm_wma_v3/corrected_phase5" / args.job_name / "checkpoints"
+    directory.mkdir(parents=True)
+    (directory / "latest_checkpoint.txt").write_text(name)
+    checkpoint = directory / name
+    for component in ("model", "optim", "scheduler", "trainer"):
+        if component != missing:
+            path = checkpoint / component / ".metadata"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+    for rank in range(args.world_size):
+        if f"rank_{rank}.pkl" != missing:
+            path = checkpoint / "dataloader" / f"rank_{rank}.pkl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+    return checkpoint
+
+
+def test_fresh_overlay_uses_official_base_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from examples import psm_wma_robocasa_local_s1
+
+    monkeypatch.setattr(psm_wma_robocasa_local_s1, "overlay_local_config", lambda _: None)
+    args = _checkpoint_args(tmp_path, "fresh")
+    _, config, _, _ = _config(tmp_path)
+    contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(_catalog(tmp_path / "cache"))
+    assert phase5._resume_checkpoint(args) is None
+    phase5.overlay_config(config, args, contract)
+    assert config.checkpoint.load_path == str(args.base_checkpoint)
+    assert config.checkpoint.load_training_state is False
+    assert config.checkpoint.strict_resume is True
+    assert set(config.checkpoint.keys_to_skip_loading) == {"net_ema.", "local_memory"}
+
+
+def test_resume_requires_complete_same_job_dcp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from examples import psm_wma_robocasa_local_s1
+
+    monkeypatch.setattr(psm_wma_robocasa_local_s1, "overlay_local_config", lambda _: None)
+    args = _checkpoint_args(tmp_path, "resume")
+    checkpoint = _write_same_job_checkpoint(args)
+    assert phase5._resume_checkpoint(args) == checkpoint
+    _, config, _, _ = _config(tmp_path)
+    contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(_catalog(tmp_path / "cache"))
+    phase5.overlay_config(config, args, contract, resume_checkpoint=checkpoint)
+    assert config.checkpoint.load_path == str(checkpoint)
+    assert config.checkpoint.load_training_state is True
+    assert config.checkpoint.strict_resume is True
+    assert config.checkpoint.keys_to_skip_loading == ["net_ema."]
+    assert all("local_memory" not in key for key in config.checkpoint.keys_to_skip_loading)
+
+
+@pytest.mark.parametrize("missing", ("model", "optim", "scheduler", "trainer", "rank_0.pkl", "rank_1.pkl"))
+def test_resume_rejects_each_missing_component(tmp_path: Path, missing: str) -> None:
+    args = _checkpoint_args(tmp_path, "resume")
+    _write_same_job_checkpoint(args, missing=missing)
+    with pytest.raises(FileNotFoundError, match="same-job DCP 缺少"):
+        phase5._resume_checkpoint(args)
+
+
+@pytest.mark.parametrize("name", ("invalid", "iter_0", "iter_000000010", "iter_-1"))
+def test_resume_rejects_invalid_latest_iteration(tmp_path: Path, name: str) -> None:
+    args = _checkpoint_args(tmp_path, "resume")
+    _write_same_job_checkpoint(args, name=name)
+    with pytest.raises(ValueError, match="iteration 不合法"):
+        phase5._resume_checkpoint(args)
+
+
 @pytest.mark.skipif(
     not all(
         os.environ.get(key)
