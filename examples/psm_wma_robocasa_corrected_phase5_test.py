@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
@@ -163,14 +164,49 @@ def test_overlay_installs_full_manifest_tokenizer_contract(monkeypatch: pytest.M
     contract.validate_tokenizer_config(config.model.config.tokenizer)
     with pytest.raises(ValueError, match="encode_exact_durations"):
         contract.validate_tokenizer_config({**config.model.config.tokenizer, "encode_exact_durations": [17]})
+    bad_chunk = deepcopy(config.model.config.tokenizer)
+    bad_chunk["encode_chunk_frames"]["256"] = 64
+    with pytest.raises(ValueError, match="encode_chunk_frames"):
+        contract.validate_tokenizer_config(bad_chunk)
+
+
+def test_overlay_validates_actual_dictconfig_tokenizer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(_catalog(tmp_path / "cache"))
+    _, config, _, _ = _config(tmp_path)
+    model = vars(config.model.config).copy()
+    model.pop("cache_root")
+    model.pop("source_root")
+    model["parallelism"] = vars(model["parallelism"])
+    config.model.config = OmegaConf.create(model)
+    from examples import psm_wma_robocasa_local_s1
+
+    monkeypatch.setattr(psm_wma_robocasa_local_s1, "overlay_local_config", lambda _: None)
+    args = SimpleNamespace(
+        t=16,
+        k=4,
+        world_size=8,
+        ga=2,
+        max_iter=30000,
+        warmup=500,
+        save_iter=100,
+        base_checkpoint=tmp_path / "base",
+        job_name="test",
+    )
+    phase5.overlay_config(config, args, contract)
+    assert isinstance(config.model.config.tokenizer, DictConfig)
+    assert list(config.model.config.tokenizer.encode_exact_durations) == [17, 61, 73]
+    phase5._validate_runtime_tokenizer(contract, config.model.config.tokenizer)
+    config.model.config.tokenizer.encode_exact_durations = [17]
+    with pytest.raises(ValueError, match="encode_exact_durations"):
+        phase5._validate_runtime_tokenizer(contract, config.model.config.tokenizer)
 
 
 @pytest.mark.skipif(
     not all(
         os.environ.get(key)
         for key in (
-            "PSM_PHASE4A_CACHE_ROOT",
-            "PSM_PHASE4A_SOURCE_ROOT",
+            "PSM_PHASE5_CACHE_ROOT",
+            "PSM_PHASE5_SOURCE_ROOT",
             "EDGE_POLICY_CHECKPOINT",
             "BASE_CHECKPOINT_PATH",
             "WAN_VAE_PATH",
@@ -179,6 +215,7 @@ def test_overlay_installs_full_manifest_tokenizer_contract(monkeypatch: pytest.M
     reason="未提供真实 exact-window cache/source/Edge/base/VAE 路径",
 )
 def test_optional_real_strict_snapshot10_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setattr(
         phase5, "verify_root_child_lock", lambda _: {"root": "test", "child": "test", "gitlink": "test"}
     )
@@ -196,8 +233,8 @@ def test_optional_real_strict_snapshot10_preflight(monkeypatch: pytest.MonkeyPat
         root_worktree=tmp_path,
         expected_root="test",
         expected_child="test",
-        cache_root=Path(os.environ["PSM_PHASE4A_CACHE_ROOT"]),
-        source_root=Path(os.environ["PSM_PHASE4A_SOURCE_ROOT"]),
+        cache_root=Path(os.environ["PSM_PHASE5_CACHE_ROOT"]),
+        source_root=Path(os.environ["PSM_PHASE5_SOURCE_ROOT"]),
         edge=Path(os.environ["EDGE_POLICY_CHECKPOINT"]),
         base_checkpoint=Path(os.environ["BASE_CHECKPOINT_PATH"]),
         vae=Path(os.environ["WAN_VAE_PATH"]),
@@ -210,7 +247,7 @@ def test_optional_real_strict_snapshot10_preflight(monkeypatch: pytest.MonkeyPat
     assert summary["online_vae_fallback"] is False
     assert summary["model_cache_hit_required"] is True
     assert dataset._dataset[0]["cached_latent_required"] is True
-    catalog.raw.contract.validate_tokenizer_config(config.model.config.tokenizer)
+    phase5._validate_runtime_tokenizer(catalog.raw.contract, config.model.config.tokenizer)
     assert report["cache_manifest_sha256"] == catalog.manifest_digest
 
 

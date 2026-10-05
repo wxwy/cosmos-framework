@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from omegaconf import DictConfig, OmegaConf
 
 from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import RoboCasaExactWindowCacheCatalog
@@ -218,6 +219,11 @@ def config_digest(
     return hashlib.sha256(json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _validate_runtime_tokenizer(contract: CorrectedRoboCasaPolicyContract, tokenizer: Any) -> None:
+    plain = OmegaConf.to_container(tokenizer, resolve=False) if isinstance(tokenizer, DictConfig) else tokenizer
+    contract.validate_tokenizer_config(plain)
+
+
 def overlay_config(
     config: Any,
     args: argparse.Namespace,
@@ -231,8 +237,10 @@ def overlay_config(
     model = config.model.config
     model.local_memory_ttt_tbptt_steps = args.t
     model.local_memory_k_local = args.k
-    model.tokenizer = contract.resolve_tokenizer_config(model.tokenizer)
-    contract.validate_tokenizer_config(model.tokenizer)
+    resolved_tokenizer = contract.resolve_tokenizer_config(model.tokenizer)
+    contract.validate_tokenizer_config(resolved_tokenizer)
+    model.tokenizer = resolved_tokenizer
+    _validate_runtime_tokenizer(contract, model.tokenizer)
     model.parallelism.data_parallel_shard_degree = args.world_size
     model.parallelism.data_parallel_replicate_degree = 1
     config.trainer.type = GroupedLocalMemoryTrainer
@@ -345,7 +353,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         or catalog.raw.contract.vae_encode_contract != contract.vae_encode_contract
     ):
         raise ValueError("预检期间 cache VAE authority 漂移")
-    contract.validate_tokenizer_config(config.model.config.tokenizer)
+    _validate_runtime_tokenizer(contract, config.model.config.tokenizer)
     witnesses = model_witnesses(args.edge, args.base_checkpoint)
     digest = config_digest(catalog, config, b_stream=args.b, active_ga=args.ga, witnesses=witnesses)
     planner = ExactWindowRankPlanner(catalog, rank=0, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
