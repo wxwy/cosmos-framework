@@ -21,11 +21,11 @@ from cosmos_framework.model.generator.mot.local_memory_segment import (
     SegmentProvenance,
 )
 from cosmos_framework.model.generator.mot.local_memory_segment_adapter import LocalMemorySegmentSidecar
-from cosmos_framework.model.generator.mot.robocasa_grouped_segment import CatalogFrontier
+from cosmos_framework.model.generator.mot.robocasa_exact_window_local import ExactWindowCatalogFrontier
 from cosmos_framework.utils.callback import Callback
 from cosmos_framework.utils.easy_io import easy_io
 
-FORMAT = "psm_v3_h3d_grouped_local_v1"
+FORMAT = "psm_v3_corrected_grouped_local_v2"
 
 
 def _profile(window: GroupedLocalMemoryWindow) -> tuple[Any, ...]:
@@ -35,6 +35,8 @@ def _profile(window: GroupedLocalMemoryWindow) -> tuple[Any, ...]:
         window.planner.rank,
         window.planner.world_size,
         window.planner.seed,
+        window.planner.b_stream,
+        window.planner.active_ga,
         encoder.visual_proj.in_features,
         encoder.action_proj.in_features,
         encoder.evidence_dim,
@@ -44,18 +46,26 @@ def _profile(window: GroupedLocalMemoryWindow) -> tuple[Any, ...]:
         core.k_local,
         core.ttt_tbptt_steps,
         core.inner_lr,
-        2,  # active_GA
         64,  # Edge action model-space
-        32,  # policy chunk
-        33,  # policy consumer frames
+        16,  # H_pred
+        17,  # consumer frames
     )
 
 
 def snapshot_grouped_local_state(
     window: GroupedLocalMemoryWindow, *, iteration: int, config_digest: str
 ) -> dict[str, Any]:
-    if window.plan is not None or type(iteration) is not int or iteration < 0 or not config_digest:
+    if (
+        window.plan is not None
+        or window._candidate is not None
+        or type(iteration) is not int
+        or iteration < 1
+        or not config_digest
+        or set(window.live.scheduler._committed)
+        != {window.planner.rank * window.planner.b_stream + index for index in range(window.planner.b_stream)}
+    ):
         raise RuntimeError("只能在成功 optimizer step 后保存 committed grouped 状态")
+    window.planner.validate_frontier(window.live.frontier)
     sidecar = {
         identity.slot_id: (
             identity,
@@ -64,10 +74,14 @@ def snapshot_grouped_local_state(
         )
         for identity, provenance, fast in window.live.sidecar.snapshot()
     }
+    if any(not bool(torch.isfinite(value).all()) for _, _, values in sidecar.values() for value in values):
+        raise ValueError("Local checkpoint fast state 非有限")
     return {
         "format": FORMAT,
         "iteration": iteration,
-        "manifest_digest": window.planner.catalog.manifest_digest,
+        "cache_manifest_sha256": window.planner.catalog.manifest_digest,
+        "cache_corpus_digest": window.planner.catalog.cache_corpus_digest,
+        "source_binding_digest": window.planner.catalog.source_binding_digest,
         "config_digest": config_digest,
         "profile": _profile(window),
         "frontier": window.live.frontier,
@@ -80,14 +94,16 @@ def restore_grouped_local_state(
     window: GroupedLocalMemoryWindow, state: dict[str, Any], *, iteration: int, config_digest: str
 ) -> None:
     """所有字段先在候选对象验证；最后一个引用赋值才改变 live。"""
-    if window.plan is not None or not isinstance(state, dict):
+    if window.plan is not None or window._candidate is not None or not isinstance(state, dict):
         raise RuntimeError("pending window 或非法 checkpoint 不可恢复")
     if (
         set(state)
         != {
             "format",
             "iteration",
-            "manifest_digest",
+            "cache_manifest_sha256",
+            "cache_corpus_digest",
+            "source_binding_digest",
             "config_digest",
             "profile",
             "frontier",
@@ -97,36 +113,42 @@ def restore_grouped_local_state(
         or state["format"] != FORMAT
         or type(state["iteration"]) is not int
         or state["iteration"] != iteration
-        or state["manifest_digest"] != window.planner.catalog.manifest_digest
+        or type(iteration) is not int
+        or iteration < 1
+        or state["cache_manifest_sha256"] != window.planner.catalog.manifest_digest
+        or state["cache_corpus_digest"] != window.planner.catalog.cache_corpus_digest
+        or state["source_binding_digest"] != window.planner.catalog.source_binding_digest
         or state["config_digest"] != config_digest
         or state["profile"] != _profile(window)
     ):
         raise ValueError("Local checkpoint schema/iteration/manifest/config/profile 不匹配")
     frontier, committed, saved = state["frontier"], state["scheduler"], state["sidecar"]
-    if type(frontier) is not CatalogFrontier or type(committed) is not dict or type(saved) is not dict:
+    if type(frontier) is not ExactWindowCatalogFrontier or type(committed) is not dict or type(saved) is not dict:
         raise ValueError("Local checkpoint frontier/scheduler/sidecar 类型不合法")
-    window.planner.plan_window(frontier)
-    expected_slots = {window.planner.rank * 8 + index for index in range(8)}
+    window.planner.validate_frontier(frontier)
+    expected_slots = {window.planner.rank * window.planner.b_stream + index for index in range(window.planner.b_stream)}
     if set(committed) != expected_slots or not set(saved).issubset(expected_slots):
-        raise ValueError("Local checkpoint 的8个 stable slot 不完整或越界")
+        raise ValueError("Local checkpoint stable slot 不完整或越界")
     core = window.model.net.local_memory_runtime.core
-    by_source_digest = {episode.source_digest: episode for episode in window.planner.episodes}
     records = {}
     for local_slot, slot in enumerate(frontier.slots):
-        slot_id = window.planner.rank * 8 + local_slot
+        slot_id = window.planner.rank * window.planner.b_stream + local_slot
         identity = committed[slot_id]
         if type(identity) is not SegmentIdentity or identity.slot_id != slot_id:
             raise ValueError("Local checkpoint scheduler identity 不合法")
         if slot.next_segment_id != identity.segment_id + 1:
             raise ValueError("Local checkpoint segment_id 不连续")
         if slot.uid is None:
-            episode = by_source_digest.get(identity.source_digest)
+            episode = window.planner.by_uid.get(identity.episode_id)
             if (
                 not identity.training_stream_end
                 or slot_id in saved
                 or episode is None
-                or identity.episode_id != episode.key.episode_id
-                or identity.category != episode.key.task
+                or slot.binding_epoch is not None
+                or slot.cursor != 0
+                or identity.episode_id != episode.uid
+                or identity.category != episode.task_class
+                or identity.source_digest != episode.source_digest
                 or identity.cursor != episode.segment_count - 1
             ):
                 raise ValueError("terminal slot 不得保留 fast state")
@@ -135,9 +157,10 @@ def restore_grouped_local_state(
         if (
             identity.training_stream_end
             or slot.cursor != identity.cursor + 1
-            or identity.episode_id != episode.key.episode_id
-            or identity.category != episode.key.task
+            or identity.episode_id != episode.uid
+            or identity.category != episode.task_class
             or identity.source_digest != episode.source_digest
+            or identity.cursor >= episode.segment_count - 1
             or slot_id not in saved
         ):
             raise ValueError("Local checkpoint slot→episode/cursor/source 不一致")
@@ -148,7 +171,7 @@ def restore_grouped_local_state(
         if (
             recorded_identity != identity
             or type(provenance) is not SegmentProvenance
-            or provenance.manifest_digest != state["manifest_digest"]
+            or provenance.manifest_digest != state["cache_manifest_sha256"]
             or provenance.config_digest != config_digest
             or provenance.source_digest != identity.source_digest
             or provenance.segment_id != identity.segment_id
@@ -162,11 +185,12 @@ def restore_grouped_local_state(
             or value.dtype != torch.float32
             or value.device.type != "cpu"
             or value.grad_fn is not None
+            or value.requires_grad
             or not bool(torch.isfinite(value).all())
             for value in values
         ):
             raise ValueError("Local checkpoint fast state 必须为 CPU finite fp32 普通 tensor")
-        fast = ContinualTTTFastState(*(value.to(core.slot_queries.device).clone() for value in values))
+        fast = ContinualTTTFastState(*(value.detach().to(core.slot_queries.device).clone() for value in values))
         core.validate_state(fast, 1)
         records[slot_id] = (identity, provenance, fast)
     sidecar = LocalMemorySegmentSidecar()
@@ -213,8 +237,10 @@ def require_dcp_grouped_resume_component(checkpointer: Any) -> bool:
         if checkpointer.load_training_state:
             raise ValueError("H3-D Stage-A warm-start 禁止继承外部训练状态")
         return False
-    if "dataloader" not in keys:
-        raise FileNotFoundError("同 job Local 恢复缺少 DCP dataloader 组件")
+    if not checkpointer.load_training_state or not {"model", "optim", "scheduler", "trainer", "dataloader"}.issubset(
+        keys
+    ):
+        raise FileNotFoundError("同 job Local 恢复缺少完整 DCP model/optim/scheduler/trainer/dataloader 组件")
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     name = f"rank_{rank}.pkl"
     path = (

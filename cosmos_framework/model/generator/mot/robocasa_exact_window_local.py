@@ -209,6 +209,37 @@ class ExactWindowRankPlanner:
             ):
                 raise ValueError("Local slot frontier 非法")
 
+    def validate_frontier(self, frontier: ExactWindowCatalogFrontier) -> None:
+        """只读校验恢复 frontier，不生成后续窗口。"""
+        if type(frontier) is not ExactWindowCatalogFrontier or type(frontier.slots) is not tuple:
+            raise ValueError("Local frontier 类型不合法")
+        if type(frontier.assigned_in_epoch) is not tuple:
+            raise ValueError("Local frontier assigned 类型不合法")
+        if any(type(slot) is not ExactWindowSlotFrontier for slot in frontier.slots):
+            raise ValueError("Local slot frontier 类型不合法")
+        if any(type(uid) is not str for uid in frontier.assigned_in_epoch) or any(
+            (slot.uid is not None and type(slot.uid) is not str)
+            or type(slot.cursor) is not int
+            or type(slot.next_segment_id) is not int
+            for slot in frontier.slots
+        ):
+            raise ValueError("Local frontier uid/cursor/segment_id 类型不合法")
+        self._validate_frontier(frontier)
+        if frontier.assigned_in_epoch != tuple(sorted(frontier.assigned_in_epoch)):
+            raise ValueError("Local frontier assigned 顺序不合法")
+        if not set(frontier.assigned_in_epoch).issubset(self._queue(frontier.epoch)):
+            raise ValueError("Local frontier assigned 不属于当前确定性队列")
+        for slot in frontier.slots:
+            if slot.uid is None:
+                continue
+            episode = self.by_uid[slot.uid]
+            if (
+                type(slot.binding_epoch) is not int
+                or slot.cursor >= episode.segment_count
+                or (slot.binding_epoch == frontier.epoch and slot.uid not in frontier.assigned_in_epoch)
+            ):
+                raise ValueError("Local slot cursor/binding epoch 不合法")
+
     def plan_window(self, frontier: ExactWindowCatalogFrontier) -> ExactWindowGroupedPlan:
         self._validate_frontier(frontier)
         slots = list(frontier.slots)
