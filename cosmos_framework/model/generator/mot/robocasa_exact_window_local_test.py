@@ -309,11 +309,7 @@ def test_corrected_module_has_no_historical_b1_imports():
 def test_optional_real_data_debug_smoke(monkeypatch: pytest.MonkeyPatch):
     """Read a bounded real segment only when the caller supplies local asset paths."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    allow_extra = os.environ.get("PSM_PHASE4A_ALLOW_EXTRA_DEBUG_CACHE") == "1"
-    cache = RoboCasaExactWindowCacheCatalog(Path(os.environ["PSM_PHASE4A_CACHE_ROOT"]), strict=not allow_extra)
-    if allow_extra:
-        assert cache.stats.extra_episode_count > 0
-        print(f"DEBUG_CACHE_EXTRA_EPISODES={cache.stats.extra_episode_count}")
+    cache = RoboCasaExactWindowCacheCatalog(Path(os.environ["PSM_PHASE4A_CACHE_ROOT"]))
     source = RoboCasaExactWindowSourceReader(cache, Path(os.environ["PSM_PHASE4A_SOURCE_ROOT"]))
     contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(cache)
     raw = RoboCasaExactWindowCachedDataset(cache, source, contract)
