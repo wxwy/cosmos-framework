@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
 """CPU-only acceptance for corrected grouped telemetry (no actual optimizer step)."""
 
 from __future__ import annotations
