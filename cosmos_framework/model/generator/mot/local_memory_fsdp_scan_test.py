@@ -184,9 +184,7 @@ def test_w0_fast_grad_participation_under_rank_divergent_slot_mix(mode: str) -> 
     states = None if mode == "fresh" else runtime.core.detach_state(runtime.core.initial_state(batch))
     mask = torch.tensor([True, False]) if mode == "mixed" else None
 
-    result, candidate, present = model.net.scan_local_memory(
-        visual, actions, valid, states, continuation_mask=mask
-    )
+    result, candidate, present = model.net.scan_local_memory(visual, actions, valid, states, continuation_mask=mask)
     assert bool(present.all())
     if mode == "continuation":
         # Compare the exact unmodified continuation forward, not a reference
