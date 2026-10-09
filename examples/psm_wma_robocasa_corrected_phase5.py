@@ -20,6 +20,7 @@ from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache
     get_action_robocasa_exact_window_cached_sft_dataset,
 )
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_policy import CorrectedRoboCasaPolicyContract
+from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
 from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
     ExactWindowLocalCatalog,
     ExactWindowRankPlanner,
@@ -410,6 +411,8 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     if args.warmup < 0 or args.warmup > args.max_iter:
         raise ValueError("warmup 越界")
     execution_stop = _execution_stop_iteration(args)
+    if getattr(args, "stop_after_iter", None) is not None and getattr(args, "dataset_index_root", None) is None:
+        raise ValueError("bounded GPU smoke 必须提供 --dataset-index-root；禁止回退到昂贵 cold build")
     lock = verify_root_child_lock(args)
     os.environ["HF_HUB_OFFLINE"] = "1"
     check_edge_checkpoint(str(args.edge))
@@ -418,14 +421,42 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         raise FileNotFoundError("WAN VAE 文件缺失")
     resume = _resume_checkpoint(args)
     config = _load_config(args)
-    cache = RoboCasaExactWindowCacheCatalog(args.cache_root)
+    init_start = time.perf_counter()
+    verify_start = time.perf_counter()
+    index_root = getattr(args, "dataset_index_root", None)
+    verified_index = (
+        VerifiedExactWindowIndex.open(index_root, cache_root=args.cache_root, source_root=args.source_root)
+        if index_root is not None
+        else None
+    )
+    index_verify_ms = (time.perf_counter() - verify_start) * 1000
+    stage = time.perf_counter()
+    cache = RoboCasaExactWindowCacheCatalog(args.cache_root, verified_index=verified_index)
+    cache_catalog_ms = (time.perf_counter() - stage) * 1000
     contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(cache)
     overlay_config(config, args, contract, resume_checkpoint=resume)
     tokenizer = config.model.config.vlm_config.tokenizer
+    stage = time.perf_counter()
     dataset = get_action_robocasa_exact_window_cached_sft_dataset(
-        cache_root=args.cache_root, source_root=args.source_root, tokenizer_config=tokenizer
+        cache_root=args.cache_root,
+        source_root=args.source_root,
+        tokenizer_config=tokenizer,
+        catalog=cache,
+        verified_index=verified_index,
     )
+    dataset_create_ms = (time.perf_counter() - stage) * 1000
+    stage = time.perf_counter()
     catalog = ExactWindowLocalCatalog(dataset, ttt_tbptt_steps=args.t)
+    local_catalog_ms = (time.perf_counter() - stage) * 1000
+    dataset_init = {
+        "verified_index_hit": verified_index is not None,
+        "index_verify_ms": index_verify_ms,
+        "cache_catalog_ms": cache_catalog_ms,
+        "sft_dataset_create_ms": dataset_create_ms,
+        "source_reader_stages": dataset._dataset.source_reader.init_timings_ms,
+        "local_catalog_ms": local_catalog_ms,
+        "total_ms": (time.perf_counter() - init_start) * 1000,
+    }
     if (
         catalog.manifest_digest != cache.manifest_sha256
         or catalog.raw.contract.vae_encode_contract != contract.vae_encode_contract
@@ -462,6 +493,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
             "source_binding_digest": catalog.source_binding_digest,
             "model_witnesses": witnesses,
             "episodes": len(catalog.episodes),
+            "dataset_init": dataset_init,
             "checkpoint_load_path": str(resume or args.base_checkpoint),
         },
         config,
@@ -478,6 +510,12 @@ def parser() -> argparse.ArgumentParser:
     for name in ("output-root", "source-root", "cache-root", "edge", "vae", "base-checkpoint"):
         result.add_argument(f"--{name}", required=True, type=Path)
     result.add_argument("--root-worktree", required=True, type=Path)
+    result.add_argument(
+        "--dataset-index-root",
+        type=Path,
+        default=None,
+        help="Prebuilt verified read-only index; missing/stale index fails closed, never rebuilds during training",
+    )
     result.add_argument("--expected-root", required=True)
     result.add_argument("--expected-child", required=True)
     result.add_argument("--job-name", default="edge_local_exact_window")
@@ -509,6 +547,8 @@ def _telemetry_sample_interval(stop_after_iter: int | None) -> int:
 def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
     report, config, catalog, _ = preflight(args)
+    if os.environ.get("RANK", "0") == "0":
+        print("[CorrectedV3][dataset_init] " + json.dumps(report["dataset_init"], sort_keys=True))
     if args.preflight:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return
