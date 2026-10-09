@@ -286,6 +286,17 @@ class ImaginaireTrainer:
         self.callbacks.on_optimizer_init_end()
         # Load the model checkpoint and get the starting iteration number.
         iteration = self.checkpointer.load(model, optimizer, scheduler, grad_scaler)
+        # An explicitly bounded diagnostic may stop earlier than the formal
+        # schedule. Keep config.trainer.max_iter, LR scheduler and DCP config
+        # unchanged; only shorten the outer execution loop.
+        execution_max_iter = getattr(self, "_execution_max_iter", self.config.trainer.max_iter)
+        if (
+            type(execution_max_iter) is not int
+            or execution_max_iter <= 0
+            or execution_max_iter > self.config.trainer.max_iter
+            or iteration >= execution_max_iter
+        ):
+            raise ValueError("Execution iteration limit conflicts with checkpoint/config")
         dataloader_fetch_count = self._resume_dataloader_fetch_count(model, iteration)
         if hasattr(dataloader_train, "set_start_iteration"):
             dataloader_train.set_start_iteration(dataloader_fetch_count)
@@ -330,12 +341,12 @@ class ImaginaireTrainer:
             maybe_enable_nsys_profiling(self.config, global_step=iteration) as nsys_profiler,
         ):
             while True:
-                if iteration >= self.config.trainer.max_iter:
+                if iteration >= execution_max_iter:
                     break
                 dataloader_train_iter = iter(dataloader_train)
                 while True:
                     # If max_iter is reached, exit the training loop before loading the nex batch
-                    if iteration >= self.config.trainer.max_iter:
+                    if iteration >= execution_max_iter:
                         _end_training = True
                         break
                     self.callbacks.on_before_dataloading(iteration)
