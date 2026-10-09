@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -32,6 +33,16 @@ def verified(tmp_path: Path) -> tuple[Path, Path, Path, RoboCasaExactWindowCache
     cache_root, source_root, index_root = tmp_path / "cache", tmp_path / "source", tmp_path / "verified"
     _cache(cache_root)
     _source(source_root)
+    # Mirror the corrected Edge tokenizer canvas (192x320 / spatial factor 16).
+    manifest_file = cache_root / "dataset_manifest.json"
+    manifest = json.loads(manifest_file.read_text())
+    manifest["latent_shape"] = [5, 48, 12, 20]
+    manifest_file.write_text(json.dumps(manifest))
+    payload_file = cache_root / "tasks/Pick_Mug/episodes/episode_000000.pt"
+    payload = torch.load(payload_file, weights_only=True)
+    for window in payload["windows"].values():
+        window["latent"] = torch.ones((5, 48, 12, 20), dtype=torch.float32)
+    torch.save(payload, payload_file)
     catalog = RoboCasaExactWindowCacheCatalog(cache_root)
     cold = RoboCasaExactWindowSourceReader(catalog, source_root)
     built = VerifiedExactWindowIndex.build(index_root, cache_catalog=catalog, source_reader=cold)
@@ -142,13 +153,17 @@ def test_factory_catalog_identity_is_shared_in_warm_path(verified) -> None:
     cache_root, source_root, index_root, _, _ = verified
     index = VerifiedExactWindowIndex.open(index_root, cache_root=cache_root, source_root=source_root)
     catalog = RoboCasaExactWindowCacheCatalog(cache_root, verified_index=index)
-    dataset = get_action_robocasa_exact_window_cached_sft_dataset(
-        cache_root=cache_root,
-        source_root=source_root,
-        tokenizer_config={"type": "dummy"},
-        catalog=catalog,
-        verified_index=index,
-    )
+    with patch(
+        "cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cached_sft.ActionTransformPipeline",
+        return_value=lambda data, _resolution: data,
+    ):
+        dataset = get_action_robocasa_exact_window_cached_sft_dataset(
+            cache_root=cache_root,
+            source_root=source_root,
+            tokenizer_config={"test": "tokenizer bypassed by unit test"},
+            catalog=catalog,
+            verified_index=index,
+        )
     assert dataset._dataset.catalog is catalog
     assert dataset._dataset.source_reader.catalog is catalog
     assert dataset._dataset.source_reader.verified_index is index
