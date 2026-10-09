@@ -29,8 +29,8 @@ from cosmos_framework.utils import distributed
 from cosmos_framework.utils.context_managers import model_init
 from cosmos_framework.utils.generator.optimizer import OptimizersContainer
 from cosmos_framework.utils.lazy_config import instantiate
-from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
 from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
+from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
 
 GENERATION_KEYS = (
     "moe_gen",
