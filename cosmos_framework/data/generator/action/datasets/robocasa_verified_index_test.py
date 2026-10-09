@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -33,6 +35,18 @@ def verified(tmp_path: Path) -> tuple[Path, Path, Path, RoboCasaExactWindowCache
     cache_root, source_root, index_root = tmp_path / "cache", tmp_path / "source", tmp_path / "verified"
     _cache(cache_root)
     _source(source_root)
+    # Official raw15 adapter expects a well-formed quaternion in state16.
+    data_file = source_root / "data/chunk-000/file-000.parquet"
+    source_table = pq.read_table(data_file)
+    states = source_table["observation.state"].to_pylist()
+    for state in states:
+        state[10:14] = [0.0, 0.0, 0.0, 1.0]
+    source_table = source_table.set_column(
+        source_table.schema.get_field_index("observation.state"),
+        "observation.state",
+        pa.array(states),
+    )
+    pq.write_table(source_table, data_file)
     # Mirror the corrected Edge tokenizer canvas (192x320 / spatial factor 16).
     manifest_file = cache_root / "dataset_manifest.json"
     manifest = json.loads(manifest_file.read_text())
@@ -210,3 +224,55 @@ def test_cold_build_loads_cache_episode_payload_only_once(tmp_path: Path, monkey
     reader = RoboCasaExactWindowSourceReader(catalog, source_root)
     assert len(reader.index) == 3
     assert reads == [root / catalog.episodes[0].relative_path]
+
+
+def test_full_raw_sample_and_formal_digest_match_across_cold_and_warm(verified, tmp_path: Path) -> None:
+    from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
+        ExactWindowLocalCatalog,
+        ExactWindowRankPlanner,
+    )
+    from examples.psm_wma_robocasa_corrected_phase5 import config_digest
+    from examples.psm_wma_robocasa_corrected_phase5_test import _config
+
+    cache_root, source_root, index_root, cold_catalog, _ = verified
+    index = VerifiedExactWindowIndex.open(index_root, cache_root=cache_root, source_root=source_root)
+    warm_catalog = RoboCasaExactWindowCacheCatalog(cache_root, verified_index=index)
+
+    def make_dataset(catalog, verified_index=None):
+        with patch(
+            "cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cached_sft.ActionTransformPipeline",
+            return_value=lambda data, _resolution: data,
+        ):
+            return get_action_robocasa_exact_window_cached_sft_dataset(
+                cache_root=cache_root,
+                source_root=source_root,
+                tokenizer_config={"test": "bypass in CPU fixture"},
+                catalog=catalog,
+                verified_index=verified_index,
+            )
+
+    cold = make_dataset(cold_catalog)
+    warm = make_dataset(warm_catalog, index)
+    assert cold._dataset.catalog is cold_catalog
+    assert warm._dataset.catalog is warm_catalog
+    for number in (0, 1, 2):
+        lhs = cold._dataset[number]
+        rhs = warm._dataset[number]
+        assert (lhs["task_class"], lhs["episode_index"], lhs["start_frame"]) == (
+            rhs["task_class"], rhs["episode_index"], rhs["start_frame"]
+        )
+        for name in ("action", "video_latent", "global_row_indices", "window_frame_indices"):
+            torch.testing.assert_close(lhs[name], rhs[name])
+
+    cold_local, warm_local = ExactWindowLocalCatalog(cold, ttt_tbptt_steps=16), ExactWindowLocalCatalog(
+        warm, ttt_tbptt_steps=16
+    )
+    assert cold_local.episodes == warm_local.episodes
+    _, config, b_stream, active_ga = _config(tmp_path)
+    witnesses = {"edge_config_sha256": "edge", "base_model_metadata_sha256": "droid"}
+    assert config_digest(cold_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses) == (
+        config_digest(warm_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses)
+    )
+    left_plan = ExactWindowRankPlanner(cold_local, rank=0, world_size=1, b_stream=1, active_ga=1)
+    right_plan = ExactWindowRankPlanner(warm_local, rank=0, world_size=1, b_stream=1, active_ga=1)
+    assert left_plan.plan_window(left_plan.initial_frontier()) == right_plan.plan_window(right_plan.initial_frontier())
