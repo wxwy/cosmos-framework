@@ -295,11 +295,16 @@ class RoboCasaExactWindowSourceReader:
             if index in self.abs_to_relative:
                 raise ValueError(f"hf_dataset absolute index 重复：{index}")
             self.abs_to_relative[index] = relative
-        for record in catalog.episodes:
-            for window_start in record.window_starts:
-                for absolute in self._identity(record.key, window_start).global_row_indices:
-                    if absolute not in self.abs_to_relative:
-                        raise ValueError(f"cache witness 未在 filtered hf_dataset：{absolute}")
+        # _bind_episode already inspected every cache window identity and
+        # confined its row witnesses to the episode's contiguous absolute
+        # bounds. Membership therefore needs only one check per SOURCE row,
+        # not 17 rechecks for each overlapping window. In particular, do not
+        # re-load all .pt episode payloads after the 8-entry reader LRU evicts
+        # them during the earlier cold binding pass.
+        for bound in self._bound.values():
+            for absolute in range(bound.dataset_from_index, bound.dataset_to_index):
+                if absolute not in self.abs_to_relative:
+                    raise ValueError(f"cache witness 未在 filtered hf_dataset：{absolute}")
 
     def _load_verified_bindings(
         self, verified_index: VerifiedExactWindowIndex, selected_files: dict[ExactWindowEpisodeKey, Path]
@@ -420,10 +425,14 @@ class RoboCasaExactWindowSourceReader:
             raise ValueError(f"source annotation task_class 与 cache 不匹配：{key}")
         for window_start in record.window_starts:
             identity = self._identity(key, window_start)
+            if identity.global_row_indices is None or any(
+                absolute < start or absolute >= end for absolute in identity.global_row_indices
+            ):
+                raise ValueError(f"cache witness 未在 filtered hf_dataset：{key}/{window_start}")
             if identity.global_row_indices != rows["index"][window_start : window_start + 17]:
                 if window_start in (0, record.window_count - 1):
                     raise ValueError(f"startup first/terminal global index witness 不匹配：{key}/{window_start}")
-                # 中间窗仍保留 runtime 逐窗校验；其 absolute witness 必须可映射。
+                # Middle-window order continues to be strictly validated on every runtime read.
         relative = str(path.relative_to(self.source_root))
         return _BoundEpisode(
             key,
