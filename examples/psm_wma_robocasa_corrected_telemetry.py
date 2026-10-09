@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
 """Read-only, rank-local telemetry for the corrected grouped Local-TTT trainer.
 
 This observer never owns checkpoint state, optimizer calls, or autograd tensors.
