@@ -3,6 +3,8 @@ on:
   push:
     branches:
       - v3-telemetry-ci-smoke-20261009
+permissions:
+  contents: write
 jobs:
   telemetry:
     runs-on: ubuntu-latest
@@ -21,9 +23,19 @@ jobs:
         run: |
           python -m py_compile examples/psm_wma_robocasa_corrected_telemetry.py
           python -m py_compile examples/psm_wma_robocasa_corrected_telemetry_test.py
-      - name: Focused lint
+      - name: Focused lint and format
         run: |
           ruff check --output-format full examples/psm_wma_robocasa_corrected_telemetry.py examples/psm_wma_robocasa_corrected_telemetry_test.py
+          ruff format examples/psm_wma_robocasa_corrected_telemetry.py examples/psm_wma_robocasa_corrected_telemetry_test.py
           ruff format --check examples/psm_wma_robocasa_corrected_telemetry.py examples/psm_wma_robocasa_corrected_telemetry_test.py
       - name: Focused unit tests
         run: python -m pytest -q examples/psm_wma_robocasa_corrected_telemetry_test.py
+      - name: Commit candidate formatting only after successful tests
+        run: |
+          if ! git diff --quiet -- examples/psm_wma_robocasa_corrected_telemetry.py examples/psm_wma_robocasa_corrected_telemetry_test.py; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add examples/psm_wma_robocasa_corrected_telemetry.py examples/psm_wma_robocasa_corrected_telemetry_test.py
+            git commit -m "style(v3): apply Ruff formatting to telemetry files"
+            git push origin HEAD:v3-telemetry-ci-smoke-20261009
+          fi
