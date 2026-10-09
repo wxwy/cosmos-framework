@@ -187,6 +187,9 @@ def test_parameter_norms_sample_only_on_interval_100():
     trainer = make_trainer()
     observer = GroupedPlanObserver(rank=0, parameter_group=group, emit=emitted.append, parameter_norm_interval=100)
     observer.start_iteration(0)
+    for _member, _index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
+        observer(phase="native_forward", trainer=trainer)
+        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.0))
     observer(phase="pre_optimizer", trainer=trainer, metrics={})
     observer(phase="post_commit", trainer=trainer, iteration=0)
     first = json.loads(emitted[-1].split("[train] ", 1)[1])
@@ -194,6 +197,9 @@ def test_parameter_norms_sample_only_on_interval_100():
     assert "local_param_norm_rank_local" not in first
 
     observer.start_iteration(99)
+    for _member, _index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
+        observer(phase="native_forward", trainer=trainer)
+        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.0))
     observer(phase="pre_optimizer", trainer=trainer, metrics={})
     observer(phase="post_commit", trainer=trainer, iteration=99)
     second = json.loads(emitted[-1].split("[train] ", 1)[1])
