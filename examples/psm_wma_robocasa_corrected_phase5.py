@@ -311,7 +311,33 @@ def _resume_checkpoint(args: argparse.Namespace) -> Path | None:
     return checkpoint
 
 
-def verify_root_child_lock(args: argparse.Namespace) -> dict[str, str]:
+def _audit_root_noncode_changes(porcelain_z: str) -> tuple[str, ...]:
+    """Permit known MM notes/Evidence, never production-code or unknown root changes."""
+    if not porcelain_z:
+        return ()
+    records = porcelain_z.split("\0")
+    if records[-1] != "":
+        raise ValueError("Root git status porcelain -z 格式不完整")
+    permitted = []
+    for record in records[:-1]:
+        if len(record) < 4 or record[2] != " ":
+            raise ValueError("Root git status porcelain -z 记录格式非法")
+        status, path = record[:2], record[3:]
+        notes = status in {" M", "M ", "MM"} and path in {"SESSION.md", "TODO.md"}
+        evidence_json = status == "??" and path.startswith("artifacts/g0/") and path.endswith(".json")
+        evidence_report = (
+            status == "??"
+            and path.startswith("docs/collab/chatgpt/DS_PRO_")
+            and path.endswith(".md")
+            and "/" not in path[len("docs/collab/chatgpt/"):]
+        )
+        if not (notes or evidence_json or evidence_report):
+            raise ValueError(f"Root 工作树含非授权改动：{status} {path}")
+        permitted.append(f"{status} {path}")
+    return tuple(permitted)
+
+
+def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
     child = Path(__file__).resolve().parents[1]
 
     def git(repo: Path, *command: str) -> str:
@@ -328,10 +354,24 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, str]:
         or len(args.expected_child) != 40
         or (actual_root, actual_child, gitlink) != (args.expected_root, args.expected_child, args.expected_child)
         or git(child, "status", "--porcelain")
-        or git(root, "status", "--porcelain")
     ):
-        raise ValueError("V3 root/child/Gitlink 或工作树不匹配")
-    return {"root": actual_root, "child": actual_child, "gitlink": gitlink}
+        raise ValueError("V3 root/child/Gitlink 或 child 工作树不匹配")
+    # Gitlink and child source remain strictly clean and SHA-pinned. The root
+    # tree contains MM-owned notes and DS-only reports that must be preserved.
+    # Read porcelain -z without .strip(), which would destroy its leading XY status.
+    root_status = subprocess.run(
+        ("git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    noncode_changes = _audit_root_noncode_changes(root_status)
+    return {
+        "root": actual_root,
+        "child": actual_child,
+        "gitlink": gitlink,
+        "allowed_root_noncode_changes": len(noncode_changes),
+    }
 
 
 def _execution_stop_iteration(args: argparse.Namespace) -> int:
