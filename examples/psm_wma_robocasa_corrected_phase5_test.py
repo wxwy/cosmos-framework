@@ -415,3 +415,31 @@ def test_telemetry_groups_are_strict_subsets_of_optimizer_allowlist() -> None:
         elif group is not None:
             assert group == "generation"
     assert phase5._telemetry_parameter_group("net.reasoner.weight") is None
+
+
+def test_checkpoint_wrapper_observes_only_successful_saves(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = []
+    timer = iter((10.0, 10.5, 11.0, 11.5))
+    monkeypatch.setattr(phase5.time, "perf_counter", lambda: next(timer))
+    checkpointer = SimpleNamespace(save=lambda *args, **kwargs: "DCP_OK")
+    observer = SimpleNamespace(log_checkpoint=lambda iteration, ms: events.append((iteration, ms)))
+    phase5.install_checkpoint_save_telemetry(checkpointer, observer)
+    assert checkpointer.save("model", iteration=100) == "DCP_OK"
+    assert events == [(100, pytest.approx(500.0))]
+
+    def fail_save(*args, **kwargs):
+        raise OSError("failure")
+
+    checkpointer = SimpleNamespace(save=fail_save)
+    phase5.install_checkpoint_save_telemetry(checkpointer, observer)
+    with pytest.raises(OSError, match="failure"):
+        checkpointer.save("model", iteration=200)
+    assert len(events) == 1  # Failed DCP must not print successful save time.
+
+
+def test_corrected_phase5_keeps_default_callbacks_disabled() -> None:
+    """Prevent accidental restoration of upstream callbacks/DCP dataloader owners."""
+    import inspect
+
+    source = inspect.getsource(phase5.overlay_config)
+    assert "config.trainer.callbacks = {}" in source
