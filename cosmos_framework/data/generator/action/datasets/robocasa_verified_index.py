@@ -234,8 +234,7 @@ class VerifiedExactWindowIndex:
         ).reshape(count, 2)
         values = values[np.argsort(values[:, 0], kind="stable")]
         if count and (
-            (values[1:, 0] <= values[:-1, 0]).any()
-            or (np.sort(values[:, 1]) != np.arange(count, dtype=np.int64)).any()
+            (values[1:, 0] <= values[:-1, 0]).any() or (np.sort(values[:, 1]) != np.arange(count, dtype=np.int64)).any()
         ):
             raise ValueError("verified index cold absolute-row map 非一一映射")
         parent = destination.parent
