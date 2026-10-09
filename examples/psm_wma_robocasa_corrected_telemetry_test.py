@@ -257,3 +257,62 @@ def test_observer_resets_after_abort_without_successful_log():
     report = json.loads(emitted[0].split("[train] ", 1)[1])
     assert report["outer_loss"] == pytest.approx(5.0)
     assert len(emitted) == 1
+
+
+def test_hot_path_does_not_call_tensor_item(monkeypatch: pytest.MonkeyPatch):
+    trainer = make_trainer()
+    observer = GroupedPlanObserver(rank=0)
+    def forbidden_item(self, *args, **kwargs):
+        raise AssertionError("per-consumer .item() forces a CUDA synchronization")
+    with monkeypatch.context() as ctx:
+        ctx.setattr(torch.Tensor, "item", forbidden_item)
+        observer(
+            phase="native_forward", trainer=trainer, member=0, index=0,
+            metrics={"flow_matching_loss_action": torch.tensor(1.0)},
+        )
+        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.25))
+    assert observer.forward == 1 and observer.backward == 1
+
+
+def test_cuda_event_timing_samples_only_every_100_steps(monkeypatch: pytest.MonkeyPatch):
+    emitted: list[str] = []
+    state = {"events": 0, "synchronizes": 0}
+
+    class FakeCudaEvent:
+        def __init__(self, **_kwargs):
+            state["events"] += 1
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, other):
+            assert isinstance(other, FakeCudaEvent)
+            return 2.5
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(torch.cuda, "Event", FakeCudaEvent)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: state.__setitem__("synchronizes", state["synchronizes"] + 1))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 1024**3)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 2 * 1024**3)
+
+    trainer = make_trainer()
+    observer = GroupedPlanObserver(rank=0, emit=emitted.append)
+    observer.start_iteration(0)
+    with observer.time_stage("forward"):
+        pass
+    observer(phase="post_commit", trainer=trainer, iteration=0)
+    assert state["events"] == 0 and state["synchronizes"] == 0
+
+    observer.start_iteration(99)
+    with observer.time_stage("forward"):
+        pass
+    with observer.time_stage("backward"):
+        pass
+    observer(phase="post_commit", trainer=trainer, iteration=99)
+    record = json.loads(emitted[-1].split("[train] ", 1)[1])
+    assert state["events"] == 4
+    assert state["synchronizes"] == 1
+    assert record["forward_cuda_event_ms"] == pytest.approx(2.5)
+    assert record["backward_cuda_event_ms"] == pytest.approx(2.5)
+    assert record["cuda_sampled"] is True
