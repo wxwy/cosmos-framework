@@ -31,9 +31,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
     started = time.perf_counter()
     if args.verify_existing:
-        index = VerifiedExactWindowIndex.open(
-            args.index_root, cache_root=args.cache_root, source_root=args.source_root
-        )
+        index = VerifiedExactWindowIndex.open(args.index_root, cache_root=args.cache_root, source_root=args.source_root)
         catalog = RoboCasaExactWindowCacheCatalog(args.cache_root, verified_index=index)
         index.check_catalog(catalog)
         report = {
