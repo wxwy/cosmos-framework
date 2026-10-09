@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -69,6 +70,10 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 metrics=metrics,
                 trainer=self,
             )
+
+    def _telemetry_stage(self, name: str):
+        observer = getattr(self, "grouped_observer", None)
+        return observer.time_stage(name) if observer is not None and hasattr(observer, "time_stage") else nullcontext()
 
     @staticmethod
     def _optimizer_lr_metrics(optimizer: Any) -> dict[str, float]:
@@ -216,6 +221,8 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                     raise
                 self._pending_grouped_resume = None
         window = self._grouped_window
+        # Observational context manager only; not part of DCP or Local live state.
+        window._telemetry_stage = self._telemetry_stage
         if grad_accum_iter == 0:
             window.begin()
         elif window.plan is None:
@@ -226,17 +233,20 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
 
         def native_loss(payloads, prefixes, index):
             nonlocal output
-            batch = collate_grouped_native_batch(payloads)
-            batch = misc.to(batch, device=next(model.parameters()).device)
+            with self._telemetry_stage("batch_collate"):
+                batch = collate_grouped_native_batch(payloads)
+            with self._telemetry_stage("batch_transfer"):
+                batch = misc.to(batch, device=next(model.parameters()).device)
             self.callbacks.on_before_forward(iteration=iteration)
-            with self.training_timer("forward"):
-                output, loss = model_ddp.training_step(batch, iteration, _local_memory_prefixes=prefixes)
+            with self._telemetry_stage("forward"):
+                with self.training_timer("forward"):
+                    output, loss = model_ddp.training_step(batch, iteration, _local_memory_prefixes=prefixes)
             if "_backward_loss" in output:
                 raise ValueError("H3-C 禁止额外 surrogate backward loss")
             scalar_metrics = {
                 key: value.detach()
                 for key, value in output.items()
-                if isinstance(value, torch.Tensor) and value.ndim == 0 and "loss" in key and bool(torch.isfinite(value))
+                if isinstance(value, torch.Tensor) and value.ndim == 0 and "loss" in key
             }
             self._observe_grouped(
                 "native_forward",
@@ -252,9 +262,10 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         def backward(weighted_loss: torch.Tensor, retain_graph: bool) -> None:
             nonlocal backward_index
             self.callbacks.on_before_backward(model, weighted_loss, iteration=iteration)
-            with self.training_timer("backward"):
-                grad_scaler.scale(weighted_loss).backward(retain_graph=retain_graph)
-                model.on_after_backward()
+            with self._telemetry_stage("backward"):
+                with self.training_timer("backward"):
+                    grad_scaler.scale(weighted_loss).backward(retain_graph=retain_graph)
+                    model.on_after_backward()
             self._observe_grouped(
                 "native_backward",
                 iteration=iteration,
@@ -266,9 +277,10 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             self.callbacks.on_after_backward(model, iteration=iteration)
 
         try:
-            segments = tuple(
-                self._grouped_producer.produce(request) for request in window.plan.members[grad_accum_iter]
-            )
+            with self._telemetry_stage("data_prepare"):
+                segments = tuple(
+                    self._grouped_producer.produce(request) for request in window.plan.members[grad_accum_iter]
+                )
             member_loss = window.run_member(segments, native_loss, backward)
             if grad_accum_iter + 1 < active_ga:
                 return output, member_loss, grad_accum_iter + 1
@@ -284,7 +296,11 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 member=grad_accum_iter,
                 metrics=self._optimizer_lr_metrics(optimizer),
             )
-            window.finish(lambda: self._optimizer_step_success(optimizer, scheduler, grad_scaler))
+            def observed_optimizer_step() -> bool:
+                with self._telemetry_stage("optimizer"):
+                    return self._optimizer_step_success(optimizer, scheduler, grad_scaler)
+
+            window.finish(observed_optimizer_step)
             self._observe_grouped("post_commit", iteration=iteration, member=grad_accum_iter)
             self._grouped_completed_iteration = iteration + 1
             self.callbacks.on_before_zero_grad(model, optimizer, scheduler, iteration=iteration)
