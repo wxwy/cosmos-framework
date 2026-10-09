@@ -21,6 +21,8 @@ from typing import Any, Mapping
 
 import torch
 
+from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
+
 _WINDOW_FRAMES = 17
 _ANCHOR_STRIDE = 4
 
@@ -139,7 +141,11 @@ class ExactWindowCorpusStats:
 class RoboCasaExactWindowCacheCatalog:
     """Validate manifest identity and file presence without loading episode tensors."""
 
-    def __init__(self, cache_root: str | Path, *, strict: bool = True) -> None:
+    def __init__(
+        self, cache_root: str | Path, *, strict: bool = True, verified_index: VerifiedExactWindowIndex | None = None
+    ) -> None:
+        if verified_index is not None and not isinstance(verified_index, VerifiedExactWindowIndex):
+            raise TypeError("cache catalog verified_index 类型不合法")
         self.cache_root = Path(cache_root)
         manifest_path = self.cache_root / "dataset_manifest.json"
         raw = manifest_path.read_bytes()
@@ -148,6 +154,8 @@ class RoboCasaExactWindowCacheCatalog:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ValueError(f"无效 cache manifest：{manifest_path}") from exc
         self.manifest_sha256 = hashlib.sha256(raw).hexdigest()
+        if verified_index is not None and verified_index.cache_manifest_sha256 != self.manifest_sha256:
+            raise ValueError("verified index 的 manifest SHA 与 cache 不匹配")
         self._validate_contract(manifest)
         self._records, task_stats = self._parse_tasks(manifest)
         missing, extra, discovered = self._audit_files()
@@ -160,7 +168,11 @@ class RoboCasaExactWindowCacheCatalog:
         known_frames = [record.source_video_frames for record in self._records.values()]
         all_frames_known = all(frames is not None for frames in known_frames)
         per_task = tuple(sorted(task_stats, key=lambda task: (task.task_class, task.task_slug)))
-        self.corpus_digest = self._corpus_digest(manifest)
+        # Only a verified immutable file snapshot may skip the 2M-window
+        # canonical corpus-hash walk. The cold path remains byte-identical.
+        self.corpus_digest = (
+            verified_index.cache_corpus_digest if verified_index is not None else self._corpus_digest(manifest)
+        )
         self.stats = ExactWindowCorpusStats(
             cache_root=str(self.cache_root),
             manifest_sha256=self.manifest_sha256,
@@ -190,6 +202,8 @@ class RoboCasaExactWindowCacheCatalog:
             min_windows_per_task=min(task.window_count for task in per_task),
             max_windows_per_task=max(task.window_count for task in per_task),
         )
+        if verified_index is not None:
+            verified_index.check_catalog(self)
 
     def _validate_contract(self, manifest: Mapping[str, Any]) -> None:
         for name, expected in (
