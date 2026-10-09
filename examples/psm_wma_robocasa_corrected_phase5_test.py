@@ -575,3 +575,9 @@ def test_root_noncode_dirty_allowlist_preserves_MM_and_DS_evidence() -> None:
 def test_root_dirty_allowlist_fails_closed_on_unknown_or_source_changes(status: str) -> None:
     with pytest.raises(ValueError, match="Root"):
         phase5._audit_root_noncode_changes(status)
+
+
+def test_bounded_diagnostic_final_step_samples_gpu_and_parameter_norms() -> None:
+    assert phase5._telemetry_sample_interval(None) == 100
+    assert phase5._telemetry_sample_interval(3) == 3
+    assert phase5._telemetry_sample_interval(1) == 1
