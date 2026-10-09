@@ -221,4 +221,3 @@ def test_continuation_mask_requires_state_and_remains_strict() -> None:
     state = net.local_memory_runtime.core.detach_state(net.local_memory_runtime.core.initial_state(2))
     with pytest.raises(ValueError, match="fresh/continuation"):
         net.scan_local_memory(visual, action, valid, state, continuation_mask=torch.tensor([True, True]))
-
