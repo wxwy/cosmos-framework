@@ -98,6 +98,7 @@ class GroupedPlanObserver:
     def _reset_step(self) -> None:
         self._started_at: float | None = None
         self._started_iteration: int | None = None
+        self._last_plan: Any = None
         self._losses: dict[str, torch.Tensor] = {}
         self._loss_coverage: dict[str, float] = {}
         self._outer: torch.Tensor | None = None
@@ -392,6 +393,11 @@ class GroupedPlanObserver:
             "lr_max": self._pre_optimizer_lr.get("lr_max"),
             "lr_scope": "pre_optimizer_before_scheduler_step",
             "step_wall_ms": step_wall_ms,
+            "step_wall_s": wall_s,
+            "action_loss": loss_values.get("flow_matching_loss_action"),
+            "vision_loss": loss_values.get("flow_matching_loss_vision"),
+            "action_loss_consumer_weight_coverage": self._loss_coverage.get("flow_matching_loss_action", 0.0),
+            "vision_loss_consumer_weight_coverage": self._loss_coverage.get("flow_matching_loss_vision", 0.0),
             "step_wall_scope": "first_trigger_to_post_commit_excludes_checkpoint",
             "other_host_overhead_ms": (
                 max(0.0, step_wall_ms - total_measured) if step_wall_ms is not None else None
