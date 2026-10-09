@@ -158,3 +158,102 @@ def test_completed_optimizer_is_not_rolled_back_by_broken_logger():
     observer = GroupedPlanObserver(emit=broken_logger)
     observer(phase="post_commit", trainer=make_trainer(), iteration=0)
     assert observer.completed == 1
+
+
+def test_stage_timing_is_distinct_from_unavailable_async_data_wait():
+    emitted: list[str] = []
+    ticks = iter((1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+    observer = GroupedPlanObserver(
+        rank=0, clock=lambda: next(ticks), emit=emitted.append,
+    )
+    trainer = make_trainer()
+    observer.start_iteration(0)
+    with observer.time_stage("data_prepare"):
+        pass
+    with observer.time_stage("forward"):
+        pass
+    observer(phase="post_commit", trainer=trainer, iteration=0)
+    record = json.loads(emitted[0].split("[train] ", 1)[1])
+    assert record["data_prepare_ms"] == pytest.approx(1000.0)
+    assert record["forward_ms"] == pytest.approx(1000.0)
+    assert record["data_wait_ms"] is None
+    assert record["data_wait_reason"] == "synchronous_producer_no_background_dataloader"
+    assert record["cpu_timing_scope"] == "host_wall_cuda_dispatch_not_gpu_kernel_time"
+    assert record["cuda_sampled"] is False
+
+
+def test_parameter_norms_sample_only_on_interval_100():
+    emitted: list[str] = []
+    trainer = make_trainer()
+    observer = GroupedPlanObserver(rank=0, parameter_group=group, emit=emitted.append, parameter_norm_interval=100)
+    observer.start_iteration(0)
+    observer(phase="pre_optimizer", trainer=trainer, metrics={})
+    observer(phase="post_commit", trainer=trainer, iteration=0)
+    first = json.loads(emitted[-1].split("[train] ", 1)[1])
+    assert first["param_norm_sampled"] is False
+    assert "local_param_norm_rank_local" not in first
+
+    observer.start_iteration(99)
+    observer(phase="pre_optimizer", trainer=trainer, metrics={})
+    observer(phase="post_commit", trainer=trainer, iteration=99)
+    second = json.loads(emitted[-1].split("[train] ", 1)[1])
+    assert second["param_norm_sampled"] is True
+    assert second["local_param_norm_rank_local"] == pytest.approx(math.sqrt(8))
+    assert second["action_param_norm_rank_local"] is not None
+    assert second["generation_param_norm_rank_local"] is not None
+    assert second["nonfinite_grad_tensors_rank_local"] == 0
+    assert second["missing_grad_tensors_rank_local"] == 0
+
+
+def test_log_uses_model_frozen_loss_coefficients_not_double_weighting():
+    emitted: list[str] = []
+    trainer = make_trainer()
+    trainer._grouped_window.model.config = SimpleNamespace(
+        rectified_flow_training_config=SimpleNamespace(
+            action_loss_weight=10.0,
+            loss_scale=10.0,
+            image_loss_scale=None,
+            sample_level_loss_averaging=False,
+        )
+    )
+    observer = GroupedPlanObserver(rank=0, emit=emitted.append)
+    for member, index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
+        observer(
+            phase="native_forward", trainer=trainer, member=member, index=index,
+            metrics={
+                "flow_matching_loss_action": torch.tensor(2.0),
+                "flow_matching_loss_vision": torch.tensor(3.0),
+                "aux_loss_gen": torch.tensor(0.5),
+                "aux_loss_und": torch.tensor(0.25),
+            },
+        )
+        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(1.0))
+    observer(phase="pre_optimizer", trainer=trainer, metrics={"lr_min": 1e-5, "lr_max": 5e-5})
+    observer(phase="post_commit", trainer=trainer, iteration=0)
+    report = json.loads(emitted[-1].split("[train] ", 1)[1])
+    assert report["outer_loss"] == pytest.approx(5.0)
+    assert report["action_contribution"] == pytest.approx(20.0)
+    assert report["vision_contribution"] == pytest.approx(30.0)
+    assert report["aux_loss_gen"] == pytest.approx(0.5)
+    assert report["aux_loss_und"] == pytest.approx(0.25)
+    assert report["inner_loss_max"] is None  # The minimal fake core publishes no max metric.
+    assert report["grad_norm_scope"] == "rank0_local_fsdp_shard"
+
+
+def test_observer_resets_after_abort_without_successful_log():
+    emitted: list[str] = []
+    trainer = make_trainer()
+    observer = GroupedPlanObserver(rank=0, emit=emitted.append)
+    observer.start_iteration(0)
+    observer(phase="native_backward", trainer=trainer, loss=torch.tensor(5.0))
+    assert not emitted
+    # A retry or clean fresh run resets purely observational state.
+    observer.start_iteration(0)
+    for _ in range(5):
+        observer(phase="native_forward", trainer=trainer)
+        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(1.0))
+    observer(phase="pre_optimizer", trainer=trainer)
+    observer(phase="post_commit", trainer=trainer, iteration=0)
+    report = json.loads(emitted[0].split("[train] ", 1)[1])
+    assert report["outer_loss"] == pytest.approx(5.0)
+    assert len(emitted) == 1
