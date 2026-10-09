@@ -22,8 +22,8 @@ from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_polic
     OfficialRoboCasaPolicyAdapter,
 )
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_source import RoboCasaExactWindowSourceReader
-from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
 from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset import RoboCasaLeRobotDataset
+from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
 from cosmos_framework.data.generator.action.utils.domain_utils import get_domain_id
 from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline, VideoResize
 
