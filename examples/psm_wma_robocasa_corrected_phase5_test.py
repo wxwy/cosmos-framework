@@ -457,7 +457,7 @@ def test_grouped_latency_instrumentation_uses_real_producer_and_model_scopes() -
     for stage in ("data_prepare", "batch_collate", "batch_transfer", "forward", "backward", "optimizer"):
         assert f'_telemetry_stage("{stage}")' in trainer_source
     assert 'timing("local_scan")' in window_source
-    assert 'self._grouped_producer.produce(request)' in trainer_source
+    assert "self._grouped_producer.produce(request)" in trainer_source
     assert "window.finish(observed_optimizer_step)" in trainer_source
     assert "config.trainer.callbacks = {}" in inspect.getsource(phase5.overlay_config)
 
@@ -487,13 +487,9 @@ def test_bounded_execution_preserves_formal_schedule_without_mutation(tmp_path: 
 
     catalog, config, b_stream, active_ga = _config(tmp_path)
     witnesses = {"edge_config_sha256": "edge", "base_model_metadata_sha256": "droid"}
-    formal_digest = phase5.config_digest(
-        catalog, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses
-    )
+    formal_digest = phase5.config_digest(catalog, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses)
     _ = phase5._execution_stop_iteration(args)
-    bounded_digest = phase5.config_digest(
-        catalog, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses
-    )
+    bounded_digest = phase5.config_digest(catalog, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses)
     assert formal_digest == bounded_digest
 
 
@@ -511,9 +507,7 @@ def test_bounded_execution_preserves_formal_schedule_without_mutation(tmp_path: 
         ({"job_name": "edge_local_exact_window"}, "bounded_"),
     ),
 )
-def test_bounded_smoke_rejects_unsafe_configuration(
-    tmp_path: Path, overrides: dict[str, object], message: str
-) -> None:
+def test_bounded_smoke_rejects_unsafe_configuration(tmp_path: Path, overrides: dict[str, object], message: str) -> None:
     args = _bounded_args(tmp_path)
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -549,13 +543,15 @@ def test_bounded_trainer_checks_completed_optimizer_iteration_not_dataloader_len
 
 def test_root_noncode_dirty_allowlist_preserves_MM_and_DS_evidence() -> None:
     status = (
-        " M SESSION.md\0"
+        "MM SESSION.md\0"
         " M TODO.md\0"
         "?? artifacts/g0/preflight_report_abc.json\0"
         "?? docs/collab/chatgpt/DS_PRO_telemetry_gate.md\0"
+        "?? scripts/plot_h3f_monitor.py\0"
     )
     allowed = phase5._audit_root_noncode_changes(status)
-    assert len(allowed) == 4
+    assert len(allowed) == 5
+    assert "?? scripts/plot_h3f_monitor.py" in allowed
     assert phase5._audit_root_noncode_changes("") == ()
 
 
@@ -568,6 +564,8 @@ def test_root_noncode_dirty_allowlist_preserves_MM_and_DS_evidence() -> None:
         "?? artifacts/g0/unsafe.py\0",
         "?? docs/collab/chatgpt/DS_PRO_unsafe.py\0",
         "?? tools/v3/unsafe.py\0",
+        "?? scripts/plot_h3f_monitor_v2.py\0",
+        " M scripts/plot_h3f_monitor.py\0",
         "R  SESSION.md\0renamed.md\0",
         " M TODO.md",
     ),
