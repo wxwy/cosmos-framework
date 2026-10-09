@@ -266,9 +266,9 @@ def test_full_raw_sample_and_formal_digest_match_across_cold_and_warm(verified, 
     assert cold_local.episodes == warm_local.episodes
     _, config, b_stream, active_ga = _config(tmp_path)
     witnesses = {"edge_config_sha256": "edge", "base_model_metadata_sha256": "droid"}
-    assert config_digest(cold_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses) == config_digest(
-        warm_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses
-    )
+    cold_digest = config_digest(cold_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses)
+    warm_digest = config_digest(warm_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses)
+    assert cold_digest == warm_digest
     left_plan = ExactWindowRankPlanner(cold_local, rank=0, world_size=1, b_stream=1, active_ga=1)
     right_plan = ExactWindowRankPlanner(warm_local, rank=0, world_size=1, b_stream=1, active_ga=1)
     assert left_plan.plan_window(left_plan.initial_frontier()) == right_plan.plan_window(right_plan.initial_frontier())
