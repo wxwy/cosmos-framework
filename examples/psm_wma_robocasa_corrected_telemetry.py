@@ -123,9 +123,7 @@ class GroupedPlanObserver:
         self._started_iteration = iteration
         self._started_at = self._clock()
         self._sample_cuda = bool(
-            self.cuda_sample_interval
-            and (iteration + 1) % self.cuda_sample_interval == 0
-            and torch.cuda.is_available()
+            self.cuda_sample_interval and (iteration + 1) % self.cuda_sample_interval == 0 and torch.cuda.is_available()
         )
         self._sample_params = bool(self.parameter_norm_interval and (iteration + 1) % self.parameter_norm_interval == 0)
         if torch.cuda.is_available():
@@ -165,8 +163,10 @@ class GroupedPlanObserver:
     def _weight_for_index(plan: Any, member: int, index: int) -> float:
         if member < 0 or member >= len(plan.members) or index < 0:
             raise ValueError("invalid grouped member/index")
-        denominator = plan.n_window if hasattr(plan, "n_window") else sum(
-            request.valid_count for group in plan.members for request in group
+        denominator = (
+            plan.n_window
+            if hasattr(plan, "n_window")
+            else sum(request.valid_count for group in plan.members for request in group)
         )
         if denominator <= 0:
             raise ValueError("empty grouped optimizer window")
@@ -321,8 +321,7 @@ class GroupedPlanObserver:
         loss_values = {
             key: (
                 _scalar(self._losses[key])
-                if math.isclose(self._loss_coverage.get(key, 0.0), 1.0, abs_tol=1e-6)
-                and key in self._losses
+                if math.isclose(self._loss_coverage.get(key, 0.0), 1.0, abs_tol=1e-6) and key in self._losses
                 else None
             )
             for key in LOSS_KEYS
