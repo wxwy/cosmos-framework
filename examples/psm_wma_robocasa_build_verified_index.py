@@ -21,7 +21,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--cache-root", required=True, type=Path)
     result.add_argument("--source-root", required=True, type=Path)
     result.add_argument("--index-root", required=True, type=Path)
-    result.add_argument("--verify-existing", action="store_true", help="Read-only fingerprint verification; never rebuild")
+    result.add_argument(
+        "--verify-existing", action="store_true", help="Read-only fingerprint verification; never rebuild"
+    )
     return result
 
 
