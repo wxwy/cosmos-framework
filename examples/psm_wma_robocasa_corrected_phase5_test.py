@@ -579,3 +579,11 @@ def test_bounded_diagnostic_final_step_samples_gpu_and_parameter_norms() -> None
     assert phase5._telemetry_sample_interval(None) == 100
     assert phase5._telemetry_sample_interval(3) == 3
     assert phase5._telemetry_sample_interval(1) == 1
+
+
+def test_bounded_smoke_requires_prebuilt_dataset_index_even_before_model_preflight(tmp_path: Path) -> None:
+    args = _bounded_args(tmp_path)
+    args.t, args.b, args.ga, args.k, args.world_size = 16, 8, 2, 4, 8
+    args.dataset_index_root = None
+    with pytest.raises(ValueError, match="dataset-index-root"):
+        phase5.preflight(args)
