@@ -127,7 +127,12 @@ class VerifiedExactWindowIndex:
             or receipt["absolute_row_count"] <= 0
             or any(
                 not isinstance(receipt.get(name), str) or len(receipt[name]) != 64
-                for name in ("cache_manifest_sha256", "cache_corpus_digest", "source_binding_digest", "row_mapping_sha256")
+                for name in (
+                    "cache_manifest_sha256",
+                    "cache_corpus_digest",
+                    "source_binding_digest",
+                    "row_mapping_sha256",
+                )
             )
         ):
             raise ValueError("verified index schema/receipt 不合法")
