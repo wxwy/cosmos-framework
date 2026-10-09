@@ -94,9 +94,7 @@ def test_cold_and_verified_warm_source_window_parity(verified) -> None:
         assert warm.index[index_number] == cold.index[index_number]
         old = cold.read_at(index_number)
         new = warm.read_at(index_number)
-        assert (old.key, old.start_frame, old.global_row_indices) == (
-            new.key, new.start_frame, new.global_row_indices
-        )
+        assert (old.key, old.start_frame, old.global_row_indices) == (new.key, new.start_frame, new.global_row_indices)
         assert old.ai_caption == new.ai_caption and old.task_class == new.task_class
         torch.testing.assert_close(old.action12, new.action12)
         torch.testing.assert_close(old.state16, new.state16)
