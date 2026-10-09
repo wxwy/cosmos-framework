@@ -289,12 +289,13 @@ class ImaginaireTrainer:
         # An explicitly bounded diagnostic may stop earlier than the formal
         # schedule. Keep config.trainer.max_iter, LR scheduler and DCP config
         # unchanged; only shorten the outer execution loop.
-        execution_max_iter = getattr(self, "_execution_max_iter", self.config.trainer.max_iter)
-        if (
-            type(execution_max_iter) is not int
-            or execution_max_iter <= 0
-            or execution_max_iter > self.config.trainer.max_iter
-            or iteration >= execution_max_iter
+        bounded_max_iter = getattr(self, "_execution_max_iter", None)
+        execution_max_iter = self.config.trainer.max_iter if bounded_max_iter is None else bounded_max_iter
+        if bounded_max_iter is not None and (
+            type(bounded_max_iter) is not int
+            or bounded_max_iter <= 0
+            or bounded_max_iter > self.config.trainer.max_iter
+            or iteration >= bounded_max_iter
         ):
             raise ValueError("Execution iteration limit conflicts with checkpoint/config")
         dataloader_fetch_count = self._resume_dataloader_fetch_count(model, iteration)
