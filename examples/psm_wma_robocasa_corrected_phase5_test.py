@@ -587,3 +587,17 @@ def test_bounded_smoke_requires_prebuilt_dataset_index_even_before_model_preflig
     args.dataset_index_root = None
     with pytest.raises(ValueError, match="dataset-index-root"):
         phase5.preflight(args)
+
+def test_missing_grad_audit_requires_exact_three_step_bounded_fresh(tmp_path: Path) -> None:
+    args = _bounded_args(tmp_path, stop=3)
+    args.audit_missing_grads = True
+    assert phase5._execution_stop_iteration(args) == 3
+    for stop in (None, 1, 2, 4):
+        args.stop_after_iter = stop
+        with pytest.raises(ValueError, match="audit-missing-grads"):
+            phase5._execution_stop_iteration(args)
+    args.stop_after_iter = 3
+    args.phase = "resume"
+    with pytest.raises(ValueError, match="fresh-only"):
+        phase5._execution_stop_iteration(args)
+    assert "--audit-missing-grads" in phase5.parser().format_help()

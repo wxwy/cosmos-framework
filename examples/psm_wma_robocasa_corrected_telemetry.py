@@ -80,15 +80,19 @@ class GroupedPlanObserver:
         emit: Callable[[str], None] = print,
         cuda_sample_interval: int = 100,
         parameter_norm_interval: int = 100,
+        audit_missing_gradients: bool = False,
     ) -> None:
         if cuda_sample_interval < 0 or parameter_norm_interval < 0:
             raise ValueError("telemetry intervals cannot be negative")
+        if type(audit_missing_gradients) is not bool:
+            raise TypeError("audit_missing_gradients must be bool")
         self.rank = rank
         self._parameter_group = parameter_group
         self._clock = clock
         self._emit = emit
         self.cuda_sample_interval = cuda_sample_interval
         self.parameter_norm_interval = parameter_norm_interval
+        self.audit_missing_gradients = audit_missing_gradients
         self.forward = 0
         self.backward = 0
         self.completed = 0
@@ -106,6 +110,7 @@ class GroupedPlanObserver:
         self._gradient_sums: dict[str, torch.Tensor | None] = {}
         self._gradient_counts: dict[str, int] = {}
         self._missing_gradient_tensors = 0
+        self._missing_grad_audit_snapshot: dict[str, Any] | None = None
         self._nonfinite_gradient_tensors: torch.Tensor | None = None
         self._parameter_sums: dict[str, torch.Tensor | None] = {}
         self._stage_ms: dict[str, float] = {}
@@ -118,6 +123,9 @@ class GroupedPlanObserver:
     def start_iteration(self, iteration: int) -> None:
         """Called once per GA window; does not mutate the batch or training state."""
         if self.rank != 0:
+            if self.audit_missing_gradients:
+                self._reset_step()
+                self._started_iteration = iteration
             return
         self._reset_step()
         self._started_iteration = iteration
@@ -244,6 +252,72 @@ class GroupedPlanObserver:
                 for key in groups:
                     self._gradient_sums[key] = _add(self._gradient_sums.get(key), squared)
                     self._gradient_counts[key] = self._gradient_counts.get(key, 0) + 1
+
+    def _capture_missing_grad_audit(self, model: Any) -> None:
+        """Inspect only gradient presence and FSDP shard metadata, never tensor values or graph."""
+        if self._parameter_group is None:
+            raise ValueError("missing-gradient audit requires a parameter selector")
+        selected = {"generation": 0, "action": 0, "local": 0}
+        absent = {"generation": 0, "action": 0, "local": 0}
+        missing: list[dict[str, Any]] = []
+        for name, parameter in model.named_parameters():
+            group = self._parameter_group(name)
+            if group is None:
+                continue
+            if group not in selected:
+                raise ValueError(f"missing-gradient audit unknown group: {group}")
+            selected[group] += 1
+            if parameter.grad is not None:
+                continue
+            absent[group] += 1
+            is_dtensor = isinstance(parameter, DTensor)
+            local_numel = parameter.to_local().numel() if is_dtensor else parameter.numel()
+            subgroups = self._gradient_group_names(name, group)
+            missing.append(
+                {
+                    "name": name,
+                    "group": group,
+                    "subgroup": subgroups[-1] if group == "local" else group,
+                    "global_numel": int(parameter.numel()),
+                    "local_numel": int(local_numel),
+                    "is_dtensor": is_dtensor,
+                    "placements": [str(item) for item in parameter.placements] if is_dtensor else [],
+                    "requires_grad": bool(parameter.requires_grad),
+                }
+            )
+        if sum(selected.values()) == 0:
+            raise ValueError("missing-gradient audit selected no parameters")
+        self._missing_grad_audit_snapshot = {
+            "selected_grad_tensors_rank_local": sum(selected.values()),
+            "present_grad_tensors_rank_local": sum(selected.values()) - len(missing),
+            "missing_grad_tensors_rank_local": len(missing),
+            "selected_by_group": selected,
+            "missing_by_group": absent,
+            "missing_grad_parameter_names": [entry["name"] for entry in missing],
+            "missing_grad_parameters": missing,
+        }
+
+    def _emit_missing_grad_audit(self, iteration: int | None) -> None:
+        snapshot = self._missing_grad_audit_snapshot or {}
+        errors: list[str] = []
+        if not snapshot:
+            errors.append("missing_pre_optimizer_snapshot")
+        if iteration is None or iteration != self._started_iteration:
+            errors.append("trigger_commit_iteration_mismatch")
+        if self.rank == 0 and snapshot.get("missing_grad_tensors_rank_local") != self._missing_gradient_tensors:
+            errors.append("rank0_missing_count_mismatch")
+        if "error" in snapshot:
+            errors.append(str(snapshot["error"]))
+        report = {
+            "status": "AUDIT_OK" if not errors else "AUDIT_ERROR",
+            "rank": self.rank,
+            "iteration": iteration + 1 if iteration is not None else None,
+            "scope": "rank_local_pre_optimizer_after_gradient_accumulation",
+            "reported_after": "optimizer_committed",
+            **snapshot,
+            "audit_errors": errors,
+        }
+        self._emit("[CorrectedV3][missing_grad_audit] " + json.dumps(report, sort_keys=True, allow_nan=False))
 
     def _pre_optimizer(self, trainer: Any, metrics: Any) -> None:
         self._pre_optimizer_lr = {key: _scalar((metrics or {}).get(key)) for key in ("lr_min", "lr_max")}
@@ -450,10 +524,17 @@ class GroupedPlanObserver:
             if self.rank == 0:
                 self._last_plan = plan
                 self._pre_optimizer(trainer, data.get("metrics"))
+            if self.audit_missing_gradients:
+                try:
+                    self._capture_missing_grad_audit(trainer._grouped_window.model)
+                except Exception as exc:
+                    self._missing_grad_audit_snapshot = {"error": f"{type(exc).__name__}:{exc}"}
         elif phase == "post_commit":
             self.completed += 1
             try:
                 self._post_commit(trainer, data.get("iteration"))
+                if self.audit_missing_gradients:
+                    self._emit_missing_grad_audit(data.get("iteration"))
             except Exception:
                 # Metrics must never change post-success training semantics.
                 pass

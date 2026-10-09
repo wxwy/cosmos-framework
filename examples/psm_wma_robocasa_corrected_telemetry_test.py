@@ -330,3 +330,86 @@ def test_cuda_event_timing_samples_only_every_100_steps(monkeypatch: pytest.Monk
     assert record["forward_cuda_event_ms"] == pytest.approx(2.5)
     assert record["backward_cuda_event_ms"] == pytest.approx(2.5)
     assert record["cuda_sampled"] is True
+
+@pytest.mark.parametrize("rank", range(8))
+def test_opt_in_missing_gradient_audit_reports_exact_names_on_each_rank_without_mutation(
+    rank: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    emitted: list[str] = []
+    trainer = make_trainer()
+    parameters = dict(trainer._grouped_window.model.named_parameters())
+    # Alternate one missing generator/action parameter to exercise rank-specific evidence.
+    first = "net.moe_gen.bias" if rank % 2 == 0 else "net.action2llm.bias"
+    second = "net.local_memory_runtime.encoder.bias"
+    parameters[first].grad = None
+    parameters[second].grad = None
+    gradients_before = {name: parameter.grad for name, parameter in parameters.items()}
+    observer = GroupedPlanObserver(
+        rank=rank, parameter_group=group, emit=emitted.append, audit_missing_gradients=True
+    )
+    observer.start_iteration(1)
+    for _ in range(5):
+        observer(phase="native_forward", trainer=trainer)
+        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.1))
+    assert emitted == []
+
+    def forbidden_sync(*_args, **_kwargs):
+        raise AssertionError("missing-gradient audit must not synchronize or reduce")
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(torch.Tensor, "item", forbidden_sync)
+        ctx.setattr(torch.distributed, "all_reduce", forbidden_sync)
+        ctx.setattr(torch.cuda, "synchronize", forbidden_sync)
+        observer(phase="pre_optimizer", trainer=trainer, iteration=1, metrics={})
+    assert emitted == []
+    assert all(parameters[name].grad is grad for name, grad in gradients_before.items())
+
+    observer(phase="post_commit", trainer=trainer, iteration=1)
+    audit_lines = [line for line in emitted if "[missing_grad_audit]" in line]
+    train_lines = [line for line in emitted if "[train]" in line]
+    assert len(audit_lines) == 1 and len(train_lines) == (1 if rank == 0 else 0)
+    report = json.loads(audit_lines[0].split("[missing_grad_audit] ", 1)[1])
+    assert report["status"] == "AUDIT_OK"
+    assert report["iteration"] == 2 and report["rank"] == rank
+    assert report["selected_grad_tensors_rank_local"] == 7
+    assert report["present_grad_tensors_rank_local"] == 5
+    assert report["missing_grad_tensors_rank_local"] == 2
+    assert report["missing_grad_parameter_names"] == [first, second]
+    assert report["missing_by_group"] == {
+        "generation": int(rank % 2 == 0),
+        "action": int(rank % 2 == 1),
+        "local": 1,
+    }
+    assert report["audit_errors"] == []
+    assert report["missing_grad_parameters"][0]["group"] == ("generation" if rank % 2 == 0 else "action")
+    assert report["missing_grad_parameters"][1]["subgroup"] == "local_encoder"
+    for entry in report["missing_grad_parameters"]:
+        assert entry["is_dtensor"] is False and entry["placements"] == []
+        assert entry["global_numel"] == entry["local_numel"] > 0
+        assert entry["requires_grad"] is True
+    if rank == 0:
+        primary = json.loads(train_lines[0].split("[train] ", 1)[1])
+        assert primary["missing_grad_tensors_rank_local"] == report["missing_grad_tensors_rank_local"]
+    assert all(parameters[name].grad is grad for name, grad in gradients_before.items())
+    assert observer.completed == 1
+
+
+def test_missing_gradient_audit_is_disabled_by_default_and_does_not_emit_before_commit() -> None:
+    trainer = make_trainer()
+    lines: list[str] = []
+    ordinary = GroupedPlanObserver(rank=1, parameter_group=group, emit=lines.append)
+    ordinary.start_iteration(0)
+    for _ in range(5):
+        ordinary(phase="native_forward", trainer=trainer)
+        ordinary(phase="native_backward", trainer=trainer)
+    ordinary(phase="pre_optimizer", trainer=trainer, iteration=0)
+    ordinary(phase="post_commit", trainer=trainer, iteration=0)
+    assert lines == []
+
+    audited = GroupedPlanObserver(rank=1, parameter_group=group, emit=lines.append, audit_missing_gradients=True)
+    audited.start_iteration(0)
+    for _ in range(5):
+        audited(phase="native_forward", trainer=trainer)
+        audited(phase="native_backward", trainer=trainer)
+    audited(phase="pre_optimizer", trainer=trainer, iteration=0)
+    assert lines == []  # Aborted or uncommitted steps do not emit a success audit.

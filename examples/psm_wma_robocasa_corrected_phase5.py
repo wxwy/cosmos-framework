@@ -381,6 +381,8 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
 def _execution_stop_iteration(args: argparse.Namespace) -> int:
     """Bound only fresh diagnostic execution, never the formal training config."""
     stop_after = getattr(args, "stop_after_iter", None)
+    if getattr(args, "audit_missing_grads", False) and stop_after != 3:
+        raise ValueError("--audit-missing-grads requires fresh bounded --stop-after-iter 3")
     if stop_after is None:
         if args.phase == "resume" and args.job_name.startswith("bounded_"):
             raise ValueError("bounded diagnostic checkpoint must not be resumed as formal training")
@@ -536,6 +538,11 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         help="Fresh-only bounded optimizer steps; preserves max_iter=30000/warmup=500/save_iter=100",
     )
+    result.add_argument(
+        "--audit-missing-grads",
+        action="store_true",
+        help="Bounded 3-step only: emit rank-local grad=None parameter names after successful optimizer commits",
+    )
     return result
 
 
@@ -574,6 +581,7 @@ def main(argv: list[str] | None = None) -> None:
         parameter_group=_telemetry_parameter_group,
         cuda_sample_interval=sample_interval,
         parameter_norm_interval=sample_interval,
+        audit_missing_gradients=args.audit_missing_grads,
     )
     trainer.grouped_observer = observer
     install_checkpoint_save_telemetry(trainer.checkpointer, observer)
