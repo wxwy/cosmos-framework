@@ -22,6 +22,7 @@ from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_polic
     OfficialRoboCasaPolicyAdapter,
 )
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_source import RoboCasaExactWindowSourceReader
+from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
 from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset import RoboCasaLeRobotDataset
 from cosmos_framework.data.generator.action.utils.domain_utils import get_domain_id
 from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline, VideoResize
@@ -166,13 +167,20 @@ def get_action_robocasa_exact_window_cached_sft_dataset(
     cfg_dropout_rate: float = 0.1,
     iterable_shuffle: bool = False,
     episode_shuffle_seed: int = 42,
+    catalog: RoboCasaExactWindowCacheCatalog | None = None,
+    verified_index: VerifiedExactWindowIndex | None = None,
 ) -> Dataset:
     """Create the strict offline source/cache dataset and reuse the official SFT transform."""
     if tokenizer_config is None:
         raise ValueError("Corrected cached SFT requires a VLM text tokenizer config")
-    catalog = RoboCasaExactWindowCacheCatalog(cache_root)
+    if catalog is None:
+        catalog = RoboCasaExactWindowCacheCatalog(cache_root, verified_index=verified_index)
+    elif catalog.cache_root.resolve() != Path(cache_root).resolve():
+        raise ValueError("shared cache catalog root 不匹配")
+    if verified_index is not None:
+        verified_index.check_catalog(catalog)
     contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(catalog)
-    source_reader = RoboCasaExactWindowSourceReader(catalog, source_root)
+    source_reader = RoboCasaExactWindowSourceReader(catalog, source_root, verified_index=verified_index)
     raw = RoboCasaExactWindowCachedDataset(catalog, source_reader, contract)
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
