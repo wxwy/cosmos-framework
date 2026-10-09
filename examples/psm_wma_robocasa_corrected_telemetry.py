@@ -127,9 +127,7 @@ class GroupedPlanObserver:
             and (iteration + 1) % self.cuda_sample_interval == 0
             and torch.cuda.is_available()
         )
-        self._sample_params = bool(
-            self.parameter_norm_interval and (iteration + 1) % self.parameter_norm_interval == 0
-        )
+        self._sample_params = bool(self.parameter_norm_interval and (iteration + 1) % self.parameter_norm_interval == 0)
         if torch.cuda.is_available():
             try:
                 torch.cuda.reset_peak_memory_stats()
@@ -248,9 +246,7 @@ class GroupedPlanObserver:
                     self._gradient_counts[key] = self._gradient_counts.get(key, 0) + 1
 
     def _pre_optimizer(self, trainer: Any, metrics: Any) -> None:
-        self._pre_optimizer_lr = {
-            key: _scalar((metrics or {}).get(key)) for key in ("lr_min", "lr_max")
-        }
+        self._pre_optimizer_lr = {key: _scalar((metrics or {}).get(key)) for key in ("lr_min", "lr_max")}
         try:
             self._observe_gradients(trainer._grouped_window.model)
         except Exception as exc:
@@ -262,15 +258,11 @@ class GroupedPlanObserver:
         result: dict[str, float | int | None] = {}
         for name in GRAD_GROUPS:
             grad_sq = self._gradient_sums.get(name)
-            result[f"{name}_grad_norm_rank_local"] = (
-                _scalar(grad_sq.sqrt()) if grad_sq is not None else None
-            )
+            result[f"{name}_grad_norm_rank_local"] = _scalar(grad_sq.sqrt()) if grad_sq is not None else None
             result[f"{name}_grad_tensor_count_rank_local"] = self._gradient_counts.get(name, 0)
             if self._sample_params:
                 param_sq = self._parameter_sums.get(name)
-                result[f"{name}_param_norm_rank_local"] = (
-                    _scalar(param_sq.sqrt()) if param_sq is not None else None
-                )
+                result[f"{name}_param_norm_rank_local"] = _scalar(param_sq.sqrt()) if param_sq is not None else None
         result["missing_grad_tensors_rank_local"] = self._missing_gradient_tensors
         result["nonfinite_grad_tensors_rank_local"] = (
             int(_scalar(self._nonfinite_gradient_tensors) or 0)
@@ -301,14 +293,10 @@ class GroupedPlanObserver:
             # Once every N steps, rank0 only; never synchronize on each consumer.
             torch.cuda.synchronize()
             for name, pairs in self._cuda_events.items():
-                result[f"{name}_cuda_event_ms"] = sum(
-                    start.elapsed_time(end) for start, end in pairs
-                )
+                result[f"{name}_cuda_event_ms"] = sum(start.elapsed_time(end) for start, end in pairs)
             compute = ("local_scan", "forward", "backward", "optimizer")
             if all(f"{name}_cuda_event_ms" in result for name in compute):
-                result["gpu_compute_cuda_event_ms"] = sum(
-                    result[f"{name}_cuda_event_ms"] or 0.0 for name in compute
-                )
+                result["gpu_compute_cuda_event_ms"] = sum(result[f"{name}_cuda_event_ms"] or 0.0 for name in compute)
         except RuntimeError as exc:
             self._errors.append(f"cuda_event_read:{type(exc).__name__}")
         return result
@@ -402,9 +390,7 @@ class GroupedPlanObserver:
             "action_loss_consumer_weight_coverage": self._loss_coverage.get("flow_matching_loss_action", 0.0),
             "vision_loss_consumer_weight_coverage": self._loss_coverage.get("flow_matching_loss_vision", 0.0),
             "step_wall_scope": "first_trigger_to_post_commit_excludes_checkpoint",
-            "other_host_overhead_ms": (
-                max(0.0, step_wall_ms - total_measured) if step_wall_ms is not None else None
-            ),
+            "other_host_overhead_ms": max(0.0, step_wall_ms - total_measured) if step_wall_ms is not None else None,
             "peak_allocated_gib": mem_allocated,
             "peak_reserved_gib": mem_reserved,
             "param_norm_sampled": self._sample_params,
@@ -429,10 +415,12 @@ class GroupedPlanObserver:
         if self.rank != 0:
             return
         try:
-            self._emit("[CorrectedV3][checkpoint] " + json.dumps({
-                "iteration": iteration,
-                "checkpoint_save_ms": elapsed_ms,
-            }, sort_keys=True, allow_nan=False))
+            self._emit(
+                "[CorrectedV3][checkpoint] "
+                + json.dumps(
+                    {"iteration": iteration, "checkpoint_save_ms": elapsed_ms}, sort_keys=True, allow_nan=False
+                )
+            )
         except Exception:
             pass
 
