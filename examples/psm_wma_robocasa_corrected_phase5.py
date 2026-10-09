@@ -498,6 +498,11 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def _telemetry_sample_interval(stop_after_iter: int | None) -> int:
+    """Sample on the last bounded step; preserve every-100-step formal cadence."""
+    return 100 if stop_after_iter is None else stop_after_iter
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
     report, config, catalog, _ = preflight(args)
@@ -520,7 +525,13 @@ def main(argv: list[str] | None = None) -> None:
     planner = ExactWindowRankPlanner(catalog, rank=rank, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     producer = ExactWindowSegmentProducer(catalog, config_digest=report["config_digest"])
     trainer.bind_grouped_stream(planner, producer, config_digest=report["config_digest"])
-    observer = GroupedPlanObserver(rank=rank, parameter_group=_telemetry_parameter_group)
+    sample_interval = _telemetry_sample_interval(getattr(args, "stop_after_iter", None))
+    observer = GroupedPlanObserver(
+        rank=rank,
+        parameter_group=_telemetry_parameter_group,
+        cuda_sample_interval=sample_interval,
+        parameter_norm_interval=sample_interval,
+    )
     trainer.grouped_observer = observer
     install_checkpoint_save_telemetry(trainer.checkpointer, observer)
     trainer.train(
