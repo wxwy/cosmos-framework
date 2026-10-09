@@ -378,17 +378,25 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         if not self.config.local_memory_enabled:
             raise RuntimeError("Local Memory is disabled")
         runtime = self.local_memory_runtime
-        if continuation_mask is not None:
+        if state_in is None:
+            if continuation_mask is not None:
+                raise ValueError("mixed Local scan 需要 batched state")
+        else:
             batch = visual_summary.shape[0]
-            if state_in is None or continuation_mask.shape != (batch,) or continuation_mask.dtype != torch.bool:
-                raise ValueError("mixed Local scan 需要 [B] bool mask 和 batched state")
-            if (
-                continuation_mask.device != visual_summary.device
+            runtime.core.validate_state(state_in, batch)
+            if continuation_mask is None:
+                # All-continuation still needs zero-valued w0 gradients on every
+                # FSDP2 rank. Otherwise rank-varying new Slot assignments produce
+                # different reduce-scatter parameter lists (PyTorch 2.10).
+                continuation_mask = torch.ones(batch, dtype=torch.bool, device=visual_summary.device)
+            elif (
+                continuation_mask.shape != (batch,)
+                or continuation_mask.dtype != torch.bool
+                or continuation_mask.device != visual_summary.device
                 or not bool(continuation_mask.any())
                 or bool(continuation_mask.all())
             ):
                 raise ValueError("continuation_mask 必须同设备且同时包含 fresh/continuation")
-            runtime.core.validate_state(state_in, batch)
             fresh = runtime.core.initial_state(batch)
             state_in = ContinualTTTFastState(
                 *(

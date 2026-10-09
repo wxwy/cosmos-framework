@@ -170,3 +170,56 @@ def test_dtensor_owned_local_without_model_scan_fails_before_b0(monkeypatch):
         _runner(_model())
     with pytest.raises(RuntimeError, match="require registered model scan_local_memory"):
         _runner(_with_model_scan(_model()))
+
+@pytest.mark.parametrize("mode", ("fresh", "continuation", "mixed"))
+def test_w0_fast_grad_participation_under_rank_divergent_slot_mix(mode: str) -> None:
+    """All-continuation must yield zero (not None) w0 grads for FSDP2 parity."""
+    torch.manual_seed(43)
+    model = _with_model_scan(_model())
+    runtime = model.net.local_memory_runtime
+    batch = 2
+    visual = torch.randn(batch, 1, 96)
+    actions = torch.randn(batch, 1, 15)
+    valid = torch.ones(batch, 1, dtype=torch.bool)
+    states = None if mode == "fresh" else runtime.core.detach_state(runtime.core.initial_state(batch))
+    mask = torch.tensor([True, False]) if mode == "mixed" else None
+
+    result, candidate, present = model.net.scan_local_memory(
+        visual, actions, valid, states, continuation_mask=mask
+    )
+    assert bool(present.all())
+    if mode == "continuation":
+        # Compare the exact unmodified continuation forward, not a reference
+        # with fresh resets. The additional path must contribute zero value.
+        reference, expected_state, _ = runtime.core.scan_segment_masked_encoded_many(
+            runtime.encoder, visual, actions, valid, states
+        )
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        for got, expected in zip(candidate, expected_state, strict=True):
+            torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+    result.square().sum().backward()
+    w0 = (
+        runtime.core.w0_fast_in_weight,
+        runtime.core.w0_fast_in_bias,
+        runtime.core.w0_fast_out_weight,
+        runtime.core.w0_fast_out_bias,
+    )
+    assert all(parameter.grad is not None for parameter in w0)
+    if mode == "continuation":
+        assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in w0)
+    else:
+        assert any(torch.count_nonzero(parameter.grad) > 0 for parameter in w0)
+
+
+def test_continuation_mask_requires_state_and_remains_strict() -> None:
+    net = _with_model_scan(_model()).net
+    visual = torch.randn(2, 1, 96)
+    action = torch.randn(2, 1, 15)
+    valid = torch.ones(2, 1, dtype=torch.bool)
+    with pytest.raises(ValueError, match="batched state"):
+        net.scan_local_memory(visual, action, valid, None, continuation_mask=torch.tensor([True, False]))
+    state = net.local_memory_runtime.core.detach_state(net.local_memory_runtime.core.initial_state(2))
+    with pytest.raises(ValueError, match="fresh/continuation"):
+        net.scan_local_memory(visual, action, valid, state, continuation_mask=torch.tensor([True, True]))
+
