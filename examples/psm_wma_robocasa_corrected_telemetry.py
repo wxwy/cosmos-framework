@@ -223,6 +223,16 @@ class GroupedPlanObserver:
                 group = self._parameter_group(name)
                 if group is None:
                     continue
+                groups = self._gradient_group_names(name, group)
+                if self._sample_params:
+                    # Parameter norms cover *all* trainable tensors, even when
+                    # a particular step did not produce their gradients.
+                    value = parameter.detach()
+                    if isinstance(value, DTensor):
+                        value = value.to_local()
+                    p_sq = value.float().square().sum()
+                    for key in groups:
+                        self._parameter_sums[key] = _add(self._parameter_sums.get(key), p_sq)
                 grad = parameter.grad
                 if grad is None:
                     self._missing_gradient_tensors += 1
@@ -233,16 +243,9 @@ class GroupedPlanObserver:
                 squared = grad.float().square().sum()
                 invalid = (~torch.isfinite(grad).all()).to(dtype=torch.int32)
                 self._nonfinite_gradient_tensors = _add(self._nonfinite_gradient_tensors, invalid)
-                for key in self._gradient_group_names(name, group):
+                for key in groups:
                     self._gradient_sums[key] = _add(self._gradient_sums.get(key), squared)
                     self._gradient_counts[key] = self._gradient_counts.get(key, 0) + 1
-                if self._sample_params:
-                    value = parameter.detach()
-                    if isinstance(value, DTensor):
-                        value = value.to_local()
-                    p_sq = value.float().square().sum()
-                    for key in self._gradient_group_names(name, group):
-                        self._parameter_sums[key] = _add(self._parameter_sums.get(key), p_sq)
 
     def _pre_optimizer(self, trainer: Any, metrics: Any) -> None:
         self._pre_optimizer_lr = {
