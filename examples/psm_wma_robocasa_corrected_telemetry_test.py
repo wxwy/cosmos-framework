@@ -163,9 +163,7 @@ def test_completed_optimizer_is_not_rolled_back_by_broken_logger():
 def test_stage_timing_is_distinct_from_unavailable_async_data_wait():
     emitted: list[str] = []
     ticks = iter((1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
-    observer = GroupedPlanObserver(
-        rank=0, clock=lambda: next(ticks), emit=emitted.append,
-    )
+    observer = GroupedPlanObserver(rank=0, clock=lambda: next(ticks), emit=emitted.append)
     trainer = make_trainer()
     observer.start_iteration(0)
     with observer.time_stage("data_prepare"):
@@ -225,7 +223,10 @@ def test_log_uses_model_frozen_loss_coefficients_not_double_weighting():
     observer = GroupedPlanObserver(rank=0, emit=emitted.append)
     for member, index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
         observer(
-            phase="native_forward", trainer=trainer, member=member, index=index,
+            phase="native_forward",
+            trainer=trainer,
+            member=member,
+            index=index,
             metrics={
                 "flow_matching_loss_action": torch.tensor(2.0),
                 "flow_matching_loss_vision": torch.tensor(3.0),
@@ -268,12 +269,17 @@ def test_observer_resets_after_abort_without_successful_log():
 def test_hot_path_does_not_call_tensor_item(monkeypatch: pytest.MonkeyPatch):
     trainer = make_trainer()
     observer = GroupedPlanObserver(rank=0)
+
     def forbidden_item(self, *args, **kwargs):
         raise AssertionError("per-consumer .item() forces a CUDA synchronization")
+
     with monkeypatch.context() as ctx:
         ctx.setattr(torch.Tensor, "item", forbidden_item)
         observer(
-            phase="native_forward", trainer=trainer, member=0, index=0,
+            phase="native_forward",
+            trainer=trainer,
+            member=0,
+            index=0,
             metrics={"flow_matching_loss_action": torch.tensor(1.0)},
         )
         observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.25))
