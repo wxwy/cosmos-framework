@@ -343,10 +343,9 @@ def test_opt_in_missing_gradient_audit_reports_exact_names_on_each_rank_without_
     second = "net.local_memory_runtime.encoder.bias"
     parameters[first].grad = None
     parameters[second].grad = None
+    parameters["net.action2llm.weight"].grad.zero_()  # Existing zero gradient is not missing.
     gradients_before = {name: parameter.grad for name, parameter in parameters.items()}
-    observer = GroupedPlanObserver(
-        rank=rank, parameter_group=group, emit=emitted.append, audit_missing_gradients=True
-    )
+    observer = GroupedPlanObserver(rank=rank, parameter_group=group, emit=emitted.append, audit_missing_gradients=True)
     observer.start_iteration(1)
     for _ in range(5):
         observer(phase="native_forward", trainer=trainer)
