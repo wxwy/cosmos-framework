@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -30,6 +30,7 @@ from cosmos_framework.utils.context_managers import model_init
 from cosmos_framework.utils.generator.optimizer import OptimizersContainer
 from cosmos_framework.utils.lazy_config import instantiate
 from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
+from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
 
 GENERATION_KEYS = (
     "moe_gen",
@@ -53,10 +54,13 @@ ACTION_KEYS = ("action2llm", "llm2action", "action_modality_embed")
 class GroupedTriggerLoader:
     """每个 optimizer iteration 精确提供 active_ga 个空触发。"""
 
-    def __init__(self, max_iter: int, active_ga: int) -> None:
+    def __init__(
+        self, max_iter: int, active_ga: int, *, on_iteration_start: Callable[[int], None] | None = None
+    ) -> None:
         if any(type(value) is not int or value <= 0 for value in (max_iter, active_ga)):
             raise ValueError("max_iter/active_ga 必须是正整数")
         self.max_iter, self.active_ga, self.start = max_iter, active_ga, 0
+        self.on_iteration_start = on_iteration_start
 
     def set_start_iteration(self, fetched: int) -> None:
         if type(fetched) is not int or not 0 <= fetched <= self.max_iter * self.active_ga:
@@ -64,38 +68,13 @@ class GroupedTriggerLoader:
         self.start = fetched
 
     def __iter__(self):
-        for _ in range(self.start, self.max_iter * self.active_ga):
+        for fetched in range(self.start, self.max_iter * self.active_ga):
+            if fetched % self.active_ga == 0 and self.on_iteration_start is not None:
+                self.on_iteration_start(fetched // self.active_ga)
             yield {}
 
     def __len__(self) -> int:
         return self.max_iter * self.active_ga - self.start
-
-
-class GroupedPlanObserver:
-    """按本次实际 plan 的有效前缀校验原生 forward/backward 次数。"""
-
-    def __init__(self) -> None:
-        self.forward = 0
-        self.backward = 0
-        self.completed = 0
-
-    def __call__(self, *, phase: str, trainer: GroupedLocalMemoryTrainer, **_: Any) -> None:
-        if phase == "native_forward":
-            self.forward += 1
-        elif phase == "native_backward":
-            self.backward += 1
-        elif phase == "pre_optimizer":
-            plan = trainer._grouped_window.plan
-            if plan is None:
-                raise RuntimeError("observer 缺少 pending grouped plan")
-            expected = sum(max(request.valid_count for request in member) for member in plan.members)
-            if (self.forward, self.backward) != (expected, expected):
-                raise RuntimeError(
-                    f"native 调用次数不匹配：forward={self.forward}, backward={self.backward}, expected={expected}"
-                )
-        elif phase == "post_commit":
-            self.completed += 1
-            self.forward = self.backward = 0
 
 
 def _selected_name(name: str) -> bool:
@@ -112,6 +91,21 @@ def _selected_name(name: str) -> bool:
         or name.startswith("net.local_memory2llm.")
         or root == "local_memory_modality_embed"
     )
+
+
+def _telemetry_parameter_group(name: str) -> str | None:
+    """The existing optimizer allowlist is the sole telemetry parameter authority."""
+    if not _selected_name(name):
+        return None
+    if (
+        name.startswith("net.local_memory_runtime.")
+        or name.startswith("net.local_memory2llm.")
+        or name.startswith("net.local_memory_modality_embed")
+    ):
+        return "local"
+    if name.split(".", 2)[1] in ACTION_KEYS:
+        return "action"
+    return "generation"
 
 
 def validate_optimizer_inventory(model: torch.nn.Module, optimizer: Any) -> dict[str, int]:
@@ -435,9 +429,13 @@ def main(argv: list[str] | None = None) -> None:
     planner = ExactWindowRankPlanner(catalog, rank=rank, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     producer = ExactWindowSegmentProducer(catalog, config_digest=report["config_digest"])
     trainer.bind_grouped_stream(planner, producer, config_digest=report["config_digest"])
-    observer = GroupedPlanObserver()
+    observer = GroupedPlanObserver(rank=rank, parameter_group=_telemetry_parameter_group)
     trainer.grouped_observer = observer
-    trainer.train(model, GroupedTriggerLoader(args.max_iter, args.ga), None)
+    trainer.train(
+        model,
+        GroupedTriggerLoader(args.max_iter, args.ga, on_iteration_start=observer.start_iteration),
+        None,
+    )
     start_iteration = int(Path(report["checkpoint_load_path"]).name[5:]) if args.phase == "resume" else 0
     if trainer._grouped_completed_iteration != args.max_iter or observer.completed != args.max_iter - start_iteration:
         raise RuntimeError("Phase5 完成的 optimizer iteration 不匹配")
