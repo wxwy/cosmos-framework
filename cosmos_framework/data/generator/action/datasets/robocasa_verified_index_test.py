@@ -278,3 +278,21 @@ def test_full_raw_sample_and_formal_digest_match_across_cold_and_warm(verified, 
     left_plan = ExactWindowRankPlanner(cold_local, rank=0, world_size=1, b_stream=1, active_ga=1)
     right_plan = ExactWindowRankPlanner(warm_local, rank=0, world_size=1, b_stream=1, active_ga=1)
     assert left_plan.plan_window(left_plan.initial_frontier()) == right_plan.plan_window(right_plan.initial_frontier())
+
+
+def test_warm_index_rejects_metadata_content_change(verified) -> None:
+    cache_root, source_root, index_root, _, _ = verified
+    info = source_root / "meta" / "info.json"
+    info.write_bytes(info.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="发生变化"):
+        VerifiedExactWindowIndex.open(index_root, cache_root=cache_root, source_root=source_root)
+
+
+def test_warm_index_rejects_schema_version_change(verified) -> None:
+    cache_root, source_root, index_root, _, _ = verified
+    receipt = index_root / "receipt.json"
+    payload = json.loads(receipt.read_text())
+    payload["schema"] = "unsupported_v0"
+    receipt.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="schema"):
+        VerifiedExactWindowIndex.open(index_root, cache_root=cache_root, source_root=source_root)
