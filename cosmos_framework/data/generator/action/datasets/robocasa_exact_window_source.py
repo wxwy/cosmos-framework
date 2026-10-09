@@ -425,14 +425,16 @@ class RoboCasaExactWindowSourceReader:
             raise ValueError(f"source annotation task_class 与 cache 不匹配：{key}")
         for window_start in record.window_starts:
             identity = self._identity(key, window_start)
+            if (
+                window_start in (0, record.window_count - 1)
+                and identity.global_row_indices != rows["index"][window_start : window_start + 17]
+            ):
+                raise ValueError(f"startup first/terminal global index witness 不匹配：{key}/{window_start}")
             if identity.global_row_indices is None or any(
                 absolute < start or absolute >= end for absolute in identity.global_row_indices
             ):
                 raise ValueError(f"cache witness 未在 filtered hf_dataset：{key}/{window_start}")
-            if identity.global_row_indices != rows["index"][window_start : window_start + 17]:
-                if window_start in (0, record.window_count - 1):
-                    raise ValueError(f"startup first/terminal global index witness 不匹配：{key}/{window_start}")
-                # Middle-window order continues to be strictly validated on every runtime read.
+            # Middle-window order continues to be strictly validated on every runtime read.
         relative = str(path.relative_to(self.source_root))
         return _BoundEpisode(
             key,
