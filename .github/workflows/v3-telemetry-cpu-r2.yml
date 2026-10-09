@@ -1,0 +1,32 @@
+name: Corrected V3 telemetry targeted unit smoke R2
+on:
+  push:
+    branches:
+      - v3-telemetry-cpu-r2-20261009
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: CPU tools
+        run: |
+          python -m pip install -q pytest ruff==0.12.7
+          python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Syntax
+        run: |
+          python -m py_compile examples/psm_wma_robocasa_corrected_telemetry.py
+          python -m py_compile examples/psm_wma_robocasa_corrected_telemetry_test.py
+          python -m py_compile examples/psm_wma_robocasa_corrected_phase5.py
+          python -m py_compile cosmos_framework/trainer/local_memory_grouped.py
+          python -m py_compile cosmos_framework/model/generator/mot/local_memory_grouped_window.py
+      - name: Ruff lint
+        run: ruff check examples/psm_wma_robocasa_corrected_telemetry.py examples/psm_wma_robocasa_corrected_telemetry_test.py examples/psm_wma_robocasa_corrected_phase5.py cosmos_framework/trainer/local_memory_grouped.py cosmos_framework/model/generator/mot/local_memory_grouped_window.py
+      - name: Actual isolated CPU tests
+        run: python -m pytest -q examples/psm_wma_robocasa_corrected_telemetry_test.py
+      - name: Ruff formatting diff
+        run: |
+          ruff format --diff examples/psm_wma_robocasa_corrected_telemetry.py examples/psm_wma_robocasa_corrected_telemetry_test.py examples/psm_wma_robocasa_corrected_phase5.py cosmos_framework/trainer/local_memory_grouped.py cosmos_framework/model/generator/mot/local_memory_grouped_window.py || true
