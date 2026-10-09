@@ -460,3 +460,77 @@ def test_grouped_latency_instrumentation_uses_real_producer_and_model_scopes() -
     assert 'self._grouped_producer.produce(request)' in trainer_source
     assert "window.finish(observed_optimizer_step)" in trainer_source
     assert "config.trainer.callbacks = {}" in inspect.getsource(phase5.overlay_config)
+
+
+def _bounded_args(tmp_path: Path, *, stop: int | None = 3) -> SimpleNamespace:
+    return SimpleNamespace(
+        phase="fresh",
+        job_name="bounded_formal_schedule_smoke",
+        output_root=tmp_path,
+        max_iter=30000,
+        warmup=500,
+        save_iter=100,
+        stop_after_iter=stop,
+    )
+
+
+def test_bounded_execution_preserves_formal_schedule_without_mutation(tmp_path: Path) -> None:
+    args = _bounded_args(tmp_path)
+    before = (args.max_iter, args.warmup, args.save_iter)
+    assert phase5._execution_stop_iteration(args) == 3
+    assert (args.max_iter, args.warmup, args.save_iter) == before == (30000, 500, 100)
+    assert phase5._execution_stop_iteration(_bounded_args(tmp_path, stop=None)) == 30000
+
+    loader = phase5.GroupedTriggerLoader(args.max_iter, active_ga=2)
+    assert len(loader) == 60000  # Actual execution cap is enforced by the trainer loop, not by changing data.
+    assert list(next(iter(loader)) for _ in range(1)) == [{}]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"stop_after_iter": 0}, "fresh-only"),
+        ({"stop_after_iter": -1}, "fresh-only"),
+        ({"stop_after_iter": 30000}, "fresh-only"),
+        ({"stop_after_iter": 30001}, "fresh-only"),
+        ({"phase": "resume"}, "fresh-only"),
+        ({"max_iter": 10}, "30000/500/100"),
+        ({"warmup": 1}, "30000/500/100"),
+        ({"save_iter": 1}, "30000/500/100"),
+        ({"job_name": "edge_local_exact_window"}, "bounded_"),
+    ),
+)
+def test_bounded_smoke_rejects_unsafe_configuration(
+    tmp_path: Path, overrides: dict[str, object], message: str
+) -> None:
+    args = _bounded_args(tmp_path)
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    with pytest.raises(ValueError, match=message):
+        phase5._execution_stop_iteration(args)
+
+
+def test_bounded_smoke_rejects_namespace_reuse_and_resume(tmp_path: Path) -> None:
+    args = _bounded_args(tmp_path)
+    output = tmp_path / "psm_wma_v3" / "corrected_phase5" / args.job_name
+    output.mkdir(parents=True)
+    with pytest.raises(FileExistsError, match="isolated"):
+        phase5._execution_stop_iteration(args)
+
+    args.phase, args.stop_after_iter = "resume", None
+    with pytest.raises(ValueError, match="must not be resumed"):
+        phase5._execution_stop_iteration(args)
+
+
+def test_bounded_trainer_checks_completed_optimizer_iteration_not_dataloader_length() -> None:
+    import inspect
+
+    from cosmos_framework.trainer import ImaginaireTrainer
+
+    train_source = inspect.getsource(ImaginaireTrainer.train)
+    assert train_source.count("if iteration >= execution_max_iter:") == 2
+    assert 'getattr(self, "_execution_max_iter", None)' in train_source
+    assert "if iteration % self.config.checkpoint.save_iter != 0:" in train_source
+    main_source = inspect.getsource(phase5.main)
+    assert "trainer._execution_max_iter = report" in main_source
+    assert "expected_iteration = report" in main_source
