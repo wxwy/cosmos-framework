@@ -18,8 +18,5 @@ jobs:
           lfs: true
       - uses: actions/setup-python@v6
       - uses: astral-sh/setup-uv@v7
-      - name: V3 telemetry Ruff formatting diagnostic (read-only)
-        run: |
-          uvx ruff==0.12.7 format --diff examples/psm_wma_robocasa_corrected_telemetry.py examples/psm_wma_robocasa_corrected_telemetry_test.py cosmos_framework/trainer/local_memory_grouped.py || true
       - run: uvx pre-commit@4.5.1 run -a -c ci/.pre-commit-config-base.yaml
       - run: uvx pre-commit@4.5.1 run -a
