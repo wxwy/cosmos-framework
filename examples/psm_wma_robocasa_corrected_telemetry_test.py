@@ -331,6 +331,7 @@ def test_cuda_event_timing_samples_only_every_100_steps(monkeypatch: pytest.Monk
     assert record["backward_cuda_event_ms"] == pytest.approx(2.5)
     assert record["cuda_sampled"] is True
 
+
 @pytest.mark.parametrize("rank", range(8))
 def test_opt_in_missing_gradient_audit_reports_exact_names_on_each_rank_without_mutation(
     rank: int, monkeypatch: pytest.MonkeyPatch
