@@ -282,6 +282,8 @@ class RoboCasaExactWindowSourceReader:
         self.init_timings_ms["total_ms"] = (time.perf_counter() - started) * 1000
 
     def _audit_cold_absolute_rows(self) -> None:
+        catalog = self.catalog
+        episode_ids = {record.key.episode_index for record in catalog.episodes}
         loaded_episodes = {
             _integer(value, "hf_dataset.episode_index") for value in self.dataset.hf_dataset["episode_index"]
         }
@@ -298,6 +300,7 @@ class RoboCasaExactWindowSourceReader:
                 for absolute in self._identity(record.key, window_start).global_row_indices:
                     if absolute not in self.abs_to_relative:
                         raise ValueError(f"cache witness 未在 filtered hf_dataset：{absolute}")
+
     def _load_verified_bindings(
         self, verified_index: VerifiedExactWindowIndex, selected_files: dict[ExactWindowEpisodeKey, Path]
     ) -> None:
