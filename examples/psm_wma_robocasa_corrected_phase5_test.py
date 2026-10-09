@@ -545,3 +545,33 @@ def test_bounded_trainer_checks_completed_optimizer_iteration_not_dataloader_len
     main_source = inspect.getsource(phase5.main)
     assert "trainer._execution_max_iter = report" in main_source
     assert "expected_iteration = report" in main_source
+
+
+def test_root_noncode_dirty_allowlist_preserves_MM_and_DS_evidence() -> None:
+    status = (
+        " M SESSION.md\0"
+        " M TODO.md\0"
+        "?? artifacts/g0/preflight_report_abc.json\0"
+        "?? docs/collab/chatgpt/DS_PRO_telemetry_gate.md\0"
+    )
+    allowed = phase5._audit_root_noncode_changes(status)
+    assert len(allowed) == 4
+    assert phase5._audit_root_noncode_changes("") == ()
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        " M examples/psm_wma_robocasa_corrected_phase5.py\0",
+        " M docs/build/contract.md\0",
+        " D SESSION.md\0",
+        "?? artifacts/g0/unsafe.py\0",
+        "?? docs/collab/chatgpt/DS_PRO_unsafe.py\0",
+        "?? tools/v3/unsafe.py\0",
+        "R  SESSION.md\0renamed.md\0",
+        " M TODO.md",
+    ),
+)
+def test_root_dirty_allowlist_fails_closed_on_unknown_or_source_changes(status: str) -> None:
+    with pytest.raises(ValueError, match="Root"):
+        phase5._audit_root_noncode_changes(status)
