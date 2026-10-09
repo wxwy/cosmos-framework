@@ -255,13 +255,16 @@ def test_full_raw_sample_and_formal_digest_match_across_cold_and_warm(verified, 
         lhs = cold._dataset[number]
         rhs = warm._dataset[number]
         assert (lhs["task_class"], lhs["episode_index"], lhs["start_frame"]) == (
-            rhs["task_class"], rhs["episode_index"], rhs["start_frame"]
+            rhs["task_class"],
+            rhs["episode_index"],
+            rhs["start_frame"],
         )
         for name in ("action", "video_latent", "global_row_indices", "window_frame_indices"):
             torch.testing.assert_close(lhs[name], rhs[name])
 
-    cold_local, warm_local = ExactWindowLocalCatalog(cold, ttt_tbptt_steps=16), ExactWindowLocalCatalog(
-        warm, ttt_tbptt_steps=16
+    cold_local, warm_local = (
+        ExactWindowLocalCatalog(cold, ttt_tbptt_steps=16),
+        ExactWindowLocalCatalog(warm, ttt_tbptt_steps=16),
     )
     assert cold_local.episodes == warm_local.episodes
     _, config, b_stream, active_ga = _config(tmp_path)
