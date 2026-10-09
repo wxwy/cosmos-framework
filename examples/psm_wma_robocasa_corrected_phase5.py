@@ -334,6 +334,30 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, str]:
     return {"root": actual_root, "child": actual_child, "gitlink": gitlink}
 
 
+def _execution_stop_iteration(args: argparse.Namespace) -> int:
+    """Bound only fresh diagnostic execution, never the formal training config."""
+    stop_after = getattr(args, "stop_after_iter", None)
+    if stop_after is None:
+        if args.phase == "resume" and args.job_name.startswith("bounded_"):
+            raise ValueError("bounded diagnostic checkpoint must not be resumed as formal training")
+        return args.max_iter
+    if (
+        args.phase != "fresh"
+        or type(stop_after) is not int
+        or not 1 <= stop_after < args.max_iter
+        or (args.max_iter, args.warmup, args.save_iter) != (30000, 500, 100)
+        or not args.job_name.startswith("bounded_")
+    ):
+        raise ValueError(
+            "--stop-after-iter is fresh-only and requires formal 30000/500/100 schedule "
+            "and a distinct bounded_ job-name"
+        )
+    namespace = args.output_root / "psm_wma_v3" / "corrected_phase5" / args.job_name
+    if namespace.exists():
+        raise FileExistsError(f"bounded diagnostic requires a new isolated job namespace: {namespace}")
+    return stop_after
+
+
 def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindowLocalCatalog, Any]:
     if any(
         type(value) is not int or value <= 0
@@ -342,6 +366,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         raise ValueError("T/B/GA/K/world_size/max_iter/save_iter 必须是正整数")
     if args.warmup < 0 or args.warmup > args.max_iter:
         raise ValueError("warmup 越界")
+    execution_stop = _execution_stop_iteration(args)
     lock = verify_root_child_lock(args)
     os.environ["HF_HUB_OFFLINE"] = "1"
     check_edge_checkpoint(str(args.edge))
@@ -387,6 +412,8 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         {
             "lock": lock,
             "config_digest": digest,
+            "execution_stop_after_iter": execution_stop,
+            "execution_scope": "bounded_diagnostic" if execution_stop < args.max_iter else "full_formal",
             "cache_manifest_sha256": catalog.manifest_digest,
             "cache_corpus_digest": catalog.cache_corpus_digest,
             "source_binding_digest": catalog.source_binding_digest,
@@ -422,6 +449,12 @@ def parser() -> argparse.ArgumentParser:
         ("warmup", 500),
     ):
         result.add_argument(f"--{name}", type=int, default=default)
+    result.add_argument(
+        "--stop-after-iter",
+        type=int,
+        default=None,
+        help="Fresh-only bounded optimizer steps; preserves max_iter=30000/warmup=500/save_iter=100",
+    )
     return result
 
 
@@ -439,6 +472,8 @@ def main(argv: list[str] | None = None) -> None:
     config.freeze()
     rank = int(os.environ["RANK"])
     trainer = GroupedLocalMemoryTrainer(config)
+    if getattr(args, "stop_after_iter", None) is not None:
+        trainer._execution_max_iter = report["execution_stop_after_iter"]
     with model_init():
         model = instantiate(config.model)
     install_optimizer_inventory_check(model, report)
@@ -454,8 +489,26 @@ def main(argv: list[str] | None = None) -> None:
         None,
     )
     start_iteration = int(Path(report["checkpoint_load_path"]).name[5:]) if args.phase == "resume" else 0
-    if trainer._grouped_completed_iteration != args.max_iter or observer.completed != args.max_iter - start_iteration:
+    expected_iteration = report["execution_stop_after_iter"]
+    if (
+        trainer._grouped_completed_iteration != expected_iteration
+        or observer.completed != expected_iteration - start_iteration
+    ):
         raise RuntimeError("Phase5 完成的 optimizer iteration 不匹配")
+    if rank == 0 and getattr(args, "stop_after_iter", None) is not None:
+        print(
+            "[CorrectedV3][bounded_stop] "
+            + json.dumps(
+                {
+                    "completed_iteration": expected_iteration,
+                    "configured_max_iter": args.max_iter,
+                    "configured_warmup": args.warmup,
+                    "config_digest": report["config_digest"],
+                    "diagnostic_only_do_not_resume": True,
+                },
+                sort_keys=True,
+            )
+        )
 
 
 if __name__ == "__main__":
