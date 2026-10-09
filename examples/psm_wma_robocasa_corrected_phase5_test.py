@@ -482,8 +482,19 @@ def test_bounded_execution_preserves_formal_schedule_without_mutation(tmp_path: 
     assert phase5._execution_stop_iteration(_bounded_args(tmp_path, stop=None)) == 30000
 
     loader = phase5.GroupedTriggerLoader(args.max_iter, active_ga=2)
-    assert len(loader) == 60000  # Actual execution cap is enforced by the trainer loop, not by changing data.
-    assert list(next(iter(loader)) for _ in range(1)) == [{}]
+    assert len(loader) == 60000  # Cap the trainer loop, not the data or formal schedule.
+    assert next(iter(loader)) == {}
+
+    catalog, config, b_stream, active_ga = _config(tmp_path)
+    witnesses = {"edge_config_sha256": "edge", "base_model_metadata_sha256": "droid"}
+    formal_digest = phase5.config_digest(
+        catalog, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses
+    )
+    _ = phase5._execution_stop_iteration(args)
+    bounded_digest = phase5.config_digest(
+        catalog, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses
+    )
+    assert formal_digest == bounded_digest
 
 
 @pytest.mark.parametrize(
