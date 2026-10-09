@@ -171,6 +171,7 @@ def test_dtensor_owned_local_without_model_scan_fails_before_b0(monkeypatch):
     with pytest.raises(RuntimeError, match="require registered model scan_local_memory"):
         _runner(_with_model_scan(_model()))
 
+
 @pytest.mark.parametrize("mode", ("fresh", "continuation", "mixed"))
 def test_w0_fast_grad_participation_under_rank_divergent_slot_mix(mode: str) -> None:
     """All-continuation must yield zero (not None) w0 grads for FSDP2 parity."""
