@@ -384,3 +384,34 @@ def test_exact_actual_k_inventory_and_missing_extra_fail(k: int) -> None:
     extra = torch.optim.AdamW([*allowed, model.net.reasoner.weight])
     with pytest.raises(ValueError, match="inventory"):
         phase5.validate_optimizer_inventory(model, extra)
+
+
+def test_trigger_telemetry_start_keeps_exact_yield_and_resume() -> None:
+    starts: list[int] = []
+    loader = phase5.GroupedTriggerLoader(4, 2, on_iteration_start=starts.append)
+    assert list(loader) == [{}, {}, {}, {}, {}, {}, {}, {}]
+    assert starts == [0, 1, 2, 3]
+
+    starts.clear()
+    loader.set_start_iteration(4)
+    assert list(loader) == [{}, {}, {}, {}]
+    assert starts == [2, 3]
+    starts.clear()
+    loader.set_start_iteration(8)
+    assert list(loader) == []
+    assert starts == []
+
+
+def test_telemetry_groups_are_strict_subsets_of_optimizer_allowlist() -> None:
+    model = nn.Module()
+    model.net = _Net(4)
+    for name, _ in model.named_parameters():
+        group = phase5._telemetry_parameter_group(name)
+        assert (group is not None) == phase5._selected_name(name)
+        if group == "action":
+            assert name.split(".", 2)[1] in phase5.ACTION_KEYS
+        elif group == "local":
+            assert "local_memory" in name
+        elif group is not None:
+            assert group == "generation"
+    assert phase5._telemetry_parameter_group("net.reasoner.weight") is None
