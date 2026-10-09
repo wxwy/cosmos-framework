@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -145,6 +146,21 @@ def install_optimizer_inventory_check(model: torch.nn.Module, report: dict[str, 
         return optimizer, scheduler
 
     model.init_optimizer_scheduler = checked
+
+
+def install_checkpoint_save_telemetry(checkpointer: Any, observer: GroupedPlanObserver) -> None:
+    """Wrap DCP save for timing only; preserve its return value and exceptions."""
+    original_save = checkpointer.save
+
+    def observed_save(*args: Any, **kwargs: Any) -> Any:
+        started = time.perf_counter()
+        result = original_save(*args, **kwargs)
+        iteration = kwargs.get("iteration")
+        if iteration is not None:
+            observer.log_checkpoint(int(iteration), (time.perf_counter() - started) * 1000.0)
+        return result
+
+    checkpointer.save = observed_save
 
 
 def _file_sha256(path: Path) -> str:
@@ -431,6 +447,7 @@ def main(argv: list[str] | None = None) -> None:
     trainer.bind_grouped_stream(planner, producer, config_digest=report["config_digest"])
     observer = GroupedPlanObserver(rank=rank, parameter_group=_telemetry_parameter_group)
     trainer.grouped_observer = observer
+    install_checkpoint_save_telemetry(trainer.checkpointer, observer)
     trainer.train(
         model,
         GroupedTriggerLoader(args.max_iter, args.ga, on_iteration_start=observer.start_iteration),
