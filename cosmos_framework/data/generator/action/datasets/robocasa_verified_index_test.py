@@ -167,3 +167,45 @@ def test_factory_catalog_identity_is_shared_in_warm_path(verified) -> None:
     assert dataset._dataset.catalog is catalog
     assert dataset._dataset.source_reader.catalog is catalog
     assert dataset._dataset.source_reader.verified_index is index
+
+
+def test_compact_index_uses_episode_offsets_not_global_window_python_tuples() -> None:
+    from types import SimpleNamespace
+
+    counts = (140, 98, 200)
+    episodes = tuple(SimpleNamespace(key=f"ep{n}", window_count=count) for n, count in enumerate(counts))
+    index = CacheDrivenFlatWindowIndex(
+        SimpleNamespace(
+            episodes=episodes,
+            stats=SimpleNamespace(exact_window_count=sum(counts)),
+        )
+    )
+    assert index._offsets == (0, 140, 238)
+    assert len(index) == 438
+    assert (index[0], index[139], index[140], index[237], index[238], index[437]) == (
+        ("ep0", 0),
+        ("ep0", 139),
+        ("ep1", 0),
+        ("ep1", 97),
+        ("ep2", 0),
+        ("ep2", 199),
+    )
+
+
+def test_cold_build_loads_cache_episode_payload_only_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, source_root = tmp_path / "cache", tmp_path / "source"
+    _cache(root)
+    _source(source_root)
+    catalog = RoboCasaExactWindowCacheCatalog(root)
+    original = torch.load
+    reads: list[Path] = []
+
+    def counted_load(filename, *args, **kwargs):
+        if str(filename).endswith(".pt"):
+            reads.append(Path(filename))
+        return original(filename, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", counted_load)
+    reader = RoboCasaExactWindowSourceReader(catalog, source_root)
+    assert len(reader.index) == 3
+    assert reads == [root / catalog.episodes[0].relative_path]
