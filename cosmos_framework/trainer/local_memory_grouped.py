@@ -296,6 +296,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 member=grad_accum_iter,
                 metrics=self._optimizer_lr_metrics(optimizer),
             )
+
             def observed_optimizer_step() -> bool:
                 with self._telemetry_stage("optimizer"):
                     return self._optimizer_step_success(optimizer, scheduler, grad_scaler)
