@@ -329,9 +329,12 @@ def _audit_root_noncode_changes(porcelain_z: str) -> tuple[str, ...]:
             status == "??"
             and path.startswith("docs/collab/chatgpt/DS_PRO_")
             and path.endswith(".md")
-            and "/" not in path[len("docs/collab/chatgpt/"):]
+            and "/" not in path[len("docs/collab/chatgpt/") :]
         )
-        if not (notes or evidence_json or evidence_report):
+        # Historical local-only H3-F visualization helper (created before this
+        # Gate, never imported by the corrected training entrypoint).
+        h3f_monitor = status == "??" and path == "scripts/plot_h3f_monitor.py"
+        if not (notes or evidence_json or evidence_report or h3f_monitor):
             raise ValueError(f"Root 工作树含非授权改动：{status} {path}")
         permitted.append(f"{status} {path}")
     return tuple(permitted)
