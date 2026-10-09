@@ -113,9 +113,7 @@ def test_no_eager_flat_tuple_expansion_and_compatible_shuffle_block(verified) ->
         (catalog.episodes[0].key, 2),
     ]
     assert compact[-1] == compact[2]
-    assert compact.get_shuffle_blocks() == (
-        tuple((catalog.episodes[0].key, start) for start in range(3)),
-    )
+    assert compact.get_shuffle_blocks() == (tuple((catalog.episodes[0].key, start) for start in range(3)),)
     with pytest.raises(IndexError):
         _ = compact[3]
 
@@ -142,9 +140,7 @@ def test_warm_index_rejects_source_data_drift(verified) -> None:
 def test_warm_index_rejects_row_map_corruption_and_missing_index(verified) -> None:
     cache_root, source_root, index_root, _, _ = verified
     with pytest.raises(FileNotFoundError):
-        VerifiedExactWindowIndex.open(
-            index_root / "missing", cache_root=cache_root, source_root=source_root
-        )
+        VerifiedExactWindowIndex.open(index_root / "missing", cache_root=cache_root, source_root=source_root)
     rows = index_root / "absolute_row_mapping.npy"
     with rows.open("ab") as out:
         out.write(b"extra")
@@ -272,8 +268,8 @@ def test_full_raw_sample_and_formal_digest_match_across_cold_and_warm(verified, 
     assert cold_local.episodes == warm_local.episodes
     _, config, b_stream, active_ga = _config(tmp_path)
     witnesses = {"edge_config_sha256": "edge", "base_model_metadata_sha256": "droid"}
-    assert config_digest(cold_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses) == (
-        config_digest(warm_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses)
+    assert config_digest(cold_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses) == config_digest(
+        warm_local, config, b_stream=b_stream, active_ga=active_ga, witnesses=witnesses
     )
     left_plan = ExactWindowRankPlanner(cold_local, rank=0, world_size=1, b_stream=1, active_ga=1)
     right_plan = ExactWindowRankPlanner(warm_local, rank=0, world_size=1, b_stream=1, active_ga=1)
