@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -23,6 +25,7 @@ from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache
     RoboCasaExactWindowCacheCatalog,
     RoboCasaExactWindowEpisodeReader,
 )
+from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
 
 _ANNOTATION = "annotation.human.task_name"
 _IDENTITY_COLUMNS = ("index", "episode_index", "frame_index", _ANNOTATION)
@@ -130,25 +133,37 @@ class _BoundEpisode:
 
 
 class CacheDrivenFlatWindowIndex:
-    """只以 cache accepted episodes 定义窗口顺序和 shuffle block。"""
+    """Compact episode-offset index: no 2M-window tuple materialization."""
 
     def __init__(self, catalog: RoboCasaExactWindowCacheCatalog) -> None:
         self.catalog = catalog
-        self._blocks = tuple(
-            tuple((record.key, start) for start in record.window_starts) for record in catalog.episodes
-        )
-        self._windows = tuple(window for block in self._blocks for window in block)
-        if len(self._windows) != catalog.stats.exact_window_count:
+        self._episodes = catalog.episodes
+        offsets = []
+        count = 0
+        for record in self._episodes:
+            offsets.append(count)
+            count += record.window_count
+        self._offsets = tuple(offsets)
+        self._length = count
+        if self._length != catalog.stats.exact_window_count:
             raise ValueError("cache window index 数量不一致")
 
     def __len__(self) -> int:
-        return len(self._windows)
+        return self._length
 
     def __getitem__(self, index: int) -> tuple[ExactWindowEpisodeKey, int]:
-        return self._windows[index]
+        if type(index) is not int:
+            raise TypeError("exact-window flat index 必须为 int")
+        if index < 0:
+            index += self._length
+        if not 0 <= index < self._length:
+            raise IndexError(index)
+        episode_position = bisect_right(self._offsets, index) - 1
+        return self._episodes[episode_position].key, index - self._offsets[episode_position]
 
     def get_shuffle_blocks(self) -> tuple[tuple[tuple[ExactWindowEpisodeKey, int], ...], ...]:
-        return self._blocks
+        """Compatibility view; expand only when explicitly requested."""
+        return tuple(tuple((record.key, start) for start in record.window_starts) for record in self._episodes)
 
 
 def _scan_identity(path: Path, episode_index: int) -> dict[str, tuple[int, ...]]:
@@ -174,15 +189,27 @@ class RoboCasaExactWindowSourceReader:
         metadata_factory: Callable[..., LeRobotDatasetMetadata] = LeRobotDatasetMetadata,
         dataset_factory: Callable[..., LeRobotDataset] = _LocalNonVisualLeRobotDataset,
         identity_scanner: Callable[[Path, int], dict[str, tuple[int, ...]]] = _scan_identity,
+        verified_index: VerifiedExactWindowIndex | None = None,
     ) -> None:
+        if verified_index is not None and not isinstance(verified_index, VerifiedExactWindowIndex):
+            raise TypeError("source reader verified_index 类型不合法")
+        started = time.perf_counter()
+        self.verified_index = verified_index
+        self.init_timings_ms: dict[str, float | bool] = {"verified_index_hit": verified_index is not None}
         self.catalog = catalog
         self.source_root = Path(source_root)
+        phase_start = time.perf_counter()
         self.index = CacheDrivenFlatWindowIndex(catalog)
+        self.init_timings_ms["flat_index_ms"] = (time.perf_counter() - phase_start) * 1000
         self.cache_reader = RoboCasaExactWindowEpisodeReader(catalog)
         _ensure_hf_hub_offline()
+        phase_start = time.perf_counter()
         self._preflight_metadata()
         self.meta = metadata_factory(repo_id="local", root=self.source_root, revision="local", force_cache_sync=False)
         self._validate_source_contract()
+        self.init_timings_ms["metadata_ms"] = (time.perf_counter() - phase_start) * 1000
+        if verified_index is not None:
+            verified_index.check_catalog(catalog)
         episode_ids = [record.key.episode_index for record in catalog.episodes]
         if len(set(episode_ids)) != len(episode_ids):
             raise ValueError("cache episode_index 跨 task 重复")
@@ -196,9 +223,15 @@ class RoboCasaExactWindowSourceReader:
             if not path.is_file():
                 raise FileNotFoundError(f"selected data parquet 缺失：{path}")
             selected_files[record.key] = path
+        phase_start = time.perf_counter()
         self._bound: dict[ExactWindowEpisodeKey, _BoundEpisode] = {}
-        for record in catalog.episodes:
-            self._bound[record.key] = self._bind_episode(record, selected_files[record.key], identity_scanner)
+        if verified_index is not None:
+            self._load_verified_bindings(verified_index, selected_files)
+        else:
+            for record in catalog.episodes:
+                self._bound[record.key] = self._bind_episode(record, selected_files[record.key], identity_scanner)
+        self.init_timings_ms["episode_binding_ms"] = (time.perf_counter() - phase_start) * 1000
+        phase_start = time.perf_counter()
         self.dataset = dataset_factory(
             repo_id="local",
             root=self.source_root,
@@ -210,22 +243,16 @@ class RoboCasaExactWindowSourceReader:
         )
         if self.dataset.meta.video_keys != []:
             raise ValueError("non-visual LeRobot reader 仍暴露 video_keys")
-        loaded_episodes = {
-            _integer(value, "hf_dataset.episode_index") for value in self.dataset.hf_dataset["episode_index"]
-        }
-        if loaded_episodes != set(episode_ids):
-            raise ValueError(f"filtered hf_dataset episode set 与 cache 不一致：{sorted(loaded_episodes)}")
-        self.abs_to_relative: dict[int, int] = {}
-        for relative, absolute in enumerate(self.dataset.hf_dataset["index"]):
-            index = _integer(absolute, "hf_dataset.index")
-            if index in self.abs_to_relative:
-                raise ValueError(f"hf_dataset absolute index 重复：{index}")
-            self.abs_to_relative[index] = relative
-        for record in catalog.episodes:
-            for window_start in record.window_starts:
-                for absolute in self._identity(record.key, window_start).global_row_indices:
-                    if absolute not in self.abs_to_relative:
-                        raise ValueError(f"cache witness 未在 filtered hf_dataset：{absolute}")
+        self.init_timings_ms["lerobot_init_ms"] = (time.perf_counter() - phase_start) * 1000
+        phase_start = time.perf_counter()
+        if verified_index is not None:
+            self.abs_to_relative = verified_index.open_rows()
+            if len(self.dataset.hf_dataset) != len(self.abs_to_relative):
+                raise ValueError("verified index row mapping 与 filtered hf_dataset 长度不匹配")
+        else:
+            self._audit_cold_absolute_rows()
+        self.init_timings_ms["row_mapping_ms"] = (time.perf_counter() - phase_start) * 1000
+        phase_start = time.perf_counter()
         self.source_binding_digest = _digest(
             {
                 "cache_corpus_digest": catalog.corpus_digest,
@@ -249,6 +276,70 @@ class RoboCasaExactWindowSourceReader:
                 ],
             }
         )
+        if verified_index is not None and self.source_binding_digest != verified_index.source_binding_digest:
+            raise ValueError("verified index source binding digest 与当前 reader 不匹配")
+        self.init_timings_ms["source_digest_ms"] = (time.perf_counter() - phase_start) * 1000
+        self.init_timings_ms["total_ms"] = (time.perf_counter() - started) * 1000
+
+    def _audit_cold_absolute_rows(self) -> None:
+        loaded_episodes = {
+            _integer(value, "hf_dataset.episode_index") for value in self.dataset.hf_dataset["episode_index"]
+        }
+        if loaded_episodes != set(episode_ids):
+            raise ValueError(f"filtered hf_dataset episode set 与 cache 不一致：{sorted(loaded_episodes)}")
+        self.abs_to_relative: dict[int, int] = {}
+        for relative, absolute in enumerate(self.dataset.hf_dataset["index"]):
+            index = _integer(absolute, "hf_dataset.index")
+            if index in self.abs_to_relative:
+                raise ValueError(f"hf_dataset absolute index 重复：{index}")
+            self.abs_to_relative[index] = relative
+        for record in catalog.episodes:
+            for window_start in record.window_starts:
+                for absolute in self._identity(record.key, window_start).global_row_indices:
+                    if absolute not in self.abs_to_relative:
+                        raise ValueError(f"cache witness 未在 filtered hf_dataset：{absolute}")
+    def _load_verified_bindings(
+        self, verified_index: VerifiedExactWindowIndex, selected_files: dict[ExactWindowEpisodeKey, Path]
+    ) -> None:
+        rows = verified_index.receipt["bindings"]
+        if len(rows) != len(self.catalog.episodes):
+            raise ValueError("verified index episode binding 数量不匹配")
+        for record, row in zip(self.catalog.episodes, rows, strict=True):
+            key = record.key
+            if (
+                row.get("task_class") != key.task_class
+                or row.get("task_slug") != key.task_slug
+                or row.get("episode_index") != key.episode_index
+                or row.get("window_count") != record.window_count
+            ):
+                raise ValueError("verified index episode identity/order 不匹配")
+            episode = self.meta.episodes[key.episode_index]
+            start = _integer(episode["dataset_from_index"], "dataset_from_index")
+            end = _integer(episode["dataset_to_index"], "dataset_to_index")
+            length = _integer(episode["length"], "episode.length")
+            relpath = selected_files[key].relative_to(self.source_root).as_posix()
+            annotation = row.get("annotation_index")
+            if (
+                row.get("dataset_from_index") != start
+                or row.get("dataset_to_index") != end
+                or row.get("length") != length
+                or row.get("data_file") != relpath
+                or length != record.window_count + 16
+                or end - start != length
+                or type(annotation) is not int
+                or self._resolve_class(annotation) != key.task_class
+            ):
+                raise ValueError("verified index episode source metadata 不匹配")
+            first = tuple(row["first_rows"])
+            terminal = tuple(row["terminal_rows"])
+            if (
+                len(first) != 17
+                or len(terminal) != 17
+                or first != tuple(range(start, start + 17))
+                or terminal != tuple(range(end - 17, end))
+            ):
+                raise ValueError("verified index first/terminal row witness 不匹配")
+            self._bound[key] = _BoundEpisode(key, annotation, length, relpath, start, end, first, terminal)
 
     def _preflight_metadata(self) -> None:
         root = self.source_root
