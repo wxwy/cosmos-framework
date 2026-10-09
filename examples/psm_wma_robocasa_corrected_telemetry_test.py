@@ -47,6 +47,8 @@ def make_trainer():
     model.net.action2llm = nn.Linear(2, 2)
     model.net.local_memory_runtime = nn.Module()
     model.net.local_memory_runtime.encoder = nn.Linear(2, 2)
+    nn.init.ones_(model.net.local_memory_runtime.encoder.weight)
+    nn.init.ones_(model.net.local_memory_runtime.encoder.bias)
     model.net.local_memory_runtime.core = LocalCore()
     for parameter in model.parameters():
         parameter.grad = torch.ones_like(parameter)
