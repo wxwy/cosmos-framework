@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -122,7 +123,9 @@ class GroupedLocalMemoryWindow:
                 LocalMemoryTransaction(GAWindowPlan((identity.member,), (request.valid_count,)), candidate.scheduler)
                 for identity, request in zip(identities, requests, strict=True)
             )
-            results = adapter.scan(segments, identities=identities, transactions=transactions)
+            timing = getattr(self, "_telemetry_stage", None)
+            with timing("local_scan") if timing is not None else nullcontext():
+                results = adapter.scan(segments, identities=identities, transactions=transactions)
             if sum(len(result.payloads) for result in results) != plan.member_counts[member_index]:
                 raise RuntimeError("member scan 有效 consumer 数与 plan 不一致")
             active_indices = [
