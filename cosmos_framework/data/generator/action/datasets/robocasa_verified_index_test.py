@@ -31,7 +31,9 @@ from cosmos_framework.data.generator.action.datasets.robocasa_verified_index imp
 
 
 @pytest.fixture
-def verified(tmp_path: Path) -> tuple[Path, Path, Path, RoboCasaExactWindowCacheCatalog, RoboCasaExactWindowSourceReader]:
+def verified(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, RoboCasaExactWindowCacheCatalog, RoboCasaExactWindowSourceReader]:
     cache_root, source_root, index_root = tmp_path / "cache", tmp_path / "source", tmp_path / "verified"
     _cache(cache_root)
     _source(source_root)
