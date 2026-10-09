@@ -443,3 +443,20 @@ def test_corrected_phase5_keeps_default_callbacks_disabled() -> None:
 
     source = inspect.getsource(phase5.overlay_config)
     assert "config.trainer.callbacks = {}" in source
+
+
+def test_grouped_latency_instrumentation_uses_real_producer_and_model_scopes() -> None:
+    """Data is produced inside training_step, not by GroupedTriggerLoader."""
+    import inspect
+
+    from cosmos_framework.model.generator.mot.local_memory_grouped_window import GroupedLocalMemoryWindow
+    from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrainer
+
+    trainer_source = inspect.getsource(GroupedLocalMemoryTrainer.training_step)
+    window_source = inspect.getsource(GroupedLocalMemoryWindow.run_member)
+    for stage in ("data_prepare", "batch_collate", "batch_transfer", "forward", "backward", "optimizer"):
+        assert f'_telemetry_stage("{stage}")' in trainer_source
+    assert 'timing("local_scan")' in window_source
+    assert 'self._grouped_producer.produce(request)' in trainer_source
+    assert "window.finish(observed_optimizer_step)" in trainer_source
+    assert "config.trainer.callbacks = {}" in inspect.getsource(phase5.overlay_config)
