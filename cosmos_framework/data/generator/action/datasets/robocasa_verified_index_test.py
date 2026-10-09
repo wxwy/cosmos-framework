@@ -108,7 +108,8 @@ def test_warm_index_requires_exact_cache_and_source_fingerprint(verified) -> Non
     cache_root, source_root, index_root, catalog, cold = verified
     assert cold.source_binding_digest
     path = cache_root / catalog.episodes[0].relative_path
-    os.utime(path, None)
+    witness = path.stat()
+    os.utime(path, ns=(witness.st_atime_ns, witness.st_mtime_ns + 10_000_000))
     with pytest.raises(ValueError, match="发生变化"):
         VerifiedExactWindowIndex.open(index_root, cache_root=cache_root, source_root=source_root)
 
