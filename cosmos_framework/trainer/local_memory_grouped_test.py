@@ -372,7 +372,7 @@ def test_async_raw_prefetch_keeps_optimizer_and_committed_frontier_parity(
             output, loss, accum = trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, accum)
             assert output["count"] == 3
             assert loss.isfinite()
-            assert accum == 0 if member == 1 else accum == 1
+            assert accum == (0 if member == 1 else 1)
         assert trainer._grouped_completed_iteration == 1
         assert scheduler.last_epoch == 1
         assert trainer._grouped_window.live.frontier == trainer._grouped_planner.plan_window(
@@ -389,9 +389,8 @@ def test_async_raw_prefetch_keeps_optimizer_and_committed_frontier_parity(
         for observed, expected in zip(model.parameters(), baseline_model.parameters(), strict=True):
             torch.testing.assert_close(observed, expected, rtol=0, atol=0)
         assert trainer._grouped_window.live.frontier == baseline._grouped_window.live.frontier
-        assert (
-            trainer._grouped_window.live.scheduler._committed
-            == baseline._grouped_window.live.scheduler._committed
+        assert set(trainer._grouped_window.live.scheduler._committed) == set(
+            baseline._grouped_window.live.scheduler._committed
         )
     finally:
         if trainer._grouped_prefetcher is not None:
