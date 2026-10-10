@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import random
+
 import pytest
 import torch
 
@@ -91,21 +92,26 @@ def test_async_does_not_consume_transform_rng_before_main_thread(monkeypatch: py
         return original(self, item, resolution)
 
     monkeypatch.setattr(transform_type, "__call__", randomized)
-    random.seed(723)
-    torch.manual_seed(723)
-    baseline = producer.produce(request)
-    expected_rng = [payload["test_rng"] for payload in baseline.consumer_payload[0]]
-    random.seed(723)
-    torch.manual_seed(723)
-    prefetcher = AsyncExactWindowRawPrefetcher(producer, num_workers=2)
+    state_py, state_torch = random.getstate(), torch.get_rng_state()
     try:
-        prefetcher.reset_iteration()
-        prefetcher.schedule((request,))
-        prepared = prefetcher.load_member((request,))
-        observed = producer.materialize(prepared[0])
-        assert [payload["test_rng"] for payload in observed.consumer_payload[0]] == expected_rng
+        random.seed(723)
+        torch.manual_seed(723)
+        baseline = producer.produce(request)
+        expected_rng = [payload["test_rng"] for payload in baseline.consumer_payload[0]]
+        random.seed(723)
+        torch.manual_seed(723)
+        prefetcher = AsyncExactWindowRawPrefetcher(producer, num_workers=2)
+        try:
+            prefetcher.reset_iteration()
+            prefetcher.schedule((request,))
+            prepared = prefetcher.load_member((request,))
+            observed = producer.materialize(prepared[0])
+            assert [payload["test_rng"] for payload in observed.consumer_payload[0]] == expected_rng
+        finally:
+            prefetcher.close()
     finally:
-        prefetcher.close()
+        random.setstate(state_py)
+        torch.set_rng_state(state_torch)
 
 
 def test_async_rejects_request_reordering_and_drains_after_abort() -> None:
