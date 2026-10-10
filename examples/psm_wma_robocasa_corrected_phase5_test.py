@@ -602,3 +602,42 @@ def test_missing_grad_audit_requires_exact_three_step_bounded_fresh(tmp_path: Pa
     with pytest.raises(ValueError, match="fresh-only"):
         phase5._execution_stop_iteration(args)
     assert "--audit-missing-grads" in phase5.parser().format_help()
+
+
+@pytest.mark.parametrize("num_workers", [0, 2, 16])
+def test_formal_cli_accepts_bounded_raw_prefetch_without_changing_config_digest(
+    tmp_path: Path, num_workers: int
+) -> None:
+    cli = [
+        "--phase", "resume", "--output-root", str(tmp_path),
+        "--source-root", str(tmp_path), "--cache-root", str(tmp_path),
+        "--edge", str(tmp_path), "--vae", str(tmp_path),
+        "--base-checkpoint", str(tmp_path), "--root-worktree", str(tmp_path),
+        "--expected-root", "a" * 40, "--expected-child", "b" * 40,
+        "--num-workers", str(num_workers),
+    ]
+    args = phase5.parser().parse_args(cli)
+    assert args.num_workers == num_workers
+    catalog, config, b_stream, active_ga = _config(tmp_path / f"workers_{num_workers}")
+    before = phase5.config_digest(
+        catalog, config, b_stream=b_stream, active_ga=active_ga,
+        witnesses={"edge_config_sha256": "edge", "base_model_metadata_sha256": "droid"}
+    )
+    assert before == phase5.config_digest(
+        catalog, config, b_stream=b_stream, active_ga=active_ga,
+        witnesses={"edge_config_sha256": "edge", "base_model_metadata_sha256": "droid"}
+    )
+    assert args.phase == "resume" and args.job_name == "edge_local_exact_window"
+
+
+def test_formal_cli_defaults_to_frozen_sync_when_num_workers_omitted(tmp_path: Path) -> None:
+    args = phase5.parser().parse_args([
+        "--phase", "resume", "--output-root", str(tmp_path),
+        "--source-root", str(tmp_path), "--cache-root", str(tmp_path),
+        "--edge", str(tmp_path), "--vae", str(tmp_path),
+        "--base-checkpoint", str(tmp_path), "--root-worktree", str(tmp_path),
+        "--expected-root", "a" * 40, "--expected-child", "b" * 40,
+    ])
+    assert args.num_workers == 0
+    assert "--num-workers" in phase5.parser().format_help()
+    assert "TelemetryJournal" in inspect.getsource(phase5.main)
