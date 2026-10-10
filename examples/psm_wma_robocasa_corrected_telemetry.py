@@ -15,12 +15,15 @@ from __future__ import annotations
 import json
 import math
 import time
+from datetime import datetime
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor
+
+from examples.psm_wma_robocasa_formal_monitor import format_progress
 
 LOSS_KEYS = (
     "flow_matching_loss_action",
@@ -81,6 +84,8 @@ class GroupedPlanObserver:
         cuda_sample_interval: int = 100,
         parameter_norm_interval: int = 100,
         audit_missing_gradients: bool = False,
+        human_progress: bool = False,
+        max_iter: int = 0,
     ) -> None:
         if cuda_sample_interval < 0 or parameter_norm_interval < 0:
             raise ValueError("telemetry intervals cannot be negative")
@@ -93,6 +98,8 @@ class GroupedPlanObserver:
         self.cuda_sample_interval = cuda_sample_interval
         self.parameter_norm_interval = parameter_norm_interval
         self.audit_missing_gradients = audit_missing_gradients
+        self.human_progress = human_progress
+        self.max_iter = max_iter
         self.forward = 0
         self.backward = 0
         self.completed = 0
@@ -429,8 +436,12 @@ class GroupedPlanObserver:
         stage = {f"{key}_ms": self._stage_ms.get(key) for key in CPU_TIMING_STAGES}
         total_measured = sum(self._stage_ms.values())
         step_wall_ms = wall_s * 1000.0 if wall_s is not None else None
+        prefetcher = getattr(trainer, "_grouped_prefetcher", None)
         record: dict[str, Any] = {
             "status": "optimizer_committed",
+            "ts_local": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "ts_epoch": time.time(),
+            "num_workers": getattr(trainer, "_grouped_num_workers", 0),
             "iteration": iteration + 1 if iteration is not None else None,
             "rank": self.rank,
             "rank_scope": "rank0_local_not_global_reduced",
@@ -438,8 +449,11 @@ class GroupedPlanObserver:
             "grad_norm_scope": "rank0_local_fsdp_shard",
             "cpu_timing_scope": "host_wall_cuda_dispatch_not_gpu_kernel_time",
             "cuda_timing_scope": "current_stream_events_every_100_steps_rank0_only",
-            "data_wait_ms": None,
-            "data_wait_reason": "synchronous_producer_no_background_dataloader",
+            "data_wait_ms": prefetcher.iteration_wait_ms if prefetcher is not None else None,
+            "data_wait_reason": (
+                "bounded_async_raw_prefetch_only" if prefetcher is not None
+                else "synchronous_producer_no_background_dataloader"
+            ),
             "valid_consumers": valid_consumers,
             "valid_consumers_per_second_rank_local": (
                 valid_consumers / wall_s if valid_consumers is not None and wall_s and wall_s > 0 else None
@@ -478,6 +492,8 @@ class GroupedPlanObserver:
         record["telemetry_errors"] = list(self._errors)
         self.last_record = record
         try:
+            if self.human_progress:
+                self._emit("[CorrectedV3][progress] " + format_progress(record, max_iter=self.max_iter))
             self._emit("[CorrectedV3][train] " + json.dumps(record, sort_keys=True, allow_nan=False))
         except Exception:
             # A post-commit logging failure must never roll back a committed optimizer step.
