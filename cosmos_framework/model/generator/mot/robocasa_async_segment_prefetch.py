@@ -50,6 +50,11 @@ class AsyncExactWindowRawPrefetcher:
         if existing is not None:
             return existing
         original = self.producer.catalog.raw
+        official = getattr(original.source_reader, "dataset", None)
+        if official is not None and (
+            getattr(official, "hf_dataset", None) is None or getattr(official, "_lazy_loading", False)
+        ):
+            raise RuntimeError("async source reader requires a fully loaded, read-only HF dataset")
         source = copy.copy(original.source_reader)
         # Never mutate the main rank reader or share its mutable OrderedDict LRU.
         source.cache_reader = RoboCasaExactWindowEpisodeReader(original.catalog, max_cached_episodes=2)
