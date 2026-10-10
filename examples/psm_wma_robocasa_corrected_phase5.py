@@ -32,6 +32,7 @@ from cosmos_framework.utils.context_managers import model_init
 from cosmos_framework.utils.generator.optimizer import OptimizersContainer
 from cosmos_framework.utils.lazy_config import instantiate
 from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
+from examples.psm_wma_robocasa_formal_monitor import TelemetryJournal
 from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
 
 GENERATION_KEYS = (
@@ -520,6 +521,10 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--expected-root", required=True)
     result.add_argument("--expected-child", required=True)
+    result.add_argument(
+        "--num-workers", type=int, default=0,
+        help="Per-rank bounded background RAW-READ threads; 0 retains synchronous semantics (not DataLoader workers)",
+    )
     result.add_argument("--job-name", default="edge_local_exact_window")
     for name, default in (
         ("t", 16),
@@ -553,6 +558,8 @@ def _telemetry_sample_interval(stop_after_iter: int | None) -> int:
 
 def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
+    if type(args.num_workers) is not int or not 0 <= args.num_workers <= 16:
+        raise ValueError("--num-workers must be 0..16")
     report, config, catalog, _ = preflight(args)
     if os.environ.get("RANK", "0") == "0":
         print("[CorrectedV3][dataset_init] " + json.dumps(report["dataset_init"], sort_keys=True))
@@ -574,22 +581,36 @@ def main(argv: list[str] | None = None) -> None:
     install_optimizer_inventory_check(model, report)
     planner = ExactWindowRankPlanner(catalog, rank=rank, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     producer = ExactWindowSegmentProducer(catalog, config_digest=report["config_digest"])
-    trainer.bind_grouped_stream(planner, producer, config_digest=report["config_digest"])
+    trainer.bind_grouped_stream(
+        planner, producer, config_digest=report["config_digest"], num_workers=args.num_workers
+    )
     sample_interval = _telemetry_sample_interval(getattr(args, "stop_after_iter", None))
+    journal = (
+        TelemetryJournal(args.output_root / "psm_wma_v3" / "corrected_phase5" / args.job_name, rank=0)
+        if rank == 0
+        else None
+    )
     observer = GroupedPlanObserver(
         rank=rank,
         parameter_group=_telemetry_parameter_group,
         cuda_sample_interval=sample_interval,
         parameter_norm_interval=sample_interval,
         audit_missing_gradients=args.audit_missing_grads,
+        human_progress=rank == 0,
+        max_iter=args.max_iter,
+        emit=journal if journal is not None else print,
     )
     trainer.grouped_observer = observer
     install_checkpoint_save_telemetry(trainer.checkpointer, observer)
-    trainer.train(
-        model,
-        GroupedTriggerLoader(args.max_iter, args.ga, on_iteration_start=observer.start_iteration),
-        None,
-    )
+    try:
+        trainer.train(
+            model,
+            GroupedTriggerLoader(args.max_iter, args.ga, on_iteration_start=observer.start_iteration),
+            None,
+        )
+    finally:
+        if journal is not None:
+            journal.close()
     start_iteration = int(Path(report["checkpoint_load_path"]).name[5:]) if args.phase == "resume" else 0
     expected_iteration = report["execution_stop_after_iter"]
     if (
