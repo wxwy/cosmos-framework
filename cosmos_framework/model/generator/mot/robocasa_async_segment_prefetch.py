@@ -18,6 +18,7 @@ from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
     PreparedExactWindowSegment,
 )
 from cosmos_framework.utils.ordered_prefetch import OrderedMemberPrefetch
+from cosmos_framework.data.generator.action.datasets.robocasa_shared_episode_reader import SharedRoboCasaEpisodeReader
 
 
 class AsyncExactWindowRawPrefetcher(OrderedMemberPrefetch[ExactWindowSegmentRequest, PreparedExactWindowSegment]):
@@ -47,10 +48,12 @@ class AsyncExactWindowRawPrefetcher(OrderedMemberPrefetch[ExactWindowSegmentRequ
         # HF tables/metadata are still shared read-only; no dataset re-initialization.
         if official is not None:
             source.dataset = copy.copy(official)
-        source.cache_reader = RoboCasaExactWindowEpisodeReader(original.catalog, max_cached_episodes=2)
+        shared = getattr(original, "cache_reader", None)
+        shared = shared if isinstance(shared, SharedRoboCasaEpisodeReader) else None
+        source.cache_reader = shared or RoboCasaExactWindowEpisodeReader(original.catalog, max_cached_episodes=2)
         raw = copy.copy(original)
         raw.source_reader = source
-        raw.cache_reader = RoboCasaExactWindowEpisodeReader(original.catalog, max_cached_episodes=2)
+        raw.cache_reader = shared or RoboCasaExactWindowEpisodeReader(original.catalog, max_cached_episodes=2)
         self._threads.raw = raw
         return raw
 

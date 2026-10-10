@@ -59,6 +59,7 @@ from cosmos_framework.simulation.robocasa.eval_utils import (
     reset_local_memory,
 )
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
+from cosmos_framework.utils.rollout_evidence import atomic_json, run_recorded_episode, save_partial_video
 
 CAMS = ["robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"]
 
@@ -234,11 +235,13 @@ def run_policy(
     video_fps=20,
     local_memory_client: RoboCasaLocalMemoryClient | None = None,
     on_prediction: Callable[[dict, float], None] | None = None,
+    on_action: Callable[[dict], None] | None = None,
 ) -> tuple[bool, int, str]:
     obs = env.reset()
     if local_memory_client is not None:
         local_memory_client.begin(0, image_size=image_size)
     rollout_error: BaseException | None = None
+    frames, gen_frames = [], []
     try:
         try:
             prompt = env.get_ep_meta().get("lang", "") or ""
@@ -299,7 +302,17 @@ def run_policy(
                     )
                 env_action = decode_10d_to_env12(a, False)
 
-            obs, _, _, _ = env.step(env_action)
+            obs, reward, env_done, info = env.step(env_action)
+            if on_action is not None:
+                on_action({
+                    "source_step": step,
+                    "predicted_action": a.tolist(),
+                    "predicted_raw15": a.tolist() if a.shape[-1] == 15 else None,
+                    "canonical_executed_raw15": canonical_raw15.tolist() if local_memory_client is not None else None,
+                    "submitted_env12": np.asarray(env_action).tolist(),
+                    "reward": float(reward), "env_done": bool(env_done),
+                    "evidence_completed": True,
+                })
             if local_memory_client is not None:
                 assert pre_composite is not None
                 local_memory_client.record_completed(0, pre_composite, canonical_raw15)
@@ -312,15 +325,18 @@ def run_policy(
             else:
                 streak = 0
 
-        if save_video is not None:
-            imageio.mimwrite(save_video, frames, fps=video_fps, macro_block_size=None)
-        if gen_video_path is not None and gen_frames:
-            imageio.mimwrite(gen_video_path, gen_frames, fps=video_fps, macro_block_size=None)
         return success, done_steps, prompt
     except BaseException as error:
         rollout_error = error
         raise
     finally:
+        media_error = None
+        try:
+            save_partial_video(frames, save_video, video_fps)
+            save_partial_video(gen_frames, gen_video_path, video_fps)
+        except Exception as error:
+            media_error = error
+            print(f"[eval] partial-video failure: {type(error).__name__}: {error}", flush=True)
         if local_memory_client is not None:
             session_id = local_memory_client.end(0)
             if session_id is not None:
@@ -333,6 +349,8 @@ def run_policy(
                         f"[eval] WARNING: Local-TTT cleanup failed after rollout error: {cleanup_error}",
                         flush=True,
                     )
+        if media_error is not None and rollout_error is None:
+            raise media_error
 
 
 def main() -> None:
@@ -350,6 +368,7 @@ def main() -> None:
         "first inference) per rollout, for comparing video-generation quality",
     )
     ap.add_argument("--action-horizon", type=int, default=16)
+    ap.add_argument("--evaluation-run-digest", default=None)
     ap.add_argument("--image-size", type=int, default=256)
     ap.add_argument("--cam-size", type=int, default=256)
     ap.add_argument(
@@ -456,69 +475,30 @@ def main() -> None:
     results = []
     local_memory_client = RoboCasaLocalMemoryClient(enabled=True) if args.local_memory_mode == "required" else None
 
-    # Official protocol: rollouts in freshly sampled held-out scenes.
-    for t in range(args.num_test_episodes):
-        prediction_records: list[dict[str, object]] = []
+    # Keep the official sequential environment reset/rollout protocol.
+    try:
+        for t in range(args.num_test_episodes):
+            result = run_recorded_episode(
+                run_policy, env, output_dir=out, episode=t, run_digest=args.evaluation_run_digest,
+                server_url=args.server_url, image_size=args.image_size,
+                action_horizon=args.action_horizon, max_steps=eff_max_steps,
+                latch=args.success_latch, timeout=args.timeout, use_state=args.use_state,
+                local_memory_client=local_memory_client,
+                save_png=str(out / f"rollout{t:02d}_init.png"),
+                save_video=str(out / f"rollout{t:02d}.mp4"),
+                gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if args.save_gen_video else None,
+            )
+            results.append(result)
+            atomic_json(out / "results.json", results)
+            print(f"[eval] rollout {t:02d} outcome={result['outcome']} steps={result['steps']} error={result['error']}", flush=True)
+    finally:
+        env.close()
 
-        def record_prediction(result: dict, latency_ms: float) -> None:
-            status = result.get("local_memory") if isinstance(result, dict) else None
-            row: dict[str, object] = {"latency_ms": float(latency_ms)}
-            if isinstance(status, dict):
-                for key in (
-                    "consumer_step",
-                    "prefix_present",
-                    "replay",
-                    "adapted_steps",
-                    "fast_state_norm",
-                    "fast_update_norm",
-                    "inner_loss_mean",
-                    "visual_endpoint_step",
-                    "visual_tail_frames",
-                ):
-                    if key in status:
-                        row[key] = status[key]
-            prediction_records.append(row)
-
-        pol_ok, pol_steps, prompt = run_policy(
-            env,
-            server_url=args.server_url,
-            image_size=args.image_size,
-            action_horizon=args.action_horizon,
-            max_steps=eff_max_steps,
-            latch=args.success_latch,
-            timeout=args.timeout,
-            use_state=args.use_state,
-            local_memory_client=local_memory_client,
-            on_prediction=record_prediction,
-            save_png=str(out / f"rollout{t:02d}_init.png"),
-            save_video=str(out / f"rollout{t:02d}.mp4"),
-            gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if args.save_gen_video else None,
-        )
-        print(f"[eval] rollout {t:02d} success={pol_ok} steps={pol_steps} prompt={prompt!r}", flush=True)
-        local_rows = [row for row in prediction_records if "consumer_step" in row]
-        results.append(
-            {
-                "ep": t,
-                "policy": pol_ok,
-                "steps": pol_steps,
-                "prompt": prompt,
-                "replans": len(prediction_records),
-                "prediction_latency_ms_mean": (
-                    float(sum(float(row["latency_ms"]) for row in prediction_records) / len(prediction_records))
-                    if prediction_records
-                    else None
-                ),
-                "post_cold_prefix_all": (
-                    all(bool(row.get("prefix_present")) for row in local_rows[1:]) if len(local_rows) > 1 else None
-                ),
-                "local_memory_predictions": prediction_records,
-            }
-        )
-
-    env.close()
     n_ok = sum(1 for r in results if r["policy"])
     print(f"\n{task_name}: {n_ok}/{len(results)} successful rollouts", flush=True)
-    (out / "results.json").write_text(json.dumps(results, indent=2))
+    atomic_json(out / "results.json", results)
+    if any(row["error"] is not None for row in results):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

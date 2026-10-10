@@ -10,6 +10,8 @@ from contextlib import nullcontext
 from typing import Any
 
 import torch
+
+from cosmos_framework.data.generator.action.utils.cached_pixel_geometry import move_cached_native_batch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -59,6 +61,8 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         index: int | None = None,
         loss: torch.Tensor | None = None,
         metrics: dict[str, Any] | None = None,
+        payloads: tuple[dict[str, Any], ...] | None = None,
+        optimizer: Any | None = None,
     ) -> None:
         observer = getattr(self, "grouped_observer", None)
         if observer is not None:
@@ -69,6 +73,8 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 index=index,
                 loss=loss,
                 metrics=metrics,
+                payloads=payloads,
+                optimizer=optimizer,
                 trainer=self,
             )
 
@@ -252,7 +258,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             with self._telemetry_stage("batch_collate"):
                 batch = collate_grouped_native_batch(payloads)
             with self._telemetry_stage("batch_transfer"):
-                batch = misc.to(batch, device=next(model.parameters()).device)
+                batch = move_cached_native_batch(batch, device=next(model.parameters()).device, move=misc.to)
             self.callbacks.on_before_forward(iteration=iteration)
             with self._telemetry_stage("forward"):
                 with self.training_timer("forward"):
@@ -271,6 +277,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 index=index,
                 loss=loss,
                 metrics=scalar_metrics,
+                payloads=payloads,
             )
             self.callbacks.on_after_forward(iteration=iteration)
             return loss
@@ -320,6 +327,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 iteration=iteration,
                 member=grad_accum_iter,
                 metrics=self._optimizer_lr_metrics(optimizer),
+                optimizer=optimizer,
             )
 
             def observed_optimizer_step() -> bool:

@@ -21,6 +21,8 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
+
+from cosmos_framework.utils.training_audit import audit_event, audit_record
 from torch.distributed.tensor import DTensor
 
 from examples.psm_wma_robocasa_formal_monitor import format_progress
@@ -489,6 +491,7 @@ class GroupedPlanObserver:
         }
         for key in LOSS_KEYS:
             record[f"{key}_coverage"] = self._loss_coverage.get(key, 0.0)
+        record.update(audit_record(self, trainer, iteration))
         record["telemetry_errors"] = list(self._errors)
         self.last_record = record
         try:
@@ -514,6 +517,7 @@ class GroupedPlanObserver:
             pass
 
     def __call__(self, *, phase: str, trainer: Any, **data: Any) -> None:
+        audit_event(self, trainer, phase, data)
         if phase == "native_forward":
             self.forward += 1
             if self.rank == 0:

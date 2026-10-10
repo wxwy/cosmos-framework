@@ -16,6 +16,8 @@ import os
 import re
 import statistics
 import time
+
+from cosmos_framework.utils.observed_exposure import observed_task_exposure
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -311,6 +313,9 @@ def update_monitor(job_dir: Path, *, world_size: int, max_iter: int, plot: bool)
         "source": "rank0_only_never_global_reduced",
         "last_iteration": latest.get("iteration"),
         "record_count": len(records),
+        **observed_task_exposure(records),
+        "latest_memory_inventory": latest.get("memory_inventory"),
+        "episode_cache_rank_local": latest.get("episode_cache_rank_local"),
         "replayed_iteration_records": superseded,
         "outer_loss": latest.get("outer_loss"),
         "action_loss": latest.get("action_loss"),

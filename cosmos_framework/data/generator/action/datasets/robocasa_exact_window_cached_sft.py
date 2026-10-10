@@ -24,6 +24,12 @@ from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_polic
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_source import RoboCasaExactWindowSourceReader
 from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset import RoboCasaLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
+from cosmos_framework.data.generator.action.datasets.robocasa_shared_episode_reader import install_rank_shared_reader
+from cosmos_framework.data.generator.action.utils.cached_pixel_geometry import (
+    CachedGeometryResize,
+    cached_pixel_placeholder,
+    compact_cached_video_enabled,
+)
 from cosmos_framework.data.generator.action.utils.domain_utils import get_domain_id
 from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline, VideoResize
 
@@ -54,6 +60,7 @@ class RoboCasaExactWindowCachedDataset(Dataset):
         if self.cache_reader.catalog is not catalog:
             raise ValueError("cache reader 与 cache catalog 身份不一致")
         self.contract = contract
+        self.compact_cached_video = compact_cached_video_enabled()
         self.policy_adapter = OfficialRoboCasaPolicyAdapter(contract)
         proxy = object.__new__(RoboCasaLeRobotDataset)
         proxy._use_base_action = True
@@ -121,7 +128,7 @@ class RoboCasaExactWindowCachedDataset(Dataset):
         idle_frames = RoboCasaLeRobotDataset._compute_idle_frames(self._idle_proxy, policy.action15)
         return {
             "ai_caption": policy.ai_caption,
-            "video": torch.zeros(_COMPOSITE_SHAPE, dtype=torch.uint8),
+            "video": cached_pixel_placeholder(compact=self.compact_cached_video),
             "video_latent": latent.contiguous(),
             "cached_latent_required": True,
             "action": policy.action_with_state15.contiguous(),
@@ -152,6 +159,8 @@ class RoboCasaExactWindowCachedDataset(Dataset):
             "cached_latent_required": True,
             "online_vae_fallback": False,
             "placeholder_geometry": list(_COMPOSITE_SHAPE),
+            "compact_cached_video": self.compact_cached_video,
+            "placeholder_storage_bytes": 1 if self.compact_cached_video else 6684672,
             "inner_collate_video_latent_abi": "Tensor[B,5,48,H,W]",
             "model_video_latent_abi": "list[B] of Tensor[1,5,48,H,W]",
             "transformed_canvas_geometry": list(self._canvas_geometry),
@@ -182,6 +191,7 @@ def get_action_robocasa_exact_window_cached_sft_dataset(
     contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(catalog)
     source_reader = RoboCasaExactWindowSourceReader(catalog, source_root, verified_index=verified_index)
     raw = RoboCasaExactWindowCachedDataset(catalog, source_reader, contract)
+    install_rank_shared_reader(raw)
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
         cfg_dropout_rate=cfg_dropout_rate,
@@ -192,6 +202,8 @@ def get_action_robocasa_exact_window_cached_sft_dataset(
         append_idle_frames=True,
         format_prompt_as_json=True,
     )
+    if raw.compact_cached_video:
+        transform.video_resize = CachedGeometryResize(transform.video_resize, tuple(raw._canvas_geometry))
     sft = ActionSFTDataset(raw, transform, resolution=None)
     sft.summary = raw.summary
     if iterable_shuffle:
