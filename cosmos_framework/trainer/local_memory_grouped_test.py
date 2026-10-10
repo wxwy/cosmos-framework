@@ -54,7 +54,7 @@ class _Model(nn.Module):
         pass
 
 
-def _trainer(active_ga=2, b_stream=8) -> GroupedLocalMemoryTrainer:
+def _trainer(active_ga=2, b_stream=8, *, num_workers=0) -> GroupedLocalMemoryTrainer:
     trainer = object.__new__(GroupedLocalMemoryTrainer)
     trainer.config = SimpleNamespace(trainer=SimpleNamespace(grad_accum_iter=active_ga, distributed_parallelism="fsdp"))
     trainer.callbacks = _Hooks()
@@ -64,6 +64,7 @@ def _trainer(active_ga=2, b_stream=8) -> GroupedLocalMemoryTrainer:
         ExactWindowRankPlanner(catalog, rank=0, world_size=1, b_stream=b_stream, active_ga=active_ga),
         producer,
         config_digest="config",
+        num_workers=num_workers,
     )
     return trainer
 
@@ -350,3 +351,48 @@ def test_trainer_scaler_skip_aborts_pending_window_without_publish(monkeypatch: 
     assert trainer._grouped_window.plan is None
     assert scheduler.last_epoch == 0
     assert trainer._grouped_completed_iteration == 0
+
+
+@pytest.mark.parametrize("num_workers", [0, 1, 2])
+def test_async_raw_prefetch_keeps_optimizer_and_committed_frontier_parity(
+    monkeypatch: pytest.MonkeyPatch, num_workers: int
+) -> None:
+    # Same model seed, same GA/T/B, same commit and next-frontier after one completed window.
+    torch.manual_seed(19)
+    model = _Model()
+    trainer = _trainer(active_ga=2, b_stream=3, num_workers=num_workers)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    monkeypatch.setattr(grouped_module, "collate_grouped_native_batch", lambda payloads: {"count": len(payloads)})
+    monkeypatch.setattr(grouped_module.misc, "to", lambda value, **kwargs: value)
+    try:
+        accum = 0
+        for member in range(2):
+            output, loss, accum = trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, accum)
+            assert output["count"] == 3
+            assert loss.isfinite()
+            assert accum == 0 if member == 1 else accum == 1
+        assert trainer._grouped_completed_iteration == 1
+        assert scheduler.last_epoch == 1
+        assert trainer._grouped_window.live.frontier == trainer._grouped_planner.plan_window(
+            trainer._grouped_planner.initial_frontier()
+        ).candidate_frontier
+        # Numerical reference for the non-prefetched, frozen CPU path with the same seed.
+        torch.manual_seed(19)
+        baseline_model = _Model()
+        baseline = _trainer(active_ga=2, b_stream=3, num_workers=0)
+        opt = torch.optim.SGD(baseline_model.parameters(), lr=0.01)
+        sch = torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 1.0)
+        for member in range(2):
+            baseline.training_step(baseline_model, opt, sch, scaler, {}, 0, member)
+        for observed, expected in zip(model.parameters(), baseline_model.parameters(), strict=True):
+            torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+        assert trainer._grouped_window.live.frontier == baseline._grouped_window.live.frontier
+        assert (
+            trainer._grouped_window.live.scheduler._committed
+            == baseline._grouped_window.live.scheduler._committed
+        )
+    finally:
+        if trainer._grouped_prefetcher is not None:
+            trainer._grouped_prefetcher.close()
