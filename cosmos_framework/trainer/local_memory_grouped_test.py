@@ -395,3 +395,41 @@ def test_async_raw_prefetch_keeps_optimizer_and_committed_frontier_parity(
     finally:
         if trainer._grouped_prefetcher is not None:
             trainer._grouped_prefetcher.close()
+
+
+
+def test_async_raw_failure_aborts_candidate_without_optimizer_or_frontier_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(19)
+    model = _Model()
+    trainer = _trainer(active_ga=2, b_stream=3, num_workers=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    initial_frontier = trainer._grouped_planner.initial_frontier()
+    old_weight = model.net.moe_gen.detach().clone()
+    assert trainer._grouped_prefetcher is not None
+
+    def fail_read(_request):
+        raise ValueError("injected async read failure")
+
+    monkeypatch.setattr(trainer._grouped_prefetcher, "_prepare", fail_read)
+    monkeypatch.setattr(grouped_module, "collate_grouped_native_batch", lambda payloads: {"count": len(payloads)})
+    monkeypatch.setattr(grouped_module.misc, "to", lambda value, **kwargs: value)
+    try:
+        _, _, accum = trainer.training_step(
+            model, optimizer, scheduler, torch.amp.GradScaler("cpu", enabled=False), {}, 0, 0
+        )
+        assert accum == 1
+        with pytest.raises(ValueError, match="injected async read failure"):
+            trainer.training_step(
+                model, optimizer, scheduler, torch.amp.GradScaler("cpu", enabled=False), {}, 0, accum
+            )
+        assert trainer._grouped_window.live.frontier == initial_frontier
+        assert trainer._grouped_window.plan is None
+        assert trainer._grouped_prefetcher._pending is None
+        assert trainer._grouped_completed_iteration == 0
+        assert scheduler.last_epoch == 0
+        torch.testing.assert_close(model.net.moe_gen.detach(), old_weight, rtol=0, atol=0)
+    finally:
+        trainer._grouped_prefetcher.close()
