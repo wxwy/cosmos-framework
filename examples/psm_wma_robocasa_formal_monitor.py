@@ -92,19 +92,24 @@ def read_train_records(path: Path) -> tuple[list[dict[str, Any]], int]:
     by_iteration: dict[int, dict[str, Any]] = {}
     superseded = 0
     with path.open(encoding="utf-8", errors="replace") as handle:
-        for number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"train JSONL invalid line {number}: {exc}") from exc
-            iteration = entry.get("iteration") if isinstance(entry, dict) else None
-            if type(iteration) is not int or iteration <= 0 or entry.get("status") != "optimizer_committed":
-                raise ValueError(f"train JSONL invalid committed iteration line {number}")
-            if iteration in by_iteration:
-                superseded += 1
-            by_iteration[iteration] = entry
+        lines = handle.readlines()
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            # A concurrent writer may have an incomplete FINAL line. Never
+            # tolerate malformed fully-terminated or interior records.
+            if number == len(lines) and not line.endswith("\n"):
+                break
+            raise ValueError(f"train JSONL invalid line {number}: {exc}") from exc
+        iteration = entry.get("iteration") if isinstance(entry, dict) else None
+        if type(iteration) is not int or iteration <= 0 or entry.get("status") != "optimizer_committed":
+            raise ValueError(f"train JSONL invalid committed iteration line {number}")
+        if iteration in by_iteration:
+            superseded += 1
+        by_iteration[iteration] = entry
     return [by_iteration[key] for key in sorted(by_iteration)], superseded
 
 
