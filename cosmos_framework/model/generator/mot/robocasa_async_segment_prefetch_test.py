@@ -6,8 +6,6 @@
 from __future__ import annotations
 
 import random
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -82,35 +80,32 @@ def test_async_only_reads_raw_and_preserves_ordered_transform(num_workers: int) 
         prefetcher.close()
 
 
-def test_async_does_not_consume_transform_rng_before_main_thread() -> None:
+def test_async_does_not_consume_transform_rng_before_main_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     _, transform, catalog, producer = _setup((17,), t=16)
     request = _request(catalog)
-    original = transform.__call__
+    transform_type = type(transform)
+    original = transform_type.__call__
 
-    def randomized(item, resolution):
+    def randomized(self, item, resolution):
         item["test_rng"] = (random.random(), float(torch.rand(())))
-        return original(item, resolution)
+        return original(self, item, resolution)
 
-    # Instance __call__ is bound by type, so patch the class instead.
-    transform.__class__.__call__ = randomized
+    monkeypatch.setattr(transform_type, "__call__", randomized)
+    random.seed(723)
+    torch.manual_seed(723)
+    baseline = producer.produce(request)
+    expected_rng = [payload["test_rng"] for payload in baseline.consumer_payload[0]]
+    random.seed(723)
+    torch.manual_seed(723)
+    prefetcher = AsyncExactWindowRawPrefetcher(producer, num_workers=2)
     try:
-        random.seed(723)
-        torch.manual_seed(723)
-        baseline = producer.produce(request)
-        expected_rng = [payload["test_rng"] for payload in baseline.consumer_payload[0]]
-        random.seed(723)
-        torch.manual_seed(723)
-        prefetcher = AsyncExactWindowRawPrefetcher(producer, num_workers=2)
-        try:
-            prefetcher.reset_iteration()
-            prefetcher.schedule((request,))
-            prepared = prefetcher.load_member((request,))
-            observed = producer.materialize(prepared[0])
-            assert [payload["test_rng"] for payload in observed.consumer_payload[0]] == expected_rng
-        finally:
-            prefetcher.close()
+        prefetcher.reset_iteration()
+        prefetcher.schedule((request,))
+        prepared = prefetcher.load_member((request,))
+        observed = producer.materialize(prepared[0])
+        assert [payload["test_rng"] for payload in observed.consumer_payload[0]] == expected_rng
     finally:
-        transform.__class__.__call__ = original
+        prefetcher.close()
 
 
 def test_async_rejects_request_reordering_and_drains_after_abort() -> None:
