@@ -123,3 +123,14 @@ def test_monitor_summary_is_atomic_and_never_modifies_dcp(tmp_path: Path) -> Non
     assert report["median_step_50_s"] == pytest.approx(42.0)
     assert (tmp_path / "checkpoints/iter_000000800/model/.metadata").exists()
     assert json.loads((tmp_path / "monitor/summary.json").read_text())["last_iteration"] == 802
+
+
+
+def test_monitor_tolerates_only_unterminated_concurrent_last_jsonl_row(tmp_path: Path) -> None:
+    path = tmp_path / "train.jsonl"
+    path.write_text(json.dumps(_record(801)) + "\n" + '{"iteration":', encoding="utf-8")
+    rows, _ = read_train_records(path)
+    assert [row["iteration"] for row in rows] == [801]
+    path.write_text('{"iteration":\n' + json.dumps(_record(802)) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        read_train_records(path)
