@@ -9,7 +9,7 @@ import hashlib
 import json
 import random
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch.nn import functional as F
@@ -294,6 +294,14 @@ class ExactWindowRankPlanner:
         return ExactWindowGroupedPlan(tuple(members), candidate, tuple(counts))
 
 
+@dataclass(frozen=True)
+class PreparedExactWindowSegment:
+    """Immutable request binding; raw CPU items only, no prompt transform or model state."""
+
+    request: ExactWindowSegmentRequest
+    items: tuple[tuple[int, dict[str, Any]], ...]
+
+
 class ExactWindowSegmentProducer:
     """Reuse a single Phase3 raw item for current payload and next-step evidence."""
 
@@ -302,7 +310,13 @@ class ExactWindowSegmentProducer:
             raise ValueError("Local producer 需要 config_digest")
         self.catalog, self.config_digest = catalog, config_digest
 
-    def produce(self, request: ExactWindowSegmentRequest) -> SegmentBatch:
+    def prepare(
+        self,
+        request: ExactWindowSegmentRequest,
+        *,
+        raw_getter: Callable[[int], dict[str, Any]] | None = None,
+    ) -> PreparedExactWindowSegment:
+        """Read deterministic raw windows; never consume transform/model RNG or Local state."""
         episode, identity = request.episode, request.identity
         if self.catalog.by_uid.get(episode.uid) is not episode:
             raise ValueError("Local request episode 不是 catalog capability")
@@ -325,7 +339,26 @@ class ExactWindowSegmentProducer:
             or raw.source_reader.source_binding_digest != self.catalog.source_binding_digest
         ):
             raise ValueError("Local catalog/source identity 已漂移")
-        items = {step: raw[episode.flat_start + step] for step in range(max(0, start - 1), start + expected)}
+        getter = raw.__getitem__ if raw_getter is None else raw_getter
+        items = tuple(
+            (step, getter(episode.flat_start + step))
+            for step in range(max(0, start - 1), start + expected)
+        )
+        return PreparedExactWindowSegment(request, items)
+
+    def materialize(self, prepared: PreparedExactWindowSegment) -> SegmentBatch:
+        """Apply the original ordered transform and construct the exact SegmentBatch on trainer thread."""
+        if not isinstance(prepared, PreparedExactWindowSegment):
+            raise TypeError("raw prefetch prepared segment 类型无效")
+        request = prepared.request
+        episode, identity = request.episode, request.identity
+        t = self.catalog.ttt_tbptt_steps
+        start = identity.cursor * t
+        expected = min(t, episode.window_count - start)
+        if tuple(step for step, _ in prepared.items) != tuple(range(max(0, start - 1), start + expected)):
+            raise ValueError("raw prefetch Segment frame range 不匹配")
+        raw = self.catalog.raw
+        items = dict(prepared.items)
         visual = torch.zeros((1, t, 96), dtype=torch.float32)
         evidence_visual = torch.zeros_like(visual)
         evidence_action = torch.zeros((1, t, 15), dtype=torch.float32)
@@ -381,6 +414,9 @@ class ExactWindowSegmentProducer:
         )
         segment.validate(t)
         return segment
+
+    def produce(self, request: ExactWindowSegmentRequest) -> SegmentBatch:
+        return self.materialize(self.prepare(request))
 
 
 @dataclass(frozen=True)
