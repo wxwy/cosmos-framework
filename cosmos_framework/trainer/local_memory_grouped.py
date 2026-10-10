@@ -16,6 +16,7 @@ from torch.distributed.tensor import DTensor
 
 from cosmos_framework.data.generator.joint_dataloader import JointDataLoader, custom_collate_fn
 from cosmos_framework.model.generator.mot.local_memory_grouped_window import GroupedLocalMemoryWindow
+from cosmos_framework.model.generator.mot.robocasa_async_segment_prefetch import AsyncExactWindowRawPrefetcher
 from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
     ExactWindowLocalCatalog,
     ExactWindowRankPlanner,
@@ -91,7 +92,10 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         producer: ExactWindowSegmentProducer,
         *,
         config_digest: str,
+        num_workers: int = 0,
     ) -> None:
+        if type(num_workers) is not int or not 0 <= num_workers <= 16:
+            raise ValueError("num_workers must be an integer in [0,16]")
         if (
             hasattr(self, "_grouped_planner")
             or getattr(self, "_grouped_window", None) is not None
@@ -114,6 +118,10 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         ):
             raise ValueError("H3-D 要求独占 DCP dataloader state callback")
         self._grouped_planner, self._grouped_producer = planner, producer
+        self._grouped_num_workers = num_workers
+        self._grouped_prefetcher = (
+            AsyncExactWindowRawPrefetcher(producer, num_workers=num_workers) if num_workers else None
+        )
         self._grouped_config_digest = config_digest
         self._grouped_completed_iteration = 0
         self._pending_grouped_resume = None
@@ -127,7 +135,12 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         if self.config.trainer.save_zero_checkpoint or not self.config.checkpoint.strict_resume:
             raise ValueError("H3-D 禁止零步 checkpoint，并要求 strict_resume")
         self._resume_required = require_dcp_grouped_resume_component(self.checkpointer)
-        super().train(model, dataloader_train, dataloader_val)
+        try:
+            super().train(model, dataloader_train, dataloader_val)
+        finally:
+            prefetcher = getattr(self, "_grouped_prefetcher", None)
+            if prefetcher is not None:
+                prefetcher.close()
 
     @staticmethod
     def _optimizer_parameters(optimizer: Any) -> list[torch.Tensor]:
@@ -223,7 +236,10 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         window = self._grouped_window
         # Observational context manager only; not part of DCP or Local live state.
         window._telemetry_stage = self._telemetry_stage
+        prefetcher = getattr(self, "_grouped_prefetcher", None)
         if grad_accum_iter == 0:
+            if prefetcher is not None:
+                prefetcher.reset_iteration()
             window.begin()
         elif window.plan is None:
             raise RuntimeError("后续 GA 调用缺少 pending grouped window")
@@ -278,9 +294,18 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
 
         try:
             with self._telemetry_stage("data_prepare"):
-                segments = tuple(
-                    self._grouped_producer.produce(request) for request in window.plan.members[grad_accum_iter]
-                )
+                requests = window.plan.members[grad_accum_iter]
+                if prefetcher is None:
+                    segments = tuple(self._grouped_producer.produce(request) for request in requests)
+                else:
+                    prepared = (
+                        tuple(self._grouped_producer.prepare(request) for request in requests)
+                        if grad_accum_iter == 0
+                        else prefetcher.load_member(requests)
+                    )
+                    segments = tuple(self._grouped_producer.materialize(item) for item in prepared)
+                    if grad_accum_iter + 1 < active_ga:
+                        prefetcher.schedule(window.plan.members[grad_accum_iter + 1])
             member_loss = window.run_member(segments, native_loss, backward)
             if grad_accum_iter + 1 < active_ga:
                 return output, member_loss, grad_accum_iter + 1
@@ -309,5 +334,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             self._zero_grad(model, optimizer, iteration)
             return output, member_loss, 0
         except Exception:
+            if prefetcher is not None:
+                prefetcher.abort()
             window.abort()
             raise
