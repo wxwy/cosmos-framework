@@ -15,16 +15,15 @@ from __future__ import annotations
 import json
 import math
 import time
-from datetime import datetime
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
 
 import torch
-
-from cosmos_framework.utils.training_audit import audit_event, audit_record
 from torch.distributed.tensor import DTensor
 
+from cosmos_framework.utils.training_audit import audit_event, audit_record
 from examples.psm_wma_robocasa_formal_monitor import format_progress
 
 LOSS_KEYS = (
@@ -453,7 +452,8 @@ class GroupedPlanObserver:
             "cuda_timing_scope": "current_stream_events_every_100_steps_rank0_only",
             "data_wait_ms": prefetcher.iteration_wait_ms if prefetcher is not None else None,
             "data_wait_reason": (
-                "bounded_async_raw_prefetch_only" if prefetcher is not None
+                "bounded_async_raw_prefetch_only"
+                if prefetcher is not None
                 else "synchronous_producer_no_background_dataloader"
             ),
             "valid_consumers": valid_consumers,

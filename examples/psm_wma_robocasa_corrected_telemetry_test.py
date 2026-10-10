@@ -415,17 +415,18 @@ def test_missing_gradient_audit_is_disabled_by_default_and_does_not_emit_before_
     assert lines == []  # Aborted or uncommitted steps do not emit a success audit.
 
 
-
 def test_human_progress_is_optional_and_original_train_json_remains_machine_readable() -> None:
     emitted: list[str] = []
-    observer = GroupedPlanObserver(
-        rank=0, emit=emitted.append, human_progress=True, max_iter=30000
-    )
+    observer = GroupedPlanObserver(rank=0, emit=emitted.append, human_progress=True, max_iter=30000)
     trainer = make_trainer()
     observer.start_iteration(0)
     for member, index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
         observer(
-            phase="native_forward", trainer=trainer, iteration=0, member=member, index=index,
+            phase="native_forward",
+            trainer=trainer,
+            iteration=0,
+            member=member,
+            index=index,
             metrics={
                 "flow_matching_loss_action": torch.tensor(1.0),
                 "flow_matching_loss_vision": torch.tensor(0.1),

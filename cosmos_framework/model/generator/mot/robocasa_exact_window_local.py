@@ -340,10 +340,7 @@ class ExactWindowSegmentProducer:
         ):
             raise ValueError("Local catalog/source identity 已漂移")
         getter = raw.__getitem__ if raw_getter is None else raw_getter
-        items = tuple(
-            (step, getter(episode.flat_start + step))
-            for step in range(max(0, start - 1), start + expected)
-        )
+        items = tuple((step, getter(episode.flat_start + step)) for step in range(max(0, start - 1), start + expected))
         return PreparedExactWindowSegment(request, items)
 
     def materialize(self, prepared: PreparedExactWindowSegment) -> SegmentBatch:

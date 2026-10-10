@@ -23,8 +23,8 @@ from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_polic
 )
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_source import RoboCasaExactWindowSourceReader
 from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset import RoboCasaLeRobotDataset
-from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
 from cosmos_framework.data.generator.action.datasets.robocasa_shared_episode_reader import install_rank_shared_reader
+from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
 from cosmos_framework.data.generator.action.utils.cached_pixel_geometry import (
     CachedGeometryResize,
     cached_pixel_placeholder,

@@ -522,7 +522,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--expected-root", required=True)
     result.add_argument("--expected-child", required=True)
     result.add_argument(
-        "--num-workers", type=int, default=0,
+        "--num-workers",
+        type=int,
+        default=0,
         help="Per-rank bounded background RAW-READ threads; 0 retains synchronous semantics (not DataLoader workers)",
     )
     result.add_argument("--job-name", default="edge_local_exact_window")
@@ -581,9 +583,7 @@ def main(argv: list[str] | None = None) -> None:
     install_optimizer_inventory_check(model, report)
     planner = ExactWindowRankPlanner(catalog, rank=rank, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     producer = ExactWindowSegmentProducer(catalog, config_digest=report["config_digest"])
-    trainer.bind_grouped_stream(
-        planner, producer, config_digest=report["config_digest"], num_workers=args.num_workers
-    )
+    trainer.bind_grouped_stream(planner, producer, config_digest=report["config_digest"], num_workers=args.num_workers)
     sample_interval = _telemetry_sample_interval(getattr(args, "stop_after_iter", None))
     journal = (
         TelemetryJournal(args.output_root / "psm_wma_v3" / "corrected_phase5" / args.job_name, rank=0)

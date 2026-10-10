@@ -71,7 +71,9 @@ def test_read_train_records_is_idempotent_on_duplicate_resume_rows(tmp_path: Pat
     assert superseded == 1
 
 
-@pytest.mark.parametrize("text", ["broken_json\n", '{"iteration":4}\n', '{"iteration":0,"status":"optimizer_committed"}\n'])
+@pytest.mark.parametrize(
+    "text", ["broken_json\n", '{"iteration":4}\n', '{"iteration":0,"status":"optimizer_committed"}\n']
+)
 def test_invalid_jsonl_fails_closed(tmp_path: Path, text: str) -> None:
     path = tmp_path / "train.jsonl"
     path.write_text(text, encoding="utf-8")
@@ -123,7 +125,6 @@ def test_monitor_summary_is_atomic_and_never_modifies_dcp(tmp_path: Path) -> Non
     assert report["median_step_50_s"] == pytest.approx(42.0)
     assert (tmp_path / "checkpoints/iter_000000800/model/.metadata").exists()
     assert json.loads((tmp_path / "monitor/summary.json").read_text())["last_iteration"] == 802
-
 
 
 def test_monitor_tolerates_only_unterminated_concurrent_last_jsonl_row(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 """Bounded shared read-only payload cache: one concurrent load per identity."""
+
 from __future__ import annotations
 
 import time
@@ -33,9 +34,16 @@ class SingleFlightLRU(Generic[K, V]):
         self._pending: dict[K, Future[V]] = {}
         self._bytes = 0
         self._stats: dict[str, int | float] = {
-            "hits": 0, "misses": 0, "coalesced": 0, "loads": 0,
-            "failures": 0, "evictions": 0, "oversized": 0,
-            "load_ms": 0.0, "wait_ms": 0.0, "peak_cached_bytes": 0,
+            "hits": 0,
+            "misses": 0,
+            "coalesced": 0,
+            "loads": 0,
+            "failures": 0,
+            "evictions": 0,
+            "oversized": 0,
+            "load_ms": 0.0,
+            "wait_ms": 0.0,
+            "peak_cached_bytes": 0,
         }
 
     def get(self, key: K, load: Callable[[], V]) -> V:
@@ -68,9 +76,7 @@ class SingleFlightLRU(Generic[K, V]):
                 raise ValueError("sizeof must return a nonnegative integer")
             with self._lock:
                 if size <= self.max_bytes:
-                    while self._cache and (
-                        len(self._cache) >= self.max_entries or self._bytes + size > self.max_bytes
-                    ):
+                    while self._cache and (len(self._cache) >= self.max_entries or self._bytes + size > self.max_bytes):
                         _, (_, removed_size) = self._cache.popitem(last=False)
                         self._bytes -= removed_size
                         self._stats["evictions"] += 1
@@ -97,8 +103,11 @@ class SingleFlightLRU(Generic[K, V]):
     def stats(self) -> dict[str, int | float]:
         with self._lock:
             return {
-                **self._stats, "cached_entries": len(self._cache), "cached_bytes": self._bytes,
-                "inflight_keys": len(self._pending), "max_entries": self.max_entries,
+                **self._stats,
+                "cached_entries": len(self._cache),
+                "cached_bytes": self._bytes,
+                "inflight_keys": len(self._pending),
+                "max_entries": self.max_entries,
                 "max_bytes": self.max_bytes,
             }
 

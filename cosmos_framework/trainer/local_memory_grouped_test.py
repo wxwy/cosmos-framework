@@ -375,9 +375,10 @@ def test_async_raw_prefetch_keeps_optimizer_and_committed_frontier_parity(
             assert accum == (0 if member == 1 else 1)
         assert trainer._grouped_completed_iteration == 1
         assert scheduler.last_epoch == 1
-        assert trainer._grouped_window.live.frontier == trainer._grouped_planner.plan_window(
-            trainer._grouped_planner.initial_frontier()
-        ).candidate_frontier
+        assert (
+            trainer._grouped_window.live.frontier
+            == trainer._grouped_planner.plan_window(trainer._grouped_planner.initial_frontier()).candidate_frontier
+        )
         # Numerical reference for the non-prefetched, frozen CPU path with the same seed.
         torch.manual_seed(19)
         baseline_model = _Model()
@@ -395,7 +396,6 @@ def test_async_raw_prefetch_keeps_optimizer_and_committed_frontier_parity(
     finally:
         if trainer._grouped_prefetcher is not None:
             trainer._grouped_prefetcher.close()
-
 
 
 def test_async_raw_failure_aborts_candidate_without_optimizer_or_frontier_commit(
@@ -422,9 +422,7 @@ def test_async_raw_failure_aborts_candidate_without_optimizer_or_frontier_commit
         )
         assert accum == 1
         with pytest.raises(ValueError, match="injected async read failure"):
-            trainer.training_step(
-                model, optimizer, scheduler, torch.amp.GradScaler("cpu", enabled=False), {}, 0, accum
-            )
+            trainer.training_step(model, optimizer, scheduler, torch.amp.GradScaler("cpu", enabled=False), {}, 0, accum)
         assert trainer._grouped_window.live.frontier == initial_frontier
         assert trainer._grouped_window.plan is None
         assert trainer._grouped_prefetcher._pending is None

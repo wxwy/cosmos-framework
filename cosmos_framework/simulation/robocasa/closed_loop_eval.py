@@ -42,7 +42,6 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-import imageio.v2 as imageio
 import numpy as np
 import robocasa  # noqa: F401  (registers RoboCasa envs like CloseToasterOvenDoor; does NOT pull lerobot)
 import robosuite
@@ -304,15 +303,20 @@ def run_policy(
 
             obs, reward, env_done, info = env.step(env_action)
             if on_action is not None:
-                on_action({
-                    "source_step": step,
-                    "predicted_action": a.tolist(),
-                    "predicted_raw15": a.tolist() if a.shape[-1] == 15 else None,
-                    "canonical_executed_raw15": canonical_raw15.tolist() if local_memory_client is not None else None,
-                    "submitted_env12": np.asarray(env_action).tolist(),
-                    "reward": float(reward), "env_done": bool(env_done),
-                    "evidence_completed": True,
-                })
+                on_action(
+                    {
+                        "source_step": step,
+                        "predicted_action": a.tolist(),
+                        "predicted_raw15": a.tolist() if a.shape[-1] == 15 else None,
+                        "canonical_executed_raw15": canonical_raw15.tolist()
+                        if local_memory_client is not None
+                        else None,
+                        "submitted_env12": np.asarray(env_action).tolist(),
+                        "reward": float(reward),
+                        "env_done": bool(env_done),
+                        "evidence_completed": True,
+                    }
+                )
             if local_memory_client is not None:
                 assert pre_composite is not None
                 local_memory_client.record_completed(0, pre_composite, canonical_raw15)
@@ -479,10 +483,18 @@ def main() -> None:
     try:
         for t in range(args.num_test_episodes):
             result = run_recorded_episode(
-                run_policy, env, output_dir=out, episode=t, run_digest=args.evaluation_run_digest,
-                server_url=args.server_url, image_size=args.image_size,
-                action_horizon=args.action_horizon, max_steps=eff_max_steps,
-                latch=args.success_latch, timeout=args.timeout, use_state=args.use_state,
+                run_policy,
+                env,
+                output_dir=out,
+                episode=t,
+                run_digest=args.evaluation_run_digest,
+                server_url=args.server_url,
+                image_size=args.image_size,
+                action_horizon=args.action_horizon,
+                max_steps=eff_max_steps,
+                latch=args.success_latch,
+                timeout=args.timeout,
+                use_state=args.use_state,
                 local_memory_client=local_memory_client,
                 save_png=str(out / f"rollout{t:02d}_init.png"),
                 save_video=str(out / f"rollout{t:02d}.mp4"),
@@ -490,7 +502,10 @@ def main() -> None:
             )
             results.append(result)
             atomic_json(out / "results.json", results)
-            print(f"[eval] rollout {t:02d} outcome={result['outcome']} steps={result['steps']} error={result['error']}", flush=True)
+            print(
+                f"[eval] rollout {t:02d} outcome={result['outcome']} steps={result['steps']} error={result['error']}",
+                flush=True,
+            )
     finally:
         env.close()
 

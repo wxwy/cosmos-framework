@@ -6,6 +6,7 @@ No pixel values enter VAE/vision normalization. The logical Tensor ABI remains
 uint8 [3,17,H,W] for unchanged native geometry/temporal helpers; its storage is
 one byte, it is never resized and it stays on CPU at the native batch boundary.
 """
+
 from __future__ import annotations
 
 import os
@@ -33,10 +34,14 @@ def pixel_shape_proxy(shape: tuple[int, ...]) -> torch.Tensor:
 
 def is_pixel_shape_proxy(value: object) -> bool:
     return (
-        isinstance(value, torch.Tensor) and value.device.type == "cpu"
-        and value.dtype == torch.uint8 and value.ndim == 4
-        and tuple(value.shape[:2]) == (3, 17) and value.storage_offset() == 0
-        and all(v > 0 for v in value.shape) and value.stride() == (0, 0, 0, 0)
+        isinstance(value, torch.Tensor)
+        and value.device.type == "cpu"
+        and value.dtype == torch.uint8
+        and value.ndim == 4
+        and tuple(value.shape[:2]) == (3, 17)
+        and value.storage_offset() == 0
+        and all(v > 0 for v in value.shape)
+        and value.stride() == (0, 0, 0, 0)
         and value.untyped_storage().nbytes() == 1
         and int(value[0, 0, 0, 0]) == 0
     )
@@ -81,13 +86,20 @@ class CachedGeometryResize:
 def move_cached_native_batch(batch: Mapping[str, Any], *, device: object, move: Callable[..., Any]) -> dict:
     """Avoid H2D for validated shape-only proxies, without changing misc.to globally."""
     samples = batch.get("video")
-    items = [s[0] for s in samples] if (
-        isinstance(samples, (list, tuple)) and samples
-        and all(isinstance(s, (list, tuple)) and len(s) == 1 for s in samples)
-    ) else []
+    items = (
+        [s[0] for s in samples]
+        if (
+            isinstance(samples, (list, tuple))
+            and samples
+            and all(isinstance(s, (list, tuple)) and len(s) == 1 for s in samples)
+        )
+        else []
+    )
     proxies = [is_pixel_shape_proxy(v) for v in items]
-    if any(isinstance(v, torch.Tensor) and v.ndim == 4 and v.stride() == (0, 0, 0, 0)
-           and not valid for v, valid in zip(items, proxies, strict=True)):
+    if any(
+        isinstance(v, torch.Tensor) and v.ndim == 4 and v.stride() == (0, 0, 0, 0) and not valid
+        for v, valid in zip(items, proxies, strict=True)
+    ):
         raise ValueError("invalid shape-only pixel tensor")
     if not any(proxies):
         return move(batch, device=device)
@@ -97,9 +109,19 @@ def move_cached_native_batch(batch: Mapping[str, Any], *, device: object, move: 
     if any(not isinstance(v, (list, tuple)) or len(v) != len(items) for v in (markers, latents, sizes)):
         raise ValueError("compact cached batch metadata/latent count mismatch")
     for video, marker, latent, size in zip(items, markers, latents, sizes, strict=True):
-        if not isinstance(marker, torch.Tensor) or marker.dtype != torch.bool or marker.shape != (1,) or not bool(marker.item()):
+        if (
+            not isinstance(marker, torch.Tensor)
+            or marker.dtype != torch.bool
+            or marker.shape != (1,)
+            or not bool(marker.item())
+        ):
             raise ValueError("compact pixels require a true cache marker per sample")
-        if not isinstance(latent, torch.Tensor) or latent.dtype != torch.float32 or latent.ndim != 5 or tuple(latent.shape[:3]) != (1, 5, 48):
+        if (
+            not isinstance(latent, torch.Tensor)
+            or latent.dtype != torch.float32
+            or latent.ndim != 5
+            or tuple(latent.shape[:3]) != (1, 5, 48)
+        ):
             raise ValueError("compact cached latent ABI mismatch")
         if not isinstance(size, torch.Tensor) or size.numel() != 4 or not torch.isfinite(size).all():
             raise ValueError("compact cached image_size missing/nonfinite")

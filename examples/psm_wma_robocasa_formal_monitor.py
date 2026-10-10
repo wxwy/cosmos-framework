@@ -16,11 +16,11 @@ import os
 import re
 import statistics
 import time
-
-from cosmos_framework.utils.observed_exposure import observed_task_exposure
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+
+from cosmos_framework.utils.observed_exposure import observed_task_exposure
 
 TRAIN_PREFIX = "[CorrectedV3][train] "
 CHECKPOINT_PREFIX = "[CorrectedV3][checkpoint] "
@@ -299,15 +299,14 @@ def update_monitor(job_dir: Path, *, world_size: int, max_iter: int, plot: bool)
     recent = [
         float(row["step_wall_s"])
         for row in records[-50:]
-        if type(row.get("step_wall_s")) in (int, float)
-        and math.isfinite(row["step_wall_s"])
-        and row["step_wall_s"] > 0
+        if type(row.get("step_wall_s")) in (int, float) and math.isfinite(row["step_wall_s"]) and row["step_wall_s"] > 0
     ]
     latest = records[-1] if records else {}
     avg_step = statistics.median(recent) if recent else None
     estimated_remaining_h = (
         max(0, max_iter - latest["iteration"]) * avg_step / 3600
-        if avg_step is not None and isinstance(latest.get("iteration"), int) else None
+        if avg_step is not None and isinstance(latest.get("iteration"), int)
+        else None
     )
     state = {
         "source": "rank0_only_never_global_reduced",
