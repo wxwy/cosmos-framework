@@ -72,6 +72,46 @@ def _raw(roots: tuple[Path, Path]) -> RoboCasaExactWindowCachedDataset:
 
 
 @pytest.mark.level(0)
+def test_cache_modes_default_to_dense_and_unshared(monkeypatch: pytest.MonkeyPatch, roots: tuple[Path, Path]) -> None:
+    from cosmos_framework.data.generator.action.datasets.robocasa_shared_episode_reader import (
+        install_rank_shared_reader,
+    )
+
+    monkeypatch.delenv("PSM_V3_COMPACT_CACHED_VIDEO", raising=False)
+    monkeypatch.delenv("PSM_V3_SHARED_EPISODE_CACHE", raising=False)
+    dataset = _raw(roots)
+    assert dataset.compact_cached_video is False
+    assert install_rank_shared_reader(dataset) is None
+    video = dataset[0]["video"]
+    assert tuple(video.shape) == (3, 17, 256, 512)
+    assert video.dtype == torch.uint8
+    assert video.is_contiguous()
+    assert video.untyped_storage().nbytes() == 3 * 17 * 256 * 512
+    assert not bool(video.any())
+
+
+@pytest.mark.level(0)
+def test_both_cache_optimizations_remain_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch, roots: tuple[Path, Path]
+) -> None:
+    from cosmos_framework.data.generator.action.datasets.robocasa_shared_episode_reader import (
+        SharedRoboCasaEpisodeReader,
+        install_rank_shared_reader,
+    )
+    from cosmos_framework.data.generator.action.utils.cached_pixel_geometry import is_pixel_shape_proxy
+
+    monkeypatch.setenv("PSM_V3_COMPACT_CACHED_VIDEO", "1")
+    monkeypatch.setenv("PSM_V3_SHARED_EPISODE_CACHE", "1")
+    dataset = _raw(roots)
+    assert dataset.compact_cached_video is True
+    assert is_pixel_shape_proxy(dataset[0]["video"])
+    reader = install_rank_shared_reader(dataset)
+    assert isinstance(reader, SharedRoboCasaEpisodeReader)
+    assert dataset.cache_reader is reader
+    assert dataset.source_reader.cache_reader is reader
+
+
+@pytest.mark.level(0)
 def test_constructor_rejects_wrong_cache_canvas_geometry(roots: tuple[Path, Path]) -> None:
     manifest_file = roots[0] / "dataset_manifest.json"
     manifest = json.loads(manifest_file.read_text())

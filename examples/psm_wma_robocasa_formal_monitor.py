@@ -104,7 +104,10 @@ class TelemetryJournal:
             self._raw.write(line.rstrip("\n") + "\n")
         except OSError as exc:
             self._write_error(exc)
-        self._console(line)
+        # Keep the complete training payload in JSONL and the raw journal,
+        # but do not echo it to torchrun/terminal on every committed step.
+        if not line.startswith(TRAIN_PREFIX):
+            self._console(line)
 
     def close(self) -> None:
         for handle in (self._metrics, self._raw):

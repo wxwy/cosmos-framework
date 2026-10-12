@@ -96,7 +96,7 @@ class SharedRoboCasaEpisodeReader(RoboCasaExactWindowEpisodeReader):
 
 def install_rank_shared_reader(raw) -> SharedRoboCasaEpisodeReader | None:
     """Construction-time wiring only. No dataset reinitialization or DCP mutation."""
-    flag = os.environ.get("PSM_V3_SHARED_EPISODE_CACHE", "1")
+    flag = os.environ.get("PSM_V3_SHARED_EPISODE_CACHE", "0")
     if flag not in {"0", "1"}:
         raise ValueError("PSM_V3_SHARED_EPISODE_CACHE must be 0 or 1")
     if flag == "0":

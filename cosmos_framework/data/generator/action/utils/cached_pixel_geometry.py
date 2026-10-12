@@ -19,7 +19,7 @@ SOURCE_SHAPE = (3, 17, 256, 512)
 
 
 def compact_cached_video_enabled() -> bool:
-    value = os.environ.get("PSM_V3_COMPACT_CACHED_VIDEO", "1")
+    value = os.environ.get("PSM_V3_COMPACT_CACHED_VIDEO", "0")
     if value not in {"0", "1"}:
         raise ValueError("PSM_V3_COMPACT_CACHED_VIDEO must be 0 or 1")
     return value == "1"

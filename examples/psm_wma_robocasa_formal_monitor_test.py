@@ -57,7 +57,29 @@ def test_journal_appends_readable_progress_and_raw_json_without_truncating(tmp_p
     assert "iter=801/30000" in text
     assert "GRAD[rank0-shard]" in text
     assert "[CorrectedV3][checkpoint]" in text
-    assert len(stdout) == 4
+    assert len(stdout) == 2
+    assert "[CorrectedV3][progress]" in stdout[0]
+    assert "[CorrectedV3][checkpoint]" in stdout[1]
+    assert not any("[CorrectedV3][train]" in line for line in stdout)
+    assert text.count("[CorrectedV3][train]") == 2
+
+
+def test_journal_preserves_non_train_console_messages(tmp_path: Path) -> None:
+    stdout: list[str] = []
+    journal = TelemetryJournal(tmp_path, emit=stdout.append)
+    progress = "[CorrectedV3][progress] iter=803/30000 optimizer_committed"
+    checkpoint = "[CorrectedV3][checkpoint] " + json.dumps({"iteration": 800})
+    warning = "[CorrectedV3][logging_error] simulated writer warning"
+    try:
+        journal("[CorrectedV3][train] " + json.dumps(_record(803)))
+        journal(progress)
+        journal(checkpoint)
+        journal(warning)
+    finally:
+        journal.close()
+    assert stdout == [progress, checkpoint, warning]
+    assert [item["iteration"] for item in read_train_records(tmp_path / "monitor/train_rank0.jsonl")[0]] == [803]
+    assert "[CorrectedV3][train]" in (tmp_path / "monitor/rank0.log").read_text()
 
 
 def test_read_train_records_is_idempotent_on_duplicate_resume_rows(tmp_path: Path) -> None:
