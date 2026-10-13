@@ -215,7 +215,6 @@ class GroupedLocalMemoryWindow:
                 transaction.successful_backward(identity, result)
                 adapter.commit(row, identity, result, transaction=transaction)
             self._member_index += 1
-            assert total is not None
             return weighted.detach()
         except Exception:
             for row, (identity, transaction, result, _) in tuple(adapter._pending.items()):
