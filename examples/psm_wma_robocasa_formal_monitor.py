@@ -34,10 +34,11 @@ def _scientific(value: object) -> str:
     return f"{value:.3e}" if isinstance(value, (int, float)) and math.isfinite(value) else "n/a"
 
 
-def _milliseconds(value: object) -> str:
-    """Render sub-ms raw prefetch waits without misleading n/ams or rounding to zero."""
-    number = _decimal(value, 3)
-    return f"{number}ms" if number != "n/a" else number
+def _data_prepare_seconds(value: object) -> str:
+    """Show main-thread data preparation wall time in seconds alongside step wall time."""
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return f"{value / 1000.0:.1f}s"
+    return "n/a"
 
 
 def format_progress(record: dict[str, Any], *, max_iter: int) -> str:
@@ -56,7 +57,7 @@ def format_progress(record: dict[str, Any], *, max_iter: int) -> str:
         f"inner={_decimal(record.get('inner_loss_mean'))} "
         f"fast_update={_decimal(record.get('fast_update_norm_mean'))} "
         f"LR={_scientific(record.get('lr_max'))} "
-        f"data={_milliseconds(record.get('data_wait_ms'))} "
+        f"data={_data_prepare_seconds(record.get('data_prepare_ms'))} "
         f"wall={_decimal(record.get('step_wall_s'), 1)}s "
         f"peak={_decimal(record.get('peak_reserved_gib'), 2)}GiB "
         f"{record.get('status', 'unknown')}"
