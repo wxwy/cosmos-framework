@@ -94,6 +94,7 @@ def pack_native_member(
         raise ValueError("packed member actual consumer count/coordinates mismatch")
     return PackedNativeMemberInputs(tuple(payloads), tuple(prefixes), tuple(positions))
 
+
 @dataclass(frozen=True)
 class GroupedLiveState:
     frontier: ExactWindowCatalogFrontier
