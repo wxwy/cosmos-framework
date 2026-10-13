@@ -12,8 +12,8 @@ import torch
 
 from cosmos_framework.data.generator.action.utils.transform_random import transform_draw
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
-from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
 from cosmos_framework.utils.generator.data_utils import read_positive_int_metadata
+from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
 
 _MAX_NUM_TOKENS = 4096
 TEXT_SYSTEM_PROMPT_KEY = "text_system_prompt"
