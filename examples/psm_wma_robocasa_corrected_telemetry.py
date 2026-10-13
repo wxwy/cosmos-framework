@@ -5,8 +5,9 @@
 
 Losses are detached tensors accumulated on-device and materialized once,
 after a successful optimizer/Local commit. CPU stage timings measure host
-wall time (often CUDA dispatch), not GPU kernel occupancy. CUDA-event phase
-estimates are sampled every 100 steps on rank 0 only. All FSDP gradient
+wall time (often CUDA dispatch), not GPU kernel occupancy. CUDA-event compute phase
+estimates are sampled every 100 steps on rank 0 only; the training-stream
+gap around CPU-only data stages is estimated per step without an added sync. All FSDP gradient
 and parameter norms are rank-local shard norms, never global reductions.
 """
 
@@ -52,6 +53,10 @@ CPU_TIMING_STAGES = (
     "optimizer",
 )
 GPU_TIMING_STAGES = frozenset(("batch_transfer", "local_scan", "forward", "backward", "optimizer"))
+# Events bracket CPU-only stages. They estimate training CUDA-stream gaps
+# while preparing data, NOT overall GPU-idle time or kernel utilization.
+DATA_STALL_CPU_STAGES = frozenset(("data_prepare", "batch_collate"))
+GPU_DATA_STALL_SCOPE = "rank0_current_cuda_stream_gap_during_cpu_data_prepare_and_batch_collate_estimate"
 
 
 def _scalar(value: Any) -> float | None:
@@ -83,13 +88,16 @@ class GroupedPlanObserver:
         clock: Callable[[], float] = time.perf_counter,
         emit: Callable[[str], None] = print,
         cuda_sample_interval: int = 100,
+        data_stall_sample_interval: int = 1,
         parameter_norm_interval: int = 100,
         audit_missing_gradients: bool = False,
         human_progress: bool = False,
         max_iter: int = 0,
     ) -> None:
-        if cuda_sample_interval < 0 or parameter_norm_interval < 0:
-            raise ValueError("telemetry intervals cannot be negative")
+        if any(type(value) is not int or value < 0 for value in (
+            cuda_sample_interval, data_stall_sample_interval, parameter_norm_interval
+        )):
+            raise ValueError("telemetry intervals must be non-negative integers")
         if type(audit_missing_gradients) is not bool:
             raise TypeError("audit_missing_gradients must be bool")
         self.rank = rank
@@ -97,6 +105,7 @@ class GroupedPlanObserver:
         self._clock = clock
         self._emit = emit
         self.cuda_sample_interval = cuda_sample_interval
+        self.data_stall_sample_interval = data_stall_sample_interval
         self.parameter_norm_interval = parameter_norm_interval
         self.audit_missing_gradients = audit_missing_gradients
         self.human_progress = human_progress
@@ -123,6 +132,9 @@ class GroupedPlanObserver:
         self._parameter_sums: dict[str, torch.Tensor | None] = {}
         self._stage_ms: dict[str, float] = {}
         self._cuda_events: dict[str, list[tuple[Any, Any]]] = {}
+        self._data_stall_events: list[tuple[Any, Any]] = []
+        self._data_stall_event_failed = False
+        self._sample_data_stall = False
         self._sample_cuda = False
         self._sample_params = False
         self._errors: list[str] = []
@@ -141,6 +153,11 @@ class GroupedPlanObserver:
         self._sample_cuda = bool(
             self.cuda_sample_interval and (iteration + 1) % self.cuda_sample_interval == 0 and torch.cuda.is_available()
         )
+        self._sample_data_stall = bool(
+            self.data_stall_sample_interval
+            and (iteration + 1) % self.data_stall_sample_interval == 0
+            and torch.cuda.is_available()
+        )
         self._sample_params = bool(self.parameter_norm_interval and (iteration + 1) % self.parameter_norm_interval == 0)
         if torch.cuda.is_available():
             try:
@@ -156,13 +173,16 @@ class GroupedPlanObserver:
             return
         before = self._clock()
         first_event = None
-        if self._sample_cuda and name in GPU_TIMING_STAGES:
+        data_gap_stage = self._sample_data_stall and name in DATA_STALL_CPU_STAGES
+        record_cuda = data_gap_stage or (self._sample_cuda and name in GPU_TIMING_STAGES)
+        if record_cuda:
             try:
                 first_event = torch.cuda.Event(enable_timing=True)
                 first_event.record()
             except RuntimeError as exc:
                 self._errors.append(f"cuda_event_start:{name}:{type(exc).__name__}")
-                first_event = None
+                if data_gap_stage:
+                    self._data_stall_event_failed = True
         try:
             yield
         finally:
@@ -171,9 +191,14 @@ class GroupedPlanObserver:
                 try:
                     last_event = torch.cuda.Event(enable_timing=True)
                     last_event.record()
-                    self._cuda_events.setdefault(name, []).append((first_event, last_event))
+                    if data_gap_stage:
+                        self._data_stall_events.append((first_event, last_event))
+                    else:
+                        self._cuda_events.setdefault(name, []).append((first_event, last_event))
                 except RuntimeError as exc:
                     self._errors.append(f"cuda_event_end:{name}:{type(exc).__name__}")
+                    if data_gap_stage:
+                        self._data_stall_event_failed = True
 
     @staticmethod
     def _weight_for_index(plan: Any, member: int, index: int) -> float:
@@ -383,6 +408,31 @@ class GroupedPlanObserver:
             self._errors.append(f"cuda_event_read:{type(exc).__name__}")
         return result
 
+    def _sample_gpu_data_stall(self) -> tuple[float | None, str]:
+        """Nonblocking current-stream data-stage gap estimate, not whole-GPU idleness.
+
+        Both CUDA events execute in order on the current training stream.
+        Previous queued GPU work can overlap the CPU stage before the first
+        event executes; elapsed_time then covers only the remaining stream gap.
+        Never synchronize here: failed/pending samples are n/a, not zero.
+        """
+        if not self._sample_data_stall:
+            return None, "not_sampled"
+        if self._data_stall_event_failed:
+            return None, "event_error"
+        if not self._data_stall_events:
+            return None, "no_data_stages"
+        try:
+            if not all(end.query() for _, end in self._data_stall_events):
+                return None, "pending_cuda_event"
+            times = [start.elapsed_time(end) for start, end in self._data_stall_events]
+            if any(not math.isfinite(t) or t < 0 for t in times):
+                return None, "invalid_cuda_duration"
+            return sum(times), "ready"
+        except RuntimeError as exc:
+            self._errors.append(f"gpu_data_stall_read:{type(exc).__name__}")
+            return None, "event_error"
+
     def _post_commit(self, trainer: Any, iteration: int | None) -> None:
         if self.rank != 0:
             return
@@ -395,6 +445,7 @@ class GroupedPlanObserver:
         if self._started_iteration is not None and iteration != self._started_iteration:
             self._errors.append("trigger/commit_iteration_mismatch")
         gpu = self._sample_cuda_events()
+        gpu_data_stall_ms, gpu_data_stall_status = self._sample_gpu_data_stall()
         local = {}
         try:
             local = self._materialize_core(trainer)
@@ -451,6 +502,10 @@ class GroupedPlanObserver:
             "cpu_timing_scope": "host_wall_cuda_dispatch_not_gpu_kernel_time",
             "cuda_timing_scope": "current_stream_events_every_100_steps_rank0_only",
             "data_wait_ms": prefetcher.iteration_wait_ms if prefetcher is not None else None,
+            "gpu_data_stall_ms": gpu_data_stall_ms,
+            "gpu_data_stall_status": gpu_data_stall_status,
+            "gpu_data_stall_scope": GPU_DATA_STALL_SCOPE,
+            "gpu_data_stall_sampled": self._sample_data_stall,
             "data_wait_reason": (
                 "bounded_async_raw_prefetch_only"
                 if prefetcher is not None

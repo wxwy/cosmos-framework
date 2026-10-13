@@ -84,27 +84,31 @@ def test_journal_preserves_non_train_console_messages(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("num_workers", "prepare_ms", "wait_ms", "expected"),
+    ("stall_ms", "stall_status", "expected"),
     [
-        (0, 11_500.0, None, "data=11.5s "),
-        (8, 10_900.0, 0.024, "data=10.9s "),
-        (16, 12_300.0, 0.046, "data=12.3s "),
-        (8, None, 0.024, "data=n/a "),
-        (8, float("nan"), 0.024, "data=n/a "),
+        (0.0, "ready", "data=0.000ms "),
+        (0.024, "ready", "data=0.024ms "),
+        (50.12, "ready", "data=50.1ms "),
+        (11_500.0, "ready", "data=11.5s "),
+        (None, "pending_cuda_event", "data=n/a "),
+        (None, "not_sampled", "data=n/a "),
+        (0.0, "pending_cuda_event", "data=n/a "),
+        (float("nan"), "ready", "data=n/a "),
     ],
 )
-def test_progress_data_reflects_main_thread_prepare_time(
-    num_workers: int, prepare_ms: float | None, wait_ms: float | None, expected: str
+def test_progress_data_shows_only_measured_gpu_stream_data_gap(
+    stall_ms: float | None, stall_status: str, expected: str
 ) -> None:
     record = _record(1340)
-    record["num_workers"] = num_workers
-    record["data_prepare_ms"] = prepare_ms
-    record["data_wait_ms"] = wait_ms
+    record["data_prepare_ms"] = 11_500.0
+    record["data_wait_ms"] = 0.024
+    record["gpu_data_stall_ms"] = stall_ms
+    record["gpu_data_stall_status"] = stall_status
     original = dict(record)
     line = format_progress(record, max_iter=30000)
     assert expected in line
-    assert "data=0.024ms" not in line
-    assert "data=n/ams" not in line
+    assert "data=0.024ms" not in line or expected == "data=0.024ms "
+    assert "data=11500" not in line
     assert record == original
 
 

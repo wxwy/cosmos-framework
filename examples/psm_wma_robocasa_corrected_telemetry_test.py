@@ -332,6 +332,94 @@ def test_cuda_event_timing_samples_only_every_100_steps(monkeypatch: pytest.Monk
     assert record["cuda_sampled"] is True
 
 
+def test_gpu_data_stall_estimates_training_stream_cpu_stage_gaps_without_synchronize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[str] = []
+    state = {"created": 0, "synchronizes": 0}
+
+    class FakeCudaEvent:
+        def __init__(self, **kwargs):
+            assert kwargs == {"enable_timing": True}
+            state["created"] += 1
+
+        def record(self):
+            pass
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, other):
+            assert isinstance(other, FakeCudaEvent)
+            return 2.5
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(torch.cuda, "Event", FakeCudaEvent)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: state.__setitem__("synchronizes", state["synchronizes"] + 1))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 1024**3)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 2 * 1024**3)
+    observer = GroupedPlanObserver(rank=0, cuda_sample_interval=100, emit=emitted.append)
+    observer.start_iteration(0)
+    for stage in ("data_prepare", "batch_collate", "forward", "backward"):
+        with observer.time_stage(stage):
+            pass
+    observer(phase="post_commit", trainer=make_trainer(), iteration=0)
+    record = json.loads(emitted[-1].split("[train] ", 1)[1])
+    assert record["gpu_data_stall_ms"] == pytest.approx(5.0)
+    assert record["gpu_data_stall_status"] == "ready"
+    assert record["gpu_data_stall_sampled"] is True
+    assert "current_cuda_stream_gap" in record["gpu_data_stall_scope"]
+    assert record["data_wait_ms"] is None
+    assert state == {"created": 4, "synchronizes": 0}
+
+
+def test_gpu_data_stall_pending_event_is_not_falsely_reported_as_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    emitted: list[str] = []
+
+    class PendingCudaEvent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def record(self):
+            pass
+
+        def query(self):
+            return False
+
+        def elapsed_time(self, other):
+            raise AssertionError("pending CUDA event must not be timed")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(torch.cuda, "Event", PendingCudaEvent)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: (_ for _ in ()).throw(AssertionError("no CUDA sync")))
+    observer = GroupedPlanObserver(rank=0, cuda_sample_interval=0, emit=emitted.append)
+    observer.start_iteration(0)
+    with observer.time_stage("data_prepare"):
+        pass
+    observer(phase="post_commit", trainer=make_trainer(), iteration=0)
+    record = json.loads(emitted[-1].split("[train] ", 1)[1])
+    assert record["gpu_data_stall_ms"] is None
+    assert record["gpu_data_stall_status"] == "pending_cuda_event"
+    assert record["gpu_data_stall_sampled"] is True
+
+
+def test_gpu_data_stall_does_not_measure_when_disabled_or_unavailable() -> None:
+    emitted: list[str] = []
+    observer = GroupedPlanObserver(rank=0, data_stall_sample_interval=0, emit=emitted.append)
+    observer.start_iteration(0)
+    with observer.time_stage("data_prepare"):
+        pass
+    observer(phase="post_commit", trainer=make_trainer(), iteration=0)
+    record = json.loads(emitted[-1].split("[train] ", 1)[1])
+    assert record["gpu_data_stall_ms"] is None
+    assert record["gpu_data_stall_status"] == "not_sampled"
+    assert record["gpu_data_stall_sampled"] is False
+
+
 @pytest.mark.parametrize("rank", range(8))
 def test_opt_in_missing_gradient_audit_reports_exact_names_on_each_rank_without_mutation(
     rank: int, monkeypatch: pytest.MonkeyPatch

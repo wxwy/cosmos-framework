@@ -34,11 +34,16 @@ def _scientific(value: object) -> str:
     return f"{value:.3e}" if isinstance(value, (int, float)) and math.isfinite(value) else "n/a"
 
 
-def _data_prepare_seconds(value: object) -> str:
-    """Show main-thread data preparation wall time in seconds alongside step wall time."""
-    if isinstance(value, (int, float)) and math.isfinite(value):
+def _gpu_data_stall_display(record: dict[str, Any]) -> str:
+    """CUDA training-stream data-gap estimate; never substitute CPU/Future time."""
+    value = record.get("gpu_data_stall_ms")
+    if record.get("gpu_data_stall_status") != "ready":
+        return "n/a"
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return "n/a"
+    if value >= 1000:
         return f"{value / 1000.0:.1f}s"
-    return "n/a"
+    return f"{value:.3f}ms" if value < 1 else f"{value:.1f}ms"
 
 
 def format_progress(record: dict[str, Any], *, max_iter: int) -> str:
@@ -57,7 +62,7 @@ def format_progress(record: dict[str, Any], *, max_iter: int) -> str:
         f"inner={_decimal(record.get('inner_loss_mean'))} "
         f"fast_update={_decimal(record.get('fast_update_norm_mean'))} "
         f"LR={_scientific(record.get('lr_max'))} "
-        f"data={_data_prepare_seconds(record.get('data_prepare_ms'))} "
+        f"data={_gpu_data_stall_display(record)} "
         f"wall={_decimal(record.get('step_wall_s'), 1)}s "
         f"peak={_decimal(record.get('peak_reserved_gib'), 2)}GiB "
         f"{record.get('status', 'unknown')}"
