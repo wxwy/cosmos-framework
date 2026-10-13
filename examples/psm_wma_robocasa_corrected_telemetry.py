@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -107,6 +108,10 @@ class GroupedPlanObserver:
         self.cuda_sample_interval = cuda_sample_interval
         self.data_stall_sample_interval = data_stall_sample_interval
         self.parameter_norm_interval = parameter_norm_interval
+        nvtx_setting = os.environ.get("PSM_V3_NVTX_STAGE_RANGES", "0")
+        if nvtx_setting not in {"0", "1"}:
+            raise ValueError("PSM_V3_NVTX_STAGE_RANGES must be 0 or 1")
+        self.nvtx_profile_enabled = nvtx_setting == "1" and rank == 0
         self.audit_missing_gradients = audit_missing_gradients
         self.human_progress = human_progress
         self.max_iter = max_iter
@@ -173,6 +178,13 @@ class GroupedPlanObserver:
             return
         before = self._clock()
         first_event = None
+        nvtx_started = False
+        if self.nvtx_profile_enabled and torch.cuda.is_available():
+            try:
+                torch.cuda.nvtx.range_push(f"PSM-V3/{name}")
+                nvtx_started = True
+            except RuntimeError as exc:
+                self._errors.append(f"nvtx_start:{name}:{type(exc).__name__}")
         data_gap_stage = self._sample_data_stall and name in DATA_STALL_CPU_STAGES
         record_cuda = data_gap_stage or (self._sample_cuda and name in GPU_TIMING_STAGES)
         if record_cuda:
@@ -199,6 +211,11 @@ class GroupedPlanObserver:
                     self._errors.append(f"cuda_event_end:{name}:{type(exc).__name__}")
                     if data_gap_stage:
                         self._data_stall_event_failed = True
+            if nvtx_started:
+                try:
+                    torch.cuda.nvtx.range_pop()
+                except RuntimeError as exc:
+                    self._errors.append(f"nvtx_end:{name}:{type(exc).__name__}")
 
     @staticmethod
     def _weight_for_native_call(plan: Any, member: int, index: int | None, payloads: Any) -> float:
@@ -514,6 +531,7 @@ class GroupedPlanObserver:
             "gpu_data_stall_status": gpu_data_stall_status,
             "gpu_data_stall_scope": GPU_DATA_STALL_SCOPE,
             "gpu_data_stall_sampled": self._sample_data_stall,
+            "nvtx_stage_ranges_enabled": self.nvtx_profile_enabled,
             "data_wait_reason": (
                 "bounded_async_full_segment_member_prefetch"
                 if getattr(trainer, "_grouped_full_segment_prefetch", False)

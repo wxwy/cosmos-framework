@@ -597,3 +597,28 @@ def test_packed_metric_weight_uses_exact_member_counts_and_rejects_missing_rows(
     with pytest.raises(ValueError, match="count"):
         GroupedPlanObserver._weight_for_native_call(plan, 0, None, one[:-1])
 
+def test_nvtx_stage_markers_are_opt_in_and_balanced(monkeypatch: pytest.MonkeyPatch) -> None:
+    markers: list[str] = []
+    monkeypatch.setenv("PSM_V3_NVTX_STAGE_RANGES", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda text: markers.append(f"begin:{text}"))
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: markers.append("end"))
+    observer = GroupedPlanObserver(rank=0, data_stall_sample_interval=0, cuda_sample_interval=0)
+    for stage in ("data_prepare", "batch_collate", "local_scan", "forward", "backward"):
+        with observer.time_stage(stage):
+            pass
+    assert markers == [
+        item for stage in ("data_prepare", "batch_collate", "local_scan", "forward", "backward")
+        for item in (f"begin:PSM-V3/{stage}", "end")
+    ]
+    markers.clear()
+    nonrank = GroupedPlanObserver(rank=1, data_stall_sample_interval=0, cuda_sample_interval=0)
+    with nonrank.time_stage("data_prepare"):
+        pass
+    assert markers == []
+
+
+def test_nvtx_unexpected_environment_value_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PSM_V3_NVTX_STAGE_RANGES", "maybe")
+    with pytest.raises(ValueError, match="NVTX"):
+        GroupedPlanObserver()
