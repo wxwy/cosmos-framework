@@ -137,14 +137,32 @@ class ConsumerAudit:
         if iteration != self.iteration:
             self.iteration, self.rows, self.memory = iteration, [], None
         if phase == "native_forward" and "payloads" in data:
-            for payload in data["payloads"]:
+            # The packed model receives slot-major consumers (V2 A2), but the
+            # canonical audit hash keeps the V3 index-major chronology.
+            # This is a trace-only reordering, never a model-input mutation.
+            payloads = data["payloads"]
+            positions = data.get("packed_positions")
+            if positions is not None:
+                if not isinstance(positions, tuple) or len(positions) != len(payloads):
+                    raise ValueError("packed audit coordinates must match native payloads")
+                members = []
+                for (slot, index), payload in zip(positions, payloads, strict=True):
+                    if type(slot) is not int or slot < 0 or type(index) is not int or index < 0:
+                        raise ValueError("packed audit slot/time coordinate invalid")
+                    members.append((index, slot, payload))
+                if len({(t, slot) for t, slot, _ in members}) != len(members):
+                    raise ValueError("packed audit consumer coordinates collide")
+                observed = ((index, payload) for index, _slot, payload in sorted(members))
+            else:
+                observed = ((data["index"], payload) for payload in payloads)
+            for index, payload in observed:
                 task = payload.get("task_class")
                 if not isinstance(task, str) or not task:
                     raise ValueError("consumer task_class missing")
                 self.rows.append(
                     (
                         data["member"],
-                        data["index"],
+                        index,
                         task,
                         _int(payload.get("episode_index"), "episode_index"),
                         _int(payload.get("start_frame"), "start_frame"),

@@ -27,13 +27,68 @@ from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
     ExactWindowCatalogFrontier,
     ExactWindowGroupedPlan,
     ExactWindowRankPlanner,
-    gather_exact_window_same_index,
 )
 
-NativeBatchLoss = Callable[[tuple[Any, ...], tuple[torch.Tensor | None, ...], int], torch.Tensor]
+# Third argument is one exact (slot_id, local_t_index) coordinate per consumer.
+# Packed model input uses slot-major order, as V2 A2; audit can reconstruct the
+# previous index-major chronology without changing consumer data or RNG here.
+NativeBatchLoss = Callable[
+    [tuple[Any, ...], tuple[torch.Tensor | None, ...], tuple[tuple[int, int], ...]], torch.Tensor
+]
 Backward = Callable[[torch.Tensor, bool], None]
 OptimizerStep = Callable[[], bool]
 
+
+@dataclass(frozen=True)
+class PackedNativeMemberInputs:
+    """V2-A2 slot-major consumer assembly. Does NOT detach Local prefix tensors."""
+
+    payloads: tuple[Any, ...]
+    prefixes: tuple[torch.Tensor | None, ...]
+    positions: tuple[tuple[int, int], ...]
+
+
+def pack_native_member(
+    segments: tuple[SegmentBatch, ...],
+    results: tuple[Any, ...],
+    identities: tuple[Any, ...],
+    *,
+    ttt_tbptt_steps: int,
+    expected_count: int,
+) -> PackedNativeMemberInputs:
+    """Merge B independently-scanned rows into one packed native forward.
+
+    Each row contributes its valid temporal consumers in chronological order.
+    No artificial padded consumers, copies of Local prefixes or graph detaches.
+    """
+    if not segments or not (len(segments) == len(results) == len(identities)):
+        raise ValueError("packed member rows/results/identities do not match")
+    payloads: list[Any] = []
+    prefixes: list[torch.Tensor | None] = []
+    positions: list[tuple[int, int]] = []
+    for segment, result, identity in zip(segments, results, identities, strict=True):
+        steps = segment.consumer_valid[0].nonzero(as_tuple=False).flatten().tolist()
+        if len(steps) != len(result.payloads) or len(steps) != len(result.locals) or len(steps) != len(result.identities):
+            raise ValueError("packed row valid-count / prefix / consumer identities mismatch")
+        for local_index, payload, prefix, consumer in zip(
+            steps, result.payloads, result.locals, result.identities, strict=True
+        ):
+            slot_id, episode_uid, absolute_step = consumer
+            if (
+                slot_id != identity.slot_id
+                or episode_uid != identity.episode_id
+                or absolute_step != identity.cursor * ttt_tbptt_steps + local_index
+                or int(segment.consumer_step[0, local_index]) != absolute_step
+                or (prefix is None) != (absolute_step == 0)
+                or payload is None
+            ):
+                raise ValueError("packed consumer identity/S0/prefix/chronology mismatch")
+            payloads.append(payload)
+            prefixes.append(prefix)
+            positions.append((slot_id, local_index))
+    if len(payloads) != expected_count or expected_count <= 0 or len(set(positions)) != expected_count:
+        raise ValueError("packed member actual consumer count/coordinates mismatch")
+    return PackedNativeMemberInputs(tuple(payloads), tuple(prefixes), tuple(positions))
 
 @dataclass(frozen=True)
 class GroupedLiveState:
@@ -128,44 +183,40 @@ class GroupedLocalMemoryWindow:
                 results = adapter.scan(segments, identities=identities, transactions=transactions)
             if sum(len(result.payloads) for result in results) != plan.member_counts[member_index]:
                 raise RuntimeError("member scan 有效 consumer 数与 plan 不一致")
-            active_indices = [
-                index
-                for index in range(self.planner.catalog.ttt_tbptt_steps)
-                if any(bool(segment.consumer_valid[0, index]) for segment in segments)
-            ]
-            total = None
-            for index in active_indices:
-                batch = gather_exact_window_same_index(segments, index)
-                prefixes = tuple(
-                    results[row].locals[index]
-                    for row, segment in enumerate(segments)
-                    if bool(segment.consumer_valid[0, index])
+            # V2 A2 alignment: one slot-major Packed Native Forward/Backward
+            # per GA member, irrespective of T. Full B8×T16 -> Batch128.
+            packed = pack_native_member(
+                segments,
+                results,
+                identities,
+                ttt_tbptt_steps=self.planner.catalog.ttt_tbptt_steps,
+                expected_count=plan.member_counts[member_index],
+            )
+            loss = native_loss(packed.payloads, packed.prefixes, packed.positions)
+            if not isinstance(loss, torch.Tensor) or loss.ndim != 0 or not loss.requires_grad:
+                raise ValueError("packed native callback must return differentiable scalar outer loss")
+            if not bool(torch.isfinite(loss)):
+                raise ValueError("packed native outer loss is non-finite")
+            # Preserve exact V3 consumer-weighted GA objective; terminal
+            # partial members use their real count, never an assumed 128.
+            weighted = loss * (len(packed.payloads) / plan.n_window)
+            backward(weighted, False)
+            if any(
+                parameter.grad is not None
+                and not bool(
+                    torch.isfinite(
+                        parameter.grad.to_local() if isinstance(parameter.grad, DTensor) else parameter.grad
+                    ).all()
                 )
-                loss = native_loss(batch.payloads, prefixes, index)
-                if not isinstance(loss, torch.Tensor) or loss.ndim != 0 or not loss.requires_grad:
-                    raise ValueError("native callback 必须返回可微标量 outer loss")
-                if not bool(torch.isfinite(loss)):
-                    raise ValueError("native outer loss 非有限")
-                weighted = loss * (len(batch.payloads) / plan.n_window)
-                backward(weighted, index != active_indices[-1])
-                if any(
-                    parameter.grad is not None
-                    and not bool(
-                        torch.isfinite(
-                            parameter.grad.to_local() if isinstance(parameter.grad, DTensor) else parameter.grad
-                        ).all()
-                    )
-                    for parameter in self.model.parameters()
-                ):
-                    raise ValueError("outer backward 梯度非有限")
-                detached = weighted.detach()
-                total = detached if total is None else total + detached
+                for parameter in self.model.parameters()
+            ):
+                raise ValueError("packed native backward gradient is non-finite")
             for row, (transaction, result, identity) in enumerate(zip(transactions, results, identities, strict=True)):
                 transaction.successful_backward(identity, result)
                 adapter.commit(row, identity, result, transaction=transaction)
             self._member_index += 1
             assert total is not None
-            return total
+            return weighted.detach()
         except Exception:
             for row, (identity, transaction, result, _) in tuple(adapter._pending.items()):
                 adapter.discard_pending(row, identity, result, transaction=transaction)

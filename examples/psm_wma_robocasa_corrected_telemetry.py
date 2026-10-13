@@ -201,35 +201,43 @@ class GroupedPlanObserver:
                         self._data_stall_event_failed = True
 
     @staticmethod
-    def _weight_for_index(plan: Any, member: int, index: int) -> float:
-        if member < 0 or member >= len(plan.members) or index < 0:
-            raise ValueError("invalid grouped member/index")
-        denominator = (
-            plan.n_window
-            if hasattr(plan, "n_window")
-            else sum(request.valid_count for group in plan.members for request in group)
+    def _weight_for_native_call(plan: Any, member: int, index: int | None, payloads: Any) -> float:
+        if type(member) is not int or not 0 <= member < len(plan.members):
+            raise ValueError("invalid grouped member")
+        denominator = plan.n_window if hasattr(plan, "n_window") else sum(
+            request.valid_count for group in plan.members for request in group
         )
         if denominator <= 0:
             raise ValueError("empty grouped optimizer window")
+        if index is None:
+            # Member-level Packed128, including terminal partial members.
+            expected = sum(request.valid_count for request in plan.members[member])
+            if not isinstance(payloads, tuple) or len(payloads) != expected:
+                raise ValueError("packed native metric count differs from exact GA plan")
+            return expected / denominator
+        if type(index) is not int or index < 0:
+            raise ValueError("invalid grouped consumer time index")
         active = sum(request.valid_count > index for request in plan.members[member])
         if active <= 0:
-            raise ValueError("native forward has no valid consumers")
+            raise ValueError("native index has no valid consumers")
         return active / denominator
 
     def _on_forward(self, trainer: Any, data: dict[str, Any]) -> None:
         member, index = data.get("member"), data.get("index")
         metrics = data.get("metrics")
-        if member is None or index is None or not isinstance(metrics, dict):
+        if member is None or not isinstance(metrics, dict):
+            return
+        if index is None and data.get("packed_positions") is None:
+            # Synthetic observer probes without consumer payloads are not metrics.
             return
         plan = trainer._grouped_window.plan
-        weight = self._weight_for_index(plan, member, index)
+        weight = self._weight_for_native_call(plan, member, index, data.get("payloads"))
         with torch.no_grad():
             for name in LOSS_KEYS:
                 value = metrics.get(name)
                 if not isinstance(value, torch.Tensor) or value.numel() != 1:
                     continue
-                # Never .item() here: the native forward loop must not introduce
-                # per-consumer GPU/CPU synchronization for logging.
+                # No .item() / GPU synchronization inside the native hot path.
                 term = value.detach().float().reshape(()) * weight
                 self._losses[name] = _add(self._losses.get(name), term)
                 self._loss_coverage[name] = self._loss_coverage.get(name, 0.0) + weight
@@ -517,6 +525,7 @@ class GroupedPlanObserver:
             ),
             "native_forward_calls": self.forward,
             "native_backward_calls": self.backward,
+            "native_batch_layout": "v2_a2_slot_major_packed_member",
             "outer_loss": _scalar(self._outer),
             **loss_values,
             **weighted,
@@ -591,7 +600,8 @@ class GroupedPlanObserver:
             plan = trainer._grouped_window.plan
             if plan is None:
                 raise RuntimeError("observer 缺少 pending grouped plan")
-            expected = sum(max(request.valid_count for request in member) for member in plan.members)
+            # One packed native forward + backward per GA member (not per T index).
+            expected = len(plan.members)
             if (self.forward, self.backward) != (expected, expected):
                 raise RuntimeError(
                     f"native 调用次数不匹配：forward={self.forward}, backward={self.backward}, expected={expected}"

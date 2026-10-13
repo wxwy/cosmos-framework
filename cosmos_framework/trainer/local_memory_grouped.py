@@ -61,6 +61,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         loss: torch.Tensor | None = None,
         metrics: dict[str, Any] | None = None,
         payloads: tuple[dict[str, Any], ...] | None = None,
+        packed_positions: tuple[tuple[int, int], ...] | None = None,
         optimizer: Any | None = None,
     ) -> None:
         observer = getattr(self, "grouped_observer", None)
@@ -73,6 +74,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 loss=loss,
                 metrics=metrics,
                 payloads=payloads,
+                packed_positions=packed_positions,
                 optimizer=optimizer,
                 trainer=self,
             )
@@ -252,7 +254,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         output: dict[str, Any] = {}
         backward_index = 0
 
-        def native_loss(payloads, prefixes, index):
+        def native_loss(payloads, prefixes, positions):
             nonlocal output
             with self._telemetry_stage("batch_collate"):
                 batch = collate_grouped_native_batch(payloads)
@@ -273,10 +275,11 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 "native_forward",
                 iteration=iteration,
                 member=grad_accum_iter,
-                index=index,
+                index=None,
                 loss=loss,
                 metrics=scalar_metrics,
                 payloads=payloads,
+                packed_positions=positions,
             )
             self.callbacks.on_after_forward(iteration=iteration)
             return loss
