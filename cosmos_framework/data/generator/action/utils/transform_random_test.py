@@ -9,6 +9,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import torch
 
 from cosmos_framework.data.generator.action.utils.transform_random import (
     scoped_transform_rng,
@@ -56,3 +57,48 @@ def test_invalid_scoped_seed_rejected(invalid) -> None:
     with pytest.raises(ValueError, match="seed"):
         with scoped_transform_rng(invalid):
             pass
+
+def test_real_text_tokenizer_uses_keyed_cfg_rng_without_touching_global_random(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cosmos_framework.data.generator.augmentors import text_tokenizer
+
+    class FakeProcessor:
+        def tokenize_text(self, caption: str, **kwargs):
+            return [len(caption)]
+
+    monkeypatch.setattr(text_tokenizer, "lazy_instantiate", lambda _: FakeProcessor())
+    transform = text_tokenizer.TextTokenizerTransform(
+        input_keys=["ai_caption"],
+        output_keys=["text_token_ids"],
+        args={"tokenizer_config": object(), "cfg_dropout_rate": 0.5},
+    )
+    state = random.getstate()
+    try:
+        with scoped_transform_rng(141):
+            a = transform({"ai_caption": "a mug"})
+        with scoped_transform_rng(141):
+            b = transform({"ai_caption": "a mug"})
+        torch.testing.assert_close(a["text_token_ids"], b["text_token_ids"], rtol=0, atol=0)
+        assert a["ai_caption"] == b["ai_caption"]
+        assert random.getstate() == state
+    finally:
+        random.setstate(state)
+
+
+def test_real_idle_metadata_dropout_uses_scoped_rng_without_global_consumption() -> None:
+    from cosmos_framework.data.generator.augmentors.idle_frames_text_info import IdleFramesTextInfo
+
+    transform = IdleFramesTextInfo(
+        args={"dropout_rate": 0.5, "enabled": True, "caption_key": "ai_caption"}
+    )
+    state = random.getstate()
+    try:
+        with scoped_transform_rng(212):
+            first = transform({"ai_caption": "grasp cup", "idle_frames": 2, "action": torch.zeros(17, 15)})
+        with scoped_transform_rng(212):
+            second = transform({"ai_caption": "grasp cup", "idle_frames": 2, "action": torch.zeros(17, 15)})
+        assert first["ai_caption"] == second["ai_caption"]
+        assert random.getstate() == state
+    finally:
+        random.setstate(state)
