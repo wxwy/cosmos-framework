@@ -18,6 +18,10 @@ from cosmos_framework.data.generator.action.utils.cached_pixel_geometry import m
 from cosmos_framework.data.generator.joint_dataloader import JointDataLoader, custom_collate_fn
 from cosmos_framework.model.generator.mot.local_memory_grouped_window import GroupedLocalMemoryWindow
 from cosmos_framework.model.generator.mot.robocasa_async_segment_prefetch import AsyncExactWindowRawPrefetcher
+from cosmos_framework.model.generator.mot.robocasa_full_segment_prefetch import (
+    AsyncExactWindowFullSegmentPrefetcher,
+    FullSegmentMember,
+)
 from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
     ExactWindowLocalCatalog,
     ExactWindowRankPlanner,
@@ -100,9 +104,15 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         *,
         config_digest: str,
         num_workers: int = 0,
+        full_segment_prefetch: bool = False,
     ) -> None:
         if type(num_workers) is not int or not 0 <= num_workers <= 16:
             raise ValueError("num_workers must be an integer in [0,16]")
+        if type(full_segment_prefetch) is not bool or (
+            full_segment_prefetch
+            and (num_workers != 1 or producer.transform_rng_mode != "consumer_keyed_v1")
+        ):
+            raise ValueError("full segment prefetch requires num_workers=1 and consumer_keyed_v1 RNG")
         if (
             hasattr(self, "_grouped_planner")
             or getattr(self, "_grouped_window", None) is not None
@@ -126,8 +136,13 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             raise ValueError("H3-D 要求独占 DCP dataloader state callback")
         self._grouped_planner, self._grouped_producer = planner, producer
         self._grouped_num_workers = num_workers
+        self._grouped_full_segment_prefetch = full_segment_prefetch
         self._grouped_prefetcher = (
-            AsyncExactWindowRawPrefetcher(producer, num_workers=num_workers) if num_workers else None
+            AsyncExactWindowFullSegmentPrefetcher(producer)
+            if full_segment_prefetch
+            else AsyncExactWindowRawPrefetcher(producer, num_workers=num_workers)
+            if num_workers
+            else None
         )
         self._grouped_config_digest = config_digest
         self._grouped_completed_iteration = 0
@@ -253,11 +268,21 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         assert window.plan is not None
         output: dict[str, Any] = {}
         backward_index = 0
+        packed_member: FullSegmentMember | None = None
 
         def native_loss(payloads, prefixes, positions):
             nonlocal output
-            with self._telemetry_stage("batch_collate"):
-                batch = collate_grouped_native_batch(payloads)
+            if packed_member is not None:
+                # Exact source dict object identity checks prevent accidental
+                # reuse of a future collated for an older/different GA member.
+                if len(payloads) != len(packed_member.payloads) or any(
+                    left is not right for left, right in zip(payloads, packed_member.payloads, strict=True)
+                ):
+                    raise ValueError("full segment prefetch packed payload identity drift")
+                batch = packed_member.collated
+            else:
+                with self._telemetry_stage("batch_collate"):
+                    batch = collate_grouped_native_batch(payloads)
             with self._telemetry_stage("batch_transfer"):
                 batch = move_cached_native_batch(batch, device=next(model.parameters()).device, move=misc.to)
             self.callbacks.on_before_forward(iteration=iteration)
@@ -304,7 +329,24 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         try:
             with self._telemetry_stage("data_prepare"):
                 requests = window.plan.members[grad_accum_iter]
-                if prefetcher is None:
+                if isinstance(prefetcher, AsyncExactWindowFullSegmentPrefetcher):
+                    # A future from the previous successful window is allowed;
+                    # otherwise the first GA0 is constructed synchronously.
+                    packed_member = (
+                        prefetcher.load_member(requests)
+                        if prefetcher._pending is not None
+                        else prefetcher.direct_member(requests)
+                    )
+                    segments = packed_member.segments
+                    if grad_accum_iter + 1 < active_ga:
+                        # GA1 complete Segment+Native collate overlaps GA0 GPU.
+                        prefetcher.schedule(window.plan.members[grad_accum_iter + 1])
+                    else:
+                        # Read-only speculative next window, still bounded to
+                        # one pending member; abort drains without publication.
+                        next_plan = self._grouped_planner.plan_window(window.plan.candidate_frontier)
+                        prefetcher.schedule(next_plan.members[0])
+                elif prefetcher is None:
                     segments = tuple(self._grouped_producer.produce(request) for request in requests)
                 else:
                     prepared = (

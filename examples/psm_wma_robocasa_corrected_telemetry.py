@@ -515,10 +515,13 @@ class GroupedPlanObserver:
             "gpu_data_stall_scope": GPU_DATA_STALL_SCOPE,
             "gpu_data_stall_sampled": self._sample_data_stall,
             "data_wait_reason": (
-                "bounded_async_raw_prefetch_only"
+                "bounded_async_full_segment_member_prefetch"
+                if getattr(trainer, "_grouped_full_segment_prefetch", False)
+                else "bounded_async_raw_prefetch_only"
                 if prefetcher is not None
                 else "synchronous_producer_no_background_dataloader"
             ),
+            "full_segment_prefetch": getattr(trainer, "_grouped_full_segment_prefetch", False),
             "valid_consumers": valid_consumers,
             "valid_consumers_per_second_rank_local": (
                 valid_consumers / wall_s if valid_consumers is not None and wall_s and wall_s > 0 else None

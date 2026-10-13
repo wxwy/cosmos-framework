@@ -190,7 +190,10 @@ def config_digest(
     b_stream: int,
     active_ga: int,
     witnesses: dict[str, str],
+    transform_rng_mode: str = "legacy_global",
 ) -> str:
+    if transform_rng_mode not in {"legacy_global", "consumer_keyed_v1"}:
+        raise ValueError("invalid transform RNG mode")
     model = config.model.config
     local = {
         key: getattr(model, f"local_memory_{key}")
@@ -232,6 +235,10 @@ def config_digest(
             "save_iter": config.checkpoint.save_iter,
         },
     }
+    # Legacy no-prefetch identity remains byte-identical; opt-in keyed RNG
+    # changes data augmentation semantics and gets an explicit new digest.
+    if transform_rng_mode != "legacy_global":
+        authority["transform_rng_mode"] = transform_rng_mode
     return hashlib.sha256(json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -418,6 +425,10 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     if args.warmup < 0 or args.warmup > args.max_iter:
         raise ValueError("warmup 越界")
     execution_stop = _execution_stop_iteration(args)
+    if getattr(args, "full_segment_prefetch", False) and (
+        args.num_workers != 1 or getattr(args, "transform_rng_mode", "legacy_global") != "consumer_keyed_v1"
+    ):
+        raise ValueError("full segment prefetch requires --num-workers 1 --transform-rng-mode consumer_keyed_v1")
     if getattr(args, "stop_after_iter", None) is not None and getattr(args, "dataset_index_root", None) is None:
         raise ValueError("bounded GPU smoke 必须提供 --dataset-index-root；禁止回退到昂贵 cold build")
     lock = verify_root_child_lock(args)
@@ -471,11 +482,20 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         raise ValueError("预检期间 cache VAE authority 漂移")
     _validate_runtime_tokenizer(contract, config.model.config.tokenizer)
     witnesses = model_witnesses(args.edge, args.base_checkpoint)
-    digest = config_digest(catalog, config, b_stream=args.b, active_ga=args.ga, witnesses=witnesses)
+    digest = config_digest(
+        catalog,
+        config,
+        b_stream=args.b,
+        active_ga=args.ga,
+        witnesses=witnesses,
+        transform_rng_mode=getattr(args, "transform_rng_mode", "legacy_global"),
+    )
     planner = ExactWindowRankPlanner(catalog, rank=0, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     plan = planner.plan_window(planner.initial_frontier())
     if args.snapshot10:
-        producer = ExactWindowSegmentProducer(catalog, config_digest=digest)
+        producer = ExactWindowSegmentProducer(
+            catalog, config_digest=digest, transform_rng_mode=getattr(args, "transform_rng_mode", "legacy_global")
+        )
         checked = 0
         while checked < 10:
             for member in plan.members:
@@ -493,6 +513,8 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         {
             "lock": lock,
             "config_digest": digest,
+            "transform_rng_mode": getattr(args, "transform_rng_mode", "legacy_global"),
+            "full_segment_prefetch": getattr(args, "full_segment_prefetch", False),
             "execution_stop_after_iter": execution_stop,
             "execution_scope": "bounded_diagnostic" if execution_stop < args.max_iter else "full_formal",
             "cache_manifest_sha256": catalog.manifest_digest,
@@ -532,6 +554,17 @@ def parser() -> argparse.ArgumentParser:
         help="Per-rank bounded background RAW-READ threads; 0 retains synchronous semantics (not DataLoader workers)",
     )
     result.add_argument("--job-name", default="edge_local_exact_window")
+    result.add_argument(
+        "--transform-rng-mode",
+        choices=("legacy_global", "consumer_keyed_v1"),
+        default="legacy_global",
+        help="Opt-in per-consumer keyed CFG augmentation for deterministic background transforms",
+    )
+    result.add_argument(
+        "--full-segment-prefetch",
+        action="store_true",
+        help="One bounded background CPU member (Raw+Transform+Segment+Collate), requires num-workers=1 and keyed RNG",
+    )
     for name, default in (
         ("t", 16),
         ("b", 8),
@@ -586,8 +619,18 @@ def main(argv: list[str] | None = None) -> None:
         model = instantiate(config.model)
     install_optimizer_inventory_check(model, report)
     planner = ExactWindowRankPlanner(catalog, rank=rank, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
-    producer = ExactWindowSegmentProducer(catalog, config_digest=report["config_digest"])
-    trainer.bind_grouped_stream(planner, producer, config_digest=report["config_digest"], num_workers=args.num_workers)
+    producer = ExactWindowSegmentProducer(
+        catalog,
+        config_digest=report["config_digest"],
+        transform_rng_mode=report["transform_rng_mode"],
+    )
+    trainer.bind_grouped_stream(
+        planner,
+        producer,
+        config_digest=report["config_digest"],
+        num_workers=args.num_workers,
+        full_segment_prefetch=report["full_segment_prefetch"],
+    )
     sample_interval = _telemetry_sample_interval(getattr(args, "stop_after_iter", None))
     journal = (
         TelemetryJournal(args.output_root / "psm_wma_v3" / "corrected_phase5" / args.job_name, rank=0)
