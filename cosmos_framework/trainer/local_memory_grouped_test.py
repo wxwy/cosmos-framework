@@ -54,17 +54,28 @@ class _Model(nn.Module):
         pass
 
 
-def _trainer(active_ga=2, b_stream=8, *, num_workers=0) -> GroupedLocalMemoryTrainer:
+def _trainer(
+    active_ga=2,
+    b_stream=8,
+    *,
+    num_workers=0,
+    full_segment_prefetch: bool = False,
+    transform_rng_mode: str = "legacy_global",
+) -> GroupedLocalMemoryTrainer:
     trainer = object.__new__(GroupedLocalMemoryTrainer)
     trainer.config = SimpleNamespace(trainer=SimpleNamespace(grad_accum_iter=active_ga, distributed_parallelism="fsdp"))
     trainer.callbacks = _Hooks()
     trainer.training_timer = lambda name: nullcontext()
-    _, _, catalog, producer = _exact_setup((5,) * 16, t=2)
+    _, _, catalog, _producer = _exact_setup((5,) * 16, t=2)
+    producer = ExactWindowSegmentProducer(
+        catalog, config_digest="config", transform_rng_mode=transform_rng_mode
+    )
     trainer.bind_grouped_stream(
         ExactWindowRankPlanner(catalog, rank=0, world_size=1, b_stream=b_stream, active_ga=active_ga),
         producer,
         config_digest="config",
         num_workers=num_workers,
+        full_segment_prefetch=full_segment_prefetch,
     )
     return trainer
 
@@ -431,3 +442,98 @@ def test_async_raw_failure_aborts_candidate_without_optimizer_or_frontier_commit
         torch.testing.assert_close(model.net.moe_gen.detach(), old_weight, rtol=0, atol=0)
     finally:
         trainer._grouped_prefetcher.close()
+
+
+def test_full_segment_prefetch_requires_exact_keyed_rng_and_single_cpu_worker() -> None:
+    with pytest.raises(ValueError, match="num_workers=1"):
+        _trainer(full_segment_prefetch=True, num_workers=0)
+    with pytest.raises(ValueError, match="consumer_keyed_v1"):
+        _trainer(full_segment_prefetch=True, num_workers=1)
+
+
+def test_full_segment_prefetch_matches_keyed_sync_2_windows_and_optimizer_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The full worker is bounded to 1 so the shared tokenizer cannot execute
+    # concurrently with the main trainer; fake reader is in-memory and read-only.
+    monkeypatch.setattr(grouped_module, "collate_grouped_native_batch", lambda payloads: {"count": len(payloads)})
+    monkeypatch.setattr(grouped_module.misc, "to", lambda value, **kwargs: value)
+    from cosmos_framework.model.generator.mot.robocasa_full_segment_prefetch import (
+        AsyncExactWindowFullSegmentPrefetcher,
+    )
+
+    snapshots = []
+    for use_prefetch in (False, True):
+        torch.manual_seed(53)
+        model = _Model()
+        trainer = _trainer(
+            active_ga=2,
+            b_stream=3,
+            num_workers=1 if use_prefetch else 0,
+            full_segment_prefetch=use_prefetch,
+            transform_rng_mode="consumer_keyed_v1",
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
+        prefetcher = trainer._grouped_prefetcher
+        if isinstance(prefetcher, AsyncExactWindowFullSegmentPrefetcher):
+            monkeypatch.setattr(prefetcher, "_worker_raw", lambda: trainer._grouped_producer.catalog.raw)
+        try:
+            for iteration in range(2):
+                for member in range(2):
+                    output, loss, accum = trainer.training_step(
+                        model, optimizer, scheduler, scaler, {}, iteration, member
+                    )
+                    assert output["count"] == 6 and loss.isfinite()
+                    assert accum == (1 if member == 0 else 0)
+                assert trainer._grouped_completed_iteration == iteration + 1
+                assert scheduler.last_epoch == iteration + 1
+            assert trainer.callbacks.events.count("on_before_forward") == 4
+            assert trainer.callbacks.events.count("on_before_backward") == 4
+            snapshots.append((
+                tuple(param.detach().clone() for param in model.parameters()),
+                trainer._grouped_window.live.frontier,
+                trainer._grouped_window.live.scheduler._committed.copy(),
+                getattr(prefetcher, "_pending", None) is not None if prefetcher is not None else False,
+            ))
+        finally:
+            if prefetcher is not None:
+                prefetcher.close()
+    for observed, expected in zip(snapshots[0][0], snapshots[1][0], strict=True):
+        torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+    assert snapshots[0][1] == snapshots[1][1]
+    assert snapshots[0][2] == snapshots[1][2]
+    assert not snapshots[0][3] and snapshots[1][3]  # one next GA0 pending, bounded by one
+
+
+def test_full_segment_prefetch_failure_never_commits_pending_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(grouped_module, "collate_grouped_native_batch", lambda payloads: {"count": len(payloads)})
+    monkeypatch.setattr(grouped_module.misc, "to", lambda value, **kwargs: value)
+    trainer = _trainer(
+        active_ga=2, b_stream=3, num_workers=1,
+        full_segment_prefetch=True, transform_rng_mode="consumer_keyed_v1",
+    )
+    model = _Model()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    pref = trainer._grouped_prefetcher
+
+    def fail(_requests):
+        raise RuntimeError("injected full member transform failure")
+
+    monkeypatch.setattr(pref, "_build", fail)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    try:
+        _, _, next_ga = trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, 0)
+        live_before = trainer._grouped_window.live
+        with pytest.raises(RuntimeError, match="injected full member transform failure"):
+            trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, next_ga)
+        assert trainer._grouped_window.live is live_before
+        assert trainer._grouped_window.plan is None
+        assert pref._pending is None
+        assert trainer._grouped_completed_iteration == 0 and scheduler.last_epoch == 0
+    finally:
+        pref.close()

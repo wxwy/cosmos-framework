@@ -697,3 +697,32 @@ def test_formal_cli_defaults_to_frozen_sync_when_num_workers_omitted(tmp_path: P
     assert args.num_workers == 0
     assert "--num-workers" in phase5.parser().format_help()
     assert "TelemetryJournal" in inspect.getsource(phase5.main)
+
+def test_full_segment_prefetch_cli_is_explicit_and_new_rng_has_distinct_digest(tmp_path: Path) -> None:
+    args = phase5.parser().parse_args([
+        "--phase", "fresh", "--output-root", str(tmp_path),
+        "--source-root", str(tmp_path), "--cache-root", str(tmp_path),
+        "--edge", str(tmp_path), "--vae", str(tmp_path),
+        "--base-checkpoint", str(tmp_path), "--root-worktree", str(tmp_path),
+        "--expected-root", "a" * 40, "--expected-child", "b" * 40,
+        "--num-workers", "1", "--transform-rng-mode", "consumer_keyed_v1",
+        "--full-segment-prefetch",
+    ])
+    assert args.full_segment_prefetch and args.num_workers == 1
+    assert args.transform_rng_mode == "consumer_keyed_v1"
+    catalog, config, b, ga = _config(tmp_path)
+    witness = {"edge_config_sha256": "edge", "base_model_metadata_sha256": "droid"}
+    legacy = phase5.config_digest(catalog, config, b_stream=b, active_ga=ga, witnesses=witness)
+    keyed = phase5.config_digest(
+        catalog, config, b_stream=b, active_ga=ga, witnesses=witness,
+        transform_rng_mode="consumer_keyed_v1",
+    )
+    assert keyed != legacy
+    assert legacy == phase5.config_digest(catalog, config, b_stream=b, active_ga=ga, witnesses=witness)
+    assert not phase5.parser().parse_args([
+        "--phase", "fresh", "--output-root", str(tmp_path),
+        "--source-root", str(tmp_path), "--cache-root", str(tmp_path),
+        "--edge", str(tmp_path), "--vae", str(tmp_path),
+        "--base-checkpoint", str(tmp_path), "--root-worktree", str(tmp_path),
+        "--expected-root", "a" * 40, "--expected-child", "b" * 40,
+    ]).full_segment_prefetch
