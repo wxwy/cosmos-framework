@@ -13,6 +13,7 @@ import pytest
 import torch
 from torch import nn
 
+from cosmos_framework.utils.training_audit import ConsumerAudit
 from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
 
 
@@ -67,6 +68,36 @@ def group(name: str) -> str | None:
     return None
 
 
+def _packed_member_payloads(member: int):
+    positions = (((0, 0), (0, 1), (0, 2), (1, 0)) if member == 0 else ((0, 0), (0, 1)))
+    payloads = tuple(
+        {
+            "task_class": "mock",
+            "episode_index": slot + 10 * member,
+            "start_frame": index,
+            "source_binding_digest": "binding",
+            "cache_corpus_digest": "cache",
+        }
+        for slot, index in positions
+    )
+    return payloads, positions
+
+
+def _emit_packed_forward(observer, trainer, member: int, metrics: dict, loss: float, *, iteration: int = 0):
+    payloads, positions = _packed_member_payloads(member)
+    observer(
+        phase="native_forward",
+        trainer=trainer,
+        iteration=iteration,
+        member=member,
+        index=None,
+        metrics=metrics,
+        payloads=payloads,
+        packed_positions=positions,
+    )
+    observer(phase="native_backward", trainer=trainer, iteration=iteration, loss=torch.tensor(loss))
+
+
 def test_successful_weighted_losses_gradient_norms_and_local_stats():
     emitted: list[str] = []
     now = iter((10.0, 15.5))
@@ -74,23 +105,18 @@ def test_successful_weighted_losses_gradient_norms_and_local_stats():
     trainer = make_trainer()
     before = [param.grad.clone() for param in trainer._grouped_window.model.parameters()]
     observer.start_iteration(0)
-    for member, index, action in ((0, 0, 1), (0, 1, 2), (0, 2, 3), (1, 0, 4), (1, 1, 5)):
-        observer(
-            phase="native_forward",
-            trainer=trainer,
-            iteration=0,
-            member=member,
-            index=index,
-            metrics={
-                "flow_matching_loss_action": torch.tensor(float(action)),
-                "flow_matching_loss_vision": torch.tensor(float(action * 2)),
+    # Old 5 index-native calls aggregated to two packed GA members with
+    # exactly the same consumer-weighted action/vision losses (16/6 and 32/6).
+    for member, action, weighted_outer in ((0, 1.75, 1.2), (1, 4.5, 1.8)):
+        _emit_packed_forward(
+            observer,
+            trainer,
+            member,
+            {
+                "flow_matching_loss_action": torch.tensor(action),
+                "flow_matching_loss_vision": torch.tensor(action * 2),
             },
-        )
-        observer(
-            phase="native_backward",
-            trainer=trainer,
-            iteration=0,
-            loss=torch.tensor(float(action) / 5),
+            weighted_outer,
         )
     assert not emitted  # no successful-iteration log before optimizer commit
     observer(phase="pre_optimizer", trainer=trainer, iteration=0, metrics={"lr_min": 1e-5, "lr_max": 5e-5})
@@ -103,7 +129,8 @@ def test_successful_weighted_losses_gradient_norms_and_local_stats():
     assert record["action_loss"] == pytest.approx(16 / 6)
     assert record["vision_loss"] == pytest.approx(32 / 6)
     assert record["action_loss_consumer_weight_coverage"] == pytest.approx(1)
-    assert record["native_forward_calls"] == record["native_backward_calls"] == 5
+    assert record["native_forward_calls"] == record["native_backward_calls"] == 2
+    assert record["native_batch_layout"] == "v2_a2_slot_major_packed_member"
     assert record["inner_loss_mean"] == pytest.approx(2)
     assert record["fast_state_norm_mean"] == pytest.approx(3)
     assert record["fast_update_norm_mean"] == pytest.approx(1)
@@ -123,9 +150,8 @@ def test_missing_metric_is_unavailable_not_fabricated_zero():
     emitted: list[str] = []
     observer = GroupedPlanObserver(rank=0, emit=emitted.append)
     trainer = make_trainer()
-    for member, index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
-        observer(phase="native_forward", trainer=trainer, member=member, index=index, metrics={})
-        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.01))
+    for member in range(2):
+        _emit_packed_forward(observer, trainer, member, {}, 0.01)
     observer(phase="pre_optimizer", trainer=trainer)
     observer(phase="post_commit", trainer=trainer, iteration=0)
     record = json.loads(emitted[0].split("[train] ", 1)[1])
@@ -139,7 +165,7 @@ def test_nonrank0_has_no_output_and_bad_counts_fail_before_optimizer():
     trainer = make_trainer()
     observer = GroupedPlanObserver(rank=1, emit=emitted.append)
     observer.start_iteration(0)
-    for _ in range(5):
+    for _ in range(2):
         observer(phase="native_forward", trainer=trainer)
         observer(phase="native_backward", trainer=trainer)
     observer(phase="pre_optimizer", trainer=trainer)
@@ -187,7 +213,7 @@ def test_parameter_norms_sample_only_on_interval_100():
     trainer = make_trainer()
     observer = GroupedPlanObserver(rank=0, parameter_group=group, emit=emitted.append, parameter_norm_interval=100)
     observer.start_iteration(0)
-    for _member, _index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
+    for _member in range(2):
         observer(phase="native_forward", trainer=trainer)
         observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.0))
     observer(phase="pre_optimizer", trainer=trainer, metrics={})
@@ -197,7 +223,7 @@ def test_parameter_norms_sample_only_on_interval_100():
     assert "local_param_norm_rank_local" not in first
 
     observer.start_iteration(99)
-    for _member, _index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
+    for _member in range(2):
         observer(phase="native_forward", trainer=trainer)
         observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.0))
     observer(phase="pre_optimizer", trainer=trainer, metrics={})
@@ -223,20 +249,17 @@ def test_log_uses_model_frozen_loss_coefficients_not_double_weighting():
         )
     )
     observer = GroupedPlanObserver(rank=0, emit=emitted.append)
-    for member, index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
-        observer(
-            phase="native_forward",
-            trainer=trainer,
-            member=member,
-            index=index,
-            metrics={
+    for member in range(2):
+        _emit_packed_forward(
+            observer, trainer, member,
+            {
                 "flow_matching_loss_action": torch.tensor(2.0),
                 "flow_matching_loss_vision": torch.tensor(3.0),
                 "aux_loss_gen": torch.tensor(0.5),
                 "aux_loss_und": torch.tensor(0.25),
             },
+            2.5,
         )
-        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(1.0))
     observer(phase="pre_optimizer", trainer=trainer, metrics={"lr_min": 1e-5, "lr_max": 5e-5})
     observer(phase="post_commit", trainer=trainer, iteration=0)
     report = json.loads(emitted[-1].split("[train] ", 1)[1])
@@ -258,9 +281,9 @@ def test_observer_resets_after_abort_without_successful_log():
     assert not emitted
     # A retry or clean fresh run resets purely observational state.
     observer.start_iteration(0)
-    for _ in range(5):
+    for _ in range(2):
         observer(phase="native_forward", trainer=trainer)
-        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(1.0))
+        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(2.5))
     observer(phase="pre_optimizer", trainer=trainer)
     observer(phase="post_commit", trainer=trainer, iteration=0)
     report = json.loads(emitted[0].split("[train] ", 1)[1])
@@ -508,19 +531,15 @@ def test_human_progress_is_optional_and_original_train_json_remains_machine_read
     observer = GroupedPlanObserver(rank=0, emit=emitted.append, human_progress=True, max_iter=30000)
     trainer = make_trainer()
     observer.start_iteration(0)
-    for member, index in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)):
-        observer(
-            phase="native_forward",
-            trainer=trainer,
-            iteration=0,
-            member=member,
-            index=index,
-            metrics={
+    for member in range(2):
+        _emit_packed_forward(
+            observer, trainer, member,
+            {
                 "flow_matching_loss_action": torch.tensor(1.0),
                 "flow_matching_loss_vision": torch.tensor(0.1),
             },
+            0.025,
         )
-        observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.01))
     observer(phase="pre_optimizer", trainer=trainer)
     observer(phase="post_commit", trainer=trainer, iteration=0)
     assert len(emitted) == 2
@@ -532,3 +551,49 @@ def test_human_progress_is_optional_and_original_train_json_remains_machine_read
     assert "T" in record["ts_local"] and isinstance(record["ts_epoch"], float)
     assert record["status"] == "optimizer_committed"
     assert record["data_wait_reason"] == "synchronous_producer_no_background_dataloader"
+
+
+def test_member_packed_audit_keeps_original_index_major_consumer_identity_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PSM_V3_STATE_AUDIT_EVERY", "0")
+    model = nn.Linear(1, 1)
+    trainer = SimpleNamespace(_grouped_window=SimpleNamespace(plan=SimpleNamespace(n_window=4)))
+    old = ConsumerAudit()
+    packed = ConsumerAudit()
+    positions = ((0, 0), (0, 1), (1, 0), (1, 1))  # model slot-major
+    payloads = tuple(
+        dict(
+            task_class="atomic",
+            episode_index=slot,
+            start_frame=index,
+            source_binding_digest="src",
+            cache_corpus_digest="corpus",
+        )
+        for slot, index in positions
+    )
+    for index in range(2):
+        rows = tuple(p for (slot, t), p in zip(positions, payloads, strict=True) if t == index)
+        old.observe("native_forward", {"iteration": 0, "member": 0, "index": index, "payloads": rows}, model)
+    packed.observe(
+        "native_forward",
+        {"iteration": 0, "member": 0, "index": None, "payloads": payloads, "packed_positions": positions},
+        model,
+    )
+    old_report = old.report(trainer, 0, expected_count=4)
+    packed_report = packed.report(trainer, 0, expected_count=4)
+    assert old_report["consumer_audit_status"] == packed_report["consumer_audit_status"] == "OBSERVED"
+    assert old_report["actual_consumer_identity_sha256"] == packed_report["actual_consumer_identity_sha256"]
+    assert old_report["actual_consumer_identity_count"] == packed_report["actual_consumer_identity_count"] == 4
+
+
+def test_packed_metric_weight_uses_exact_member_counts_and_rejects_missing_rows() -> None:
+    trainer = make_trainer()
+    plan = trainer._grouped_window.plan
+    one, _ = _packed_member_payloads(0)
+    two, _ = _packed_member_payloads(1)
+    assert GroupedPlanObserver._weight_for_native_call(plan, 0, None, one) == pytest.approx(4 / 6)
+    assert GroupedPlanObserver._weight_for_native_call(plan, 1, None, two) == pytest.approx(2 / 6)
+    with pytest.raises(ValueError, match="count"):
+        GroupedPlanObserver._weight_for_native_call(plan, 0, None, one[:-1])
+
