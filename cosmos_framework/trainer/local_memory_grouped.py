@@ -18,14 +18,14 @@ from cosmos_framework.data.generator.action.utils.cached_pixel_geometry import m
 from cosmos_framework.data.generator.joint_dataloader import JointDataLoader, custom_collate_fn
 from cosmos_framework.model.generator.mot.local_memory_grouped_window import GroupedLocalMemoryWindow
 from cosmos_framework.model.generator.mot.robocasa_async_segment_prefetch import AsyncExactWindowRawPrefetcher
-from cosmos_framework.model.generator.mot.robocasa_full_segment_prefetch import (
-    AsyncExactWindowFullSegmentPrefetcher,
-    FullSegmentMember,
-)
 from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
     ExactWindowLocalCatalog,
     ExactWindowRankPlanner,
     ExactWindowSegmentProducer,
+)
+from cosmos_framework.model.generator.mot.robocasa_full_segment_prefetch import (
+    AsyncExactWindowFullSegmentPrefetcher,
+    FullSegmentMember,
 )
 from cosmos_framework.trainer import ImaginaireTrainer
 from cosmos_framework.trainer.local_memory_grouped_resume import (

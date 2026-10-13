@@ -10,12 +10,12 @@ import random
 import pytest
 
 import cosmos_framework.trainer.local_memory_grouped as grouped_module
+from cosmos_framework.model.generator.mot.robocasa_async_segment_prefetch_test import _assert_segment_equal
+from cosmos_framework.model.generator.mot.robocasa_exact_window_local import ExactWindowSegmentProducer
+from cosmos_framework.model.generator.mot.robocasa_exact_window_local_test import _request, _setup
 from cosmos_framework.model.generator.mot.robocasa_full_segment_prefetch import (
     AsyncExactWindowFullSegmentPrefetcher,
 )
-from cosmos_framework.model.generator.mot.robocasa_exact_window_local import ExactWindowSegmentProducer
-from cosmos_framework.model.generator.mot.robocasa_exact_window_local_test import _request, _setup
-from cosmos_framework.model.generator.mot.robocasa_async_segment_prefetch_test import _assert_segment_equal
 
 
 def _keyed_producer():
