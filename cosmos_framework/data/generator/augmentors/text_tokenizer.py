@@ -10,6 +10,7 @@ from typing import Optional
 
 import torch
 
+from cosmos_framework.data.generator.action.utils.transform_random import transform_draw
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
 from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
 from cosmos_framework.utils.generator.data_utils import read_positive_int_metadata
@@ -50,7 +51,7 @@ def _tokenize_captions_separately(
             raise TypeError(f"Separate text tokenization does not support caption type {type(caption).__name__}")
 
     # CFG remains a sample-level decision: either every view is conditioned or none is.
-    if cfg_dropout_rate > 0 and random.random() < cfg_dropout_rate:
+    if cfg_dropout_rate > 0 and transform_draw(random.random) < cfg_dropout_rate:
         caption_texts = [""] * len(caption_texts)
 
     data_dict[input_key] = caption_texts
@@ -101,7 +102,7 @@ class TextTokenizerTransform(Augmentor):
         if self.cfg_dropout_rate > 0:
             # If CFG is used, randomly dropout the input caption
             # We dropout the input caption by replacing it with an empty string
-            if random.random() < self.cfg_dropout_rate:
+            if transform_draw(random.random) < self.cfg_dropout_rate:
                 input_caption = ""
                 data_dict[self.input_keys[0]] = input_caption
 
@@ -194,7 +195,7 @@ class TextTokenizerTransformForEditing(Augmentor):
         if isinstance(input_caption, dict):
             input_caption = json.dumps(input_caption)
             data_dict[self.input_keys[0]] = input_caption
-        if self.cfg_dropout_rate > 0 and random.random() < self.cfg_dropout_rate:
+        if self.cfg_dropout_rate > 0 and transform_draw(random.random) < self.cfg_dropout_rate:
             input_caption = ""
             data_dict[self.input_keys[0]] = input_caption
         text_ids = self._processor.tokenize_text(input_caption, system_prompt=self._system_prompt)

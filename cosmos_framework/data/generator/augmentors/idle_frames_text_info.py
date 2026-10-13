@@ -22,6 +22,7 @@ import random
 
 import torch
 
+from cosmos_framework.data.generator.action.utils.transform_random import transform_draw
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
 from cosmos_framework.utils import log
 
@@ -151,7 +152,7 @@ class IdleFramesTextInfo(Augmentor):
         if not self.enabled:
             return data_dict
 
-        if random.random() < self.dropout_rate:
+        if transform_draw(random.random) < self.dropout_rate:
             return data_dict
 
         n = self._get_scalar_int(data_dict.get(self.idle_frames_key), self.idle_frames_key)

@@ -15,6 +15,7 @@ import torch
 from torch.nn import functional as F
 
 from cosmos_framework.data.generator.action.datasets.action_sft_dataset import ActionSFTDataset
+from cosmos_framework.data.generator.action.utils.transform_random import scoped_transform_rng
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import ExactWindowEpisodeKey
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cached_sft import (
     RoboCasaExactWindowCachedDataset,
@@ -305,10 +306,19 @@ class PreparedExactWindowSegment:
 class ExactWindowSegmentProducer:
     """Reuse a single Phase3 raw item for current payload and next-step evidence."""
 
-    def __init__(self, catalog: ExactWindowLocalCatalog, *, config_digest: str) -> None:
+    def __init__(
+        self,
+        catalog: ExactWindowLocalCatalog,
+        *,
+        config_digest: str,
+        transform_rng_mode: str = "legacy_global",
+    ) -> None:
         if not config_digest:
             raise ValueError("Local producer 需要 config_digest")
+        if transform_rng_mode not in {"legacy_global", "consumer_keyed_v1"}:
+            raise ValueError("transform_rng_mode must be legacy_global or consumer_keyed_v1")
         self.catalog, self.config_digest = catalog, config_digest
+        self.transform_rng_mode = transform_rng_mode
 
     def prepare(
         self,
@@ -379,7 +389,27 @@ class ExactWindowSegmentProducer:
             ):
                 raise ValueError("Local raw item identity/ABI 不匹配")
             visual[0, index] = robocasa_current_latent_to_visual96(item["video_latent"][0])
-            payloads[index] = self.catalog.wrapped_sft._transform(dict(item), self.catalog.wrapped_sft._resolution)
+            # Opt-in keyed augmentation isolates CFG dropout from global Python
+            # RNG so CPU worker completion order cannot perturb a training step.
+            seed = None
+            if self.transform_rng_mode == "consumer_keyed_v1":
+                seed = int(
+                    _digest(
+                        (
+                            "psm_v3_transform_v1",
+                            self.catalog.source_binding_digest,
+                            identity.slot_id,
+                            episode.uid,
+                            request.binding_epoch,
+                            step,
+                        )
+                    )[:16],
+                    16,
+                )
+            with scoped_transform_rng(seed):
+                payloads[index] = self.catalog.wrapped_sft._transform(
+                    dict(item), self.catalog.wrapped_sft._resolution
+                )
             consumer_valid[0, index] = True
             consumer_step[0, index] = step
             if step > 0:
