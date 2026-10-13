@@ -68,7 +68,11 @@ def pack_native_member(
     positions: list[tuple[int, int]] = []
     for segment, result, identity in zip(segments, results, identities, strict=True):
         steps = segment.consumer_valid[0].nonzero(as_tuple=False).flatten().tolist()
-        if len(steps) != len(result.payloads) or len(steps) != len(result.locals) or len(steps) != len(result.identities):
+        if (
+            len(steps) != len(result.payloads)
+            or len(steps) != len(result.locals)
+            or len(steps) != len(result.identities)
+        ):
             raise ValueError("packed row valid-count / prefix / consumer identities mismatch")
         for local_index, payload, prefix, consumer in zip(
             steps, result.payloads, result.locals, result.identities, strict=True
