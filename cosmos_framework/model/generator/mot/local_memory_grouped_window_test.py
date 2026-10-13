@@ -73,10 +73,10 @@ def test_ga2_full_window_uses_exact_256_consumer_weight_and_publishes_after_step
     before = runner.live
     plan = runner.begin()
     assert plan.member_counts == (128, 128) and plan.n_window == 256
-    seen: list[tuple[int, int, bool]] = []
+    seen: list[tuple[tuple[tuple[int, int], ...], int, int]] = []
 
-    def native(payloads, prefixes, index):
-        seen.append((index, len(payloads), all(prefix is None for prefix in prefixes)))
+    def native(payloads, prefixes, positions):
+        seen.append((positions, len(payloads), sum(prefix is None for prefix in prefixes)))
         return model.net.moe_gen
 
     first = runner.run_member(_segments(runner, 0), native, _backward)
@@ -86,10 +86,11 @@ def test_ga2_full_window_uses_exact_256_consumer_weight_and_publishes_after_step
     assert runner.live is before and len(runner._candidate.sidecar.snapshot()) == 0
     assert float(first + second) == 2.0
     torch.testing.assert_close(model.net.moe_gen.grad, torch.tensor(1.0))
-    assert len(seen) == 32
-    assert seen[0] == (0, 8, True)
-    assert all(size == 8 for _, size, _ in seen)
-    assert not seen[16][2]  # continuation 在下一 member 消费上一段 candidate fast state
+    assert len(seen) == 2
+    assert seen[0][1:] == (128, 8)  # each slot has S0 exactly once
+    assert seen[1][1:] == (128, 0)  # continuing segment has all Local prefixes
+    assert seen[0][0][:17] == tuple((0, t) for t in range(16)) + ((1, 0),)
+    assert seen[1][0][:2] == ((0, 0), (0, 1))
 
     steps = []
     runner.finish(lambda: steps.append("optimizer_step") or True)
@@ -103,7 +104,7 @@ def test_joint_outer_gradient_reaches_host_and_model_owned_local_slow_params() -
     model, runner = _setup()
     runner.begin()
 
-    def native(payloads, prefixes, index):
+    def native(payloads, prefixes, positions):
         present = [prefix for prefix in prefixes if prefix is not None]
         signal = torch.stack([prefix.square().mean() for prefix in present]).mean() if present else 0.0
         return model.net.moe_gen * (signal + 1.0)
@@ -125,13 +126,13 @@ def test_terminal_remainder_uses_actual_window_count_without_ga_rescale() -> Non
     assert plan.member_counts == (128, 8) and plan.n_window == 136
     calls = []
 
-    def native(payloads, prefixes, index):
-        calls.append((index, len(payloads)))
+    def native(payloads, prefixes, positions):
+        calls.append((positions, len(payloads)))
         return model.net.moe_gen
 
     for member in range(2):
         runner.run_member(_segments(runner, member), native, _backward)
-    assert len(calls) == 17 and calls[-1] == (0, 8)
+    assert len(calls) == 2 and calls[0][1] == 128 and calls[1][1] == 8
     torch.testing.assert_close(model.net.moe_gen.grad, torch.tensor(1.0))
     runner.abort()
 
@@ -144,13 +145,13 @@ def test_terminal_rebind_in_second_member_has_new_s0_without_local_prefix() -> N
     )
     seen = []
 
-    def native(payloads, prefixes, index):
-        seen.append(all(prefix is None for prefix in prefixes))
+    def native(payloads, prefixes, positions):
+        seen.append(sum(prefix is None for prefix in prefixes))
         return model.net.moe_gen
 
     runner.run_member(_segments(runner, 0), native, _backward)
     runner.run_member(_segments(runner, 1), native, _backward)
-    assert seen[0] and seen[16]
+    assert seen == [8, 8]
     assert runner.live.sidecar.snapshot() == ()
     runner.abort()
 
@@ -176,10 +177,10 @@ def test_member_failure_leaves_live_state_unchanged(failure: str) -> None:
     else:
         member = 0
 
-    def native(payloads, prefixes, index):
-        if index == 3 and failure in ("native", "second_member"):
+    def native(payloads, prefixes, positions):
+        if failure in ("native", "second_member"):
             raise RuntimeError("native failure")
-        if index == 3 and failure == "nonfinite":
+        if failure == "nonfinite":
             return model.net.moe_gen * torch.tensor(float("nan"))
         return model.net.moe_gen
 
@@ -213,7 +214,7 @@ def test_optimizer_skip_or_exception_never_publishes_candidate(mode: str) -> Non
     assert runner.live.sidecar.snapshot() == () and runner.plan is None
 
 
-def test_t32_b3_ga3_uses_one_scan_per_member_and_same_index_native_order() -> None:
+def test_t32_b3_ga3_uses_one_scan_and_one_packed_native_per_member() -> None:
     model, runner = _setup(frames=96, t=32, b_stream=3, active_ga=3)
     before = runner.live
     plan = runner.begin()
@@ -221,8 +222,8 @@ def test_t32_b3_ga3_uses_one_scan_per_member_and_same_index_native_order() -> No
     assert plan.member_counts == (96, 96, 96) and plan.n_window == 288
     seen = []
 
-    def native(payloads, prefixes, index):
-        seen.append((index, len(payloads), all(prefix is None for prefix in prefixes)))
+    def native(payloads, prefixes, positions):
+        seen.append((positions, len(payloads), sum(prefix is None for prefix in prefixes)))
         assert all(item["video_latent"].shape == (5, 48, 2, 2) for item in payloads)
         return model.net.moe_gen
 
@@ -230,8 +231,10 @@ def test_t32_b3_ga3_uses_one_scan_per_member_and_same_index_native_order() -> No
         runner.run_member(_segments(runner, member), native, _backward)
         assert runner.live is before
         assert model.net.scan_calls == member + 1
-    assert len(seen) == 96 and [index for index, _, _ in seen] == list(range(32)) * 3
-    assert seen[0] == (0, 3, True) and seen[32] == (0, 3, False) and seen[64] == (0, 3, True)
+    assert len(seen) == 3
+    assert [count for _, count, _ in seen] == [96, 96, 96]
+    assert [none_count for _, _, none_count in seen] == [3, 0, 3]
+    assert seen[0][0][:3] == ((0, 0), (0, 1), (0, 2))
     torch.testing.assert_close(model.net.moe_gen.grad, torch.tensor(1.0))
     runner.finish(lambda: True)
     assert runner.live is not before and runner.live.frontier == plan.candidate_frontier
@@ -268,7 +271,7 @@ def test_optional_strict_real_data_grouped_smoke(monkeypatch: pytest.MonkeyPatch
     segments = tuple(producer.produce(request) for request in plan.members[0])
     assert len(segments) == 2 and all(segment.consumer_valid.shape == (1, 16) for segment in segments)
 
-    def native(payloads, prefixes, index):
+    def native(payloads, prefixes, positions):
         assert all(payload["video_latent"].shape == cache.latent_shape for payload in payloads)
         signal = (
             torch.stack([prefix.square().mean() for prefix in prefixes if prefix is not None]).mean()

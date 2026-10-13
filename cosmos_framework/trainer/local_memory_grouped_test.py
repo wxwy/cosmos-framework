@@ -69,7 +69,7 @@ def _trainer(active_ga=2, b_stream=8, *, num_workers=0) -> GroupedLocalMemoryTra
     return trainer
 
 
-@pytest.mark.parametrize("size", [1, 3, 8])
+@pytest.mark.parametrize("size", [1, 3, 8, 128])
 def test_collate_uses_native_joint_dataloader_multi_sample_abi(size: int) -> None:
     payloads = tuple(
         {
@@ -148,7 +148,7 @@ def test_trainer_dynamic_ga_runs_one_optimizer_then_publishes_and_zeros_grad(
     old_weight = model.net.moe_gen.detach().clone()
     for member in range(active_ga):
         output, loss, accum = trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, accum)
-        assert output["count"] == 8 and loss.isfinite()
+        assert output["count"] == 8 * min(2, 5 - 2 * member) and loss.isfinite()
         if member == 0:
             before = trainer._grouped_window.live if active_ga > 1 else None
         if member + 1 < active_ga:
@@ -162,7 +162,7 @@ def test_trainer_dynamic_ga_runs_one_optimizer_then_publishes_and_zeros_grad(
         assert trainer._grouped_window.live is not before
     assert len(trainer._grouped_window.live.scheduler._committed) == 8
     assert all(parameter.grad is None for parameter in model.parameters())
-    expected_calls = sum(min(2, 5 - 2 * member) for member in range(active_ga))
+    expected_calls = active_ga  # one packed native F/B per GA member
     assert trainer.callbacks.events.count("on_before_forward") == expected_calls
     assert trainer.callbacks.events.count("on_before_backward") == expected_calls
     assert trainer.callbacks.events.count("on_before_optimizer_step") == 1
@@ -370,7 +370,7 @@ def test_async_raw_prefetch_keeps_optimizer_and_committed_frontier_parity(
         accum = 0
         for member in range(2):
             output, loss, accum = trainer.training_step(model, optimizer, scheduler, scaler, {}, 0, accum)
-            assert output["count"] == 3
+            assert output["count"] == 6
             assert loss.isfinite()
             assert accum == (0 if member == 1 else 1)
         assert trainer._grouped_completed_iteration == 1
