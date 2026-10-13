@@ -100,6 +100,53 @@ def test_ga2_full_window_uses_exact_256_consumer_weight_and_publishes_after_step
     assert runner.live.sidecar.snapshot() == ()  # terminal 完成后清除 fast state
 
 
+
+def test_packed128_fp32_loss_and_slow_gradients_match_index_weighted_reference() -> None:
+    """CPU oracle uses identical scan graph and evaluates each time-index loss separately."""
+    model, runner = _setup(frames=64, t=16, b_stream=8, active_ga=2)
+    plan = runner.begin()
+    assert plan.member_counts == (128, 128) and plan.n_window == 256
+    selected = (
+        model.net.moe_gen,
+        model.net.local_memory_runtime.encoder.visual_proj.weight,
+        model.net.local_memory_runtime.core.slot_queries,
+    )
+    total_reference = [torch.zeros_like(p) for p in selected]
+    counts = []
+
+    for member in range(2):
+        def native(payloads, prefixes, positions):
+            assert len(payloads) == len(prefixes) == len(positions) == 128
+            counts.append(len(payloads))
+            # Identical per-consumer function, varying Local prefixes and S0.
+            values = torch.stack([
+                model.net.moe_gen
+                * (prefix.square().mean() + 1.0 if prefix is not None else model.net.moe_gen.new_tensor(1.0))
+                for prefix in prefixes
+            ])
+            packed_mean = values.mean()
+            # Independent old V3 Index8 oracle: each index mean weighted
+            # by its actual valid count, not by a flat GA constant.
+            indexed = torch.zeros_like(packed_mean)
+            for index in range(16):
+                active = [value for value, pos in zip(values, positions, strict=True) if pos[1] == index]
+                indexed = indexed + torch.stack(active).mean() * (len(active) / len(values))
+            torch.testing.assert_close(packed_mean, indexed, rtol=1e-5, atol=1e-6)
+            reference_grad = torch.autograd.grad(indexed, selected, retain_graph=True)
+            for i, grad in enumerate(reference_grad):
+                total_reference[i] = total_reference[i] + grad * (len(values) / plan.n_window)
+            return packed_mean
+
+        runner.run_member(_segments(runner, member), native, _backward)
+
+    assert counts == [128, 128]
+    for param, expected in zip(selected, total_reference, strict=True):
+        assert param.grad is not None and torch.isfinite(param.grad).all()
+        torch.testing.assert_close(param.grad, expected, rtol=1e-4, atol=1e-5)
+    runner.abort()
+
+
+
 def test_joint_outer_gradient_reaches_host_and_model_owned_local_slow_params() -> None:
     model, runner = _setup()
     runner.begin()

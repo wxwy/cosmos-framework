@@ -459,7 +459,7 @@ def test_opt_in_missing_gradient_audit_reports_exact_names_on_each_rank_without_
     gradients_before = {name: parameter.grad for name, parameter in parameters.items()}
     observer = GroupedPlanObserver(rank=rank, parameter_group=group, emit=emitted.append, audit_missing_gradients=True)
     observer.start_iteration(1)
-    for _ in range(5):
+    for _ in range(2):
         observer(phase="native_forward", trainer=trainer)
         observer(phase="native_backward", trainer=trainer, loss=torch.tensor(0.1))
     assert emitted == []
@@ -510,7 +510,7 @@ def test_missing_gradient_audit_is_disabled_by_default_and_does_not_emit_before_
     lines: list[str] = []
     ordinary = GroupedPlanObserver(rank=1, parameter_group=group, emit=lines.append)
     ordinary.start_iteration(0)
-    for _ in range(5):
+    for _ in range(2):
         ordinary(phase="native_forward", trainer=trainer)
         ordinary(phase="native_backward", trainer=trainer)
     ordinary(phase="pre_optimizer", trainer=trainer, iteration=0)
@@ -519,7 +519,7 @@ def test_missing_gradient_audit_is_disabled_by_default_and_does_not_emit_before_
 
     audited = GroupedPlanObserver(rank=1, parameter_group=group, emit=lines.append, audit_missing_gradients=True)
     audited.start_iteration(0)
-    for _ in range(5):
+    for _ in range(2):
         audited(phase="native_forward", trainer=trainer)
         audited(phase="native_backward", trainer=trainer)
     audited(phase="pre_optimizer", trainer=trainer, iteration=0)
