@@ -481,11 +481,14 @@ def test_full_segment_prefetch_matches_keyed_sync_2_windows_and_optimizer_state(
             monkeypatch.setattr(prefetcher, "_worker_raw", lambda: trainer._grouped_producer.catalog.raw)
         try:
             for iteration in range(2):
+                exact_plan = trainer._grouped_planner.plan_window(trainer._grouped_window.live.frontier) if (
+                    hasattr(trainer, "_grouped_window")
+                ) else trainer._grouped_planner.plan_window(trainer._grouped_planner.initial_frontier())
                 for member in range(2):
                     output, loss, accum = trainer.training_step(
                         model, optimizer, scheduler, scaler, {}, iteration, member
                     )
-                    assert output["count"] == 6 and loss.isfinite()
+                    assert output["count"] == exact_plan.member_counts[member] and loss.isfinite()
                     assert accum == (1 if member == 0 else 0)
                 assert trainer._grouped_completed_iteration == iteration + 1
                 assert scheduler.last_epoch == iteration + 1
