@@ -52,6 +52,9 @@ LOCAL_KEYS = (
 )
 OPTIMIZER_KEYS = (*GENERATION_KEYS, *LOCAL_KEYS)
 ACTION_KEYS = ("action2llm", "llm2action", "action_modality_embed")
+# This changes the gradient accumulation/RNG graph and must not silently
+# same-job resume the legacy per-index native execution checkpoint.
+NATIVE_BATCH_LAYOUT = "v2_a2_member_packed_slot_major_v1"
 
 
 class GroupedTriggerLoader:
@@ -198,6 +201,7 @@ def config_digest(
         "cache_corpus_digest": catalog.cache_corpus_digest,
         "source_binding_digest": catalog.source_binding_digest,
         "model": "Cosmos3-Edge-Policy-DROID/corrected-exact-window-v1",
+        "native_batch_layout": NATIVE_BATCH_LAYOUT,
         "model_witnesses": witnesses,
         "raw_action_dim": 15,
         "state_dim": 15,

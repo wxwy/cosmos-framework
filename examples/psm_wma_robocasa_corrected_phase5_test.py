@@ -39,7 +39,7 @@ def test_observer_uses_actual_plan_prefix_lengths() -> None:
     )
     trainer = SimpleNamespace(_grouped_window=SimpleNamespace(plan=plan))
     observer = phase5.GroupedPlanObserver()
-    for _ in range(5):
+    for _ in range(2):
         observer(phase="native_forward", trainer=trainer)
         observer(phase="native_backward", trainer=trainer)
     observer(phase="pre_optimizer", trainer=trainer)
@@ -137,6 +137,22 @@ def test_digest_path_invariance_and_semantic_sensitivity(tmp_path: Path) -> None
     config.model.config.local_memory_evidence_dim = 256
     config.optimizer.weight_decay = 0.1
     assert phase5.config_digest(catalog, config, b_stream=b, active_ga=ga, witnesses=base_witnesses) != base
+
+
+
+def test_native_packed_batch_layout_is_part_of_strict_resume_digest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    catalog, config, b, ga = _config(tmp_path)
+    witnesses = {"edge_config_sha256": "edge", "base_model_metadata_sha256": "dcp"}
+    packed_digest = phase5.config_digest(catalog, config, b_stream=b, active_ga=ga, witnesses=witnesses)
+    assert phase5.NATIVE_BATCH_LAYOUT == "v2_a2_member_packed_slot_major_v1"
+    with monkeypatch.context() as m:
+        m.setattr(phase5, "NATIVE_BATCH_LAYOUT", "legacy_index8_native_v1")
+        legacy_digest = phase5.config_digest(catalog, config, b_stream=b, active_ga=ga, witnesses=witnesses)
+    assert packed_digest != legacy_digest
+    assert phase5.config_digest(catalog, config, b_stream=b, active_ga=ga, witnesses=witnesses) == packed_digest
+
 
 
 def test_overlay_installs_full_manifest_tokenizer_contract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
