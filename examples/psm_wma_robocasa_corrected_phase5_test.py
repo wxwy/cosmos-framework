@@ -732,6 +732,7 @@ def test_formal_and_resume_require_accepted_index_before_data_open(tmp_path: Pat
     args = _bounded_args(tmp_path)
     args.stop_after_iter = None
     args.job_name = "edge_local_exact_window"
+    args.t, args.b, args.ga, args.k, args.world_size = 16, 8, 2, 4, 8
     args.dataset_index_root = None
     with pytest.raises(ValueError, match="dataset-index-root"):
         phase5.preflight(args)
