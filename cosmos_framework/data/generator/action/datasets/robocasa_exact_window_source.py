@@ -223,10 +223,17 @@ class RoboCasaExactWindowSourceReader:
             ep_idx = record.key.episode_index
             if ep_idx < 0 or ep_idx >= len(self.meta.episodes):
                 raise ValueError(f"source 缺少 cache episode_index={ep_idx}")
-            relative = self.meta.get_data_file_path(ep_idx)
-            path = _local_path(self.source_root, relative, "selected data")
-            if not trusted_training and not path.is_file():
-                raise FileNotFoundError(f"selected data parquet 缺失：{path}")
+            relative = Path(self.meta.get_data_file_path(ep_idx))
+            if trusted_training:
+                # Logical traversal guard only: filesystem resolution/stat for
+                # every accepted parquet belongs to offline dataset validation.
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError(f"selected data 路径越界：{relative}")
+                path = self.source_root / relative
+            else:
+                path = _local_path(self.source_root, relative, "selected data")
+                if not path.is_file():
+                    raise FileNotFoundError(f"selected data parquet 缺失：{path}")
             selected_files[record.key] = path
         phase_start = time.perf_counter()
         self._bound: dict[ExactWindowEpisodeKey, _BoundEpisode] = {}

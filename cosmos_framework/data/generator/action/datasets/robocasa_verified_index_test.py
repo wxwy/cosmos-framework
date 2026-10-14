@@ -314,10 +314,21 @@ def test_trusted_training_uses_offline_receipt_without_dataset_rescans(verified)
         catalog = RoboCasaExactWindowCacheCatalog(cache_root, verified_index=index)
     assert not catalog.stats.file_audit_performed
     assert catalog.stats.as_dict()["completeness_scope"] == "trusted_offline_verified_index_receipt"
-    with patch.object(
-        RoboCasaExactWindowSourceReader, "_preflight_metadata", side_effect=AssertionError("unexpected meta rglob")
+    with (
+        patch.object(
+            RoboCasaExactWindowSourceReader, "_preflight_metadata",
+            side_effect=AssertionError("unexpected meta rglob"),
+        ),
+        patch(
+            "cosmos_framework.data.generator.action.datasets.robocasa_exact_window_source._local_path",
+            side_effect=AssertionError("unexpected selected-file resolve/stat"),
+        ),
     ):
-        warm = RoboCasaExactWindowSourceReader(catalog, source_root, verified_index=index)
+        warm = RoboCasaExactWindowSourceReader(
+            catalog, source_root, verified_index=index,
+            metadata_factory=lambda **_: cold.meta,
+            dataset_factory=lambda **_: cold.dataset,
+        )
     assert warm.init_timings_ms["trusted_offline_index"] is True
     assert len(warm.index) == len(cold.index)
     source = cold.read_at(0)
