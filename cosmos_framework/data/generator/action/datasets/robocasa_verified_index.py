@@ -95,10 +95,15 @@ class AbsoluteRowLookup(Mapping[int, int]):
 class VerifiedExactWindowIndex:
     """Load a prebuilt immutable receipt, or explicitly build one from a cold reader."""
 
-    def __init__(self, root: Path, receipt: dict[str, Any], rows_path: Path) -> None:
+    def __init__(
+        self, root: Path, receipt: dict[str, Any], rows_path: Path, *, trusted_training: bool = False
+    ) -> None:
         self.root = root
         self.receipt = receipt
         self.rows_path = rows_path
+        # Only an explicitly requested training path may rely on already accepted
+        # offline file witnesses without checking them again.
+        self.trusted_training = trusted_training
 
     @property
     def cache_corpus_digest(self) -> str:
@@ -113,7 +118,21 @@ class VerifiedExactWindowIndex:
         return str(self.receipt["source_binding_digest"])
 
     @classmethod
-    def open(cls, root: str | Path, *, cache_root: str | Path, source_root: str | Path) -> VerifiedExactWindowIndex:
+    def open(
+        cls,
+        root: str | Path,
+        *,
+        cache_root: str | Path,
+        source_root: str | Path,
+        verify_files: bool = True,
+    ) -> VerifiedExactWindowIndex:
+        """Strict offline load by default; training may trust a pre-accepted receipt.
+
+        verify_files=False never stat-walks the cache/source or re-hashes the
+        row mapping. Required sample reads continue to fail normally if missing.
+        """
+        if type(verify_files) is not bool:
+            raise TypeError("verify_files must be a bool")
         directory = Path(root)
         raw = (directory / RECEIPT).read_bytes()
         receipt = json.loads(raw)
@@ -136,10 +155,11 @@ class VerifiedExactWindowIndex:
             )
         ):
             raise ValueError("verified index schema/receipt 不合法")
-        if _sha256(directory / ROWS) != receipt["row_mapping_sha256"]:
+        if verify_files and _sha256(directory / ROWS) != receipt["row_mapping_sha256"]:
             raise ValueError("verified index absolute-row 映射哈希不匹配")
-        store = cls(directory, receipt, directory / ROWS)
-        store.verify_files(cache_root=cache_root, source_root=source_root)
+        store = cls(directory, receipt, directory / ROWS, trusted_training=not verify_files)
+        if verify_files:
+            store.verify_files(cache_root=cache_root, source_root=source_root)
         return store
 
     def verify_files(self, *, cache_root: str | Path, source_root: str | Path) -> None:

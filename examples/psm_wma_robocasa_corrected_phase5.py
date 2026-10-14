@@ -429,8 +429,8 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         args.num_workers != 1 or getattr(args, "transform_rng_mode", "legacy_global") != "consumer_keyed_v1"
     ):
         raise ValueError("full segment prefetch requires --num-workers 1 --transform-rng-mode consumer_keyed_v1")
-    if getattr(args, "stop_after_iter", None) is not None and getattr(args, "dataset_index_root", None) is None:
-        raise ValueError("bounded GPU smoke 必须提供 --dataset-index-root；禁止回退到昂贵 cold build")
+    if getattr(args, "dataset_index_root", None) is None:
+        raise ValueError("训练/Resume 必须提供已离线验收的 --dataset-index-root；禁止 cold build 与数据全量复检")
     lock = verify_root_child_lock(args)
     os.environ["HF_HUB_OFFLINE"] = "1"
     check_edge_checkpoint(str(args.edge))
@@ -442,10 +442,11 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     init_start = time.perf_counter()
     verify_start = time.perf_counter()
     index_root = getattr(args, "dataset_index_root", None)
-    verified_index = (
-        VerifiedExactWindowIndex.open(index_root, cache_root=args.cache_root, source_root=args.source_root)
-        if index_root is not None
-        else None
+    verified_index = VerifiedExactWindowIndex.open(
+        index_root,
+        cache_root=args.cache_root,
+        source_root=args.source_root,
+        verify_files=False,  # owner-approved offline acceptance: never rescan on train/resume
     )
     index_verify_ms = (time.perf_counter() - verify_start) * 1000
     stage = time.perf_counter()
@@ -467,8 +468,10 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     catalog = ExactWindowLocalCatalog(dataset, ttt_tbptt_steps=args.t)
     local_catalog_ms = (time.perf_counter() - stage) * 1000
     dataset_init = {
-        "verified_index_hit": verified_index is not None,
-        "index_verify_ms": index_verify_ms,
+        "verified_index_hit": True,
+        "verified_index_mode": "trusted_offline_receipt_no_rescan",
+        "index_verify_ms": index_verify_ms,  # historical telemetry key; now measures open only
+        "index_open_ms": index_verify_ms,
         "cache_catalog_ms": cache_catalog_ms,
         "sft_dataset_create_ms": dataset_create_ms,
         "source_reader_stages": dataset._dataset.source_reader.init_timings_ms,

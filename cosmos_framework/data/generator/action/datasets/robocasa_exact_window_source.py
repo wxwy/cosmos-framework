@@ -195,7 +195,11 @@ class RoboCasaExactWindowSourceReader:
             raise TypeError("source reader verified_index 类型不合法")
         started = time.perf_counter()
         self.verified_index = verified_index
-        self.init_timings_ms: dict[str, float | bool] = {"verified_index_hit": verified_index is not None}
+        trusted_training = verified_index is not None and verified_index.trusted_training
+        self.init_timings_ms: dict[str, float | bool] = {
+            "verified_index_hit": verified_index is not None,
+            "trusted_offline_index": trusted_training,
+        }
         self.catalog = catalog
         self.source_root = Path(source_root)
         phase_start = time.perf_counter()
@@ -204,7 +208,8 @@ class RoboCasaExactWindowSourceReader:
         self.cache_reader = RoboCasaExactWindowEpisodeReader(catalog)
         _ensure_hf_hub_offline()
         phase_start = time.perf_counter()
-        self._preflight_metadata()
+        if not trusted_training:
+            self._preflight_metadata()
         self.meta = metadata_factory(repo_id="local", root=self.source_root, revision="local", force_cache_sync=False)
         self._validate_source_contract()
         self.init_timings_ms["metadata_ms"] = (time.perf_counter() - phase_start) * 1000
@@ -220,7 +225,7 @@ class RoboCasaExactWindowSourceReader:
                 raise ValueError(f"source 缺少 cache episode_index={ep_idx}")
             relative = self.meta.get_data_file_path(ep_idx)
             path = _local_path(self.source_root, relative, "selected data")
-            if not path.is_file():
+            if not trusted_training and not path.is_file():
                 raise FileNotFoundError(f"selected data parquet 缺失：{path}")
             selected_files[record.key] = path
         phase_start = time.perf_counter()

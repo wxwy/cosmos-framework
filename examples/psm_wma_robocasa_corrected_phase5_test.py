@@ -726,3 +726,15 @@ def test_full_segment_prefetch_cli_is_explicit_and_new_rng_has_distinct_digest(t
         "--base-checkpoint", str(tmp_path), "--root-worktree", str(tmp_path),
         "--expected-root", "a" * 40, "--expected-child", "b" * 40,
     ]).full_segment_prefetch
+
+
+def test_formal_and_resume_require_accepted_index_before_data_open(tmp_path: Path) -> None:
+    args = _bounded_args(tmp_path)
+    args.stop_after_iter = None
+    args.job_name = "edge_local_exact_window"
+    args.dataset_index_root = None
+    with pytest.raises(ValueError, match="dataset-index-root"):
+        phase5.preflight(args)
+    args.phase = "resume"
+    with pytest.raises(ValueError, match="dataset-index-root"):
+        phase5.preflight(args)

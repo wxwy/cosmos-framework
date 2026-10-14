@@ -293,3 +293,59 @@ def test_warm_index_rejects_schema_version_change(verified) -> None:
     receipt.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="schema"):
         VerifiedExactWindowIndex.open(index_root, cache_root=cache_root, source_root=source_root)
+
+
+def test_trusted_training_uses_offline_receipt_without_dataset_rescans(verified) -> None:
+    cache_root, source_root, index_root, _, cold = verified
+    # The strict offline path is already covered by the existing fixture tests.
+    # The warm training path must never invoke the full row-map hash or file walk.
+    with (
+        patch.object(VerifiedExactWindowIndex, "verify_files", side_effect=AssertionError("unexpected file verification")),
+        patch("cosmos_framework.data.generator.action.datasets.robocasa_verified_index._sha256",
+              side_effect=AssertionError("unexpected row mapping rehash")),
+    ):
+        index = VerifiedExactWindowIndex.open(
+            index_root, cache_root=cache_root, source_root=source_root, verify_files=False
+        )
+    assert index.trusted_training
+    with patch.object(
+        RoboCasaExactWindowCacheCatalog, "_audit_files", side_effect=AssertionError("unexpected cache glob/stat")
+    ):
+        catalog = RoboCasaExactWindowCacheCatalog(cache_root, verified_index=index)
+    assert not catalog.stats.file_audit_performed
+    assert catalog.stats.as_dict()["completeness_scope"] == "trusted_offline_verified_index_receipt"
+    with patch.object(
+        RoboCasaExactWindowSourceReader, "_preflight_metadata", side_effect=AssertionError("unexpected meta rglob")
+    ):
+        warm = RoboCasaExactWindowSourceReader(catalog, source_root, verified_index=index)
+    assert warm.init_timings_ms["trusted_offline_index"] is True
+    assert len(warm.index) == len(cold.index)
+    source = cold.read_at(0)
+    target = warm.read_at(0)
+    assert (source.key, source.start_frame, source.global_row_indices) == (
+        target.key, target.start_frame, target.global_row_indices
+    )
+    torch.testing.assert_close(source.action12, target.action12)
+    torch.testing.assert_close(source.state16, target.state16)
+
+
+def test_trusted_training_defers_missing_cache_payload_until_requested_read(verified) -> None:
+    cache_root, source_root, index_root, catalog, _ = verified
+    path = cache_root / catalog.episodes[0].relative_path
+    path.unlink()
+    # Only offline audit detects an unrequested missing file before starting.
+    index = VerifiedExactWindowIndex.open(index_root, cache_root=cache_root, source_root=source_root,
+                                          verify_files=False)
+    trusted_catalog = RoboCasaExactWindowCacheCatalog(cache_root, verified_index=index)
+    assert trusted_catalog.stats.file_audit_performed is False
+    record = trusted_catalog.episodes[0]
+    with pytest.raises(FileNotFoundError):
+        RoboCasaExactWindowEpisodeReader(trusted_catalog).read_window(record.key, 0)
+
+
+def test_trusted_training_requires_explicit_boolean_mode(verified) -> None:
+    cache_root, source_root, index_root, _, _ = verified
+    with pytest.raises(TypeError, match="verify_files"):
+        VerifiedExactWindowIndex.open(
+            index_root, cache_root=cache_root, source_root=source_root, verify_files=0
+        )

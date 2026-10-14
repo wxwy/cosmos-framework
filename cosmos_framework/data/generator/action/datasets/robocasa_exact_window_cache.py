@@ -120,6 +120,7 @@ class ExactWindowCorpusStats:
     max_episodes_per_task: int
     min_windows_per_task: int
     max_windows_per_task: int
+    file_audit_performed: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         """Rank0-ready, JSON-compatible internal-cache-completeness accounting."""
@@ -134,7 +135,10 @@ class ExactWindowCorpusStats:
             for task in self.per_task
         ]
         values["payload_validation"] = "lazy_on_episode_and_window_read"
-        values["completeness_scope"] = "declared_cache_corpus_only"
+        values["completeness_scope"] = (
+            "trusted_offline_verified_index_receipt" if not self.file_audit_performed
+            else "declared_cache_corpus_only"
+        )
         return values
 
 
@@ -158,7 +162,13 @@ class RoboCasaExactWindowCacheCatalog:
             raise ValueError("verified index 的 manifest SHA 与 cache 不匹配")
         self._validate_contract(manifest)
         self._records, task_stats = self._parse_tasks(manifest)
-        missing, extra, discovered = self._audit_files()
+        # Training reuses the immutable, offline-accepted file inventory rather
+        # than restatting every payload or globbing the entire 451GB cache.
+        trusted_training = verified_index is not None and verified_index.trusted_training
+        if trusted_training:
+            missing, extra, discovered = [], [], len(self._records)
+        else:
+            missing, extra, discovered = self._audit_files()
         if missing:
             raise ValueError(f"cache manifest 声明的 episode 文件缺失（{len(missing)}）：{missing[:3]}")
         if extra and strict:
@@ -197,6 +207,7 @@ class RoboCasaExactWindowCacheCatalog:
             duplicate_episode_count=0,
             invalid_episode_count=0,  # Payload validation is intentionally lazy.
             per_task=per_task,
+            file_audit_performed=not trusted_training,
             min_episodes_per_task=min(task.episode_count for task in per_task),
             max_episodes_per_task=max(task.episode_count for task in per_task),
             min_windows_per_task=min(task.window_count for task in per_task),
