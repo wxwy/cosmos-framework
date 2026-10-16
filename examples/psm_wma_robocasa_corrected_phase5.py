@@ -737,6 +737,8 @@ def _execution_stop_iteration(args: argparse.Namespace) -> int:
 
 
 def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindowLocalCatalog, Any]:
+    if getattr(args, "dataset_index_root", None) is None:
+        raise ValueError("训练/Resume 必须提供已离线验收的 --dataset-index-root；禁止 cold build 与数据全量复检")
     check_job_namespace(args)
     if any(
         type(value) is not int or value <= 0
@@ -750,8 +752,6 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         args.num_workers != 1 or getattr(args, "transform_rng_mode", "legacy_global") != "consumer_keyed_v1"
     ):
         raise ValueError("full segment prefetch requires --num-workers 1 --transform-rng-mode consumer_keyed_v1")
-    if getattr(args, "dataset_index_root", None) is None:
-        raise ValueError("训练/Resume 必须提供已离线验收的 --dataset-index-root；禁止 cold build 与数据全量复检")
     _load_runtime()
     lock = verify_root_child_lock(args)
     os.environ["HF_HUB_OFFLINE"] = "1"

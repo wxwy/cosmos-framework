@@ -164,6 +164,12 @@ def _trainer_module():
     mod("cosmos_framework.utils.lazy_config", LazyConfig=Serializer, instantiate=MagicMock())
     mod("cosmos_framework.utils.checkpointer", Checkpointer=MagicMock())
     mod("cosmos_framework.utils.misc", StragglerDetectorV2=MagicMock())
+    # Megatron is an external boundary too. Never let an installed real package
+    # evaluate torch annotations while this sandbox has the synthetic torch active.
+    # Exercise the Trainer's Megatron-present branch instead of forcing ImportError.
+    parallel_state = NS(initialize_model_parallel=lambda **kwargs: None)
+    mod("megatron", __path__=[])
+    mod("megatron.core", __path__=[], parallel_state=parallel_state)
     with patch.dict(sys.modules, modules):
         module = _load("f0_trainer_cpu", CHILD / "cosmos_framework/trainer/__init__.py")
     module.misc.to.side_effect = lambda data, **kw: data
@@ -396,6 +402,24 @@ class LifecycleTests(unittest.TestCase):
             with self.subTest(budget=budget):
                 self.args.formal_execution_until = budget
                 self.assertIn("formal execution budget", self.cli().stderr)
+
+    def test_missing_index_precedes_namespace_read_and_runtime_for_fresh_and_resume(self):
+        path = phase5.job_namespace(self.args)
+        path.mkdir(parents=True)
+        (path / phase5.JOB_IDENTITY).write_text("foreign identity must not be read")
+        before = _witness(path)
+        self.args.dataset_index_root = None
+        for phase in ("fresh", "resume"):
+            self.args.phase = phase
+            with self.subTest(phase=phase):
+                self.assertIn("dataset-index-root", self.cli().stderr)
+                with (
+                    patch.object(phase5, "check_job_namespace", side_effect=AssertionError("namespace read")),
+                    patch.object(phase5, "_load_runtime", side_effect=AssertionError("runtime initialized")),
+                    self.assertRaisesRegex(ValueError, "dataset-index-root"),
+                ):
+                    phase5.preflight(self.args)
+                self.assertEqual(before, _witness(path))
 
     def test_formal_and_diagnostic_options_cannot_mix(self):
         for key, value in (
@@ -692,11 +716,42 @@ class TrainerTests(unittest.TestCase):
                 getattr(self.trainer.checkpointer, operation).side_effect = None
 
     def test_real_constructor_propagates_writer_failure_before_legacy_config_overwrite(self):
-        config = NS(model=NS(), trainer=NS(), job=NS(path_local="MUST_NOT_BE_CREATED"))
+        config = NS(
+            model=NS(),
+            trainer=NS(),
+            job=NS(path_local="MUST_NOT_BE_CREATED"),
+            model_parallel=NS(
+                pipeline_model_parallel_size=1,
+                tensor_model_parallel_size=1,
+                context_parallel_size=1,
+                sequence_parallel=False,
+            ),
+        )
         with self.assertRaisesRegex(RuntimeError, "Job lifecycle config write failed"):
             self.module.ImaginaireTrainer(config, config_writer=MagicMock(side_effect=FileExistsError("old job")))
         self.module.dist.broadcast_object_list.assert_called_once()
         self.assertFalse(Path(config.job.path_local).exists())
+
+
+class FixtureIsolationTests(unittest.TestCase):
+    def test_host_megatron_cannot_import_against_fake_torch_and_modules_are_restored(self):
+        class HostMegatronCore(ModuleType):
+            def __getattr__(self, name):
+                raise AssertionError(f"real Megatron accessed inside synthetic torch sandbox: {name}")
+
+        host_core = HostMegatronCore("megatron.core")
+        host_megatron = ModuleType("megatron")
+        host_megatron.__path__ = []
+        host_megatron.core = host_core
+        host_torch = ModuleType("torch")
+        host_torch.dtype = type("HostDtype", (), {})
+        with patch.dict(sys.modules, {"megatron": host_megatron, "megatron.core": host_core, "torch": host_torch}):
+            module = _trainer_module()
+            self.assertTrue(module.USE_MEGATRON)
+            self.assertIs(sys.modules["megatron"], host_megatron)
+            self.assertIs(sys.modules["megatron.core"], host_core)
+            self.assertIs(sys.modules["torch"], host_torch)
+            self.assertIsNot(module.parallel_state, host_core)
 
 
 if __name__ == "__main__":
