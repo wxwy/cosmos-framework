@@ -245,6 +245,45 @@ def _worker(rank, root, init_file, scenario, event, release):
         previous = (
             (Path(saver.save_dirname) / "latest_checkpoint.txt").read_bytes() if scenario != "first_failure" else None
         )
+        if scenario == "resume_success":
+            expected_model = {key: value.clone() for key, value in objects[0].state_dict().items()}
+            expected_scheduler = copy.deepcopy(objects[2].state_dict())
+            expected_draw = _sample()
+            with torch.no_grad():
+                for parameter in objects[0].parameters():
+                    parameter.add_(100)
+            for value in objects[1].state.values():
+                value["step"].fill_(99)
+                value["exp_avg"].fill_(99)
+                value["exp_avg_sq"].fill_(99)
+            objects[2].last_epoch = 99
+            iteration = saver.load(*objects)
+            actual_draw = _sample()
+            model_matches = all(
+                torch.equal(expected_model[key], value) for key, value in objects[0].state_dict().items()
+            )
+            optimizer_matches = all(
+                value["step"].item() == 1 and not value["exp_avg"].any().item() and not value["exp_avg_sq"].any().item()
+                for value in objects[1].state.values()
+            )
+            local_rank = callbacks._callbacks[0].restored["rank"]
+            status = {
+                "success": iteration == 1
+                and model_matches
+                and optimizer_matches
+                and objects[2].state_dict() == expected_scheduler
+                and actual_draw == expected_draw
+                and local_rank == rank
+                and saver.rng_restored_from_same_job is True,
+                "rank": rank,
+                "local_rank": local_rank,
+                "model_matches": model_matches,
+                "optimizer_matches": optimizer_matches,
+                "expected_draw": expected_draw,
+                "actual_draw": actual_draw,
+            }
+            (Path(root) / f"rank_{rank}.json").write_text(json.dumps(status))
+            return
         if scenario == "source_disagreement":
             if rank == 1:
                 saver._read_latest_checkpoint_file = lambda: None
@@ -430,7 +469,7 @@ class DistributedSaveTests(unittest.TestCase):
                 json.loads((root / f"rank_{rank}.json").read_text())
                 for rank in range(1 if scenario == "hard_exit" else 2)
             ]
-            expected = scenario == "delay"
+            expected = scenario in {"delay", "resume_success"}
             self.assertTrue(all(report["success"] == expected for report in reports), reports)
             if not expected:
                 self.assertTrue(all(report["latest_unchanged"] for report in reports))
@@ -439,7 +478,10 @@ class DistributedSaveTests(unittest.TestCase):
                 else:
                     self.assertEqual(_reader(root / "checkpoints")["checkpoint"], "iter_000000001")
             else:
-                self.assertEqual(_reader(root / "checkpoints")["checkpoint"], "iter_000000002")
+                self.assertEqual(
+                    _reader(root / "checkpoints")["checkpoint"],
+                    "iter_000000001" if scenario == "resume_success" else "iter_000000002",
+                )
             if scenario in {"rng_failure", "rng_wrong_rank"}:
                 self.assertTrue(all(report["rng_unchanged"] and report["rng_restored"] is False for report in reports))
             if scenario in {"partial_sidecar", "hard_exit"}:
@@ -485,6 +527,9 @@ class DistributedSaveTests(unittest.TestCase):
     def test_unresponsive_rank_hits_bounded_gloo_timeout_without_publication(self):
         self._scenario("stall")
 
+    def test_both_ranks_restore_model_optimizer_local_and_distinct_rng(self):
+        self._scenario("resume_success")
+
 
 class SingleRankTests(unittest.TestCase):
     @classmethod
@@ -519,11 +564,14 @@ class SingleRankTests(unittest.TestCase):
         np.random.seed(29)
         torch.manual_seed(29)
         self.saver.save(*self.objects, iteration=1)
+        expected_model = {key: value.clone() for key, value in self.objects[0].state_dict().items()}
         expected = _sample()
         with torch.no_grad():
             for parameter in self.objects[0].parameters():
                 parameter.add_(100)
         self.saver.load(*self.objects)
+        for key, value in self.objects[0].state_dict().items():
+            self.assertTrue(torch.equal(value, expected_model[key]), key)
         self.assertEqual(_sample(), expected)
         self.assertTrue(self.saver.rng_restored_from_same_job)
         self.assertEqual(self.callbacks._callbacks[0].restored["rank"], 0)
