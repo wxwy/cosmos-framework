@@ -5,7 +5,7 @@ import functools
 import inspect
 import os
 import signal
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,9 +13,13 @@ import torch
 import torch.distributed as dist
 import torch.utils.data
 
-from cosmos_framework.utils.flags import INTERNAL
 from cosmos_framework.utils.context_managers import distributed_init
-from cosmos_framework.utils.profiling import maybe_enable_memory_snapshot, maybe_enable_nsys_profiling, maybe_enable_profiling
+from cosmos_framework.utils.flags import INTERNAL
+from cosmos_framework.utils.profiling import (
+    maybe_enable_memory_snapshot,
+    maybe_enable_nsys_profiling,
+    maybe_enable_profiling,
+)
 
 try:
     from megatron.core import parallel_state
@@ -25,12 +29,11 @@ except ImportError:
     USE_MEGATRON = False
 
 
-from cosmos_framework.utils.lazy_config import LazyConfig, instantiate
 from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import callback, distributed, ema, log, misc
 from cosmos_framework.utils.checkpointer import Checkpointer
+from cosmos_framework.utils.lazy_config import LazyConfig, instantiate
 from cosmos_framework.utils.misc import StragglerDetectorV2
-
 
 
 @dataclass
@@ -88,11 +91,13 @@ class ImaginaireTrainer:
         training_timer (misc.Timer): Timer object to time code blocks and functions.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, *, config_writer: Callable[[Any, Any], None] | None = None):
         """Constructor of the trainer.
 
         Args:
             config (Config): The config object for the Imaginaire codebase.
+            config_writer: Optional rank0 lifecycle writer (config, LazyConfig).
+                Its failure is broadcast before any Trainer job logging or checkpoint setup.
         """
         super().__init__()
         self.config = config
@@ -136,7 +141,19 @@ class ImaginaireTrainer:
                     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
         # Create the local job directory, save the config file, and pipe to a local log.
-        if distributed.is_rank0():
+        if config_writer is not None:
+            # Profile-owned lifecycle: validate/claim before any canonical config write.
+            # Share failures so a rank0 write error cannot leave peers at the next barrier.
+            error = [None]
+            if distributed.is_rank0():
+                try:
+                    config_writer(config, LazyConfig)
+                except Exception as exc:
+                    error[0] = f"{type(exc).__name__}: {exc}"
+            dist.broadcast_object_list(error, src=0)
+            if error[0] is not None:
+                raise RuntimeError(f"Job lifecycle config write failed: {error[0]}")
+        elif distributed.is_rank0():
             os.makedirs(config.job.path_local, exist_ok=True)
             # Save the config as .pkl for reproducibility.
             LazyConfig.save_pkl(config, f"{config.job.path_local}/config.pkl")
@@ -367,6 +384,10 @@ class ImaginaireTrainer:
                             if stop_signal:
                                 raise StopIteration
                     except StopIteration:
+                        if getattr(self, "_require_committed_execution_boundary", False):
+                            raise RuntimeError(
+                                "Dataloader ended before execution budget at a committed optimizer/Local boundary"
+                            )
                         break
                     finally:
                         self.callbacks.on_after_dataloading(iteration)
@@ -400,6 +421,10 @@ class ImaginaireTrainer:
                         continue
                     # Do the following when an actual optimizer (update) step has been made.
                     iteration += 1
+                    if getattr(self, "_require_committed_execution_boundary", False) and (
+                        getattr(self, "_grouped_completed_iteration", None) != iteration
+                    ):
+                        raise RuntimeError("Missing committed optimizer/Local boundary before checkpoint")
                     # Save checkpoint.
                     if iteration % self.config.checkpoint.save_iter == 0:
                         self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
@@ -422,7 +447,12 @@ class ImaginaireTrainer:
                 if _end_training:
                     break
         self._validation_iterator = None
-        log.success("Done with training.")
+        if getattr(self, "_require_committed_execution_boundary", False) and (
+            grad_accum_iter != 0
+            or iteration != execution_max_iter
+            or getattr(self, "_grouped_completed_iteration", None) != iteration
+        ):
+            raise RuntimeError("Execution must end at the requested committed optimizer/Local boundary")
         if sm_carveout:
             torch._C._set_sm_carveout_experimental(None)
         if iteration % self.config.checkpoint.save_iter != 0:
@@ -431,6 +461,7 @@ class ImaginaireTrainer:
         self.checkpointer.finalize()
         distributed.barrier()
         self.callbacks.on_app_end()
+        log.success("Done with training.")
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
 

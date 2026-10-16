@@ -3,37 +3,109 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import fcntl
+import functools
 import hashlib
 import json
+import math
 import os
+import re
 import subprocess
 import time
+import uuid
+from collections.abc import Mapping
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-import torch
-from omegaconf import DictConfig, OmegaConf
+if TYPE_CHECKING:
+    import torch
+    from omegaconf import DictConfig, OmegaConf
 
-from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
-from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import RoboCasaExactWindowCacheCatalog
-from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cached_sft import (
-    get_action_robocasa_exact_window_cached_sft_dataset,
-)
-from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_policy import CorrectedRoboCasaPolicyContract
-from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
-from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
-    ExactWindowLocalCatalog,
-    ExactWindowRankPlanner,
-    ExactWindowSegmentProducer,
-)
-from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrainer, collate_grouped_native_batch
-from cosmos_framework.utils import distributed
-from cosmos_framework.utils.context_managers import model_init
-from cosmos_framework.utils.generator.optimizer import OptimizersContainer
-from cosmos_framework.utils.lazy_config import instantiate
-from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
-from examples.psm_wma_robocasa_formal_monitor import TelemetryJournal
-from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
+    from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
+    from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
+        RoboCasaExactWindowCacheCatalog,
+    )
+    from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cached_sft import (
+        get_action_robocasa_exact_window_cached_sft_dataset,
+    )
+    from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_policy import (
+        CorrectedRoboCasaPolicyContract,
+    )
+    from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
+    from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
+        ExactWindowLocalCatalog,
+        ExactWindowRankPlanner,
+        ExactWindowSegmentProducer,
+    )
+    from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrainer, collate_grouped_native_batch
+    from cosmos_framework.utils import distributed
+    from cosmos_framework.utils.context_managers import model_init
+    from cosmos_framework.utils.generator.optimizer import OptimizersContainer
+    from cosmos_framework.utils.lazy_config import instantiate
+    from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
+    from examples.psm_wma_robocasa_formal_monitor import TelemetryJournal
+    from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
+
+
+def _load_runtime() -> None:
+    """Keep read-only namespace rejection and CLI help usable without CUDA dependencies."""
+    global torch
+    global DictConfig
+    global OmegaConf
+    global load_experiment_from_toml
+    global RoboCasaExactWindowCacheCatalog
+    global get_action_robocasa_exact_window_cached_sft_dataset
+    global CorrectedRoboCasaPolicyContract
+    global VerifiedExactWindowIndex
+    global ExactWindowLocalCatalog
+    global ExactWindowRankPlanner
+    global ExactWindowSegmentProducer
+    global GroupedLocalMemoryTrainer
+    global collate_grouped_native_batch
+    global distributed
+    global model_init
+    global OptimizersContainer
+    global instantiate
+    global GroupedPlanObserver
+    global TelemetryJournal
+    global RECIPE
+    global check_droid_dcp
+    global check_edge_checkpoint
+    global _RUNTIME_READY
+    if globals().get("_RUNTIME_READY", False):
+        return
+    import torch
+    from omegaconf import DictConfig, OmegaConf
+
+    from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
+    from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
+        RoboCasaExactWindowCacheCatalog,
+    )
+    from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cached_sft import (
+        get_action_robocasa_exact_window_cached_sft_dataset,
+    )
+    from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_policy import (
+        CorrectedRoboCasaPolicyContract,
+    )
+    from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
+    from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
+        ExactWindowLocalCatalog,
+        ExactWindowRankPlanner,
+        ExactWindowSegmentProducer,
+    )
+    from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrainer, collate_grouped_native_batch
+    from cosmos_framework.utils import distributed
+    from cosmos_framework.utils.context_managers import model_init
+    from cosmos_framework.utils.generator.optimizer import OptimizersContainer
+    from cosmos_framework.utils.lazy_config import instantiate
+    from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
+    from examples.psm_wma_robocasa_formal_monitor import TelemetryJournal
+    from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
+
+    _RUNTIME_READY = True
+
 
 GENERATION_KEYS = (
     "moe_gen",
@@ -55,6 +127,234 @@ ACTION_KEYS = ("action2llm", "llm2action", "action_modality_embed")
 # This changes the gradient accumulation/RNG graph and must not silently
 # same-job resume the legacy per-index native execution checkpoint.
 NATIVE_BATCH_LAYOUT = "v2_a2_member_packed_slot_major_v1"
+JOB_IDENTITY = "v3_job_identity.json"
+
+
+def _json_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+def job_namespace(args: argparse.Namespace) -> Path:
+    """Reject traversal and symlink aliases instead of resolving into an old job."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.job_name) or args.job_name in {".", ".."}:
+        raise ValueError("job-name must be one ordinary path component")
+    if ".." in args.output_root.parts:
+        raise ValueError("output-root traversal is forbidden")
+    path = args.output_root.absolute() / "psm_wma_v3" / "corrected_phase5" / args.job_name
+    if any(part.is_symlink() for part in (path, *path.parents)):
+        raise ValueError("job namespace symlink alias is forbidden")
+    return path
+
+
+def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Read-only checks; a new Fresh claim is still required after distributed agreement."""
+    path = job_namespace(args)
+    if args.phase == "fresh":
+        if path.exists():
+            raise FileExistsError(f"Fresh requires a previously nonexistent job namespace: {path}")
+        return None
+    if args.job_name.startswith("bounded_"):
+        raise ValueError("bounded diagnostic checkpoint must not be resumed as formal training")
+    if (path / JOB_IDENTITY).is_symlink():
+        raise ValueError("job identity symlink is forbidden")
+    record = json.loads((path / JOB_IDENTITY).read_text())
+    if (
+        record.get("schema") != "corrected_phase5_f0_v1"
+        or record.get("namespace") != str(path)
+        or record.get("root") != args.expected_root
+        or record.get("child") != args.expected_child
+        or record.get("native_batch_layout") != NATIVE_BATCH_LAYOUT
+        or record.get("diagnostic_only_do_not_resume") is not False
+        or record.get("semantic_digest") != _json_digest(record.get("semantic"))
+    ):
+        raise ValueError("same-job identity Root/Child/Layout/namespace mismatch")
+    if semantic is not None and record["semantic"] != semantic:
+        raise ValueError("same-job training semantic identity mismatch")
+    if set(record.get("canonical_config_sha256", {})) != {"config.pkl", "config.yaml"}:
+        raise ValueError("canonical config witnesses missing")
+    for name, digest in record["canonical_config_sha256"].items():
+        item = path / name
+        if item.is_symlink() or _file_sha256(item) != digest:
+            raise ValueError(f"canonical config changed: {name}")
+    return record
+
+
+def _identity_value(value: Any) -> Any:
+    """Serialize resolved training values without process addresses or unsafe pickle loads."""
+    if value is None or type(value) in (str, int, bool):
+        return value
+    if isinstance(value, Enum):
+        return _identity_value(value.value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("nonfinite config identity")
+        return value
+    if isinstance(value, Path):
+        return str(value.resolve())
+    if isinstance(value, functools.partial):
+        return {
+            "callable": _identity_value(value.func),
+            "args": _identity_value(value.args),
+            "kwargs": _identity_value(value.keywords),
+        }
+    if isinstance(value, type) or callable(value):
+        if "<lambda>" in value.__qualname__ or "<locals>" in value.__qualname__:
+            raise ValueError("anonymous training config callable has no stable identity")
+        return f"{value.__module__}.{value.__qualname__}"
+    # OmegaConf is loaded only for the full config preflight, never namespace-only checks.
+    if "OmegaConf" in globals() and OmegaConf.is_config(value):
+        return _identity_value(OmegaConf.to_container(value, resolve=True))
+    if isinstance(value, Mapping):
+        return {str(key): _identity_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_identity_value(item) for item in value]
+    fields = getattr(type(value), "__attrs_attrs__", ())
+    if dataclasses.is_dataclass(value):
+        fields = dataclasses.fields(value)
+    if fields:
+        return {field.name: _identity_value(getattr(value, field.name)) for field in fields}
+    if type(value).__module__ == "torch" and type(value).__name__ in {"dtype", "memory_format", "device"}:
+        return str(value)
+    raise TypeError(f"unsupported config identity value: {type(value)}")
+
+
+def training_identity(args: argparse.Namespace, config: Any, report: dict[str, Any]) -> dict[str, Any]:
+    """Bind complete model/optimizer/seed semantics; exclude phase/load path and run budget."""
+    return {
+        "root": args.expected_root,
+        "child": args.expected_child,
+        "native_batch_layout": NATIVE_BATCH_LAYOUT,
+        "training": {
+            name: _identity_value(getattr(config, name))
+            for name in ("model", "optimizer", "scheduler", "trainer", "model_parallel", "data_setting")
+        },
+        "checkpoint": {
+            name: _identity_value(getattr(config.checkpoint, name)) for name in ("save_iter", "strict_resume")
+        },
+        "source_paths": {
+            name: str(getattr(args, name).resolve())
+            for name in ("source_root", "cache_root", "dataset_index_root", "base_checkpoint", "edge", "vae")
+        },
+        "authority": {
+            key: report[key]
+            for key in (
+                "cache_manifest_sha256",
+                "cache_corpus_digest",
+                "source_binding_digest",
+                "model_witnesses",
+                "transform_rng_mode",
+            )
+        },
+        "contract": {
+            "raw_action_dim": 15,
+            "state_dim": 15,
+            "h_pred": 16,
+            "consumer_frames": 17,
+            "t": args.t,
+            "b": args.b,
+            "ga": args.ga,
+            "k": args.k,
+            "world_size": args.world_size,
+        },
+        "rng": {"seed_by_rank": True, "deterministic_algorithms": torch.are_deterministic_algorithms_enabled()},
+        "index_receipt_sha256": _file_sha256(args.dataset_index_root / "receipt.json"),
+    }
+
+
+class JobLifecycle:
+    """Rank0-only writer after all ranks have agreed on read-only preflight."""
+
+    def __init__(self, args: argparse.Namespace, report: dict[str, Any]):
+        self.args, self.report = args, report
+        self.path = job_namespace(args)
+        self.launch_id = uuid.uuid4().hex
+        self._lease = None
+
+    def close(self) -> None:
+        if self._lease is not None:
+            self._lease.close()
+            self._lease = None
+
+    def write_config(self, config: Any, serializer: Any) -> None:
+        semantic = self.report["training_identity"]
+        if Path(config.job.path_local).absolute() != self.path:
+            raise ValueError("Trainer job path differs from claimed namespace")
+        check_job_namespace(self.args, semantic)
+        if self.args.phase == "fresh":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # mkdir(exist_ok=False) is the cross-process compare-and-create operation.
+            # A failed/interrupted claim remains partial and can never be silently reused.
+            self.path.mkdir()
+        # Keep the rank0 descriptor alive throughout this launch. Never unlink the
+        # lock inode: a second Resume must not write alongside the first one.
+        lease_path = self.path / "launch.lock"
+        if lease_path.is_symlink():
+            raise ValueError("launch lock symlink is forbidden")
+        self._lease = lease_path.open("xb" if self.args.phase == "fresh" else "r+b")
+        fcntl.flock(self._lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if self.args.phase == "resume" and str(_resume_checkpoint(self.args)) != self.report["checkpoint_load_path"]:
+            raise ValueError("latest checkpoint changed between preflight and exclusive launch")
+        if (self.path / "launches").is_symlink():
+            raise ValueError("launch snapshots symlink is forbidden")
+        launch = self.path / "launches" / self.launch_id
+        launch.mkdir(parents=True)
+        serializer.save_pkl(config, str(launch / "config.pkl"))
+        serializer.save_yaml(config, str(launch / "config.yaml"))
+        # Serializers may log failures instead of raising. Require both actual outputs.
+        for name in ("config.pkl", "config.yaml"):
+            if not (launch / name).is_file() or (launch / name).stat().st_size == 0:
+                raise RuntimeError(f"resolved config snapshot missing: {name}")
+        record = {
+            "phase": self.args.phase,
+            "formal_execution_until": getattr(self.args, "formal_execution_until", None),
+            "execution_stop_after_iter": self.report["execution_stop_after_iter"],
+            "semantic_digest": _json_digest(semantic),
+            "config_digest": self.report["config_digest"],
+        }
+        (launch / "launch.json").write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
+        if self.args.phase == "fresh":
+            for name in ("config.pkl", "config.yaml"):
+                with (self.path / name).open("xb") as out:
+                    out.write((launch / name).read_bytes())
+            identity = {
+                "schema": "corrected_phase5_f0_v1",
+                "namespace": str(self.path),
+                "root": self.args.expected_root,
+                "child": self.args.expected_child,
+                "native_batch_layout": NATIVE_BATCH_LAYOUT,
+                "semantic": semantic,
+                "semantic_digest": _json_digest(semantic),
+                "diagnostic_only_do_not_resume": self.args.stop_after_iter is not None,
+                "canonical_config_sha256": {
+                    name: _file_sha256(self.path / name) for name in ("config.pkl", "config.yaml")
+                },
+            }
+            with (self.path / JOB_IDENTITY).open("x") as out:
+                json.dump(identity, out, sort_keys=True, indent=2)
+                out.write("\n")
+
+
+def _agree_preflight(args: argparse.Namespace):
+    """Collect errors before any rank can claim the namespace or construct Trainer."""
+    result, error = None, None
+    try:
+        result = preflight(args)
+        result[1].validate()
+        result[1].freeze()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    errors = [None] * args.world_size
+    torch.distributed.all_gather_object(errors, error)
+    if any(errors):
+        raise RuntimeError(f"all-rank read-only preflight failed: {errors}")
+    # Also reject inconsistent per-rank resolved configs before a writer is installed.
+    identities = [None] * args.world_size
+    torch.distributed.all_gather_object(identities, result[0]["config_digest"])
+    if len(set(identities)) != 1:
+        raise ValueError("all-rank training config identities disagree")
+    return result
 
 
 class GroupedTriggerLoader:
@@ -311,14 +611,22 @@ def _resume_checkpoint(args: argparse.Namespace) -> Path | None:
     if args.phase == "fresh":
         return None
     latest = args.output_root / "psm_wma_v3/corrected_phase5" / args.job_name / "checkpoints/latest_checkpoint.txt"
+    if latest.is_symlink() or latest.parent.is_symlink():
+        raise ValueError("same-job checkpoint symlink alias is forbidden")
     name = latest.read_text().strip()
     if not name.startswith("iter_") or not name[5:].isdigit() or not 0 < int(name[5:]) < args.max_iter:
         raise ValueError("same-job latest checkpoint iteration 不合法")
     checkpoint = latest.parent / name
+    if checkpoint.is_symlink():
+        raise ValueError("same-job checkpoint symlink alias is forbidden")
     for component in ("model", "optim", "scheduler", "trainer"):
+        if (checkpoint / component).is_symlink() or (checkpoint / component / ".metadata").is_symlink():
+            raise ValueError("same-job checkpoint component symlink is forbidden")
         if not (checkpoint / component / ".metadata").is_file():
             raise FileNotFoundError(f"same-job DCP 缺少 {component}")
     for rank in range(args.world_size):
+        if (checkpoint / "dataloader").is_symlink() or (checkpoint / "dataloader" / f"rank_{rank}.pkl").is_symlink():
+            raise ValueError("same-job Local sidecar symlink is forbidden")
         if not (checkpoint / "dataloader" / f"rank_{rank}.pkl").is_file():
             raise FileNotFoundError(f"same-job DCP 缺少 rank_{rank} Local 状态")
     return checkpoint
@@ -391,8 +699,20 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _execution_stop_iteration(args: argparse.Namespace) -> int:
-    """Bound only fresh diagnostic execution, never the formal training config."""
+    """Bound execution only; preserve the configured training/scheduler horizon."""
     stop_after = getattr(args, "stop_after_iter", None)
+    formal_until = getattr(args, "formal_execution_until", None)
+    if formal_until is not None:
+        if (
+            stop_after is not None
+            or args.job_name.startswith("bounded_")
+            or type(formal_until) is not int
+            or not 1 <= formal_until <= args.max_iter
+            or (args.max_iter, args.warmup, args.save_iter) != (30000, 500, 100)
+            or getattr(args, "audit_missing_grads", False)
+        ):
+            raise ValueError("formal execution budget requires 1..30000 and schedule 30000/500/100; no diagnostics")
+        return formal_until
     if getattr(args, "audit_missing_grads", False) and stop_after != 3:
         raise ValueError("--audit-missing-grads requires fresh bounded --stop-after-iter 3")
     if stop_after is None:
@@ -417,6 +737,7 @@ def _execution_stop_iteration(args: argparse.Namespace) -> int:
 
 
 def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindowLocalCatalog, Any]:
+    check_job_namespace(args)
     if any(
         type(value) is not int or value <= 0
         for value in (args.t, args.b, args.ga, args.k, args.world_size, args.max_iter, args.save_iter)
@@ -431,6 +752,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         raise ValueError("full segment prefetch requires --num-workers 1 --transform-rng-mode consumer_keyed_v1")
     if getattr(args, "dataset_index_root", None) is None:
         raise ValueError("训练/Resume 必须提供已离线验收的 --dataset-index-root；禁止 cold build 与数据全量复检")
+    _load_runtime()
     lock = verify_root_child_lock(args)
     os.environ["HF_HUB_OFFLINE"] = "1"
     check_edge_checkpoint(str(args.edge))
@@ -438,6 +760,8 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     if not args.vae.is_file():
         raise FileNotFoundError("WAN VAE 文件缺失")
     resume = _resume_checkpoint(args)
+    if resume is not None and int(resume.name[5:]) >= execution_stop:
+        raise ValueError("restored iteration must be below execution budget")
     config = _load_config(args)
     init_start = time.perf_counter()
     verify_start = time.perf_counter()
@@ -512,26 +836,27 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
                     checked += 1
             if checked < 10:
                 plan = planner.plan_window(plan.candidate_frontier)
-    return (
-        {
-            "lock": lock,
-            "config_digest": digest,
-            "transform_rng_mode": getattr(args, "transform_rng_mode", "legacy_global"),
-            "full_segment_prefetch": getattr(args, "full_segment_prefetch", False),
-            "execution_stop_after_iter": execution_stop,
-            "execution_scope": "bounded_diagnostic" if execution_stop < args.max_iter else "full_formal",
-            "cache_manifest_sha256": catalog.manifest_digest,
-            "cache_corpus_digest": catalog.cache_corpus_digest,
-            "source_binding_digest": catalog.source_binding_digest,
-            "model_witnesses": witnesses,
-            "episodes": len(catalog.episodes),
-            "dataset_init": dataset_init,
-            "checkpoint_load_path": str(resume or args.base_checkpoint),
-        },
-        config,
-        catalog,
-        dataset,
-    )
+    report = {
+        "lock": lock,
+        "config_digest": digest,
+        "transform_rng_mode": getattr(args, "transform_rng_mode", "legacy_global"),
+        "full_segment_prefetch": getattr(args, "full_segment_prefetch", False),
+        "execution_stop_after_iter": execution_stop,
+        "execution_scope": "bounded_diagnostic" if getattr(args, "stop_after_iter", None) is not None else "formal",
+        "cache_manifest_sha256": catalog.manifest_digest,
+        "cache_corpus_digest": catalog.cache_corpus_digest,
+        "source_binding_digest": catalog.source_binding_digest,
+        "model_witnesses": witnesses,
+        "episodes": len(catalog.episodes),
+        "dataset_init": dataset_init,
+        "checkpoint_load_path": str(resume or args.base_checkpoint),
+    }
+    semantic = training_identity(args, config, report)
+    check_job_namespace(args, semantic)
+    report["training_identity"] = semantic
+    # A new profile/schema cannot silently resume historical jobs with incomplete identity.
+    report["config_digest"] = _json_digest({"phase5_digest": digest, "training_identity": semantic})
+    return report, config, catalog, dataset
 
 
 def parser() -> argparse.ArgumentParser:
@@ -542,6 +867,12 @@ def parser() -> argparse.ArgumentParser:
     for name in ("output-root", "source-root", "cache-root", "edge", "vae", "base-checkpoint"):
         result.add_argument(f"--{name}", required=True, type=Path)
     result.add_argument("--root-worktree", required=True, type=Path)
+    result.add_argument(
+        "--formal-execution-until",
+        type=int,
+        default=None,
+        help="Stop a formal job at a committed optimizer iteration without changing its 30000/500/100 schedule",
+    )
     result.add_argument(
         "--dataset-index-root",
         type=Path,
@@ -602,22 +933,23 @@ def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
     if type(args.num_workers) is not int or not 0 <= args.num_workers <= 16:
         raise ValueError("--num-workers must be 0..16")
-    report, config, catalog, _ = preflight(args)
-    if os.environ.get("RANK", "0") == "0":
-        print("[CorrectedV3][dataset_init] " + json.dumps(report["dataset_init"], sort_keys=True))
     if args.preflight:
+        report, _, _, _ = preflight(args)
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return
+    _load_runtime()
     if int(os.environ.get("WORLD_SIZE", "0")) != args.world_size or not torch.cuda.is_available():
         raise RuntimeError("训练要求匹配 world_size 的 CUDA torchrun")
     os.environ["IMAGINAIRE_OUTPUT_ROOT"] = str(args.output_root)
     distributed.init()
-    config.validate()
-    config.freeze()
+    report, config, catalog, _ = _agree_preflight(args)
     rank = int(os.environ["RANK"])
-    trainer = GroupedLocalMemoryTrainer(config)
-    if getattr(args, "stop_after_iter", None) is not None:
-        trainer._execution_max_iter = report["execution_stop_after_iter"]
+    if rank == 0:
+        print("[CorrectedV3][dataset_init] " + json.dumps(report["dataset_init"], sort_keys=True))
+    lifecycle = JobLifecycle(args, report)
+    trainer = GroupedLocalMemoryTrainer(config, config_writer=lifecycle.write_config)
+    trainer._execution_max_iter = report["execution_stop_after_iter"]
+    trainer._require_committed_execution_boundary = True
     with model_init():
         model = instantiate(config.model)
     install_optimizer_inventory_check(model, report)
@@ -668,6 +1000,7 @@ def main(argv: list[str] | None = None) -> None:
         or observer.completed != expected_iteration - start_iteration
     ):
         raise RuntimeError("Phase5 完成的 optimizer iteration 不匹配")
+    lifecycle.close()
     if rank == 0 and getattr(args, "stop_after_iter", None) is not None:
         print(
             "[CorrectedV3][bounded_stop] "
