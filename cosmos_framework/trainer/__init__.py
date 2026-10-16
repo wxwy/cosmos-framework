@@ -341,7 +341,10 @@ class ImaginaireTrainer:
             self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=0)
 
         _end_training = False
-        if torch.are_deterministic_algorithms_enabled():
+        if (
+            torch.are_deterministic_algorithms_enabled()
+            and getattr(self.checkpointer, "rng_restored_from_same_job", False) is not True
+        ):
             # Re-seed all global RNGs after init (model load, checkpoint load, compile warmup,
             # callbacks) so data-augmentation randomness starts from a deterministic state
             # regardless of how much RNG state init consumed.

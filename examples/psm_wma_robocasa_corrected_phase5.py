@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     import torch
     from omegaconf import DictConfig, OmegaConf
 
+    from cosmos_framework.checkpoint.dcp import SafeLocalDistributedCheckpointer
     from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
     from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
         RoboCasaExactWindowCacheCatalog,
@@ -73,12 +74,14 @@ def _load_runtime() -> None:
     global RECIPE
     global check_droid_dcp
     global check_edge_checkpoint
+    global SafeLocalDistributedCheckpointer
     global _RUNTIME_READY
     if globals().get("_RUNTIME_READY", False):
         return
     import torch
     from omegaconf import DictConfig, OmegaConf
 
+    from cosmos_framework.checkpoint.dcp import SafeLocalDistributedCheckpointer
     from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
     from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
         RoboCasaExactWindowCacheCatalog,
@@ -231,7 +234,8 @@ def training_identity(args: argparse.Namespace, config: Any, report: dict[str, A
             for name in ("model", "optimizer", "scheduler", "trainer", "model_parallel", "data_setting")
         },
         "checkpoint": {
-            name: _identity_value(getattr(config.checkpoint, name)) for name in ("save_iter", "strict_resume")
+            **{name: _identity_value(getattr(config.checkpoint, name)) for name in ("save_iter", "strict_resume")},
+            "safety_profile": "psm_v3_sync_local_v1",
         },
         "source_paths": {
             name: str(getattr(args, name).resolve())
@@ -578,6 +582,8 @@ def overlay_config(
     config.scheduler.warm_up_steps = [args.warmup]
     config.checkpoint.save_iter = args.save_iter
     config.checkpoint.strict_resume = True
+    config.checkpoint.dcp_async_mode_enabled = False
+    config.checkpoint.type = {"_target_": SafeLocalDistributedCheckpointer}
     config.checkpoint.load_path = str(resume_checkpoint or args.base_checkpoint)
     config.checkpoint.load_training_state = resume_checkpoint is not None
     config.checkpoint.keys_to_skip_loading = ["net_ema."] if resume_checkpoint else ["net_ema.", "local_memory"]
