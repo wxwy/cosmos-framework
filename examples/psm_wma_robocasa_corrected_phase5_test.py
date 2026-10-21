@@ -69,6 +69,25 @@ def _config(path: Path, *, t: int = 16, b: int = 8, ga: int = 2, k: int = 4):
         source_root=path / "source",
     )
     config = SimpleNamespace(
+        dataloader_train={
+            "dataloader": {
+                "datasets": {
+                    "robocasa": {
+                        "dataset": {
+                            "chunk_length": 32,
+                            "fps": 20,
+                            "camera_set": "left_wrist",
+                            "use_state": True,
+                            "use_base_action": True,
+                            "base_encoding": "raw",
+                            "action_normalization": None,
+                            "mode": "wam",
+                            "max_action_dim": 64,
+                        }
+                    }
+                }
+            }
+        },
         model=SimpleNamespace(config=model),
         optimizer=SimpleNamespace(
             keys_to_select=phase5.OPTIMIZER_KEYS,

@@ -71,7 +71,11 @@ class Serializer:
 
     @staticmethod
     def save_yaml(config, path):
-        Path(path).write_text(json.dumps({"phase": config.phase, "schedule": [30000, 500, 100]}))
+        Path(path).write_text(
+            json.dumps(
+                {"phase": config.phase, "schedule": [30000, 500, 100], "dataloader_train": config.dataloader_train}
+            )
+        )
 
 
 def _report(args, semantic=None):
@@ -80,11 +84,51 @@ def _report(args, semantic=None):
         "config_digest": "d" * 64,
         "execution_stop_after_iter": phase5._execution_stop_iteration(args),
         "checkpoint_load_path": str(phase5.job_namespace(args) / "checkpoints/iter_000000100"),
+        "effective_data_source": phase5.describe_effective_data_source(
+            _config(args),
+            NS(
+                action_horizon=16,
+                chunk_length=16,
+                observation_frames=17,
+                action_dim=15,
+                state_dim=15,
+                **_dataset_fields(),
+            ),
+            ttt_steps=args.t,
+        ),
     }
 
 
+def _dataset_fields():
+    return dict(
+        fps=20,
+        camera_set="left_wrist",
+        use_state=True,
+        use_base_action=True,
+        base_encoding="raw",
+        action_normalization=None,
+        mode="wam",
+        max_action_dim=64,
+    )
+
+
 def _config(args):
-    return NS(phase=args.phase, job=NS(path_local=str(phase5.job_namespace(args))))
+    return NS(
+        phase=args.phase,
+        job=NS(path_local=str(phase5.job_namespace(args))),
+        dataloader_train={
+            "dataloader": {
+                "datasets": {
+                    "robocasa": {
+                        "dataset": {
+                            "chunk_length": 16,
+                            **_dataset_fields(),
+                        }
+                    }
+                }
+            }
+        },
+    )
 
 
 def _write_job(args, report=None, serializer=Serializer):
@@ -602,6 +646,7 @@ class TrainerTests(unittest.TestCase):
             )
             config = self.trainer.config
             config.job, config.phase = _config(args).job, args.phase
+            config.dataloader_train = _config(args).dataloader_train
             config.model = {}
             self.trainer.bind_grouped_stream = MagicMock()
 

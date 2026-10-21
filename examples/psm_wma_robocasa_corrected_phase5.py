@@ -19,6 +19,13 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from examples.psm_wma_robocasa_effective_config import (
+    describe_effective_data_source,
+    synchronize_legacy_chunk_length,
+    validate_effective_snapshot,
+    validate_saved_yaml,
+)
+
 if TYPE_CHECKING:
     import torch
     from omegaconf import DictConfig, OmegaConf
@@ -286,6 +293,8 @@ class JobLifecycle:
         if Path(config.job.path_local).absolute() != self.path:
             raise ValueError("Trainer job path differs from claimed namespace")
         check_job_namespace(self.args, semantic)
+        effective_data_source = self.report["effective_data_source"]
+        validate_effective_snapshot(config, effective_data_source)
         if self.args.phase == "fresh":
             self.path.parent.mkdir(parents=True, exist_ok=True)
             # mkdir(exist_ok=False) is the cross-process compare-and-create operation.
@@ -310,12 +319,14 @@ class JobLifecycle:
         for name in ("config.pkl", "config.yaml"):
             if not (launch / name).is_file() or (launch / name).stat().st_size == 0:
                 raise RuntimeError(f"resolved config snapshot missing: {name}")
+        validate_saved_yaml(launch / "config.yaml", effective_data_source)
         record = {
             "phase": self.args.phase,
             "formal_execution_until": getattr(self.args, "formal_execution_until", None),
             "execution_stop_after_iter": self.report["execution_stop_after_iter"],
             "semantic_digest": _json_digest(semantic),
             "config_digest": self.report["config_digest"],
+            "effective_data_source": effective_data_source,
         }
         (launch / "launch.json").write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
         if self.args.phase == "fresh":
@@ -561,6 +572,7 @@ def overlay_config(
     from examples.psm_wma_robocasa_local_s1 import overlay_local_config
 
     overlay_local_config(config)
+    synchronize_legacy_chunk_length(config, contract)
     model = config.model.config
     model.local_memory_ttt_tbptt_steps = args.t
     model.local_memory_k_local = args.k
@@ -856,6 +868,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         "episodes": len(catalog.episodes),
         "dataset_init": dataset_init,
         "checkpoint_load_path": str(resume or args.base_checkpoint),
+        "effective_data_source": describe_effective_data_source(config, catalog.raw.contract, ttt_steps=args.t),
     }
     semantic = training_identity(args, config, report)
     check_job_namespace(args, semantic)
