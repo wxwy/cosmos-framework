@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import re
 import subprocess
 import time
@@ -138,6 +139,51 @@ ACTION_KEYS = ("action2llm", "llm2action", "action_modality_embed")
 # same-job resume the legacy per-index native execution checkpoint.
 NATIVE_BATCH_LAYOUT = "v2_a2_member_packed_slot_major_v1"
 JOB_IDENTITY = "v3_job_identity.json"
+G1_JOB = "packed128_droid_fresh_g1_20261019"
+G1_FROZEN_ROOT = "e0121d34592d10323ede480eb3409468a07371ba"
+G1_FROZEN_CHILD = "2d128ed5a07601cdd424974f99b67832eafeeb41"
+G1_RUNTIME_BASE_CHILD = "35b0ea1ccee9ee26653ed6589c484f0997d1c586"
+G1_CONFIG_YAML_SHA256 = "f87e2e49c6931ce7dc32b467aa3f8026269f5ad255216e1cdd8fafb1d7e7374e"
+G1_CHECKPOINT = "iter_000008900"
+
+
+def _owner_g1_cross_pair_resume(args: argparse.Namespace) -> bool:
+    enabled = getattr(args, "owner_authorized_g1_cross_pair_resume", False)
+    if type(enabled) is not bool:
+        raise ValueError("Owner G1 override must be an explicit boolean flag")
+    if enabled and (
+        args.phase != "resume"
+        or args.job_name != G1_JOB
+        or tuple(getattr(args, key, None) for key in ("t", "b", "ga", "k", "world_size")) != (16, 8, 2, 4, 8)
+        or (args.max_iter, args.warmup, args.save_iter) != (30000, 500, 100)
+        or getattr(args, "stop_after_iter", None) is not None
+    ):
+        raise ValueError("Owner cross-pair override is only for G1 formal iter8900 Resume T16/B8/GA2/K4/world8")
+    return enabled
+
+
+def _semantic_drift_paths(old: Any, new: Any, path: str = "semantic") -> list[str]:
+    if type(old) is not type(new):
+        return [path]
+    if isinstance(old, dict):
+        return [
+            item
+            for key in sorted(old.keys() | new.keys())
+            for item in (
+                [f"{path}.{key}"]
+                if key not in old or key not in new
+                else _semantic_drift_paths(old[key], new[key], f"{path}.{key}")
+            )
+        ]
+    if isinstance(old, list):
+        if len(old) != len(new):
+            return [path]
+        return [
+            item
+            for index, (a, b) in enumerate(zip(old, new, strict=True))
+            for item in _semantic_drift_paths(a, b, f"{path}[{index}]")
+        ]
+    return [] if old == new else [path]
 
 
 def _json_digest(value: Any) -> str:
@@ -160,6 +206,7 @@ def job_namespace(args: argparse.Namespace) -> Path:
 
 def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Read-only checks; a new Fresh claim is still required after distributed agreement."""
+    override = _owner_g1_cross_pair_resume(args)
     path = job_namespace(args)
     if args.phase == "fresh":
         if path.exists():
@@ -173,15 +220,30 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
     if (
         record.get("schema") != "corrected_phase5_f0_v1"
         or record.get("namespace") != str(path)
-        or record.get("root") != args.expected_root
-        or record.get("child") != args.expected_child
+        or record.get("root") != (G1_FROZEN_ROOT if override else args.expected_root)
+        or record.get("child") != (G1_FROZEN_CHILD if override else args.expected_child)
         or record.get("native_batch_layout") != NATIVE_BATCH_LAYOUT
         or record.get("diagnostic_only_do_not_resume") is not False
         or record.get("semantic_digest") != _json_digest(record.get("semantic"))
     ):
         raise ValueError("same-job identity Root/Child/Layout/namespace mismatch")
-    if semantic is not None and record["semantic"] != semantic:
-        raise ValueError("same-job training semantic identity mismatch")
+    if override and (
+        not isinstance(record["semantic"], dict)
+        or (record["semantic"].get("root"), record["semantic"].get("child")) != (G1_FROZEN_ROOT, G1_FROZEN_CHILD)
+        or record.get("canonical_config_sha256", {}).get("config.yaml") != G1_CONFIG_YAML_SHA256
+    ):
+        raise ValueError("frozen G1 source/semantic/config authority mismatch")
+    if semantic is not None:
+        if override:
+            if (semantic.get("root"), semantic.get("child")) != (args.expected_root, args.expected_child):
+                raise ValueError("runtime G1 semantic source does not match expected Pair")
+            old = {key: value for key, value in record["semantic"].items() if key not in {"root", "child"}}
+            new = {key: value for key, value in semantic.items() if key not in {"root", "child"}}
+            drift = _semantic_drift_paths(old, new)
+            if drift:
+                raise ValueError("G1 semantic drift outside root/child: " + ", ".join(drift))
+        elif record["semantic"] != semantic:
+            raise ValueError("same-job training semantic identity mismatch")
     if set(record.get("canonical_config_sha256", {})) != {"config.pkl", "config.yaml"}:
         raise ValueError("canonical config witnesses missing")
     for name, digest in record["canonical_config_sha256"].items():
@@ -189,6 +251,95 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
         if item.is_symlink() or _file_sha256(item) != digest:
             raise ValueError(f"canonical config changed: {name}")
     return record
+
+
+def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], phase5_digest: str) -> dict[str, Any]:
+    """Read frozen authorities; never rewrite identity or relax actual state restoration."""
+    if not _owner_g1_cross_pair_resume(args):
+        raise ValueError("G1 compatibility requires explicit Owner authorization")
+    if not isinstance(phase5_digest, str) or re.fullmatch(r"[0-9a-f]{64}", phase5_digest) is None:
+        raise ValueError("G1 phase5 digest must be a full SHA256")
+    record = check_job_namespace(args, report["training_identity"])
+    checkpoint = _resume_checkpoint(args)
+    if str(checkpoint) != report["checkpoint_load_path"]:
+        raise ValueError("G1 checkpoint changed since preflight")
+    expected = _json_digest({"phase5_digest": phase5_digest, "training_identity": record["semantic"]})
+    path = job_namespace(args)
+    launches = path / "launches"
+    if launches.is_symlink():
+        raise ValueError("G1 launches symlink is forbidden")
+    frozen_launch = None
+    for item in sorted(launches.glob("*/launch.json")):
+        if item.is_symlink() or item.parent.is_symlink():
+            raise ValueError("G1 launch symlink is forbidden")
+        prior = json.loads(item.read_text())
+        if prior.get("semantic_digest") != record["semantic_digest"]:
+            continue
+        if prior.get("config_digest") != expected:
+            raise ValueError("G1 phase5/config digest differs from historical launch")
+        if prior.get("phase") == "fresh":
+            for name, digest in record["canonical_config_sha256"].items():
+                snapshot = item.parent / name
+                if snapshot.is_symlink() or _file_sha256(snapshot) != digest:
+                    raise ValueError("G1 original launch config differs from frozen canonical config")
+            frozen_launch = {"path": str(item), "sha256": _file_sha256(item)}
+    if frozen_launch is None:
+        raise ValueError("G1 original frozen-config launch authority is missing")
+    witnesses = {}
+    for rank in range(args.world_size):
+        sidecar = checkpoint / "dataloader" / f"rank_{rank}.pkl"
+        before = _file_sha256(sidecar)
+        # Same trusted local G1 pickle format already used by the unchanged DCP loader.
+        with sidecar.open("rb") as stream:
+            state = pickle.load(stream)
+            if stream.read(1):
+                raise ValueError("G1 sidecar has trailing bytes")
+        if _file_sha256(sidecar) != before:
+            raise ValueError("G1 sidecar changed during read-only validation")
+        if (
+            not isinstance(state, dict)
+            or state.get("format") != "psm_v3_corrected_grouped_local_v2"
+            or type(state.get("iteration")) is not int
+            or state["iteration"] != 8900
+            or state.get("config_digest") != expected
+            or type(state.get("profile")) is not tuple
+            or state["profile"][:2] != (rank, args.world_size)
+            or not isinstance(state.get("sidecar"), dict)
+            or any(
+                state.get(name) != report[name]
+                for name in ("cache_manifest_sha256", "cache_corpus_digest", "source_binding_digest")
+            )
+        ):
+            raise ValueError(f"G1 rank{rank} sidecar digest/iteration/source/profile mismatch")
+        for saved in state["sidecar"].values():
+            if type(saved) is not tuple or len(saved) != 3 or getattr(saved[1], "config_digest", None) != expected:
+                raise ValueError(f"G1 rank{rank} SegmentProvenance config digest mismatch")
+        witnesses[str(rank)] = {"sha256": before, "bytes": sidecar.stat().st_size}
+    lock = report["lock"]
+    if (lock["root"], lock["child"], lock["gitlink"]) != (args.expected_root, args.expected_child, args.expected_child):
+        raise ValueError("G1 runtime source provenance mismatch")
+    return {
+        "schema": "g1_iter8900_owner_cross_pair_resume_v1",
+        "owner_override": True,
+        "owner_flag": "--owner-authorized-g1-cross-pair-resume",
+        "frozen_source": {"root": record["root"], "child": record["child"]},
+        "runtime_source": lock,
+        "frozen_semantic_digest": record["semantic_digest"],
+        "runtime_semantic_digest": _json_digest(report["training_identity"]),
+        "canonical_config_sha256": record["canonical_config_sha256"],
+        "phase5_digest": phase5_digest,
+        "config_digest": expected,
+        "checkpoint": str(checkpoint),
+        "iteration": 8900,
+        "frozen_launch": frozen_launch,
+        "rank_sidecars": witnesses,
+        "validation": {
+            "non_source_semantics": "PASS",
+            "full_component_presence": "PASS",
+            "all_rank_digest_iteration_source_provenance": "PASS",
+            "optimizer_scheduler_rng_cursor_fast_state_restoration": "PENDING_UNCHANGED_STRICT_RUNTIME_LOAD",
+        },
+    }
 
 
 def _identity_value(value: Any) -> Any:
@@ -309,6 +460,16 @@ class JobLifecycle:
         fcntl.flock(self._lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if self.args.phase == "resume" and str(_resume_checkpoint(self.args)) != self.report["checkpoint_load_path"]:
             raise ValueError("latest checkpoint changed between preflight and exclusive launch")
+        if _owner_g1_cross_pair_resume(self.args):
+            current = {**self.report, "lock": verify_root_child_lock(self.args)}
+            audit = _g1_resume_compatibility(
+                self.args, current, self.report["owner_cross_pair_resume"]["phase5_digest"]
+            )
+            if (
+                audit != self.report["owner_cross_pair_resume"]
+                or audit["config_digest"] != self.report["config_digest"]
+            ):
+                raise ValueError("G1 compatibility authority changed before exclusive launch")
         if (self.path / "launches").is_symlink():
             raise ValueError("launch snapshots symlink is forbidden")
         launch = self.path / "launches" / self.launch_id
@@ -328,6 +489,8 @@ class JobLifecycle:
             "config_digest": self.report["config_digest"],
             "effective_data_source": effective_data_source,
         }
+        if _owner_g1_cross_pair_resume(self.args):
+            record["owner_cross_pair_resume"] = self.report["owner_cross_pair_resume"]
         (launch / "launch.json").write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
         if self.args.phase == "fresh":
             for name in ("config.pkl", "config.yaml"):
@@ -366,7 +529,10 @@ def _agree_preflight(args: argparse.Namespace):
         raise RuntimeError(f"all-rank read-only preflight failed: {errors}")
     # Also reject inconsistent per-rank resolved configs before a writer is installed.
     identities = [None] * args.world_size
-    torch.distributed.all_gather_object(identities, result[0]["config_digest"])
+    identity = result[0]["config_digest"]
+    if _owner_g1_cross_pair_resume(args):
+        identity = _json_digest({"config_digest": identity, "audit": result[0]["owner_cross_pair_resume"]})
+    torch.distributed.all_gather_object(identities, identity)
     if len(set(identities)) != 1:
         raise ValueError("all-rank training config identities disagree")
     return result
@@ -626,12 +792,15 @@ def _load_config(args: argparse.Namespace):
 
 
 def _resume_checkpoint(args: argparse.Namespace) -> Path | None:
+    override = _owner_g1_cross_pair_resume(args)
     if args.phase == "fresh":
         return None
     latest = args.output_root / "psm_wma_v3/corrected_phase5" / args.job_name / "checkpoints/latest_checkpoint.txt"
     if latest.is_symlink() or latest.parent.is_symlink():
         raise ValueError("same-job checkpoint symlink alias is forbidden")
     name = latest.read_text().strip()
+    if override and name != G1_CHECKPOINT:
+        raise ValueError("Owner G1 override requires exactly completed iter_000008900")
     if not name.startswith("iter_") or not name[5:].isdigit() or not 0 < int(name[5:]) < args.max_iter:
         raise ValueError("same-job latest checkpoint iteration 不合法")
     checkpoint = latest.parent / name
@@ -680,6 +849,7 @@ def _audit_root_noncode_changes(porcelain_z: str) -> tuple[str, ...]:
 
 
 def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
+    override = _owner_g1_cross_pair_resume(args)
     child = Path(__file__).resolve().parents[1]
 
     def git(repo: Path, *command: str) -> str:
@@ -708,12 +878,19 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
         text=True,
     ).stdout
     noncode_changes = _audit_root_noncode_changes(root_status)
-    return {
+    lock = {
         "root": actual_root,
         "child": actual_child,
         "gitlink": gitlink,
         "allowed_root_noncode_changes": len(noncode_changes),
     }
+    if override:
+        # New reviewed implementation SHA is pinned by --expected-child. The
+        # design's 35b0 baseline must be its ancestor, not an impossible self-SHA.
+        git(child, "merge-base", "--is-ancestor", G1_RUNTIME_BASE_CHILD, actual_child)
+        lock["allowed_root_noncode_change_paths"] = list(noncode_changes)
+        lock["runtime_base_child"] = G1_RUNTIME_BASE_CHILD
+    return lock
 
 
 def _execution_stop_iteration(args: argparse.Namespace) -> int:
@@ -837,23 +1014,6 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     )
     planner = ExactWindowRankPlanner(catalog, rank=0, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     plan = planner.plan_window(planner.initial_frontier())
-    if args.snapshot10:
-        producer = ExactWindowSegmentProducer(
-            catalog, config_digest=digest, transform_rng_mode=getattr(args, "transform_rng_mode", "legacy_global")
-        )
-        checked = 0
-        while checked < 10:
-            for member in plan.members:
-                for request in member:
-                    if checked == 10:
-                        break
-                    segment = producer.produce(request)
-                    if segment.consumer_payload[0][0]["cached_latent_required"] is not True:
-                        raise ValueError("snapshot10 缺少 cached latent")
-                    collate_grouped_native_batch((segment.consumer_payload[0][0],))
-                    checked += 1
-            if checked < 10:
-                plan = planner.plan_window(plan.candidate_frontier)
     report = {
         "lock": lock,
         "config_digest": digest,
@@ -875,12 +1035,39 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     report["training_identity"] = semantic
     # A new profile/schema cannot silently resume historical jobs with incomplete identity.
     report["config_digest"] = _json_digest({"phase5_digest": digest, "training_identity": semantic})
+    if _owner_g1_cross_pair_resume(args):
+        report["owner_cross_pair_resume"] = _g1_resume_compatibility(args, report, digest)
+        report["config_digest"] = report["owner_cross_pair_resume"]["config_digest"]
+    if args.snapshot10:
+        producer = ExactWindowSegmentProducer(
+            catalog,
+            config_digest=report["config_digest"] if _owner_g1_cross_pair_resume(args) else digest,
+            transform_rng_mode=getattr(args, "transform_rng_mode", "legacy_global"),
+        )
+        checked = 0
+        while checked < 10:
+            for member in plan.members:
+                for request in member:
+                    if checked == 10:
+                        break
+                    segment = producer.produce(request)
+                    if segment.consumer_payload[0][0]["cached_latent_required"] is not True:
+                        raise ValueError("snapshot10 缺少 cached latent")
+                    collate_grouped_native_batch((segment.consumer_payload[0][0],))
+                    checked += 1
+            if checked < 10:
+                plan = planner.plan_window(plan.candidate_frontier)
     return report, config, catalog, dataset
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--phase", choices=("fresh", "resume"), required=True)
+    result.add_argument(
+        "--owner-authorized-g1-cross-pair-resume",
+        action="store_true",
+        help="Explicit Owner exception for G1 iter8900 only; preserve old digest and all non-source checks",
+    )
     result.add_argument("--preflight", action="store_true")
     result.add_argument("--snapshot10", action="store_true")
     for name in ("output-root", "source-root", "cache-root", "edge", "vae", "base-checkpoint"):
