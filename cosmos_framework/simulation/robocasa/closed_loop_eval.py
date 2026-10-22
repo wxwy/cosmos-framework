@@ -15,12 +15,10 @@ MUJOCO_GL=egl PYTHONPATH=. python cosmos_framework/simulation/robocasa/closed_lo
   --local-memory-mode required \
   --success-latch 1 --seed 0 --image-size 256 --cam-size 256
 
-TWO PYTHON ENVIRONMENTS ARE REQUIRED. robosuite/robocasa and cosmos-framework cannot share one
-venv (conflicting numpy/mujoco pins), so this script -- which only drives the simulator -- runs
-in the robosuite/robocasa venv, while the policy is served by
-``cosmos_framework.scripts.action_policy_server_robocasa`` from the cosmos-framework venv. Only
-empty namespace packages are imported from ``cosmos_framework`` here, so ``PYTHONPATH=.`` is
-enough and cosmos-framework need not be installed in the simulator venv.
+The simulator and policy server may use one compatible interpreter or separate environments.
+The manual launcher attests the selected simulator's actual imports and pinned vendor identity
+before environment creation. Only empty namespace packages are imported from ``cosmos_framework``
+here, so ``PYTHONPATH=.`` is enough and cosmos-framework need not be installed in the simulator venv.
 
 The evaluation contract -- ``--action-horizon``, ``--camera-set``, ``--use-state``,
 ``--base-encoding`` -- MUST match the training recipe. A mismatch does not raise; it silently
@@ -37,14 +35,13 @@ Writes ``results.json`` (one record per rollout) into ``--output-dir``.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
-import robocasa  # noqa: F401  (registers RoboCasa envs like CloseToasterOvenDoor; does NOT pull lerobot)
-import robosuite
 from PIL import Image
 
 from cosmos_framework.inference.robocasa_local_memory_contract import validate_local_memory_eval_contract
@@ -184,6 +181,10 @@ def official_horizon(task: str):
 
 
 def make_env(dataset_dir: str, cam_size: int, *, obj_split=None, layout_style=None, seed=None):
+    # The strict launcher re-attests source identity before these vendor imports.
+    import robocasa  # noqa: F401 (registers task environments)
+    import robosuite
+
     env_meta = get_env_metadata(dataset_dir)
     ek = dict(env_meta["env_kwargs"])
     ek["env_name"] = env_meta["env_name"]
@@ -218,6 +219,33 @@ def check_success(env) -> bool:
         return False
 
 
+def verify_runtime(args, task_name: str) -> dict | None:
+    """Recheck the actual Simulator interpreter before importing vendor/env code."""
+    required = (args.runtime_probe_script, args.runtime_lock_file, args.expected_runtime_digest, args.runtime_tasks)
+    if not any(required) and args.runtime_asset_manifest is None:
+        return None  # Direct legacy entry; the unified launcher always supplies all fields.
+    if not all(required):
+        raise ValueError("runtime identity requires probe, lock, digest and the complete selected task set")
+    tasks = args.runtime_tasks.split(",")
+    if not all(tasks) or len(tasks) != len(set(tasks)) or task_name not in tasks:
+        raise ValueError("runtime selected task identity mismatch")
+    path = Path(args.runtime_probe_script).resolve(strict=True)
+    spec = importlib.util.spec_from_file_location("psm_robocasa_runtime_probe", path)
+    if spec is None or spec.loader is None:
+        raise ValueError("cannot load pinned runtime probe")
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    runtime = probe.probe_runtime(
+        lock_path=Path(args.runtime_lock_file), asset_manifest=args.runtime_asset_manifest, tasks=tasks
+    )
+    if runtime.get("digest") != args.expected_runtime_digest:
+        raise ValueError("Simulator runtime changed after preflight")
+    horizons = runtime.get("protocol", {}).get("official_horizons", {})
+    if set(horizons) != set(tasks) or any(type(value) is not int or value <= 0 for value in horizons.values()):
+        raise ValueError("runtime is missing authoritative official task horizons")
+    return runtime
+
+
 def run_policy(
     env,
     *,
@@ -231,6 +259,9 @@ def run_policy(
     save_png=None,
     save_video=None,
     gen_video_path=None,
+    generated_video_mode=None,
+    generated_run_digest=None,
+    generated_attempt_id=None,
     video_fps=20,
     local_memory_client: RoboCasaLocalMemoryClient | None = None,
     on_prediction: Callable[[dict, float], None] | None = None,
@@ -238,7 +269,10 @@ def run_policy(
     on_cleanup: Callable[[dict], None] | None = None,
 ) -> tuple[bool, int, str]:
     rollout_error: BaseException | None = None
-    frames, gen_frames = [], []
+    frames, generated = [], []
+    mode = generated_video_mode or ("all" if gen_video_path is not None else "none")
+    if mode not in {"none", "first", "all"} or (mode != "none" and gen_video_path is None):
+        raise ValueError("generated video requires a valid mode and output path")
     try:
         obs = env.reset()
         if local_memory_client is not None:
@@ -249,9 +283,10 @@ def run_policy(
             prompt = ""
         init_comp = compose(obs).astype(np.uint8)
         if save_png is not None:
-            Image.fromarray(init_comp).save(save_png)
-        frames = [init_comp]
-        gen_frames = []
+            with open(save_png, "xb") as handle:
+                Image.fromarray(init_comp).save(handle, format="PNG")
+        frames = [init_comp] if save_video is not None else []
+        replans = 0
         streak, queue, success, done_steps = 0, [], False, max_steps
         for step in range(max_steps):
             if not queue:
@@ -276,8 +311,30 @@ def run_policy(
                     if not isinstance(status, dict):
                         raise RuntimeError("required Local-TTT server response is missing local_memory status")
                     local_memory_client.acknowledge(0, status)
-                if gen_video_path is not None and result.get("video"):
-                    gen_frames.extend(decode_pred_video(result["video"]))
+                if mode == "all" or (mode == "first" and replans == 0):
+                    if not result.get("video"):
+                        raise ValueError("enabled generated video is missing from model prediction")
+                    generated_frames = list(decode_pred_video(result["video"]))
+                    if not generated_frames:
+                        raise ValueError("enabled generated video contains no decoded frames")
+                    base = Path(gen_video_path)
+                    target = base.with_name(f"{base.stem}_replan{replans:04d}{base.suffix}") if mode == "all" else base
+                    save_partial_video(generated_frames, target, video_fps)
+                    generated.append(
+                        {"replan": replans, "source_step": step, "file": target.name, "frames": len(generated_frames)}
+                    )
+                    atomic_json(
+                        base.with_name(base.stem + "_manifest.json"),
+                        {
+                            "schema": "psm_generated_video_v1",
+                            "evaluation_run_digest": generated_run_digest,
+                            "evaluation_attempt_id": generated_attempt_id,
+                            "mode": mode,
+                            "status": "IN_PROGRESS",
+                            "videos": generated,
+                        },
+                    )
+                replans += 1
                 acts = result["action"]
                 queue = acts[:action_horizon] if action_horizon > 0 else list(acts)
 
@@ -321,7 +378,8 @@ def run_policy(
             if local_memory_client is not None:
                 assert pre_composite is not None
                 local_memory_client.record_completed(0, pre_composite, canonical_raw15)
-            frames.append(compose(obs).astype(np.uint8))
+            if save_video is not None:
+                frames.append(compose(obs).astype(np.uint8))
             if check_success(env):
                 streak += 1
                 if streak >= latch:
@@ -338,7 +396,6 @@ def run_policy(
         media_error = None
         try:
             save_partial_video(frames, save_video, video_fps)
-            save_partial_video(gen_frames, gen_video_path, video_fps)
         except Exception as error:
             media_error = error
             print(f"[eval] partial-video failure: {type(error).__name__}: {error}", flush=True)
@@ -382,11 +439,19 @@ def main() -> None:
     ap.add_argument(
         "--save-gen-video",
         action="store_true",
-        help="save the model's GENERATED video (flow-matching vision branch, from the "
-        "first inference) per rollout, for comparing video-generation quality",
+        help="legacy alias for --save-generated-video first (per episode)",
     )
+    ap.add_argument("--save-generated-video", choices=("none", "first", "all"), default=None)
+    ap.add_argument("--no-save-rollout-mp4", action="store_true")
+    ap.add_argument("--no-save-init-png", action="store_true")
+    ap.add_argument("--runtime-probe-script", type=Path)
+    ap.add_argument("--runtime-lock-file", type=Path)
+    ap.add_argument("--runtime-asset-manifest", type=Path)
+    ap.add_argument("--expected-runtime-digest")
+    ap.add_argument("--runtime-tasks")
     ap.add_argument("--action-horizon", type=int, default=16)
     ap.add_argument("--evaluation-run-digest", default=None)
+    ap.add_argument("--evaluation-attempt-id", default=None)
     ap.add_argument("--image-size", type=int, default=256)
     ap.add_argument("--cam-size", type=int, default=256)
     ap.add_argument(
@@ -438,6 +503,9 @@ def main() -> None:
     ap.add_argument("--output-dir", default=".")
     ap.add_argument("--progress-file", type=Path, default=None)
     args = ap.parse_args()
+    if args.save_gen_video and args.save_generated_video not in (None, "first"):
+        raise ValueError("--save-gen-video conflicts with --save-generated-video")
+    video_mode = args.save_generated_video or ("first" if args.save_gen_video else "none")
 
     global CAMERA_SET, USE_BASE_ACTION, BASE_ENCODING
     CAMERA_SET = args.camera_set
@@ -453,8 +521,19 @@ def main() -> None:
     )
 
     out = Path(args.output_dir)
+    task_name = get_env_metadata(args.dataset_dir)["env_name"]
+    if args.evaluation_attempt_id is not None and (
+        args.evaluation_attempt_id != f"{task_name}/{out.name}" or out.parent.name != task_name
+    ):
+        raise ValueError("evaluation attempt identity must match the output namespace")
     out.mkdir(parents=True, exist_ok=True)
 
+    runtime = verify_runtime(args, task_name)
+    if runtime is not None:
+        atomic_json(out / "runtime_attestation.json", runtime)
+    # The verified registry already incorporates RoboCasa 1.0.1's 1.5x horizon update.
+    h = runtime["protocol"]["official_horizons"][task_name] if runtime is not None else official_horizon(task_name)
+    eff_max_steps = h if h else args.max_steps
     env = make_env(
         args.dataset_dir,
         args.cam_size,
@@ -465,9 +544,6 @@ def main() -> None:
     print(f"[eval] official protocol: rollouts={args.num_test_episodes} seed={args.seed}", flush=True)
 
     # Effective rollout horizon: official per-task (robocasa registry) or the fixed --max-steps.
-    task_name = get_env_metadata(args.dataset_dir)["env_name"]
-    h = official_horizon(task_name)
-    eff_max_steps = h if h else args.max_steps
     print(f"[eval] {task_name}: official horizon {eff_max_steps}", flush=True)
 
     # wait for server
@@ -508,6 +584,7 @@ def main() -> None:
                             "event": event,
                             "episode": episode,
                             "evaluation_run_digest": args.evaluation_run_digest,
+                            "evaluation_attempt_id": args.evaluation_attempt_id,
                         }
                     )
                     + "\n"
@@ -522,6 +599,7 @@ def main() -> None:
                     output_dir=out,
                     episode=t,
                     run_digest=args.evaluation_run_digest,
+                    attempt_id=args.evaluation_attempt_id,
                     server_url=args.server_url,
                     image_size=args.image_size,
                     action_horizon=args.action_horizon,
@@ -533,10 +611,21 @@ def main() -> None:
                     on_cleanup=lambda witness, episode=t: atomic_json(
                         out / f"rollout{episode:02d}_cleanup.json", witness
                     ),
-                    save_png=str(out / f"rollout{t:02d}_init.png"),
-                    save_video=str(out / f"rollout{t:02d}.mp4"),
-                    gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if args.save_gen_video else None,
+                    save_png=str(out / f"rollout{t:02d}_init.png") if not args.no_save_init_png else None,
+                    save_video=str(out / f"rollout{t:02d}.mp4") if not args.no_save_rollout_mp4 else None,
+                    gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if video_mode != "none" else None,
+                    generated_video_mode=video_mode,
+                    generated_run_digest=args.evaluation_run_digest,
+                    generated_attempt_id=args.evaluation_attempt_id,
                 )
+                generated_manifest = out / f"rollout{t:02d}_generated_manifest.json"
+                result["generated_videos"] = []
+                if generated_manifest.exists():
+                    generated = json.loads(generated_manifest.read_text())
+                    generated["status"] = "FAILED" if result["error"] is not None else "COMPLETE"
+                    result["generated_videos"] = [video["file"] for video in generated["videos"]]
+                    atomic_json(generated_manifest, generated)
+                atomic_json(out / f"rollout{t:02d}_episode.json", result)
                 results.append(result)
                 atomic_json(out / "results.json", results)
                 print(

@@ -49,7 +49,9 @@ def save_partial_video(frames, path, fps: int) -> None:
         pending.unlink(missing_ok=True)
 
 
-def run_recorded_episode(runner, env, *, output_dir, episode: int, run_digest: str | None, **kwargs) -> dict:
+def run_recorded_episode(
+    runner, env, *, output_dir, episode: int, run_digest: str | None, attempt_id: str | None = None, **kwargs
+) -> dict:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     actions_path = output_dir / f"rollout{episode:02d}_actions.jsonl"
@@ -68,6 +70,8 @@ def run_recorded_episode(runner, env, *, output_dir, episode: int, run_digest: s
         def record_action(row):
             nonlocal count
             record = dict(row, evaluation_run_digest=run_digest, episode=episode)
+            if attempt_id is not None:
+                record["evaluation_attempt_id"] = attempt_id
             actions.write(json.dumps(record, allow_nan=False) + "\n")
             actions.flush()
             count += 1
@@ -81,6 +85,8 @@ def run_recorded_episode(runner, env, *, output_dir, episode: int, run_digest: s
                 "evaluation_run_digest": run_digest,
                 "episode": episode,
             }
+            if attempt_id is not None:
+                row["evaluation_attempt_id"] = attempt_id
             predictions.write(json.dumps(row, allow_nan=False) + "\n")
             predictions.flush()
             rows.append(row)
@@ -115,6 +121,8 @@ def run_recorded_episode(runner, env, *, output_dir, episode: int, run_digest: s
             "predictions_file": predictions_path.name,
             "completed_action_records": count,
         }
+        if attempt_id is not None:
+            result["evaluation_attempt_id"] = attempt_id
         atomic_json(output_dir / f"rollout{episode:02d}_episode.json", result)
         if interrupted is not None:
             raise interrupted
