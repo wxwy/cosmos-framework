@@ -630,6 +630,7 @@ def test_launch_revalidates_continuity_before_any_snapshot_write(job, monkeypatc
 
 
 def test_real_preflight_wires_historical_digest_to_report_and_snapshot_producer(job, monkeypatch):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     args = job.args
     args.vae.parent.mkdir(exist_ok=True)
     args.vae.touch()
