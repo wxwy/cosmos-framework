@@ -235,13 +235,14 @@ def run_policy(
     local_memory_client: RoboCasaLocalMemoryClient | None = None,
     on_prediction: Callable[[dict, float], None] | None = None,
     on_action: Callable[[dict], None] | None = None,
+    on_cleanup: Callable[[dict], None] | None = None,
 ) -> tuple[bool, int, str]:
-    obs = env.reset()
-    if local_memory_client is not None:
-        local_memory_client.begin(0, image_size=image_size)
     rollout_error: BaseException | None = None
     frames, gen_frames = [], []
     try:
+        obs = env.reset()
+        if local_memory_client is not None:
+            local_memory_client.begin(0, image_size=image_size)
         try:
             prompt = env.get_ep_meta().get("lang", "") or ""
         except Exception:
@@ -341,20 +342,33 @@ def run_policy(
         except Exception as error:
             media_error = error
             print(f"[eval] partial-video failure: {type(error).__name__}: {error}", flush=True)
-        if local_memory_client is not None:
-            session_id = local_memory_client.end(0)
-            if session_id is not None:
-                try:
+        cleanup_error = None
+        session_id = None
+        try:
+            if local_memory_client is not None:
+                session_id = local_memory_client.end(0)
+                if session_id is not None:
                     reset_local_memory(server_url, session_id, timeout)
-                except Exception as cleanup_error:
-                    if rollout_error is None:
-                        raise
-                    print(
-                        f"[eval] WARNING: Local-TTT cleanup failed after rollout error: {cleanup_error}",
-                        flush=True,
-                    )
-        if media_error is not None and rollout_error is None:
-            raise media_error
+        except Exception as error:
+            cleanup_error = error
+            print(f"[eval] Local-TTT cleanup failure: {type(error).__name__}: {error}", flush=True)
+        witness = {
+            "session_id": session_id,
+            "reset_ok": cleanup_error is None,
+            "rollout_error": repr(rollout_error) if rollout_error is not None else None,
+            "media_error": repr(media_error) if media_error is not None else None,
+            "cleanup_error": repr(cleanup_error) if cleanup_error is not None else None,
+        }
+        try:
+            if on_cleanup is not None:
+                on_cleanup(witness)
+        except Exception as error:
+            cleanup_error = cleanup_error or error
+        if rollout_error is None:
+            if media_error is not None:
+                raise media_error
+            if cleanup_error is not None:
+                raise cleanup_error
 
 
 def main() -> None:
@@ -422,6 +436,7 @@ def main() -> None:
         help="V3 online Local-TTT. Formal iter500 evaluation must use required.",
     )
     ap.add_argument("--output-dir", default=".")
+    ap.add_argument("--progress-file", type=Path, default=None)
     args = ap.parse_args()
 
     global CAMERA_SET, USE_BASE_ACTION, BASE_ENCODING
@@ -481,31 +496,56 @@ def main() -> None:
 
     # Keep the official sequential environment reset/rollout protocol.
     try:
-        for t in range(args.num_test_episodes):
-            result = run_recorded_episode(
-                run_policy,
-                env,
-                output_dir=out,
-                episode=t,
-                run_digest=args.evaluation_run_digest,
-                server_url=args.server_url,
-                image_size=args.image_size,
-                action_horizon=args.action_horizon,
-                max_steps=eff_max_steps,
-                latch=args.success_latch,
-                timeout=args.timeout,
-                use_state=args.use_state,
-                local_memory_client=local_memory_client,
-                save_png=str(out / f"rollout{t:02d}_init.png"),
-                save_video=str(out / f"rollout{t:02d}.mp4"),
-                gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if args.save_gen_video else None,
-            )
-            results.append(result)
-            atomic_json(out / "results.json", results)
-            print(
-                f"[eval] rollout {t:02d} outcome={result['outcome']} steps={result['steps']} error={result['error']}",
-                flush=True,
-            )
+        with (args.progress_file or out / "episode_progress.jsonl").open(
+            "x", encoding="utf-8", buffering=1
+        ) as progress:
+
+            def emit(event, episode):
+                progress.write(
+                    json.dumps(
+                        {
+                            "schema": "psm_episode_progress_v1",
+                            "event": event,
+                            "episode": episode,
+                            "evaluation_run_digest": args.evaluation_run_digest,
+                        }
+                    )
+                    + "\n"
+                )
+                progress.flush()
+
+            for t in range(args.num_test_episodes):
+                emit("start", t)
+                result = run_recorded_episode(
+                    run_policy,
+                    env,
+                    output_dir=out,
+                    episode=t,
+                    run_digest=args.evaluation_run_digest,
+                    server_url=args.server_url,
+                    image_size=args.image_size,
+                    action_horizon=args.action_horizon,
+                    max_steps=eff_max_steps,
+                    latch=args.success_latch,
+                    timeout=args.timeout,
+                    use_state=args.use_state,
+                    local_memory_client=local_memory_client,
+                    on_cleanup=lambda witness, episode=t: atomic_json(
+                        out / f"rollout{episode:02d}_cleanup.json", witness
+                    ),
+                    save_png=str(out / f"rollout{t:02d}_init.png"),
+                    save_video=str(out / f"rollout{t:02d}.mp4"),
+                    gen_video_path=str(out / f"rollout{t:02d}_generated.mp4") if args.save_gen_video else None,
+                )
+                results.append(result)
+                atomic_json(out / "results.json", results)
+                print(
+                    f"[eval] rollout {t:02d} outcome={result['outcome']} steps={result['steps']} error={result['error']}",
+                    flush=True,
+                )
+                emit("end", t)
+                if result["error"] is not None:
+                    break  # Do not register another episode after a failed cleanup/rollout.
     finally:
         env.close()
 
