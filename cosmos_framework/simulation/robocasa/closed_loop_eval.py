@@ -56,6 +56,7 @@ from cosmos_framework.simulation.robocasa.eval_utils import (
 )
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
 from cosmos_framework.utils.rollout_evidence import atomic_json, run_recorded_episode, save_partial_video
+from cosmos_framework.utils.rollout_progress import LiveProgressWriter
 
 CAMS = ["robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"]
 
@@ -267,13 +268,38 @@ def run_policy(
     on_prediction: Callable[[dict, float], None] | None = None,
     on_action: Callable[[dict], None] | None = None,
     on_cleanup: Callable[[dict], None] | None = None,
+    on_progress: Callable[[dict], None] | None = None,
 ) -> tuple[bool, int, str]:
     rollout_error: BaseException | None = None
     frames, generated = [], []
     mode = generated_video_mode or ("all" if gen_video_path is not None else "none")
     if mode not in {"none", "first", "all"} or (mode != "none" and gen_video_path is None):
         raise ValueError("generated video requires a valid mode and output path")
+    progress_steps, progress_predictions, progress_latency = 0, 0, None
+    progress_stage = "environment_initialization"
+
+    def observe(stage, *, event="stage", error=None, **extra):
+        nonlocal progress_stage
+        progress_stage = stage
+        if on_progress is not None:
+            try:
+                on_progress(
+                    {
+                        "event": event,
+                        "stage": stage,
+                        "max_steps": max_steps,
+                        "steps": progress_steps,
+                        "predictions": progress_predictions,
+                        "last_prediction_ms": progress_latency,
+                        "error": error,
+                        **extra,
+                    }
+                )
+            except Exception:
+                pass
+
     try:
+        observe("environment_initialization")
         obs = env.reset()
         if local_memory_client is not None:
             local_memory_client.begin(0, image_size=image_size)
@@ -281,6 +307,7 @@ def run_policy(
             prompt = env.get_ep_meta().get("lang", "") or ""
         except Exception:
             prompt = ""
+        observe("environment_initialization", instruction=prompt)
         init_comp = compose(obs).astype(np.uint8)
         if save_png is not None:
             with open(save_png, "xb") as handle:
@@ -288,11 +315,13 @@ def run_policy(
         frames = [init_comp] if save_video is not None else []
         replans = 0
         streak, queue, success, done_steps = 0, [], False, max_steps
+        observe("executing")
         for step in range(max_steps):
             if not queue:
                 comp = compose(obs)
                 state_token = build_state_token(obs) if use_state else None
                 local_payload = local_memory_client.payload(0) if local_memory_client is not None else None
+                observe("predicting")
                 prediction_t0 = time.monotonic()
                 result = predict(
                     server_url,
@@ -304,6 +333,9 @@ def run_policy(
                     local_memory=local_payload,
                 )
                 prediction_ms = (time.monotonic() - prediction_t0) * 1000.0
+                progress_predictions += 1
+                progress_latency = prediction_ms
+                observe("executing")
                 if on_prediction is not None:
                     on_prediction(result, prediction_ms)
                 if local_memory_client is not None:
@@ -312,6 +344,7 @@ def run_policy(
                         raise RuntimeError("required Local-TTT server response is missing local_memory status")
                     local_memory_client.acknowledge(0, status)
                 if mode == "all" or (mode == "first" and replans == 0):
+                    observe("video_saving")
                     if not result.get("video"):
                         raise ValueError("enabled generated video is missing from model prediction")
                     generated_frames = list(decode_pred_video(result["video"]))
@@ -334,6 +367,7 @@ def run_policy(
                             "videos": generated,
                         },
                     )
+                    observe("executing")
                 replans += 1
                 acts = result["action"]
                 queue = acts[:action_horizon] if action_horizon > 0 else list(acts)
@@ -360,6 +394,7 @@ def run_policy(
                 env_action = decode_10d_to_env12(a, False)
 
             obs, reward, env_done, info = env.step(env_action)
+            progress_steps = step + 1
             if on_action is not None:
                 on_action(
                     {
@@ -391,23 +426,33 @@ def run_policy(
         return success, done_steps, prompt
     except BaseException as error:
         rollout_error = error
+        try:
+            observe(progress_stage, event="error", error=f"{type(error).__name__}: {error}"[:2048])
+        except Exception:
+            pass
         raise
     finally:
         media_error = None
         try:
+            if save_video is not None:
+                observe("video_saving")
             save_partial_video(frames, save_video, video_fps)
         except Exception as error:
             media_error = error
+            observe("video_saving", event="error", error=f"{type(error).__name__}: {error}"[:2048])
             print(f"[eval] partial-video failure: {type(error).__name__}: {error}", flush=True)
         cleanup_error = None
         session_id = None
         try:
+            if local_memory_client is not None:
+                observe("local_cleanup")
             if local_memory_client is not None:
                 session_id = local_memory_client.end(0)
                 if session_id is not None:
                     reset_local_memory(server_url, session_id, timeout)
         except Exception as error:
             cleanup_error = error
+            observe("local_cleanup", event="error", error=f"{type(error).__name__}: {error}"[:2048])
             print(f"[eval] Local-TTT cleanup failure: {type(error).__name__}: {error}", flush=True)
         witness = {
             "session_id": session_id,
@@ -502,6 +547,7 @@ def main() -> None:
     )
     ap.add_argument("--output-dir", default=".")
     ap.add_argument("--progress-file", type=Path, default=None)
+    ap.add_argument("--live-progress-file", type=Path, default=None)
     args = ap.parse_args()
     if args.save_gen_video and args.save_generated_video not in (None, "first"):
         raise ValueError("--save-gen-video conflicts with --save-generated-video")
@@ -527,45 +573,56 @@ def main() -> None:
     ):
         raise ValueError("evaluation attempt identity must match the output namespace")
     out.mkdir(parents=True, exist_ok=True)
-
-    runtime = verify_runtime(args, task_name)
-    if runtime is not None:
-        atomic_json(out / "runtime_attestation.json", runtime)
-    # The verified registry already incorporates RoboCasa 1.0.1's 1.5x horizon update.
-    h = runtime["protocol"]["official_horizons"][task_name] if runtime is not None else official_horizon(task_name)
-    eff_max_steps = h if h else args.max_steps
-    env = make_env(
-        args.dataset_dir,
-        args.cam_size,
-        obj_split=ATOMIC_SEEN_OBJ_SPLIT,
-        layout_style=ATOMIC_SEEN_LAYOUT_STYLE,
-        seed=args.seed,
+    live = LiveProgressWriter(
+        args.live_progress_file,
+        run_digest=args.evaluation_run_digest,
+        attempt_id=args.evaluation_attempt_id,
+        task=task_name,
+        episodes=args.num_test_episodes,
     )
+
+    live.emit(stage="environment_initialization")
+    with live.observe_errors():
+        runtime = verify_runtime(args, task_name)
+        if runtime is not None:
+            atomic_json(out / "runtime_attestation.json", runtime)
+        # The verified registry already incorporates RoboCasa 1.0.1's 1.5x horizon update.
+        h = runtime["protocol"]["official_horizons"][task_name] if runtime is not None else official_horizon(task_name)
+        eff_max_steps = h if h else args.max_steps
+        live.emit(stage="environment_initialization", max_steps=eff_max_steps)
+        env = make_env(
+            args.dataset_dir,
+            args.cam_size,
+            obj_split=ATOMIC_SEEN_OBJ_SPLIT,
+            layout_style=ATOMIC_SEEN_LAYOUT_STYLE,
+            seed=args.seed,
+        )
     print(f"[eval] official protocol: rollouts={args.num_test_episodes} seed={args.seed}", flush=True)
 
     # Effective rollout horizon: official per-task (robocasa registry) or the fixed --max-steps.
     print(f"[eval] {task_name}: official horizon {eff_max_steps}", flush=True)
 
     # wait for server
-    import requests
+    with live.observe_errors():
+        import requests
 
-    t0 = time.time()
-    while time.time() - t0 < args.timeout:
-        try:
-            info_response = requests.get(f"{args.server_url}/info", timeout=5)
-            if info_response.ok:
-                info = info_response.json()
-                server_mode = (info.get("local_memory") or {}).get("mode", "off")
-                if server_mode != args.local_memory_mode:
-                    raise RuntimeError(
-                        f"eval/server Local-TTT mode mismatch: eval={args.local_memory_mode} server={server_mode}"
-                    )
-                print(f"[train-scene] server ready at {args.server_url} local_memory={server_mode}", flush=True)
-                break
-        except requests.RequestException:
-            time.sleep(3)
-    else:
-        raise RuntimeError("server not ready")
+        t0 = time.time()
+        while time.time() - t0 < args.timeout:
+            try:
+                info_response = requests.get(f"{args.server_url}/info", timeout=5)
+                if info_response.ok:
+                    info = info_response.json()
+                    server_mode = (info.get("local_memory") or {}).get("mode", "off")
+                    if server_mode != args.local_memory_mode:
+                        raise RuntimeError(
+                            f"eval/server Local-TTT mode mismatch: eval={args.local_memory_mode} server={server_mode}"
+                        )
+                    print(f"[train-scene] server ready at {args.server_url} local_memory={server_mode}", flush=True)
+                    break
+            except requests.RequestException:
+                time.sleep(3)
+        else:
+            raise RuntimeError("server not ready")
 
     results = []
     local_memory_client = RoboCasaLocalMemoryClient(enabled=True) if args.local_memory_mode == "required" else None
@@ -593,6 +650,21 @@ def main() -> None:
 
             for t in range(args.num_test_episodes):
                 emit("start", t)
+                live.emit(
+                    event="episode_start",
+                    stage="executing",
+                    episode=t,
+                    steps=0,
+                    predictions=0,
+                    last_prediction_ms=None,
+                    outcome=None,
+                    error=None,
+                    instruction=None,
+                )
+
+                def observe_episode(fields):
+                    live.emit(episode=t, **fields)
+
                 result = run_recorded_episode(
                     run_policy,
                     env,
@@ -617,7 +689,9 @@ def main() -> None:
                     generated_video_mode=video_mode,
                     generated_run_digest=args.evaluation_run_digest,
                     generated_attempt_id=args.evaluation_attempt_id,
+                    on_progress=observe_episode if args.live_progress_file is not None else None,
                 )
+                live.emit(stage="result_writing", episode=t, steps=result["steps"], predictions=result["replans"])
                 generated_manifest = out / f"rollout{t:02d}_generated_manifest.json"
                 result["generated_videos"] = []
                 if generated_manifest.exists():
@@ -634,13 +708,34 @@ def main() -> None:
                 )
                 emit("end", t)
                 if result["error"] is not None:
+                    live.emit(event="error", error=result["error"], outcome=result["outcome"])
+                live.emit(
+                    event="episode_end",
+                    stage="executing",
+                    episode=t,
+                    steps=result["steps"],
+                    predictions=result["replans"],
+                    outcome=result["outcome"],
+                    error=result["error"],
+                )
+                if result["error"] is not None:
                     break  # Do not register another episode after a failed cleanup/rollout.
+    except BaseException as error:
+        try:
+            live.emit(event="error", error=f"{type(error).__name__}: {error}"[:2048])
+        except Exception:
+            pass
+        raise
     finally:
-        env.close()
+        live.emit(stage="environment_close")
+        with live.observe_errors():
+            env.close()
 
     n_ok = sum(1 for r in results if r["policy"])
     print(f"\n{task_name}: {n_ok}/{len(results)} successful rollouts", flush=True)
-    atomic_json(out / "results.json", results)
+    live.emit(stage="result_writing")
+    with live.observe_errors():
+        atomic_json(out / "results.json", results)
     if any(row["error"] is not None for row in results):
         raise SystemExit(1)
 
