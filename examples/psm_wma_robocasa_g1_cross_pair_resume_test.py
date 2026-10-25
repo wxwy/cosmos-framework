@@ -585,6 +585,20 @@ def test_launcher_explicit_flag_only_reaches_named_resume_without_running_torch(
     proc = subprocess.run(["bash", str(launcher), "resume", "9000", flag], env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     assert json.loads(capture.read_text()).count(flag) == 1
+
+    # The permanent G1 recovery contract must work with neither a one-off
+    # override flag nor an EXPECTED_ROOT environment pin.
+    implicit = dict(env)
+    implicit.pop("EXPECTED_ROOT")
+    capture.unlink()
+    resumed = subprocess.run(
+        ["bash", str(launcher), "resume", "12000"], env=implicit, capture_output=True, text=True
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    argv = json.loads(capture.read_text())
+    assert flag not in argv
+    assert argv[argv.index("--expected-root") + 1] == "G1_ROOT_HEAD_NOT_PINNED"
+
     for argv, name in [
         (["fresh", "9000", flag], phase5.G1_JOB),
         (["resume", "9000", flag], "other"),
