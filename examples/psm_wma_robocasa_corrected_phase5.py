@@ -243,11 +243,9 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
         raise ValueError("frozen G1 source/semantic/config authority mismatch")
     if semantic is not None:
         if override:
-            # G1 Root is provenance, not an equality-based Resume admission key.
-            # Real runtime source identity is cross-checked against the observed
-            # Git HEAD/Gitlink in _g1_resume_compatibility().
-            if semantic.get("child") != args.expected_child:
-                raise ValueError("runtime G1 Child source does not match expected Gitlink")
+            # G1 Root/Child are runtime provenance, never caller-supplied
+            # expected-HEAD admission keys. Real Child/Gitlink integrity and
+            # observed source identity are verified in _g1_resume_compatibility().
             old = {key: value for key, value in record["semantic"].items() if key not in {"root", "child"}}
             new = {key: value for key, value in semantic.items() if key not in {"root", "child"}}
             drift = _semantic_drift_paths(old, new)
@@ -327,9 +325,9 @@ def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], p
                 raise ValueError(f"G1 rank{rank} SegmentProvenance config digest mismatch")
         witnesses[str(rank)] = {"sha256": before, "bytes": sidecar.stat().st_size}
     lock = report["lock"]
-    # Keep the observed Root HEAD in the audit but never reject G1 Resume
-    # because it differs from an old caller-provided EXPECTED_ROOT.
-    if (lock["child"], lock["gitlink"]) != (args.expected_child, args.expected_child) or (
+    # Runtime Root/Child are recorded from Git, not caller-supplied SHA pins.
+    # Still require the actual Child commit to match the Root Gitlink.
+    if lock["child"] != lock["gitlink"] or (
         report["training_identity"].get("root"),
         report["training_identity"].get("child"),
     ) != (lock["root"], lock["child"]):
@@ -407,7 +405,7 @@ def training_identity(args: argparse.Namespace, config: Any, report: dict[str, A
     return {
         **({"training_profile": "matched_no_ttt_v1"} if getattr(args, "no_ttt", False) else {}),
         "root": report["lock"]["root"] if _owner_g1_cross_pair_resume(args) else args.expected_root,
-        "child": args.expected_child,
+        "child": report["lock"]["child"] if _owner_g1_cross_pair_resume(args) else args.expected_child,
         "native_batch_layout": NATIVE_BATCH_LAYOUT,
         "training": {
             name: _identity_value(getattr(config, name))
@@ -906,9 +904,9 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
     actual_child = git(child, "rev-parse", "HEAD")
     gitlink = git(root, "ls-tree", "HEAD", "cosmos-framework").split()[2]
     if (
-        (not override and (len(args.expected_root) != 40 or actual_root != args.expected_root))
-        or len(args.expected_child) != 40
-        or (actual_child, gitlink) != (args.expected_child, args.expected_child)
+        (not override and (len(args.expected_root or "") != 40 or actual_root != args.expected_root))
+        or (not override and (len(args.expected_child or "") != 40 or actual_child != args.expected_child))
+        or actual_child != gitlink
         or git(child, "status", "--porcelain")
     ):
         raise ValueError("V3 root/child/Gitlink 或 child 工作树不匹配")
@@ -929,8 +927,8 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
         "allowed_root_noncode_changes": len(noncode_changes),
     }
     if override:
-        # New reviewed implementation SHA is pinned by --expected-child. The
-        # design's 35b0 baseline must be its ancestor, not an impossible self-SHA.
+        # Reject unrelated Child histories while allowing G1 to continue
+        # under later V3 revisions without repinning EXPECTED_CHILD.
         git(child, "merge-base", "--is-ancestor", G1_RUNTIME_BASE_CHILD, actual_child)
         lock["allowed_root_noncode_change_paths"] = list(noncode_changes)
         lock["runtime_base_child"] = G1_RUNTIME_BASE_CHILD
@@ -1141,8 +1139,10 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         help="Prebuilt verified read-only index; missing/stale index fails closed, never rebuilds during training",
     )
-    result.add_argument("--expected-root", required=True)
-    result.add_argument("--expected-child", required=True)
+    # Required only for non-G1 jobs; the standing named G1 Resume records
+    # observed runtime SHAs and checks actual Child HEAD == Gitlink instead.
+    result.add_argument("--expected-root")
+    result.add_argument("--expected-child")
     result.add_argument(
         "--num-workers",
         type=int,
