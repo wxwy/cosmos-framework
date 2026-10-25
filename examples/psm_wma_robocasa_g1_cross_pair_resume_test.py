@@ -13,6 +13,7 @@ import json
 import os
 import pickle
 import random
+import shutil
 import subprocess
 import sys
 from copy import deepcopy
@@ -292,11 +293,9 @@ def test_historical_digest_matches_launch_all_ranks_and_original_local_restore(j
     print("G1_COMPATIBILITY_WITNESS " + json.dumps(audit, sort_keys=True))
 
 
-@pytest.mark.parametrize("change", ["no_flag", "fresh", "other_job", "ga", "t", "b", "k", "world_size", "schedule"])
+@pytest.mark.parametrize("change", ["fresh", "other_job", "ga", "t", "b", "k", "world_size", "schedule"])
 def test_override_scope_is_not_a_general_bypass(job, change):
-    if change == "no_flag":
-        job.args.owner_authorized_g1_cross_pair_resume = False
-    elif change == "fresh":
+    if change == "fresh":
         job.args.phase = "fresh"
     elif change == "other_job":
         job.args.job_name = "another_job"
@@ -573,7 +572,7 @@ def test_runtime_source_lock_remains_strict(job, monkeypatch, fault):
         repo, args = command[2], command[3:]
         if args == ("rev-parse", "HEAD"):
             value = job.args.expected_root if Path(repo) == job.args.root_worktree else job.args.expected_child
-            if fault == "wrong_root" and Path(repo) == job.args.root_worktree:
+            if fault in ("wrong_root", "short_expected") and Path(repo) == job.args.root_worktree:
                 value = "c" * 40
             if fault == "wrong_child" and Path(repo) != job.args.root_worktree:
                 value = "c" * 40
@@ -594,10 +593,13 @@ def test_runtime_source_lock_remains_strict(job, monkeypatch, fault):
         return NS(stdout="")
 
     monkeypatch.setattr(phase5.subprocess, "run", run)
-    if fault == "none":
+    if fault in ("none", "wrong_root", "short_expected"):
         lock = phase5.verify_root_child_lock(job.args)
         assert lock["child"] == lock["gitlink"] == job.args.expected_child
         assert lock["runtime_base_child"] == phase5.G1_RUNTIME_BASE_CHILD
+        assert lock["root_head_is_provenance_not_resume_gate"] is True
+        if fault != "none":
+            assert lock["root"] == "c" * 40
     else:
         with pytest.raises((ValueError, subprocess.CalledProcessError)):
             phase5.verify_root_child_lock(job.args)
@@ -692,3 +694,72 @@ def test_original_callback_stages_state_without_clearing_validation(job):
     window = CPUWindow(job.windows[0].model, job.windows[0].planner)
     LOCAL.restore_grouped_local_state(window, trainer._pending_grouped_resume, iteration=8900, config_digest=job.digest)
     assert window.live.frontier == job.states[0]["frontier"]
+
+
+def test_named_g1_resume_auto_accepts_stale_expected_root_without_flag(job):
+    """Owner's G1 authorization persists across future Ctrl-C / SIGTERM restarts."""
+    job.args.owner_authorized_g1_cross_pair_resume = False
+    job.args.expected_root = "stale-root-head-is-not-an-identity-gate"
+    job.args.expected_child = "stale-child-head-is-not-an-identity-gate"
+    # Current requested source fields are recorded, never used to change the
+    # original G1 frozen record or its legacy Local config digest.
+    runtime = deepcopy(job.report["training_identity"])
+    runtime["root"], runtime["child"] = job.args.expected_root, job.args.expected_child
+    job.report["training_identity"] = runtime
+    before = _witness(job.path)
+    assert phase5._owner_g1_cross_pair_resume(job.args) is True
+    assert phase5.check_job_namespace(job.args, runtime) == job.record
+    audit = phase5._g1_resume_compatibility(job.args, job.report, RAW_DIGEST)
+    assert audit["owner_flag"] == "G1_SCOPED_RESUME_POLICY"
+    assert audit["iteration"] == 8900
+    assert audit["config_digest"] == job.digest
+    assert _witness(job.path) == before
+
+
+@pytest.mark.parametrize("latest", [12000, 13000, 29900])
+def test_named_g1_repeat_resume_uses_latest_rank_state_without_requiring_iter8900(job, latest):
+    """A second/third interruption must not be stopped by the first 8900 bridge."""
+    job.args.owner_authorized_g1_cross_pair_resume = False
+    job.args.formal_execution_until = min(latest + 100, 30000)
+    latest_path = job.checkpoint.parent / f"iter_{latest:09d}"
+    shutil.copytree(job.checkpoint, latest_path)
+    for rank, prior in enumerate(job.states):
+        state = deepcopy(prior)
+        state["iteration"] = latest
+        with (latest_path / "dataloader" / f"rank_{rank}.pkl").open("wb") as out:
+            pickle.dump(state, out)
+    (latest_path.parent / "latest_checkpoint.txt").write_text(latest_path.name)
+    job.report["checkpoint_load_path"] = str(latest_path)
+    before = _witness(job.path)
+    assert phase5._resume_checkpoint(job.args) == latest_path
+    audit = phase5._g1_resume_compatibility(job.args, job.report, RAW_DIGEST)
+    assert audit["checkpoint"] == str(latest_path)
+    assert audit["iteration"] == latest
+    assert audit["config_digest"] == job.digest
+    assert len(audit["rank_sidecars"]) == 8
+    assert _witness(job.path) == before
+
+
+def test_g1_repeat_resume_mixed_rank_iteration_rejected_before_write(job):
+    latest = 12000
+    new_path = job.checkpoint.parent / f"iter_{latest:09d}"
+    shutil.copytree(job.checkpoint, new_path)
+    for rank, state in enumerate(job.states):
+        payload = deepcopy(state)
+        payload["iteration"] = latest if rank != 7 else latest - 100
+        with (new_path / "dataloader" / f"rank_{rank}.pkl").open("wb") as out:
+            pickle.dump(payload, out)
+    (new_path.parent / "latest_checkpoint.txt").write_text(new_path.name)
+    job.report["checkpoint_load_path"] = str(new_path)
+    before = _witness(job.path)
+    with pytest.raises(ValueError, match="G1 rank7"):
+        phase5._g1_resume_compatibility(job.args, job.report, RAW_DIGEST)
+    assert _witness(job.path) == before
+
+
+def test_non_g1_override_still_requires_explicit_scope(job):
+    job.args.owner_authorized_g1_cross_pair_resume = True
+    for phase, job_name in (("fresh", phase5.G1_JOB), ("resume", "no_ttt_another_job")):
+        job.args.phase, job.args.job_name = phase, job_name
+        with pytest.raises(ValueError, match="only valid"):
+            phase5._owner_g1_cross_pair_resume(job.args)
