@@ -337,7 +337,12 @@ def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], p
     return {
         "schema": "g1_iter8900_owner_cross_pair_resume_v1",
         "owner_override": True,
-        "owner_flag": "--owner-authorized-g1-cross-pair-resume",
+        "owner_authorization": "standing_named_g1_same_job_resume",
+        "owner_flag": (
+            "--owner-authorized-g1-cross-pair-resume"
+            if getattr(args, "owner_authorized_g1_cross_pair_resume", False)
+            else None
+        ),
         "frozen_source": {"root": record["root"], "child": record["child"]},
         "runtime_source": lock,
         "frozen_semantic_digest": record["semantic_digest"],
