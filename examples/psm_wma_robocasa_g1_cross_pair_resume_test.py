@@ -293,22 +293,27 @@ def test_historical_digest_matches_launch_all_ranks_and_original_local_restore(j
     print("G1_COMPATIBILITY_WITNESS " + json.dumps(audit, sort_keys=True))
 
 
-def test_named_g1_resume_without_legacy_owner_flag_or_current_root_pin(job):
-    # The Owner's G1 standing recovery rule is not tied to a one-off
-    # cross-pair flag, nor to the caller's stale expected Root HEAD.
+def test_named_g1_resume_without_legacy_owner_flag_or_expected_sha_pins(job):
+    # Neither caller-provided Root nor Child SHA should gate the named G1
+    # Resume. Observed Child/Gitlink remain identical and recorded.
+    actual_child = job.report["lock"]["child"]
     job.args.owner_authorized_g1_cross_pair_resume = False
-    job.args.expected_root = "OLD_HEAD_NOT_REQUIRED"
+    job.args.expected_root = None
+    job.args.expected_child = "STALE_CHILD_PIN"
     assert phase5._owner_g1_cross_pair_resume(job.args) is True
     assert phase5.check_job_namespace(job.args, job.report["training_identity"]) == job.record
-    # Report identity must bind the *observed* runtime Root, not the
-    # deliberately stale CLI string.
     report = deepcopy(job.report)
     report["lock"]["root"] = "c" * 40
+    report["lock"]["child"] = report["lock"]["gitlink"] = "d" * 40
     identity = deepcopy(report["training_identity"])
     identity["root"] = "c" * 40
+    identity["child"] = "d" * 40
     report["training_identity"] = identity
     audit = phase5._g1_resume_compatibility(job.args, report, RAW_DIGEST)
     assert audit["runtime_source"]["root"] == "c" * 40
+    assert audit["runtime_source"]["child"] == "d" * 40
+    assert audit["frozen_source"]["child"] != audit["runtime_source"]["child"]
+    assert actual_child != job.args.expected_child
     assert audit["owner_authorization"] == "standing_named_g1_same_job_resume"
     assert audit["owner_flag"] is None
 
@@ -318,6 +323,8 @@ def test_g1_repeated_resume_uses_latest_checkpoint_and_rank_iterations(job, iter
     # Synthetic component presence and 8rank Local state. This proves
     # admission is no longer restricted to iter8900, not real CUDA DCP load.
     job.args.owner_authorized_g1_cross_pair_resume = False
+    job.args.expected_root = None
+    job.args.expected_child = None
     checkpoint = job.checkpoint
     if iteration != 8900:
         checkpoint = checkpoint.parent / f"iter_{iteration:09d}"
@@ -589,18 +596,34 @@ def test_launcher_explicit_flag_only_reaches_named_resume_without_running_torch(
     assert proc.returncode == 0, proc.stderr
     assert json.loads(capture.read_text()).count(flag) == 1
 
-    # The permanent G1 recovery contract must work with neither a one-off
-    # override flag nor an EXPECTED_ROOT environment pin.
+    # The standing G1 recovery contract must work without either HEAD pin,
+    # and must omit both flags even when stale pins are present in the shell.
     implicit = dict(env)
     implicit.pop("EXPECTED_ROOT")
+    implicit.pop("EXPECTED_CHILD")
     capture.unlink()
     resumed = subprocess.run(
         ["bash", str(launcher), "resume", "12000"], env=implicit, capture_output=True, text=True
     )
     assert resumed.returncode == 0, resumed.stderr
     argv = json.loads(capture.read_text())
-    assert flag not in argv
-    assert argv[argv.index("--expected-root") + 1] == "G1_ROOT_HEAD_NOT_PINNED"
+    assert flag not in argv and "--expected-root" not in argv and "--expected-child" not in argv
+    capture.unlink()
+    resumed = subprocess.run(
+        ["bash", str(launcher), "resume", "12000"], env=env, capture_output=True, text=True
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    argv = json.loads(capture.read_text())
+    assert "--expected-root" not in argv and "--expected-child" not in argv
+
+    # Non-G1 jobs must continue to require both caller-pinned source SHAs.
+    other_env = dict(implicit, JOB_NAME="another_job")
+    capture.unlink()
+    denied = subprocess.run(
+        ["bash", str(launcher), "resume", "12000"], env=other_env, capture_output=True, text=True
+    )
+    assert denied.returncode == 2 and b"EXPECTED_ROOT" in denied.stderr
+    assert not capture.exists()
 
     for argv, name in [
         (["fresh", "9000", flag], phase5.G1_JOB),
@@ -624,20 +647,28 @@ def test_launcher_explicit_flag_only_reaches_named_resume_without_running_torch(
         "dirty_root_source",
         "wrong_lineage",
         "short_expected",
+        "stale_expected_child",
+        "non_g1_stale_child",
     ],
 )
 def test_runtime_source_lock_remains_strict(job, monkeypatch, fault):
     calls = []
+    actual_root, actual_child = job.args.expected_root, job.args.expected_child
     if fault == "short_expected":
-        # Deliberately stale/short caller Root pin must not block G1.
+        # Deliberately stale/short Root pin cannot block G1.
         job.args.expected_root = "a" * 8
+    elif fault in ("stale_expected_child", "non_g1_stale_child"):
+        job.args.expected_child = "STALE_CHILD_SHA"
+        if fault == "non_g1_stale_child":
+            job.args.owner_authorized_g1_cross_pair_resume = False
+            job.args.job_name = "another_job"
 
     def run(command, **kwargs):
         command = tuple(command)
         calls.append(command)
         repo, args = command[2], command[3:]
         if args == ("rev-parse", "HEAD"):
-            value = job.args.expected_root if Path(repo) == job.args.root_worktree else job.args.expected_child
+            value = actual_root if Path(repo) == job.args.root_worktree else actual_child
             if fault in ("wrong_root", "short_expected") and Path(repo) == job.args.root_worktree:
                 value = "c" * 40
             if fault == "wrong_child" and Path(repo) != job.args.root_worktree:
@@ -646,24 +677,24 @@ def test_runtime_source_lock_remains_strict(job, monkeypatch, fault):
         if args[:2] == ("ls-tree", "HEAD"):
             return NS(
                 stdout="160000 commit "
-                + ("d" * 40 if fault == "wrong_gitlink" else job.args.expected_child)
+                + ("d" * 40 if fault == "wrong_gitlink" else actual_child)
                 + "\tcosmos-framework\n"
             )
         if args == ("status", "--porcelain"):
             return NS(stdout=" M examples/changed.py\n" if fault == "dirty_child" else "")
         if args[0] == "status":
             return NS(stdout=" M scripts/unsafe.py\0" if fault == "dirty_root_source" else "")
-        assert args == ("merge-base", "--is-ancestor", phase5.G1_RUNTIME_BASE_CHILD, job.args.expected_child)
+        assert args == ("merge-base", "--is-ancestor", phase5.G1_RUNTIME_BASE_CHILD, actual_child)
         if fault == "wrong_lineage":
             raise subprocess.CalledProcessError(1, command)
         return NS(stdout="")
 
     monkeypatch.setattr(phase5.subprocess, "run", run)
-    if fault in {"none", "wrong_root", "short_expected"}:
+    if fault in {"none", "wrong_root", "short_expected", "stale_expected_child"}:
         lock = phase5.verify_root_child_lock(job.args)
-        assert lock["child"] == lock["gitlink"] == job.args.expected_child
+        assert lock["child"] == lock["gitlink"] == actual_child
         assert lock["runtime_base_child"] == phase5.G1_RUNTIME_BASE_CHILD
-        if fault != "none":
+        if fault in ("wrong_root", "short_expected"):
             assert lock["root"] == "c" * 40
     else:
         with pytest.raises((ValueError, subprocess.CalledProcessError)):
