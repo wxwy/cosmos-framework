@@ -201,7 +201,11 @@ class ConsumerAudit:
             "state_fingerprint_sampled": bool(self.every and (iteration + 1) % self.every == 0),
             "memory_inventory": self.memory,
         }
-        if result["state_fingerprint_sampled"]:
+        model_config = getattr(getattr(trainer._grouped_window, "model", None), "config", None)
+        if getattr(model_config, "local_memory_enabled", True) is False:
+            result["state_fingerprint_sampled"] = False
+            result["fast_state_status"] = "DISABLED_NOT_INSTANTIATED"
+        elif result["state_fingerprint_sampled"]:
             started = time.perf_counter()
             result["committed_fast_state_sha256"] = fast_state_fingerprint(
                 trainer._grouped_window.live.sidecar.snapshot()

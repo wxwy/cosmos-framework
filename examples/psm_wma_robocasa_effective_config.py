@@ -75,7 +75,9 @@ def synchronize_legacy_chunk_length(config: Any, contract: Any) -> None:
         node[key] = contract.chunk_length
 
 
-def describe_effective_data_source(config: Any, contract: Any, *, ttt_steps: int) -> dict[str, Any]:
+def describe_effective_data_source(
+    config: Any, contract: Any, *, ttt_steps: int, local_memory_enabled: bool = True
+) -> dict[str, Any]:
     """Record real producer provenance separately from the unused legacy mirror."""
     _, fields = _legacy_fields(config)
     metadata = {
@@ -97,6 +99,11 @@ def describe_effective_data_source(config: Any, contract: Any, *, ttt_steps: int
         "legacy_dataset_contract": {key: getattr(contract, key) for key in _DATASET_KEYS},
         "legacy_chunk_fields": {path: node[key] for path, node, key in fields},
     }
+    if not local_memory_enabled:
+        metadata["producer_chain"][-1] = (
+            "cosmos_framework.trainer.matched_no_ttt.MatchedNoTTTTrainer.bind_grouped_stream"
+        )
+        metadata.update(local_memory_enabled=False, local_ttt_tbptt_steps=None, consumer_block_steps=ttt_steps)
     validate_effective_snapshot(config, metadata)
     return metadata
 
@@ -117,8 +124,14 @@ def validate_effective_snapshot(config: Any, metadata: Mapping) -> None:
                 ("fps", 20.0),
             )
         )
-        or type(metadata["local_ttt_tbptt_steps"]) is not int
-        or metadata["local_ttt_tbptt_steps"] <= 0
+        or (
+            metadata.get("local_memory_enabled", True) is not False
+            and (type(metadata["local_ttt_tbptt_steps"]) is not int or metadata["local_ttt_tbptt_steps"] <= 0)
+        )
+        or (
+            metadata.get("local_memory_enabled", True) is False
+            and (metadata["local_ttt_tbptt_steps"] is not None or metadata.get("consumer_block_steps") != 16)
+        )
         or any(node[key] != 16 for _, node, key in fields)
         or metadata["legacy_chunk_fields"] != {path: node[key] for path, node, key in fields}
     ):

@@ -29,8 +29,6 @@ from examples.psm_wma_robocasa_effective_config import (
 
 if TYPE_CHECKING:
     import torch
-    from omegaconf import DictConfig, OmegaConf
-
     from cosmos_framework.checkpoint.dcp import SafeLocalDistributedCheckpointer
     from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
     from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
@@ -56,6 +54,7 @@ if TYPE_CHECKING:
     from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
     from examples.psm_wma_robocasa_formal_monitor import TelemetryJournal
     from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
+    from omegaconf import DictConfig, OmegaConf
 
 
 def _load_runtime() -> None:
@@ -87,8 +86,6 @@ def _load_runtime() -> None:
     if globals().get("_RUNTIME_READY", False):
         return
     import torch
-    from omegaconf import DictConfig, OmegaConf
-
     from cosmos_framework.checkpoint.dcp import SafeLocalDistributedCheckpointer
     from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
     from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
@@ -114,6 +111,7 @@ def _load_runtime() -> None:
     from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
     from examples.psm_wma_robocasa_formal_monitor import TelemetryJournal
     from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
+    from omegaconf import DictConfig, OmegaConf
 
     _RUNTIME_READY = True
 
@@ -152,7 +150,8 @@ def _owner_g1_cross_pair_resume(args: argparse.Namespace) -> bool:
     if type(enabled) is not bool:
         raise ValueError("Owner G1 override must be an explicit boolean flag")
     if enabled and (
-        args.phase != "resume"
+        getattr(args, "no_ttt", False)
+        or args.phase != "resume"
         or args.job_name != G1_JOB
         or tuple(getattr(args, key, None) for key in ("t", "b", "ga", "k", "world_size")) != (16, 8, 2, 4, 8)
         or (args.max_iter, args.warmup, args.save_iter) != (30000, 500, 100)
@@ -207,6 +206,9 @@ def job_namespace(args: argparse.Namespace) -> Path:
 def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Read-only checks; a new Fresh claim is still required after distributed agreement."""
     override = _owner_g1_cross_pair_resume(args)
+    no_ttt = getattr(args, "no_ttt", False)
+    if no_ttt and not args.job_name.startswith(("no_ttt_", "bounded_no_ttt_")):
+        raise ValueError("Matched No-TTT requires a separate no_ttt_ job namespace")
     path = job_namespace(args)
     if args.phase == "fresh":
         if path.exists():
@@ -225,6 +227,7 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
         or record.get("native_batch_layout") != NATIVE_BATCH_LAYOUT
         or record.get("diagnostic_only_do_not_resume") is not False
         or record.get("semantic_digest") != _json_digest(record.get("semantic"))
+        or (record.get("semantic", {}).get("training_profile") == "matched_no_ttt_v1") != no_ttt
     ):
         raise ValueError("same-job identity Root/Child/Layout/namespace mismatch")
     if override and (
@@ -384,6 +387,7 @@ def _identity_value(value: Any) -> Any:
 def training_identity(args: argparse.Namespace, config: Any, report: dict[str, Any]) -> dict[str, Any]:
     """Bind complete model/optimizer/seed semantics; exclude phase/load path and run budget."""
     return {
+        **({"training_profile": "matched_no_ttt_v1"} if getattr(args, "no_ttt", False) else {}),
         "root": args.expected_root,
         "child": args.expected_child,
         "native_batch_layout": NATIVE_BATCH_LAYOUT,
@@ -595,13 +599,21 @@ def _telemetry_parameter_group(name: str) -> str | None:
     return "generation"
 
 
-def validate_optimizer_inventory(model: torch.nn.Module, optimizer: Any) -> dict[str, int]:
+def validate_optimizer_inventory(model: torch.nn.Module, optimizer: Any, *, no_ttt: bool = False) -> dict[str, int]:
     """用实际模型身份和实际 optimizer 参数集合核对精确 allowlist。"""
     named = dict(model.named_parameters())
-    expected = {name for name in named if _selected_name(name)}
+    if no_ttt:
+        from cosmos_framework.trainer.matched_no_ttt import require_no_local_model
+
+        require_no_local_model(model)
+    expected = {name for name in named if _selected_name(name) and (not no_ttt or "local_memory" not in name)}
     generation = {name for name in expected if any(key in name for key in GENERATION_KEYS)}
     local = expected - generation
-    if not generation or not local or any(not any(key in name for key in LOCAL_KEYS) for name in local):
+    if (
+        not generation
+        or (not no_ttt and not local)
+        or any(not any(key in name for key in LOCAL_KEYS) for name in local)
+    ):
         raise ValueError("generation/Local 参数集合缺失或重叠")
     if any(parameter.requires_grad != (name in expected) for name, parameter in named.items()):
         raise ValueError("非 generation/Local 参数必须冻结，选中参数必须可训练")
@@ -623,12 +635,12 @@ def validate_optimizer_inventory(model: torch.nn.Module, optimizer: Any) -> dict
     }
 
 
-def install_optimizer_inventory_check(model: torch.nn.Module, report: dict[str, Any]) -> None:
+def install_optimizer_inventory_check(model: torch.nn.Module, report: dict[str, Any], *, no_ttt: bool = False) -> None:
     original = model.init_optimizer_scheduler
 
     def checked(optimizer_config, scheduler_config):
         optimizer, scheduler = original(optimizer_config, scheduler_config)
-        report["optimizer_inventory"] = validate_optimizer_inventory(model, optimizer)
+        report["optimizer_inventory"] = validate_optimizer_inventory(model, optimizer, no_ttt=no_ttt)
         return optimizer, scheduler
 
     model.init_optimizer_scheduler = checked
@@ -676,11 +688,17 @@ def config_digest(
     if transform_rng_mode not in {"legacy_global", "consumer_keyed_v1"}:
         raise ValueError("invalid transform RNG mode")
     model = config.model.config
-    local = {
-        key: getattr(model, f"local_memory_{key}")
-        for key in ("ttt_tbptt_steps", "k_local", "ttt_dim", "fast_hidden_dim", "dim", "evidence_dim", "inner_lr")
-    }
+    no_ttt = getattr(model, "local_memory_enabled", True) is False
+    local = (
+        None
+        if no_ttt
+        else {
+            key: getattr(model, f"local_memory_{key}")
+            for key in ("ttt_tbptt_steps", "k_local", "ttt_dim", "fast_hidden_dim", "dim", "evidence_dim", "inner_lr")
+        }
+    )
     authority = {
+        **({"training_profile": "matched_no_ttt_v1"} if no_ttt else {}),
         "cache_manifest_sha256": catalog.manifest_digest,
         "cache_corpus_digest": catalog.cache_corpus_digest,
         "source_binding_digest": catalog.source_binding_digest,
@@ -738,6 +756,10 @@ def overlay_config(
     from examples.psm_wma_robocasa_local_s1 import overlay_local_config
 
     overlay_local_config(config)
+    if getattr(args, "no_ttt", False):
+        # Config-only overlay above supplies the identical non-Local optimizer,
+        # compile and EMA settings. Disable before any model is instantiated.
+        config.model.config.local_memory_enabled = False
     synchronize_legacy_chunk_length(config, contract)
     model = config.model.config
     model.local_memory_ttt_tbptt_steps = args.t
@@ -749,12 +771,16 @@ def overlay_config(
     model.parallelism.data_parallel_shard_degree = args.world_size
     model.parallelism.data_parallel_replicate_degree = 1
     config.trainer.type = GroupedLocalMemoryTrainer
+    if getattr(args, "no_ttt", False):
+        from cosmos_framework.trainer.matched_no_ttt import MatchedNoTTTTrainer
+
+        config.trainer.type = MatchedNoTTTTrainer
     config.trainer.grad_accum_iter = args.ga
     config.trainer.max_iter = args.max_iter
     config.trainer.run_validation = False
     config.trainer.callbacks = {}
     config.trainer.save_zero_checkpoint = False
-    config.optimizer.keys_to_select = list(OPTIMIZER_KEYS)
+    config.optimizer.keys_to_select = list(GENERATION_KEYS if getattr(args, "no_ttt", False) else OPTIMIZER_KEYS)
     config.optimizer.lr_multipliers = {key: 5.0 for key in ACTION_KEYS}
     config.scheduler.cycle_lengths = [args.max_iter]
     config.scheduler.warm_up_steps = [args.warmup]
@@ -935,6 +961,13 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     if getattr(args, "dataset_index_root", None) is None:
         raise ValueError("训练/Resume 必须提供已离线验收的 --dataset-index-root；禁止 cold build 与数据全量复检")
     check_job_namespace(args)
+    if getattr(args, "no_ttt", False) and (
+        (args.t, args.b, args.ga, args.k, args.world_size) != (16, 8, 2, 4, 8)
+        or args.num_workers != 0
+        or getattr(args, "full_segment_prefetch", False)
+        or getattr(args, "transform_rng_mode", "legacy_global") != "legacy_global"
+    ):
+        raise ValueError("Matched No-TTT freezes T16/B8/GA2/world8 and synchronous legacy-global transforms")
     if any(
         type(value) is not int or value <= 0
         for value in (args.t, args.b, args.ga, args.k, args.world_size, args.max_iter, args.save_iter)
@@ -1028,7 +1061,9 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         "episodes": len(catalog.episodes),
         "dataset_init": dataset_init,
         "checkpoint_load_path": str(resume or args.base_checkpoint),
-        "effective_data_source": describe_effective_data_source(config, catalog.raw.contract, ttt_steps=args.t),
+        "effective_data_source": describe_effective_data_source(
+            config, catalog.raw.contract, ttt_steps=args.t, local_memory_enabled=not getattr(args, "no_ttt", False)
+        ),
     }
     semantic = training_identity(args, config, report)
     check_job_namespace(args, semantic)
@@ -1062,6 +1097,9 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument(
+        "--no-ttt", action="store_true", help="Independent matched Packed128 baseline; never a G1 Resume override"
+    )
     result.add_argument("--phase", choices=("fresh", "resume"), required=True)
     result.add_argument(
         "--owner-authorized-g1-cross-pair-resume",
@@ -1153,12 +1191,17 @@ def main(argv: list[str] | None = None) -> None:
     if rank == 0:
         print("[CorrectedV3][dataset_init] " + json.dumps(report["dataset_init"], sort_keys=True))
     lifecycle = JobLifecycle(args, report)
-    trainer = GroupedLocalMemoryTrainer(config, config_writer=lifecycle.write_config)
+    trainer_type = GroupedLocalMemoryTrainer
+    if args.no_ttt:
+        from cosmos_framework.trainer.matched_no_ttt import MatchedNoTTTTrainer
+
+        trainer_type = MatchedNoTTTTrainer
+    trainer = trainer_type(config, config_writer=lifecycle.write_config)
     trainer._execution_max_iter = report["execution_stop_after_iter"]
     trainer._require_committed_execution_boundary = True
     with model_init():
         model = instantiate(config.model)
-    install_optimizer_inventory_check(model, report)
+    install_optimizer_inventory_check(model, report, no_ttt=args.no_ttt)
     planner = ExactWindowRankPlanner(catalog, rank=rank, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     producer = ExactWindowSegmentProducer(
         catalog,
@@ -1178,7 +1221,12 @@ def main(argv: list[str] | None = None) -> None:
         if rank == 0
         else None
     )
-    observer = GroupedPlanObserver(
+    observer_type = GroupedPlanObserver
+    if args.no_ttt:
+        from examples.psm_wma_robocasa_matched_no_ttt import NoTTTPlanObserver
+
+        observer_type = NoTTTPlanObserver
+    observer = observer_type(
         rank=rank,
         parameter_group=_telemetry_parameter_group,
         cuda_sample_interval=sample_interval,
