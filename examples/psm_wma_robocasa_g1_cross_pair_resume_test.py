@@ -17,6 +17,7 @@ import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
+from shutil import copytree
 from types import ModuleType
 from types import SimpleNamespace as NS
 
@@ -292,11 +293,57 @@ def test_historical_digest_matches_launch_all_ranks_and_original_local_restore(j
     print("G1_COMPATIBILITY_WITNESS " + json.dumps(audit, sort_keys=True))
 
 
-@pytest.mark.parametrize("change", ["no_flag", "fresh", "other_job", "ga", "t", "b", "k", "world_size", "schedule"])
+def test_named_g1_resume_without_legacy_owner_flag_or_current_root_pin(job):
+    # The Owner's G1 standing recovery rule is not tied to a one-off
+    # cross-pair flag, nor to the caller's stale expected Root HEAD.
+    job.args.owner_authorized_g1_cross_pair_resume = False
+    job.args.expected_root = "OLD_HEAD_NOT_REQUIRED"
+    assert phase5._owner_g1_cross_pair_resume(job.args) is True
+    assert phase5.check_job_namespace(job.args, job.report["training_identity"]) == job.record
+    # Report identity must bind the *observed* runtime Root, not the
+    # deliberately stale CLI string.
+    report = deepcopy(job.report)
+    report["lock"]["root"] = "c" * 40
+    identity = deepcopy(report["training_identity"])
+    identity["root"] = "c" * 40
+    report["training_identity"] = identity
+    assert phase5._g1_resume_compatibility(job.args, report, RAW_DIGEST)["runtime_source"]["root"] == "c" * 40
+
+
+@pytest.mark.parametrize("iteration", [8900, 9000, 12000])
+def test_g1_repeated_resume_uses_latest_checkpoint_and_rank_iterations(job, iteration):
+    # Synthetic component presence and 8rank Local state. This proves
+    # admission is no longer restricted to iter8900, not real CUDA DCP load.
+    job.args.owner_authorized_g1_cross_pair_resume = False
+    checkpoint = job.checkpoint
+    if iteration != 8900:
+        checkpoint = checkpoint.parent / f"iter_{iteration:09d}"
+        copytree(job.checkpoint, checkpoint)
+        for rank in range(8):
+            sidecar = checkpoint / "dataloader" / f"rank_{rank}.pkl"
+            state = pickle.loads(sidecar.read_bytes())
+            state["iteration"] = iteration
+            sidecar.write_bytes(pickle.dumps(state))
+        (checkpoint.parent / "latest_checkpoint.txt").write_text(checkpoint.name)
+    report = deepcopy(job.report)
+    report["checkpoint_load_path"] = str(checkpoint)
+    assert phase5._resume_checkpoint(job.args) == checkpoint
+    audit = phase5._g1_resume_compatibility(job.args, report, RAW_DIGEST)
+    assert audit["iteration"] == iteration
+    assert audit["checkpoint"] == str(checkpoint)
+    assert len(audit["rank_sidecars"]) == 8
+    if iteration != 8900:
+        damaged = checkpoint / "dataloader/rank_7.pkl"
+        state = pickle.loads(damaged.read_bytes())
+        state["iteration"] = 8900
+        damaged.write_bytes(pickle.dumps(state))
+        with pytest.raises(ValueError, match="rank7|Sidecar|sidecar|迭代"):
+            phase5._g1_resume_compatibility(job.args, report, RAW_DIGEST)
+
+
+@pytest.mark.parametrize("change", ["fresh", "other_job", "ga", "t", "b", "k", "world_size", "schedule"])
 def test_override_scope_is_not_a_general_bypass(job, change):
-    if change == "no_flag":
-        job.args.owner_authorized_g1_cross_pair_resume = False
-    elif change == "fresh":
+    if change == "fresh":
         job.args.phase = "fresh"
     elif change == "other_job":
         job.args.job_name = "another_job"
@@ -565,6 +612,7 @@ def test_launcher_explicit_flag_only_reaches_named_resume_without_running_torch(
 def test_runtime_source_lock_remains_strict(job, monkeypatch, fault):
     calls = []
     if fault == "short_expected":
+        # Deliberately stale/short caller Root pin must not block G1.
         job.args.expected_root = "a" * 8
 
     def run(command, **kwargs):
@@ -573,7 +621,7 @@ def test_runtime_source_lock_remains_strict(job, monkeypatch, fault):
         repo, args = command[2], command[3:]
         if args == ("rev-parse", "HEAD"):
             value = job.args.expected_root if Path(repo) == job.args.root_worktree else job.args.expected_child
-            if fault == "wrong_root" and Path(repo) == job.args.root_worktree:
+            if fault in ("wrong_root", "short_expected") and Path(repo) == job.args.root_worktree:
                 value = "c" * 40
             if fault == "wrong_child" and Path(repo) != job.args.root_worktree:
                 value = "c" * 40
@@ -594,10 +642,12 @@ def test_runtime_source_lock_remains_strict(job, monkeypatch, fault):
         return NS(stdout="")
 
     monkeypatch.setattr(phase5.subprocess, "run", run)
-    if fault == "none":
+    if fault in {"none", "wrong_root", "short_expected"}:
         lock = phase5.verify_root_child_lock(job.args)
         assert lock["child"] == lock["gitlink"] == job.args.expected_child
         assert lock["runtime_base_child"] == phase5.G1_RUNTIME_BASE_CHILD
+        if fault != "none":
+            assert lock["root"] == "c" * 40
     else:
         with pytest.raises((ValueError, subprocess.CalledProcessError)):
             phase5.verify_root_child_lock(job.args)
