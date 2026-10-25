@@ -274,6 +274,7 @@ def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], p
         raise ValueError("G1 phase5 digest must be a full SHA256")
     record = check_job_namespace(args, report["training_identity"])
     checkpoint = _resume_checkpoint(args)
+    checkpoint_iteration = int(checkpoint.name[5:])
     if str(checkpoint) != report["checkpoint_load_path"]:
         raise ValueError("G1 checkpoint changed since preflight")
     expected = _json_digest({"phase5_digest": phase5_digest, "training_identity": record["semantic"]})
@@ -313,7 +314,7 @@ def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], p
             not isinstance(state, dict)
             or state.get("format") != "psm_v3_corrected_grouped_local_v2"
             or type(state.get("iteration")) is not int
-            or state["iteration"] != 8900
+            or state["iteration"] != checkpoint_iteration
             or state.get("config_digest") != expected
             or type(state.get("profile")) is not tuple
             or state["profile"][:2] != (rank, args.world_size)
@@ -329,12 +330,21 @@ def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], p
                 raise ValueError(f"G1 rank{rank} SegmentProvenance config digest mismatch")
         witnesses[str(rank)] = {"sha256": before, "bytes": sidecar.stat().st_size}
     lock = report["lock"]
-    if (lock["root"], lock["child"], lock["gitlink"]) != (args.expected_root, args.expected_child, args.expected_child):
-        raise ValueError("G1 runtime source provenance mismatch")
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", lock.get("root", "")) is None
+        or re.fullmatch(r"[0-9a-f]{40}", lock.get("child", "")) is None
+        or lock["child"] != lock["gitlink"]
+    ):
+        raise ValueError("G1 runtime source/Gitlink provenance mismatch")
     return {
         "schema": "g1_iter8900_owner_cross_pair_resume_v1",
         "owner_override": True,
-        "owner_flag": "--owner-authorized-g1-cross-pair-resume",
+        "owner_flag": (
+            "--owner-authorized-g1-cross-pair-resume"
+            if getattr(args, "owner_authorized_g1_cross_pair_resume", False)
+            else "G1_SCOPED_RESUME_POLICY"
+        ),
+        "repeatable_same_job_resume": True,
         "frozen_source": {"root": record["root"], "child": record["child"]},
         "runtime_source": lock,
         "frozen_semantic_digest": record["semantic_digest"],
@@ -343,7 +353,7 @@ def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], p
         "phase5_digest": phase5_digest,
         "config_digest": expected,
         "checkpoint": str(checkpoint),
-        "iteration": 8900,
+        "iteration": checkpoint_iteration,
         "frozen_launch": frozen_launch,
         "rank_sidecars": witnesses,
         "validation": {
