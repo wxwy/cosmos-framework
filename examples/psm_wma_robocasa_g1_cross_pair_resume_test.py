@@ -307,7 +307,10 @@ def test_named_g1_resume_without_legacy_owner_flag_or_current_root_pin(job):
     identity = deepcopy(report["training_identity"])
     identity["root"] = "c" * 40
     report["training_identity"] = identity
-    assert phase5._g1_resume_compatibility(job.args, report, RAW_DIGEST)["runtime_source"]["root"] == "c" * 40
+    audit = phase5._g1_resume_compatibility(job.args, report, RAW_DIGEST)
+    assert audit["runtime_source"]["root"] == "c" * 40
+    assert audit["owner_authorization"] == "standing_named_g1_same_job_resume"
+    assert audit["owner_flag"] is None
 
 
 @pytest.mark.parametrize("iteration", [8900, 9000, 12000])
