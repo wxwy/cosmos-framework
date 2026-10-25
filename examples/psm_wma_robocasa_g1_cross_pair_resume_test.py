@@ -763,3 +763,41 @@ def test_non_g1_override_still_requires_explicit_scope(job):
         job.args.phase, job.args.job_name = phase, job_name
         with pytest.raises(ValueError, match="only valid"):
             phase5._owner_g1_cross_pair_resume(job.args)
+
+
+def test_g1_launcher_resolves_runtime_source_without_frozen_expected_sha(tmp_path):
+    """Even an old EXPECTED_ROOT value may not stop G1 after interruption."""
+    fake = tmp_path / "capture_python"
+    capture = tmp_path / "captured.json"
+    fake.write_text(
+        f"#!{sys.executable}\nimport json,sys\nfrom pathlib import Path\n"
+        f"Path({str(capture)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+    )
+    fake.chmod(0o700)
+    env = dict(os.environ, PYTHON=str(fake), JOB_NAME=phase5.G1_JOB)
+    for key in (
+        "OUTPUT_ROOT",
+        "SOURCE_ROOT",
+        "CACHE_ROOT",
+        "DATASET_INDEX_ROOT",
+        "EDGE_POLICY_CHECKPOINT",
+        "WAN_VAE_PATH",
+        "BASE_CHECKPOINT_PATH",
+    ):
+        env[key] = "synthetic_" + key
+    env["EXPECTED_ROOT"] = "stale_root_head_from_previous_start"
+    env["EXPECTED_CHILD"] = "stale_child_head_from_previous_start"
+    launcher = CHILD.parent / "scripts/train_v3_packed128_staged.sh"
+    process = subprocess.run(["bash", str(launcher), "resume", "13000"], env=env, capture_output=True, text=True)
+    assert process.returncode == 0, process.stderr
+    argv = json.loads(capture.read_text())
+    current_root = subprocess.run(
+        ("git", "-C", str(CHILD.parent), "rev-parse", "HEAD"), capture_output=True, text=True, check=True
+    ).stdout.strip()
+    current_child = subprocess.run(
+        ("git", "-C", str(CHILD), "rev-parse", "HEAD"), capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert argv[argv.index("--expected-root") + 1] == current_root
+    assert argv[argv.index("--expected-child") + 1] == current_child
+    assert "--owner-authorized-g1-cross-pair-resume" not in argv
+    assert "--phase" in argv and argv[argv.index("--phase") + 1] == "resume"
