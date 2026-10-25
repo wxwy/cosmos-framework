@@ -149,16 +149,21 @@ def _owner_g1_cross_pair_resume(args: argparse.Namespace) -> bool:
     enabled = getattr(args, "owner_authorized_g1_cross_pair_resume", False)
     if type(enabled) is not bool:
         raise ValueError("Owner G1 override must be an explicit boolean flag")
-    if enabled and (
+    # Owner's standing G1 instruction: Resume is permitted after every fully
+    # committed same-job checkpoint, without repinning the runtime Root HEAD.
+    # The historical --owner-authorized flag is accepted for compatibility but
+    # no longer needed when this *exact* G1 job is resumed.
+    g1_resume = args.phase == "resume" and args.job_name == G1_JOB
+    if enabled and not g1_resume:
+        raise ValueError("G1 cross-pair flag is only valid for this named G1 Resume")
+    if g1_resume and (
         getattr(args, "no_ttt", False)
-        or args.phase != "resume"
-        or args.job_name != G1_JOB
         or tuple(getattr(args, key, None) for key in ("t", "b", "ga", "k", "world_size")) != (16, 8, 2, 4, 8)
         or (args.max_iter, args.warmup, args.save_iter) != (30000, 500, 100)
         or getattr(args, "stop_after_iter", None) is not None
     ):
-        raise ValueError("Owner cross-pair override is only for G1 formal iter8900 Resume T16/B8/GA2/K4/world8")
-    return enabled
+        raise ValueError("G1 Resume requires unchanged formal T16/B8/GA2/K4/world8 and 30000/500/100")
+    return g1_resume
 
 
 def _semantic_drift_paths(old: Any, new: Any, path: str = "semantic") -> list[str]:
@@ -238,8 +243,11 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
         raise ValueError("frozen G1 source/semantic/config authority mismatch")
     if semantic is not None:
         if override:
-            if (semantic.get("root"), semantic.get("child")) != (args.expected_root, args.expected_child):
-                raise ValueError("runtime G1 semantic source does not match expected Pair")
+            # G1 Root is provenance, not an equality-based Resume admission key.
+            # Real runtime source identity is cross-checked against the observed
+            # Git HEAD/Gitlink in _g1_resume_compatibility().
+            if semantic.get("child") != args.expected_child:
+                raise ValueError("runtime G1 Child source does not match expected Gitlink")
             old = {key: value for key, value in record["semantic"].items() if key not in {"root", "child"}}
             new = {key: value for key, value in semantic.items() if key not in {"root", "child"}}
             drift = _semantic_drift_paths(old, new)
@@ -303,7 +311,7 @@ def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], p
             not isinstance(state, dict)
             or state.get("format") != "psm_v3_corrected_grouped_local_v2"
             or type(state.get("iteration")) is not int
-            or state["iteration"] != 8900
+            or state["iteration"] != int(checkpoint.name[5:])
             or state.get("config_digest") != expected
             or type(state.get("profile")) is not tuple
             or state["profile"][:2] != (rank, args.world_size)
@@ -319,8 +327,13 @@ def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], p
                 raise ValueError(f"G1 rank{rank} SegmentProvenance config digest mismatch")
         witnesses[str(rank)] = {"sha256": before, "bytes": sidecar.stat().st_size}
     lock = report["lock"]
-    if (lock["root"], lock["child"], lock["gitlink"]) != (args.expected_root, args.expected_child, args.expected_child):
-        raise ValueError("G1 runtime source provenance mismatch")
+    # Keep the observed Root HEAD in the audit but never reject G1 Resume
+    # because it differs from an old caller-provided EXPECTED_ROOT.
+    if (lock["child"], lock["gitlink"]) != (args.expected_child, args.expected_child) or (
+        report["training_identity"].get("root"),
+        report["training_identity"].get("child"),
+    ) != (lock["root"], lock["child"]):
+        raise ValueError("G1 runtime Child/Gitlink/provenance mismatch")
     return {
         "schema": "g1_iter8900_owner_cross_pair_resume_v1",
         "owner_override": True,
@@ -333,7 +346,7 @@ def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], p
         "phase5_digest": phase5_digest,
         "config_digest": expected,
         "checkpoint": str(checkpoint),
-        "iteration": 8900,
+        "iteration": int(checkpoint.name[5:]),
         "frozen_launch": frozen_launch,
         "rank_sidecars": witnesses,
         "validation": {
@@ -388,7 +401,7 @@ def training_identity(args: argparse.Namespace, config: Any, report: dict[str, A
     """Bind complete model/optimizer/seed semantics; exclude phase/load path and run budget."""
     return {
         **({"training_profile": "matched_no_ttt_v1"} if getattr(args, "no_ttt", False) else {}),
-        "root": args.expected_root,
+        "root": report["lock"]["root"] if _owner_g1_cross_pair_resume(args) else args.expected_root,
         "child": args.expected_child,
         "native_batch_layout": NATIVE_BATCH_LAYOUT,
         "training": {
@@ -825,10 +838,10 @@ def _resume_checkpoint(args: argparse.Namespace) -> Path | None:
     if latest.is_symlink() or latest.parent.is_symlink():
         raise ValueError("same-job checkpoint symlink alias is forbidden")
     name = latest.read_text().strip()
-    if override and name != G1_CHECKPOINT:
-        raise ValueError("Owner G1 override requires exactly completed iter_000008900")
     if not name.startswith("iter_") or not name[5:].isdigit() or not 0 < int(name[5:]) < args.max_iter:
         raise ValueError("same-job latest checkpoint iteration 不合法")
+    if override and int(name[5:]) < int(G1_CHECKPOINT[5:]):
+        raise ValueError("G1 Resume latest checkpoint predates the original completed iter8900")
     checkpoint = latest.parent / name
     if checkpoint.is_symlink():
         raise ValueError("same-job checkpoint symlink alias is forbidden")
@@ -888,9 +901,9 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
     actual_child = git(child, "rev-parse", "HEAD")
     gitlink = git(root, "ls-tree", "HEAD", "cosmos-framework").split()[2]
     if (
-        len(args.expected_root) != 40
+        (not override and (len(args.expected_root) != 40 or actual_root != args.expected_root))
         or len(args.expected_child) != 40
-        or (actual_root, actual_child, gitlink) != (args.expected_root, args.expected_child, args.expected_child)
+        or (actual_child, gitlink) != (args.expected_child, args.expected_child)
         or git(child, "status", "--porcelain")
     ):
         raise ValueError("V3 root/child/Gitlink 或 child 工作树不匹配")
