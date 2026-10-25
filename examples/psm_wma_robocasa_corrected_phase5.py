@@ -146,19 +146,29 @@ G1_CHECKPOINT = "iter_000008900"
 
 
 def _owner_g1_cross_pair_resume(args: argparse.Namespace) -> bool:
-    enabled = getattr(args, "owner_authorized_g1_cross_pair_resume", False)
-    if type(enabled) is not bool:
+    """G1-only persistent same-job recovery; no source HEAD or iter8900 gate.
+
+    Owner authorized repeated interruption recovery for the one frozen G1 job.
+    Actual runtime source SHAs remain in the audit, while frozen semantic/DCP
+    and all rank-local Local-TTT state checks remain strict. Other jobs retain
+    the original strict source-pair policy.
+    """
+    requested = getattr(args, "owner_authorized_g1_cross_pair_resume", False)
+    if type(requested) is not bool:
         raise ValueError("Owner G1 override must be an explicit boolean flag")
-    if enabled and (
+    is_g1_resume = args.phase == "resume" and args.job_name == G1_JOB
+    if requested and not is_g1_resume:
+        raise ValueError("Owner G1 override is only valid for the named G1 Resume")
+    if not is_g1_resume:
+        return False
+    if (
         getattr(args, "no_ttt", False)
-        or args.phase != "resume"
-        or args.job_name != G1_JOB
         or tuple(getattr(args, key, None) for key in ("t", "b", "ga", "k", "world_size")) != (16, 8, 2, 4, 8)
         or (args.max_iter, args.warmup, args.save_iter) != (30000, 500, 100)
         or getattr(args, "stop_after_iter", None) is not None
     ):
-        raise ValueError("Owner cross-pair override is only for G1 formal iter8900 Resume T16/B8/GA2/K4/world8")
-    return enabled
+        raise ValueError("G1 Resume requires T16/B8/GA2/K4/world8 and formal 30000/500/100; no No-TTT")
+    return True
 
 
 def _semantic_drift_paths(old: Any, new: Any, path: str = "semantic") -> list[str]:
@@ -818,15 +828,15 @@ def _load_config(args: argparse.Namespace):
 
 
 def _resume_checkpoint(args: argparse.Namespace) -> Path | None:
-    override = _owner_g1_cross_pair_resume(args)
     if args.phase == "fresh":
         return None
     latest = args.output_root / "psm_wma_v3/corrected_phase5" / args.job_name / "checkpoints/latest_checkpoint.txt"
     if latest.is_symlink() or latest.parent.is_symlink():
         raise ValueError("same-job checkpoint symlink alias is forbidden")
     name = latest.read_text().strip()
-    if override and name != G1_CHECKPOINT:
-        raise ValueError("Owner G1 override requires exactly completed iter_000008900")
+    # Recover the latest committed checkpoint, not the one-time G1 iter8900
+    # migration point. Full model/optimizer/scheduler/trainer and all eight
+    # dataloader states remain mandatory.
     if not name.startswith("iter_") or not name[5:].isdigit() or not 0 < int(name[5:]) < args.max_iter:
         raise ValueError("same-job latest checkpoint iteration 不合法")
     checkpoint = latest.parent / name
@@ -875,7 +885,7 @@ def _audit_root_noncode_changes(porcelain_z: str) -> tuple[str, ...]:
 
 
 def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
-    override = _owner_g1_cross_pair_resume(args)
+    g1_recovery = _owner_g1_cross_pair_resume(args)
     child = Path(__file__).resolve().parents[1]
 
     def git(repo: Path, *command: str) -> str:
@@ -887,16 +897,26 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
     actual_root = git(root, "rev-parse", "HEAD")
     actual_child = git(child, "rev-parse", "HEAD")
     gitlink = git(root, "ls-tree", "HEAD", "cosmos-framework").split()[2]
+    # On the named G1 Resume path, Root HEAD and requested/pinned SHA strings
+    # are provenance ONLY; changing docs or V3 commits must never block another
+    # interruption recovery. Child must still be the actual Gitlink and clean.
     if (
-        len(args.expected_root) != 40
-        or len(args.expected_child) != 40
-        or (actual_root, actual_child, gitlink) != (args.expected_root, args.expected_child, args.expected_child)
+        re.fullmatch(r"[0-9a-f]{40}", actual_root) is None
+        or re.fullmatch(r"[0-9a-f]{40}", actual_child) is None
+        or actual_child != gitlink
         or git(child, "status", "--porcelain")
+        or (
+            not g1_recovery
+            and (
+                len(args.expected_root) != 40
+                or len(args.expected_child) != 40
+                or (actual_root, actual_child) != (args.expected_root, args.expected_child)
+            )
+        )
     ):
         raise ValueError("V3 root/child/Gitlink 或 child 工作树不匹配")
-    # Gitlink and child source remain strictly clean and SHA-pinned. The root
-    # tree contains MM-owned notes and DS-only reports that must be preserved.
-    # Read porcelain -z without .strip(), which would destroy its leading XY status.
+    # Reject modified production sources even for G1; this is a worktree
+    # safety check, not a root-HEAD equality check.
     root_status = subprocess.run(
         ("git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"),
         check=True,
@@ -910,12 +930,11 @@ def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
         "gitlink": gitlink,
         "allowed_root_noncode_changes": len(noncode_changes),
     }
-    if override:
-        # New reviewed implementation SHA is pinned by --expected-child. The
-        # design's 35b0 baseline must be its ancestor, not an impossible self-SHA.
+    if g1_recovery:
         git(child, "merge-base", "--is-ancestor", G1_RUNTIME_BASE_CHILD, actual_child)
         lock["allowed_root_noncode_change_paths"] = list(noncode_changes)
         lock["runtime_base_child"] = G1_RUNTIME_BASE_CHILD
+        lock["root_head_is_provenance_not_resume_gate"] = True
     return lock
 
 
