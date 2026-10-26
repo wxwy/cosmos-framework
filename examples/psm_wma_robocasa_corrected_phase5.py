@@ -176,21 +176,18 @@ def _expected_source_identity(args: argparse.Namespace) -> tuple[str | None, str
     return args.expected_root, args.expected_child
 
 
-def _nottt4_frozen_source_pair_valid(record: dict[str, Any]) -> bool:
-    """Old 4GPU No-TTT Jobs recorded real SHAs; later ones recorded sentinels.
+# Historical formal world4 No-TTT Job: its CPU Worker setting and code SHA are
+# not training-state authorities. Keep its DCP/frontier intact and do not gate
+# same-job Resume on old/new Job identity fields.
+NOTTT4_LEGACY_JOB = "no_ttt_packed128_droid_fresh_30k_world4_ga4"
 
-    Source HEAD admission is owner-exempt for this exact profile, but the
-    immutable Job identity must still be self-consistent and well-formed.
-    """
-    frozen = record.get("semantic")
-    if not isinstance(frozen, dict):
-        return False
-    pair = (record.get("root"), record.get("child"))
-    if pair != (frozen.get("root"), frozen.get("child")):
-        return False
-    if pair == (NOTTT4_UNCHECKED_SOURCE, NOTTT4_UNCHECKED_SOURCE):
-        return True
-    return all(type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value) for value in pair)
+
+def _nottt4_resume_without_job_identity(args: argparse.Namespace) -> bool:
+    return (
+        _nottt4_source_gate_disabled(args)
+        and args.phase == "resume"
+        and args.job_name == NOTTT4_LEGACY_JOB
+    )
 
 
 def _owner_g1_cross_pair_resume(args: argparse.Namespace) -> bool:
@@ -261,7 +258,6 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
     profile_from_args(args)  # Validate loader options, never compare them to checkpoint identity.
     override = _owner_g1_cross_pair_resume(args)
     expected_root, expected_child = _expected_source_identity(args)
-    nottt4 = _nottt4_source_gate_disabled(args)
     no_ttt = getattr(args, "no_ttt", False)
     if no_ttt and not args.job_name.startswith(("no_ttt_", "bounded_no_ttt_")):
         raise ValueError("Matched No-TTT requires a separate no_ttt_ job namespace")
@@ -275,17 +271,21 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
     if (path / JOB_IDENTITY).is_symlink():
         raise ValueError("job identity symlink is forbidden")
     record = json.loads((path / JOB_IDENTITY).read_text())
+    if _nottt4_resume_without_job_identity(args):
+        # Owner opt-out for the one existing formal No-TTT job. Do not compare
+        # SHA, sentinel, schema, semantic digest or config snapshot to runtime
+        # identity. The saved semantic is needed solely to reproduce the
+        # original rank-sidecar config_digest without rewriting the checkpoint.
+        # DCP components, rank/frontier/source binding and iteration continue
+        # to be checked by the checkpoint loader and NoTTTFrontierCallback.
+        if not isinstance(record, dict) or not isinstance(record.get("semantic"), dict):
+            raise ValueError("No-TTT Resume requires readable frozen training state")
+        return record
     if (
         record.get("schema") != "corrected_phase5_f0_v1"
         or record.get("namespace") != str(path)
-        or (
-            not _nottt4_frozen_source_pair_valid(record)
-            if nottt4
-            else (
-                record.get("root") != (G1_FROZEN_ROOT if override else expected_root)
-                or record.get("child") != (G1_FROZEN_CHILD if override else expected_child)
-            )
-        )
+        or record.get("root") != (G1_FROZEN_ROOT if override else expected_root)
+        or record.get("child") != (G1_FROZEN_CHILD if override else expected_child)
         or record.get("native_batch_layout") != NATIVE_BATCH_LAYOUT
         or record.get("diagnostic_only_do_not_resume") is not False
         or not isinstance(record.get("semantic"), dict)
@@ -309,14 +309,6 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
             drift = _semantic_drift_paths(old, new)
             if drift:
                 raise ValueError("G1 semantic drift outside root/child: " + ", ".join(drift))
-        elif nottt4:
-            # A historical Root/Child SHA is provenance, not the runtime code
-            # identity. All model/data/scheduler/seed/GA fields stay frozen.
-            old = {key: value for key, value in record["semantic"].items() if key not in {"root", "child"}}
-            new = {key: value for key, value in semantic.items() if key not in {"root", "child"}}
-            drift = _semantic_drift_paths(old, new)
-            if drift:
-                raise ValueError("No-TTT semantic drift outside Root/Child: " + ", ".join(drift))
         elif record["semantic"] != semantic:
             raise ValueError("same-job training semantic identity mismatch")
     if set(record.get("canonical_config_sha256", {})) != {"config.pkl", "config.yaml"}:
@@ -1188,20 +1180,19 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
             "raw_cache_policy": "spawned_cpu_workers",
         }
     frozen_job = check_job_namespace(args, semantic)
-    if frozen_job is not None and _nottt4_source_gate_disabled(args):
-        # Resume keeps the actual historical training digest and all rank
-        # sidecars. Rewriting Root/Child to sentinels would change that digest.
-        # check_job_namespace already verified non-source semantics and
-        # canonical Job files; this never mutates the frozen identity.
+    if frozen_job is not None and _nottt4_resume_without_job_identity(args):
+        # The saved semantic is not revalidated against runtime code identity.
+        # It reproduces the ORIGINAL config_digest required by all four saved
+        # rank sidecars; model/optimizer/RNG/frontier are loaded unmodified.
         frozen_semantic = frozen_job["semantic"]
-        if frozen_semantic != semantic:
-            report["nottt4_legacy_source_resume"] = {
-                "schema": "nottt4_historical_source_provenance_v1",
-                "frozen_root": frozen_job["root"],
-                "frozen_child": frozen_job["child"],
-                "runtime_source_validation": "owner_disabled_for_nottt_world4_ga4",
-                "historical_sha_is_not_runtime_source_verification": True,
-            }
+        report["nottt4_legacy_source_resume"] = {
+            "schema": "nottt4_owner_skipped_job_identity_v1",
+            "identity_gate": "disabled_for_existing_formal_nottt4_resume",
+            "runtime_source_validation": "owner_disabled_for_nottt_world4_ga4",
+            "frozen_semantic_digest": _json_digest(frozen_semantic),
+            "frozen_config_checksum_not_revalidated": True,
+            "original_job_and_checkpoints_unmodified": True,
+        }
         semantic = frozen_semantic
     report["training_identity"] = semantic
     # Loader runtime choices are outside this strong digest; model/data/GA/seed remain strict.
