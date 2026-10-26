@@ -143,6 +143,35 @@ G1_FROZEN_CHILD = "2d128ed5a07601cdd424974f99b67832eafeeb41"
 G1_RUNTIME_BASE_CHILD = "35b0ea1ccee9ee26653ed6589c484f0997d1c586"
 G1_CONFIG_YAML_SHA256 = "f87e2e49c6931ce7dc32b467aa3f8026269f5ad255216e1cdd8fafb1d7e7374e"
 G1_CHECKPOINT = "iter_000008900"
+# Only for the Owner-authorized 4GPU No-TTT profile. Do not falsely claim a
+# source SHA identity when Root/Child HEAD and Root status were not examined.
+NOTTT4_UNCHECKED_SOURCE = "nottt_world4_ga4_source_head_not_verified"
+
+
+def _nottt4_source_gate_disabled(args: argparse.Namespace) -> bool:
+    """Narrow Owner exception: only the independent No-TTT world4/GA4 job.
+
+    Skip Root status and source Git SHA checks, *not* the model/data/config,
+    Job namespace, optimizer, DCP, or per-rank frontier continuity checks.
+    """
+    return (
+        getattr(args, "no_ttt", False) is True
+        and isinstance(getattr(args, "job_name", None), str)
+        and args.job_name.startswith("no_ttt_")
+        and args.job_name.endswith("_world4_ga4")
+        and getattr(args, "phase", None) in {"fresh", "resume"}
+        and tuple(getattr(args, key, None) for key in ("t", "b", "ga", "k", "world_size"))
+        == (16, 8, 4, 4, 4)
+        and getattr(args, "num_workers", None) == 0
+        and getattr(args, "full_segment_prefetch", False) is False
+        and getattr(args, "transform_rng_mode", "legacy_global") == "legacy_global"
+    )
+
+
+def _expected_source_identity(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    if _nottt4_source_gate_disabled(args):
+        return NOTTT4_UNCHECKED_SOURCE, NOTTT4_UNCHECKED_SOURCE
+    return args.expected_root, args.expected_child
 
 
 def _owner_g1_cross_pair_resume(args: argparse.Namespace) -> bool:
@@ -211,6 +240,7 @@ def job_namespace(args: argparse.Namespace) -> Path:
 def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Read-only checks; a new Fresh claim is still required after distributed agreement."""
     override = _owner_g1_cross_pair_resume(args)
+    expected_root, expected_child = _expected_source_identity(args)
     no_ttt = getattr(args, "no_ttt", False)
     if no_ttt and not args.job_name.startswith(("no_ttt_", "bounded_no_ttt_")):
         raise ValueError("Matched No-TTT requires a separate no_ttt_ job namespace")
@@ -227,8 +257,8 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
     if (
         record.get("schema") != "corrected_phase5_f0_v1"
         or record.get("namespace") != str(path)
-        or record.get("root") != (G1_FROZEN_ROOT if override else args.expected_root)
-        or record.get("child") != (G1_FROZEN_CHILD if override else args.expected_child)
+        or record.get("root") != (G1_FROZEN_ROOT if override else expected_root)
+        or record.get("child") != (G1_FROZEN_CHILD if override else expected_child)
         or record.get("native_batch_layout") != NATIVE_BATCH_LAYOUT
         or record.get("diagnostic_only_do_not_resume") is not False
         or record.get("semantic_digest") != _json_digest(record.get("semantic"))
@@ -402,10 +432,11 @@ def _identity_value(value: Any) -> Any:
 
 def training_identity(args: argparse.Namespace, config: Any, report: dict[str, Any]) -> dict[str, Any]:
     """Bind complete model/optimizer/seed semantics; exclude phase/load path and run budget."""
+    expected_root, expected_child = _expected_source_identity(args)
     return {
         **({"training_profile": "matched_no_ttt_v1"} if getattr(args, "no_ttt", False) else {}),
-        "root": report["lock"]["root"] if _owner_g1_cross_pair_resume(args) else args.expected_root,
-        "child": report["lock"]["child"] if _owner_g1_cross_pair_resume(args) else args.expected_child,
+        "root": report["lock"]["root"] if _owner_g1_cross_pair_resume(args) else expected_root,
+        "child": report["lock"]["child"] if _owner_g1_cross_pair_resume(args) else expected_child,
         "native_batch_layout": NATIVE_BATCH_LAYOUT,
         "training": {
             name: _identity_value(getattr(config, name))
@@ -516,11 +547,12 @@ class JobLifecycle:
             for name in ("config.pkl", "config.yaml"):
                 with (self.path / name).open("xb") as out:
                     out.write((launch / name).read_bytes())
+            expected_root, expected_child = _expected_source_identity(self.args)
             identity = {
                 "schema": "corrected_phase5_f0_v1",
                 "namespace": str(self.path),
-                "root": self.args.expected_root,
-                "child": self.args.expected_child,
+                "root": expected_root,
+                "child": expected_child,
                 "native_batch_layout": NATIVE_BATCH_LAYOUT,
                 "semantic": semantic,
                 "semantic_digest": _json_digest(semantic),
@@ -891,6 +923,18 @@ def _audit_root_noncode_changes(porcelain_z: str) -> tuple[str, ...]:
 
 
 def verify_root_child_lock(args: argparse.Namespace) -> dict[str, Any]:
+    if _nottt4_source_gate_disabled(args):
+        # Explicit Owner decision: for this one 4GPU No-TTT job, do NOT
+        # inspect git status, Root HEAD, Child HEAD or Root Gitlink.
+        # This is an unverified source identity, never a fabricated SHA.
+        return {
+            "root": NOTTT4_UNCHECKED_SOURCE,
+            "child": NOTTT4_UNCHECKED_SOURCE,
+            "gitlink": NOTTT4_UNCHECKED_SOURCE,
+            "allowed_root_noncode_changes": None,
+            "source_validation": "owner_disabled_for_nottt_world4_ga4",
+        }
+
     override = _owner_g1_cross_pair_resume(args)
     child = Path(__file__).resolve().parents[1]
 
