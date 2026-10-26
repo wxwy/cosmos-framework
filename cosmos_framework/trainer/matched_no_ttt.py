@@ -29,7 +29,7 @@ from cosmos_framework.utils import misc
 from cosmos_framework.utils.callback import Callback
 
 FORMAT = "psm_v3_matched_no_ttt_frontier_v1"
-LOADER_FORMAT = "psm_v3_matched_no_ttt_loader_frontier_v1"
+LOADER_FORMAT = "psm_v3_matched_no_ttt_loader_frontier_v1"  # Old opt-in candidate; not written anymore.
 
 
 def require_no_local_model(model: Any) -> None:
@@ -107,12 +107,8 @@ class MatchedNoTTTWindow:
 
 def _binding(trainer) -> dict[str, Any]:
     planner = trainer._grouped_planner
+    # Worker pool configuration never changes the committed consumer frontier.
     return {
-        **(
-            {"loader_profile": trainer._no_ttt_loader.profile.identity()}
-            if getattr(trainer, "_no_ttt_loader", None) is not None
-            else {}
-        ),
         "config_digest": trainer._grouped_config_digest,
         "cache_manifest_sha256": planner.catalog.manifest_digest,
         "cache_corpus_digest": planner.catalog.cache_corpus_digest,
@@ -154,7 +150,7 @@ class NoTTTFrontierCallback(Callback):
             raise RuntimeError("No-TTT checkpoint requires a committed optimizer boundary")
         trainer._grouped_planner.validate_frontier(window.live.frontier)
         return {
-            "format": LOADER_FORMAT if getattr(trainer, "_no_ttt_loader", None) is not None else FORMAT,
+            "format": FORMAT,  # Transport-independent; compatible with existing workers=0 checkpoints.
             **_binding(trainer),
             "iteration": trainer._grouped_completed_iteration,
             "frontier": window.live.frontier,
@@ -178,7 +174,7 @@ def restore_no_ttt_frontier(trainer, iteration: int) -> None:
     if (
         not isinstance(state, dict)
         or set(state) != {"format", "iteration", "frontier", *binding}
-        or state["format"] != (LOADER_FORMAT if getattr(trainer, "_no_ttt_loader", None) is not None else FORMAT)
+        or state["format"] != FORMAT
         or type(state["iteration"]) is not int
         or state["iteration"] != iteration
         or iteration < 1
