@@ -538,15 +538,15 @@ class JobLifecycle:
         validate_saved_yaml(launch / "config.yaml", effective_data_source)
         record = {
             "phase": self.args.phase,
-            "cpu_loader_runtime": (
-                profile_from_args(self.args).identity() if getattr(self.args, "no_ttt", False) else None
-            ),
             "formal_execution_until": getattr(self.args, "formal_execution_until", None),
             "execution_stop_after_iter": self.report["execution_stop_after_iter"],
             "semantic_digest": _json_digest(semantic),
             "config_digest": self.report["config_digest"],
             "effective_data_source": effective_data_source,
         }
+        if getattr(self.args, "no_ttt", False):
+            # Keep worker choices auditable per launch without entering model/data identity.
+            record["cpu_loader_runtime"] = profile_from_args(self.args).identity()
         if _owner_g1_cross_pair_resume(self.args):
             record["owner_cross_pair_resume"] = self.report["owner_cross_pair_resume"]
         (launch / "launch.json").write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
