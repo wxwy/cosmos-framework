@@ -241,7 +241,7 @@ def job_namespace(args: argparse.Namespace) -> Path:
 
 def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Read-only checks; a new Fresh claim is still required after distributed agreement."""
-    loader_profile = profile_from_args(args)
+    profile_from_args(args)  # Validate loader options, never compare them to checkpoint identity.
     override = _owner_g1_cross_pair_resume(args)
     expected_root, expected_child = _expected_source_identity(args)
     no_ttt = getattr(args, "no_ttt", False)
@@ -266,8 +266,6 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
         or record.get("diagnostic_only_do_not_resume") is not False
         or record.get("semantic_digest") != _json_digest(record.get("semantic"))
         or (record.get("semantic", {}).get("training_profile") == "matched_no_ttt_v1") != no_ttt
-        or record.get("semantic", {}).get("no_ttt_cpu_loader")
-        != (loader_profile.identity() if loader_profile.workers else None)
     ):
         raise ValueError("same-job identity Root/Child/Layout/namespace mismatch")
     if override and (
@@ -438,9 +436,8 @@ def _identity_value(value: Any) -> Any:
 def training_identity(args: argparse.Namespace, config: Any, report: dict[str, Any]) -> dict[str, Any]:
     """Bind complete model/optimizer/seed semantics; exclude phase/load path and run budget."""
     expected_root, expected_child = _expected_source_identity(args)
-    loader_profile = profile_from_args(args)
+    profile_from_args(args)  # Runtime validation only; count/prefetch/timeout are not training semantics.
     return {
-        **({"no_ttt_cpu_loader": loader_profile.identity()} if loader_profile.workers else {}),
         **({"training_profile": "matched_no_ttt_v1"} if getattr(args, "no_ttt", False) else {}),
         "root": report["lock"]["root"] if _owner_g1_cross_pair_resume(args) else expected_root,
         "child": report["lock"]["child"] if _owner_g1_cross_pair_resume(args) else expected_child,
@@ -541,6 +538,9 @@ class JobLifecycle:
         validate_saved_yaml(launch / "config.yaml", effective_data_source)
         record = {
             "phase": self.args.phase,
+            "cpu_loader_runtime": (
+                profile_from_args(self.args).identity() if getattr(self.args, "no_ttt", False) else None
+            ),
             "formal_execution_until": getattr(self.args, "formal_execution_until", None),
             "execution_stop_after_iter": self.report["execution_stop_after_iter"],
             "semantic_digest": _json_digest(semantic),
@@ -1152,7 +1152,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         }
     check_job_namespace(args, semantic)
     report["training_identity"] = semantic
-    # A new profile/schema cannot silently resume historical jobs with incomplete identity.
+    # Loader runtime choices are outside this strong digest; model/data/GA/seed remain strict.
     report["config_digest"] = _json_digest({"phase5_digest": digest, "training_identity": semantic})
     if _owner_g1_cross_pair_resume(args):
         report["owner_cross_pair_resume"] = _g1_resume_compatibility(args, report, digest)
