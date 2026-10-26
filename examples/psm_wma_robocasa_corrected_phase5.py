@@ -545,8 +545,10 @@ class JobLifecycle:
             "effective_data_source": effective_data_source,
         }
         if getattr(self.args, "no_ttt", False):
-            # Keep worker choices auditable per launch without entering model/data identity.
-            record["cpu_loader_runtime"] = profile_from_args(self.args).identity()
+            # Keep worker choices auditable per launch; workers=0 legacy metadata stays identical.
+            profile = profile_from_args(self.args)
+            if profile.workers:
+                record["cpu_loader_runtime"] = profile.identity()
         if _owner_g1_cross_pair_resume(self.args):
             record["owner_cross_pair_resume"] = self.report["owner_cross_pair_resume"]
         (launch / "launch.json").write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
