@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
+
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_policy import CorrectedRoboCasaPolicyContract
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_policy_test import _catalog
 from cosmos_framework.trainer.matched_no_ttt import MatchedNoTTTTrainer
@@ -15,7 +17,6 @@ from examples.psm_wma_robocasa_corrected_phase5_test import _config
 from examples.psm_wma_robocasa_matched_no_ttt import NoTTTPlanObserver
 from examples.psm_wma_robocasa_phase5_f0_test import Serializer, _args, _report
 from examples.psm_wma_robocasa_phase5_f0_test import _config as lifecycle_config
-from torch import nn
 
 
 def test_overlay_only_removes_local_and_keeps_data_loss_optimizer_schedule(tmp_path):
@@ -100,7 +101,9 @@ def test_g1_owner_override_cannot_enable_no_ttt(tmp_path):
         phase5.G1_JOB,
         "--owner-authorized-g1-cross-pair-resume",
     )
-    with pytest.raises(ValueError, match="Owner"):
+    with pytest.raises(
+        ValueError, match=r"^G1 Resume requires unchanged formal T16/B8/GA2/K4/world8 and 30000/500/100$"
+    ):
         phase5.check_job_namespace(args)
 
 
@@ -129,9 +132,7 @@ def test_mismatched_no_ttt_geometry_rejected_before_runtime(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize(("world_size", "ga"), [(8, 2), (4, 4)])
-def test_both_matched_no_ttt_profiles_pass_geometry_gate_before_real_assets(
-    tmp_path, monkeypatch, world_size, ga
-):
+def test_both_matched_no_ttt_profiles_pass_geometry_gate_before_real_assets(tmp_path, monkeypatch, world_size, ga):
     args = _args(
         tmp_path,
         "--no-ttt",
@@ -152,9 +153,7 @@ def test_both_matched_no_ttt_profiles_pass_geometry_gate_before_real_assets(
 
 
 @pytest.mark.parametrize(("world_size", "ga"), [(4, 2), (8, 4), (2, 8), (4, 8)])
-def test_no_ttt_rejects_unreviewed_world_ga_pairs_before_runtime(
-    tmp_path, monkeypatch, world_size, ga
-):
+def test_no_ttt_rejects_unreviewed_world_ga_pairs_before_runtime(tmp_path, monkeypatch, world_size, ga):
     args = _args(
         tmp_path,
         "--no-ttt",
@@ -177,8 +176,13 @@ def test_no_ttt_rejects_unreviewed_world_ga_pairs_before_runtime(
 def _owner_nott4_args(tmp_path):
     return _args(
         tmp_path,
-        "--no-ttt", "--job-name", "no_ttt_packed128_droid_fresh_30k_world4_ga4",
-        "--world-size", "4", "--ga", "4",
+        "--no-ttt",
+        "--job-name",
+        "no_ttt_packed128_droid_fresh_30k_world4_ga4",
+        "--world-size",
+        "4",
+        "--ga",
+        "4",
     )
 
 
@@ -275,8 +279,14 @@ def test_four_gpu_ga4_overlay_keeps_generation_optimizer_and_2048_global_budget(
     config.model.config.activation_checkpointing = SimpleNamespace(mode="selective")
     contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(_catalog(tmp_path / "cache"))
     args = _args(
-        tmp_path, "--no-ttt", "--job-name", "no_ttt_packed128_4gpu",
-        "--world-size", "4", "--ga", "4",
+        tmp_path,
+        "--no-ttt",
+        "--job-name",
+        "no_ttt_packed128_4gpu",
+        "--world-size",
+        "4",
+        "--ga",
+        "4",
     )
     phase5.overlay_config(config, args, contract)
     assert config.model.config.local_memory_enabled is False

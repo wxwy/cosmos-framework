@@ -602,16 +602,12 @@ def test_launcher_explicit_flag_only_reaches_named_resume_without_running_torch(
     implicit.pop("EXPECTED_ROOT")
     implicit.pop("EXPECTED_CHILD")
     capture.unlink()
-    resumed = subprocess.run(
-        ["bash", str(launcher), "resume", "12000"], env=implicit, capture_output=True, text=True
-    )
+    resumed = subprocess.run(["bash", str(launcher), "resume", "12000"], env=implicit, capture_output=True, text=True)
     assert resumed.returncode == 0, resumed.stderr
     argv = json.loads(capture.read_text())
     assert flag not in argv and "--expected-root" not in argv and "--expected-child" not in argv
     capture.unlink()
-    resumed = subprocess.run(
-        ["bash", str(launcher), "resume", "12000"], env=env, capture_output=True, text=True
-    )
+    resumed = subprocess.run(["bash", str(launcher), "resume", "12000"], env=env, capture_output=True, text=True)
     assert resumed.returncode == 0, resumed.stderr
     argv = json.loads(capture.read_text())
     assert "--expected-root" not in argv and "--expected-child" not in argv
@@ -619,10 +615,8 @@ def test_launcher_explicit_flag_only_reaches_named_resume_without_running_torch(
     # Non-G1 jobs must continue to require both caller-pinned source SHAs.
     other_env = dict(implicit, JOB_NAME="another_job")
     capture.unlink()
-    denied = subprocess.run(
-        ["bash", str(launcher), "resume", "12000"], env=other_env, capture_output=True, text=True
-    )
-    assert denied.returncode == 2 and b"EXPECTED_ROOT" in denied.stderr
+    denied = subprocess.run(["bash", str(launcher), "resume", "12000"], env=other_env, capture_output=True, text=True)
+    assert denied.returncode == 2 and "Missing required environment variable: EXPECTED_ROOT" in denied.stderr
     assert not capture.exists()
 
     for argv, name in [

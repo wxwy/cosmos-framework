@@ -8,6 +8,8 @@ G1. Native Cosmos computes the unchanged action/vision/auxiliary outer loss.
 
 from __future__ import annotations
 
+import json
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +29,7 @@ from cosmos_framework.utils import misc
 from cosmos_framework.utils.callback import Callback
 
 FORMAT = "psm_v3_matched_no_ttt_frontier_v1"
+LOADER_FORMAT = "psm_v3_matched_no_ttt_loader_frontier_v1"
 
 
 def require_no_local_model(model: Any) -> None:
@@ -105,6 +108,11 @@ class MatchedNoTTTWindow:
 def _binding(trainer) -> dict[str, Any]:
     planner = trainer._grouped_planner
     return {
+        **(
+            {"loader_profile": trainer._no_ttt_loader.profile.identity()}
+            if getattr(trainer, "_no_ttt_loader", None) is not None
+            else {}
+        ),
         "config_digest": trainer._grouped_config_digest,
         "cache_manifest_sha256": planner.catalog.manifest_digest,
         "cache_corpus_digest": planner.catalog.cache_corpus_digest,
@@ -135,16 +143,18 @@ class NoTTTFrontierCallback(Callback):
     def state_dict(self):
         trainer = self.trainer
         window = getattr(trainer, "_grouped_window", None)
+        loader = getattr(trainer, "_no_ttt_loader", None)
         if (
             trainer._no_ttt_failed
             or window is None
             or window.plan is not None
             or trainer._grouped_completed_iteration < 1
+            or (loader is not None and loader.pending is not None)
         ):
             raise RuntimeError("No-TTT checkpoint requires a committed optimizer boundary")
         trainer._grouped_planner.validate_frontier(window.live.frontier)
         return {
-            "format": FORMAT,
+            "format": LOADER_FORMAT if getattr(trainer, "_no_ttt_loader", None) is not None else FORMAT,
             **_binding(trainer),
             "iteration": trainer._grouped_completed_iteration,
             "frontier": window.live.frontier,
@@ -168,7 +178,7 @@ def restore_no_ttt_frontier(trainer, iteration: int) -> None:
     if (
         not isinstance(state, dict)
         or set(state) != {"format", "iteration", "frontier", *binding}
-        or state["format"] != FORMAT
+        or state["format"] != (LOADER_FORMAT if getattr(trainer, "_no_ttt_loader", None) is not None else FORMAT)
         or type(state["iteration"]) is not int
         or state["iteration"] != iteration
         or iteration < 1
@@ -195,7 +205,9 @@ class MatchedNoTTTTrainer(ImaginaireTrainer):
     _require_finite_gradients = staticmethod(GroupedLocalMemoryTrainer._require_finite_gradients)
     _optimizer_step_success = staticmethod(GroupedLocalMemoryTrainer._optimizer_step_success)
 
-    def bind_grouped_stream(self, planner, producer, *, config_digest, num_workers=0, full_segment_prefetch=False):
+    def bind_grouped_stream(
+        self, planner, producer, *, config_digest, num_workers=0, full_segment_prefetch=False, loader_profile=None
+    ):
         if num_workers != 0 or full_segment_prefetch:
             raise ValueError("Matched No-TTT initially requires the matched synchronous G1 data path")
         if hasattr(self, "_grouped_planner"):
@@ -216,6 +228,11 @@ class MatchedNoTTTTrainer(ImaginaireTrainer):
         self._grouped_num_workers = 0
         self._pending_grouped_resume = None
         self._resume_required = self._no_ttt_failed = False
+        self._no_ttt_loader = None
+        if loader_profile is not None and loader_profile.workers:
+            from cosmos_framework.trainer.no_ttt_cpu_loader import NoTTTCpuLoader
+
+            self._no_ttt_loader = NoTTTCpuLoader(producer, loader_profile)
         self.callbacks._callbacks.insert(0, NoTTTFrontierCallback(self))
 
     def train(self, model, dataloader_train, dataloader_val):
@@ -225,7 +242,11 @@ class MatchedNoTTTTrainer(ImaginaireTrainer):
         if self.config.trainer.save_zero_checkpoint or not self.config.checkpoint.strict_resume:
             raise ValueError("No-TTT requires strict Resume and forbids zero-step checkpoints")
         self._resume_required = require_dcp_grouped_resume_component(self.checkpointer)
-        return super().train(model, dataloader_train, dataloader_val)
+        try:
+            return super().train(model, dataloader_train, dataloader_val)
+        finally:
+            if self._no_ttt_loader is not None:
+                self._no_ttt_loader.close()
 
     def training_step(self, model_ddp, optimizer, scheduler, grad_scaler, data, iteration=0, grad_accum_iter=0):
         del data
@@ -247,15 +268,25 @@ class MatchedNoTTTTrainer(ImaginaireTrainer):
                 raise RuntimeError("No-TTT iteration/member chronology mismatch")
             if grad_accum_iter == 0:
                 window.begin()
+                if self._no_ttt_loader is not None:
+                    self._no_ttt_loader.begin(window.plan)
             with self._telemetry_stage("data_prepare"):
                 segments = tuple(
-                    self._grouped_producer.produce(request) for request in window.plan.members[window.member]
+                    (
+                        self._grouped_producer.produce(request)
+                        if self._no_ttt_loader is None
+                        else self._no_ttt_loader.materialize(request)
+                    )
+                    for request in window.plan.members[window.member]
                 )
                 if any(segment.segment_provenance.config_digest != self._grouped_config_digest for segment in segments):
                     raise ValueError("No-TTT segment config provenance mismatch")
                 payloads, positions = window.pack(segments)
             with self._telemetry_stage("batch_collate"):
+                started = time.perf_counter() if self._no_ttt_loader is not None else None
                 batch = collate_grouped_native_batch(payloads)
+                if started is not None:
+                    self._no_ttt_loader.metrics["collate_host_ms"] += (time.perf_counter() - started) * 1000
             with self._telemetry_stage("batch_transfer"):
                 batch = move_cached_native_batch(batch, device=next(model.parameters()).device, move=misc.to)
             self.callbacks.on_before_forward(iteration=iteration)
@@ -316,6 +347,17 @@ class MatchedNoTTTTrainer(ImaginaireTrainer):
                     raise RuntimeError("No-TTT optimizer skipped; frontier not committed")
             window.finish()
             self._grouped_completed_iteration = iteration + 1
+            if self._no_ttt_loader is not None:
+                loader_metrics = self._no_ttt_loader.finish()
+                loader_metrics.update(iteration=iteration + 1, rank=planner.rank)
+                try:
+                    emit = getattr(self, "cpu_loader_observer", None)
+                    if emit is not None:
+                        emit(loader_metrics)
+                    else:
+                        print("[NoTTT][cpu_loader] " + json.dumps(loader_metrics, sort_keys=True), flush=True)
+                except Exception:
+                    pass  # Passive post-commit telemetry cannot change optimizer semantics.
             self._observe_grouped("post_commit", iteration=iteration, member=grad_accum_iter)
             self.callbacks.on_before_zero_grad(model, optimizer, scheduler, iteration=iteration)
             model.on_before_zero_grad(optimizer, scheduler, iteration=iteration)
@@ -325,4 +367,6 @@ class MatchedNoTTTTrainer(ImaginaireTrainer):
             self._no_ttt_failed = True
             if hasattr(self, "_grouped_window"):
                 self._grouped_window.abort()
+            if self._no_ttt_loader is not None:
+                self._no_ttt_loader.close()
             raise

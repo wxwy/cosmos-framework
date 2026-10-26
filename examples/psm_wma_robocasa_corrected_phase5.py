@@ -20,6 +20,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from cosmos_framework.utils.no_ttt_loader_profile import profile_from_args
 from examples.psm_wma_robocasa_effective_config import (
     describe_effective_data_source,
     synchronize_legacy_chunk_length,
@@ -29,6 +30,8 @@ from examples.psm_wma_robocasa_effective_config import (
 
 if TYPE_CHECKING:
     import torch
+    from omegaconf import DictConfig, OmegaConf
+
     from cosmos_framework.checkpoint.dcp import SafeLocalDistributedCheckpointer
     from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
     from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
@@ -54,7 +57,6 @@ if TYPE_CHECKING:
     from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
     from examples.psm_wma_robocasa_formal_monitor import TelemetryJournal
     from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
-    from omegaconf import DictConfig, OmegaConf
 
 
 def _load_runtime() -> None:
@@ -86,6 +88,8 @@ def _load_runtime() -> None:
     if globals().get("_RUNTIME_READY", False):
         return
     import torch
+    from omegaconf import DictConfig, OmegaConf
+
     from cosmos_framework.checkpoint.dcp import SafeLocalDistributedCheckpointer
     from cosmos_framework.configs.toml_config.sft_config import load_experiment_from_toml
     from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
@@ -111,7 +115,6 @@ def _load_runtime() -> None:
     from examples.psm_wma_robocasa_corrected_telemetry import GroupedPlanObserver
     from examples.psm_wma_robocasa_formal_monitor import TelemetryJournal
     from examples.psm_wma_robocasa_native import RECIPE, check_droid_dcp, check_edge_checkpoint
-    from omegaconf import DictConfig, OmegaConf
 
     _RUNTIME_READY = True
 
@@ -160,8 +163,7 @@ def _nottt4_source_gate_disabled(args: argparse.Namespace) -> bool:
         and args.job_name.startswith("no_ttt_")
         and args.job_name.endswith("_world4_ga4")
         and getattr(args, "phase", None) in {"fresh", "resume"}
-        and tuple(getattr(args, key, None) for key in ("t", "b", "ga", "k", "world_size"))
-        == (16, 8, 4, 4, 4)
+        and tuple(getattr(args, key, None) for key in ("t", "b", "ga", "k", "world_size")) == (16, 8, 4, 4, 4)
         and getattr(args, "num_workers", None) == 0
         and getattr(args, "full_segment_prefetch", False) is False
         and getattr(args, "transform_rng_mode", "legacy_global") == "legacy_global"
@@ -239,6 +241,7 @@ def job_namespace(args: argparse.Namespace) -> Path:
 
 def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Read-only checks; a new Fresh claim is still required after distributed agreement."""
+    loader_profile = profile_from_args(args)
     override = _owner_g1_cross_pair_resume(args)
     expected_root, expected_child = _expected_source_identity(args)
     no_ttt = getattr(args, "no_ttt", False)
@@ -263,6 +266,8 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
         or record.get("diagnostic_only_do_not_resume") is not False
         or record.get("semantic_digest") != _json_digest(record.get("semantic"))
         or (record.get("semantic", {}).get("training_profile") == "matched_no_ttt_v1") != no_ttt
+        or record.get("semantic", {}).get("no_ttt_cpu_loader")
+        != (loader_profile.identity() if loader_profile.workers else None)
     ):
         raise ValueError("same-job identity Root/Child/Layout/namespace mismatch")
     if override and (
@@ -433,7 +438,9 @@ def _identity_value(value: Any) -> Any:
 def training_identity(args: argparse.Namespace, config: Any, report: dict[str, Any]) -> dict[str, Any]:
     """Bind complete model/optimizer/seed semantics; exclude phase/load path and run budget."""
     expected_root, expected_child = _expected_source_identity(args)
+    loader_profile = profile_from_args(args)
     return {
+        **({"no_ttt_cpu_loader": loader_profile.identity()} if loader_profile.workers else {}),
         **({"training_profile": "matched_no_ttt_v1"} if getattr(args, "no_ttt", False) else {}),
         "root": report["lock"]["root"] if _owner_g1_cross_pair_resume(args) else expected_root,
         "child": report["lock"]["child"] if _owner_g1_cross_pair_resume(args) else expected_child,
@@ -1135,6 +1142,14 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         ),
     }
     semantic = training_identity(args, config, report)
+    loader_profile = profile_from_args(args)
+    if loader_profile.workers:
+        report["effective_data_source"]["cpu_raw_loader"] = {
+            **loader_profile.identity(),
+            "lifecycle": "configured_not_started_during_preflight",
+            "source_identity_reads": "parent_bounded_mmap",
+            "raw_cache_policy": "spawned_cpu_workers",
+        }
     check_job_namespace(args, semantic)
     report["training_identity"] = semantic
     # A new profile/schema cannot silently resume historical jobs with incomplete identity.
@@ -1166,6 +1181,16 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument(
+        "--no-ttt-loader-workers",
+        type=int,
+        default=0,
+        help="No-TTT-only spawned CPU DataLoader processes; independent of G1 --num-workers threads",
+    )
+    result.add_argument("--no-ttt-prefetch-factor", type=int, default=None)
+    result.add_argument("--no-ttt-persistent-workers", action="store_true", default=None)
+    result.add_argument("--no-ttt-nonpersistent-workers", dest="no_ttt_persistent_workers", action="store_false")
+    result.add_argument("--no-ttt-loader-timeout-s", type=float, default=None)
     result.add_argument(
         "--no-ttt", action="store_true", help="Independent matched Packed128 baseline; never a G1 Resume override"
     )
@@ -1246,6 +1271,7 @@ def _telemetry_sample_interval(stop_after_iter: int | None) -> int:
 
 def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
+    profile_from_args(args)  # Reject invalid opt-in settings before CUDA/distributed setup.
     if type(args.num_workers) is not int or not 0 <= args.num_workers <= 16:
         raise ValueError("--num-workers must be 0..16")
     if args.preflight:
@@ -1285,6 +1311,7 @@ def main(argv: list[str] | None = None) -> None:
         config_digest=report["config_digest"],
         num_workers=args.num_workers,
         full_segment_prefetch=report["full_segment_prefetch"],
+        **({"loader_profile": profile_from_args(args)} if profile_from_args(args).workers else {}),
     )
     sample_interval = _telemetry_sample_interval(getattr(args, "stop_after_iter", None))
     journal = (

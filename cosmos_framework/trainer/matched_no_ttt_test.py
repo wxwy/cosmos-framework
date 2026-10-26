@@ -335,7 +335,8 @@ def test_no_ttt_passive_telemetry_records_consumer_source_without_fake_fast_stat
 def test_world4_ga4_four_rank_packed_consumer_budget_and_frontier():
     # Real ExactWindowRankPlanner + Producer + No-TTT window, with four
     # logical ranks and four GA members per rank. No CUDA/model/DCP invoked.
-    # Leave sufficient distinct episodes per hash-partitioned rank for GA4.\n    _, _, catalog, producer = _setup((16,) * 256, t=16)
+    # Leave sufficient distinct episodes per hash-partitioned rank for GA4.
+    _, _, catalog, producer = _setup((16,) * 256, t=16)
     all_rank_episode_sets = []
     total_consumers = 0
     for rank in range(4):
