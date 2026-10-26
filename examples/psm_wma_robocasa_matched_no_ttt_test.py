@@ -288,8 +288,9 @@ def test_nottt4_source_check_bypass_never_leaks_to_other_jobs_or_profiles(tmp_pa
         phase5.verify_root_child_lock(args)
 
 
-def test_nottt4_frozen_semantic_and_resume_config_stay_strict_despite_no_git(tmp_path):
+def test_other_nottt4_job_retains_strict_identity_validation(tmp_path):
     args = _owner_nott4_args(tmp_path)
+    args.job_name = "no_ttt_other_world4_ga4"
     args.expected_root = "stale-root-sha"
     args.expected_child = "stale-child-sha"
     identity = {
@@ -317,6 +318,83 @@ def test_nottt4_frozen_semantic_and_resume_config_stay_strict_despite_no_git(tmp
         stream.write("modified")
     with pytest.raises(ValueError, match="canonical config"):
         phase5.check_job_namespace(args, identity)
+
+
+@pytest.mark.parametrize("historical_root_child", [True, False])
+def test_existing_formal_nottt4_resume_skips_job_identity_without_rewriting_checkpoint(tmp_path, historical_root_child):
+    """Legacy real SHA and newer sentinel jobs reuse original digest, regardless of nw."""
+    import json
+
+    args = _owner_nott4_args(tmp_path)
+    frozen_root = "215305ecb9ab9631af44cbb3469bc4179dd4aeab"
+    frozen_child = "a4bc0c728b57ee8aaf49f951f6aed1a17b986573"
+    if not historical_root_child:
+        frozen_root = frozen_child = phase5.NOTTT4_UNCHECKED_SOURCE
+    frozen = {
+        "training_profile": "matched_no_ttt_v1",
+        "root": frozen_root,
+        "child": frozen_child,
+        "contract": {"world_size": 4, "ga": 4},
+    }
+    report = _report(args, frozen)
+    lifecycle = phase5.JobLifecycle(args, report)
+    lifecycle.write_config(lifecycle_config(args), Serializer)
+    lifecycle.close()
+    job = phase5.job_namespace(args)
+    identity_path = job / phase5.JOB_IDENTITY
+    record = json.loads(identity_path.read_text())
+    # Reproduce the actual job format created before the SHA-exemption fix.
+    record["root"], record["child"] = frozen_root, frozen_child
+    identity_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+    before = {p.relative_to(job): p.read_bytes() for p in job.rglob("*") if p.is_file()}
+
+    args.phase = "resume"
+    args.no_ttt_loader_workers = 8
+    args.no_ttt_prefetch_factor = 1
+    args.no_ttt_persistent_workers = True
+    args.no_ttt_loader_timeout_s = 120
+    current_runtime = {
+        **frozen,
+        "root": phase5.NOTTT4_UNCHECKED_SOURCE,
+        "child": phase5.NOTTT4_UNCHECKED_SOURCE,
+    }
+    read = phase5.check_job_namespace(args, current_runtime)
+    assert read["root"] == frozen_root and read["child"] == frozen_child
+    runtime_report = {}
+    selected = phase5._resume_semantic_without_nottt4_job_identity(args, read, current_runtime, runtime_report)
+    assert selected == frozen
+    assert runtime_report["nottt4_legacy_source_resume"]["identity_gate"].startswith("disabled_")
+    old_digest = phase5._json_digest({"phase5_digest": "a" * 64, "training_identity": frozen})
+    resumed_digest = phase5._json_digest({"phase5_digest": "a" * 64, "training_identity": selected})
+    assert resumed_digest == old_digest
+    if historical_root_child:
+        assert old_digest != phase5._json_digest(
+            {"phase5_digest": "a" * 64, "training_identity": current_runtime}
+        )
+    assert {p.relative_to(job): p.read_bytes() for p in job.rglob("*") if p.is_file()} == before
+
+
+def test_formal_nottt4_resume_only_requires_readable_frozen_semantic(tmp_path):
+    import json
+
+    args = _owner_nott4_args(tmp_path)
+    frozen = {"training_profile": "matched_no_ttt_v1", "root": "old", "child": "old"}
+    lifecycle = phase5.JobLifecycle(args, _report(args, frozen))
+    lifecycle.write_config(lifecycle_config(args), Serializer)
+    lifecycle.close()
+    path = phase5.job_namespace(args) / phase5.JOB_IDENTITY
+    record = json.loads(path.read_text())
+    record["schema"] = "legacy_schema"
+    record["root"] = "old"
+    record["child"] = "old"
+    record["semantic_digest"] = "historical-different"
+    path.write_text(json.dumps(record))
+    args.phase = "resume"
+    assert phase5.check_job_namespace(args, {"root": "new"})["semantic"] == frozen
+    record["semantic"] = None
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="readable frozen training state"):
+        phase5.check_job_namespace(args)
 
 
 def test_four_gpu_ga4_overlay_keeps_generation_optimizer_and_2048_global_budget(tmp_path):
