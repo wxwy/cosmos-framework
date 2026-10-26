@@ -161,6 +161,7 @@ def test_eight_worker_same_profile_checkpoint_cpu_roundtrip_and_old_count_reject
         expected_scheduler = deepcopy(source[3].state_dict())
         expected_momentum = source[2].state[source[1].net.moe_gen]["momentum_buffer"].clone()
         expected_rng = (random.getstate(), np.random.get_state(), torch.get_rng_state().clone())
+        source[0]._no_ttt_loader.close()  # Avoid overlapping eight-worker pools in this CPU fixture.
 
         resumed = make(rank=0, workers=8)
         resumed[1].load_state_dict(checkpoint["model"])
@@ -187,6 +188,7 @@ def test_eight_worker_same_profile_checkpoint_cpu_roundtrip_and_old_count_reject
         assert np.array_equal(np.random.get_state()[1], expected_rng[1][1])
         assert np.random.get_state()[2:] == expected_rng[1][2:]
         torch.testing.assert_close(torch.get_rng_state(), expected_rng[2], rtol=0, atol=0)
+        resumed[0]._no_ttt_loader.close()
 
         mismatched = make(rank=0, workers=2)
         mismatched[0].callbacks._callbacks[0].load_state_dict(checkpoint["dataloader"])
