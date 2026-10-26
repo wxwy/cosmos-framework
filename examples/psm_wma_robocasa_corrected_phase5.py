@@ -320,6 +320,26 @@ def check_job_namespace(args: argparse.Namespace, semantic: dict[str, Any] | Non
     return record
 
 
+def _resume_semantic_without_nottt4_job_identity(
+    args: argparse.Namespace,
+    frozen_job: dict[str, Any] | None,
+    runtime_semantic: dict[str, Any],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Reuse only the saved semantic to reproduce the old DCP sidecar digest."""
+    if frozen_job is None or not _nottt4_resume_without_job_identity(args):
+        return runtime_semantic
+    frozen_semantic = frozen_job["semantic"]
+    report["nottt4_legacy_source_resume"] = {
+        "schema": "nottt4_owner_skipped_job_identity_v1",
+        "identity_gate": "disabled_for_existing_formal_nottt4_resume",
+        "runtime_source_validation": "owner_disabled_for_nottt_world4_ga4",
+        "frozen_semantic_digest": _json_digest(frozen_semantic),
+        "frozen_config_checksum_not_revalidated": True,
+    }
+    return frozen_semantic
+
+
 def _g1_resume_compatibility(args: argparse.Namespace, report: dict[str, Any], phase5_digest: str) -> dict[str, Any]:
     """Read frozen authorities; never rewrite identity or relax actual state restoration."""
     if not _owner_g1_cross_pair_resume(args):
@@ -1180,20 +1200,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
             "raw_cache_policy": "spawned_cpu_workers",
         }
     frozen_job = check_job_namespace(args, semantic)
-    if frozen_job is not None and _nottt4_resume_without_job_identity(args):
-        # The saved semantic is not revalidated against runtime code identity.
-        # It reproduces the ORIGINAL config_digest required by all four saved
-        # rank sidecars; model/optimizer/RNG/frontier are loaded unmodified.
-        frozen_semantic = frozen_job["semantic"]
-        report["nottt4_legacy_source_resume"] = {
-            "schema": "nottt4_owner_skipped_job_identity_v1",
-            "identity_gate": "disabled_for_existing_formal_nottt4_resume",
-            "runtime_source_validation": "owner_disabled_for_nottt_world4_ga4",
-            "frozen_semantic_digest": _json_digest(frozen_semantic),
-            "frozen_config_checksum_not_revalidated": True,
-            "original_job_and_checkpoints_unmodified": True,
-        }
-        semantic = frozen_semantic
+    semantic = _resume_semantic_without_nottt4_job_identity(args, frozen_job, semantic, report)
     report["training_identity"] = semantic
     # Loader runtime choices are outside this strong digest; model/data/GA/seed remain strict.
     report["config_digest"] = _json_digest({"phase5_digest": digest, "training_identity": semantic})
