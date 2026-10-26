@@ -272,7 +272,13 @@ def test_zero_worker_options_fail(kwargs):
 )
 def test_cli_worker_profile_rejects_old_job_and_other_routes(change, workers):
     args = SimpleNamespace(
-        no_ttt=True, world_size=4, ga=4, b=8, t=16, job_name=f"no_ttt_new_mpw{workers}_world4_ga4", no_ttt_loader_workers=workers
+        no_ttt=True,
+        world_size=4,
+        ga=4,
+        b=8,
+        t=16,
+        job_name=f"no_ttt_new_mpw{workers}_world4_ga4",
+        no_ttt_loader_workers=workers,
     )
     args.__dict__.update(change)
     with pytest.raises(ValueError, match="NEW"):
