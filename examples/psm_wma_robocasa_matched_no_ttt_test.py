@@ -174,6 +174,100 @@ def test_no_ttt_rejects_unreviewed_world_ga_pairs_before_runtime(
         phase5.preflight(args)
 
 
+def _owner_nott4_args(tmp_path):
+    return _args(
+        tmp_path,
+        "--no-ttt", "--job-name", "no_ttt_packed128_droid_fresh_30k_world4_ga4",
+        "--world-size", "4", "--ga", "4",
+    )
+
+
+def test_nottt4_root_and_child_git_checks_are_fully_skipped_on_preflight(tmp_path, monkeypatch):
+    args = _owner_nott4_args(tmp_path)
+    args.expected_root = None
+    args.expected_child = None
+
+    def forbidden_git(*_args, **_kwargs):
+        pytest.fail("the Owner-exempt 4GPU No-TTT job must never invoke Git")
+
+    monkeypatch.setattr(phase5.subprocess, "run", forbidden_git)
+    lock = phase5.verify_root_child_lock(args)
+    assert lock["root"] == lock["child"] == lock["gitlink"] == phase5.NOTTT4_UNCHECKED_SOURCE
+    assert lock["allowed_root_noncode_changes"] is None
+    assert lock["source_validation"] == "owner_disabled_for_nottt_world4_ga4"
+
+    # Prove the real preflight reaches the official Edge asset gate without
+    # running any Git status/HEAD command even with no Git metadata available.
+    monkeypatch.setattr(phase5, "_load_runtime", lambda: None)
+
+    def reached_edge(_path):
+        raise ValueError("Reached Edge identity validation")
+
+    monkeypatch.setattr(phase5, "check_edge_checkpoint", reached_edge)
+    with pytest.raises(ValueError, match="Reached Edge identity validation"):
+        phase5.preflight(args)
+    assert not phase5.job_namespace(args).exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("no_ttt", False),
+        ("job_name", "no_ttt_world8"),
+        ("job_name", "packed128_droid_fresh_g1_20261019"),
+        ("world_size", 8),
+        ("ga", 2),
+        ("num_workers", 1),
+        ("full_segment_prefetch", True),
+        ("transform_rng_mode", "consumer_keyed_v1"),
+    ],
+)
+def test_nottt4_source_check_bypass_never_leaks_to_other_jobs_or_profiles(tmp_path, monkeypatch, field, value):
+    args = _owner_nott4_args(tmp_path)
+    assert phase5._nottt4_source_gate_disabled(args)
+    setattr(args, field, value)
+    assert not phase5._nottt4_source_gate_disabled(args)
+    assert phase5._expected_source_identity(args) == (args.expected_root, args.expected_child)
+
+    def must_reach_strict_git(*_args, **_kwargs):
+        raise RuntimeError("Strict Git checks still enabled for this profile")
+
+    monkeypatch.setattr(phase5.subprocess, "run", must_reach_strict_git)
+    with pytest.raises(RuntimeError, match="Strict Git checks still enabled"):
+        phase5.verify_root_child_lock(args)
+
+
+def test_nottt4_frozen_semantic_and_resume_config_stay_strict_despite_no_git(tmp_path):
+    args = _owner_nott4_args(tmp_path)
+    args.expected_root = "stale-root-sha"
+    args.expected_child = "stale-child-sha"
+    identity = {
+        "training_profile": "matched_no_ttt_v1",
+        "root": phase5.NOTTT4_UNCHECKED_SOURCE,
+        "child": phase5.NOTTT4_UNCHECKED_SOURCE,
+        "contract": {"world_size": 4, "ga": 4},
+    }
+    report = _report(args, identity)
+    lifecycle = phase5.JobLifecycle(args, report)
+    lifecycle.write_config(lifecycle_config(args), Serializer)
+    lifecycle.close()
+    path = phase5.job_namespace(args)
+    original = {p.relative_to(path): p.read_bytes() for p in path.rglob("*") if p.is_file()}
+    args.phase = "resume"
+    args.expected_root = "another-root-value"
+    args.expected_child = None
+    assert phase5.check_job_namespace(args, identity)["semantic"] == identity
+    assert {p.relative_to(path): p.read_bytes() for p in path.rglob("*") if p.is_file()} == original
+    wrong = deepcopy(identity)
+    wrong["contract"]["ga"] = 8
+    with pytest.raises(ValueError, match="semantic"):
+        phase5.check_job_namespace(args, wrong)
+    with (path / "config.yaml").open("a") as stream:
+        stream.write("modified")
+    with pytest.raises(ValueError, match="canonical config"):
+        phase5.check_job_namespace(args, identity)
+
+
 def test_four_gpu_ga4_overlay_keeps_generation_optimizer_and_2048_global_budget(tmp_path):
     _, config, _, _ = _config(tmp_path)
     config.model.config.ema = SimpleNamespace(enabled=True)
