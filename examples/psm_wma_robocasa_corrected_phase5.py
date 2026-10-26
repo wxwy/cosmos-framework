@@ -977,13 +977,22 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     if getattr(args, "dataset_index_root", None) is None:
         raise ValueError("训练/Resume 必须提供已离线验收的 --dataset-index-root；禁止 cold build 与数据全量复检")
     check_job_namespace(args)
+    # Preserve the reviewed 8-GPU profile and admit a separate 4-GPU /
+    # GA4 profile with the same nominal global effective consumer budget:
+    # world_size * B8 * T16 * GA = 2048.
+    # Rank partitioning differs from world8; this is batch-size matched,
+    # not an assertion of identical per-step Consumer identities.
     if getattr(args, "no_ttt", False) and (
-        (args.t, args.b, args.ga, args.k, args.world_size) != (16, 8, 2, 4, 8)
+        (args.t, args.b, args.k) != (16, 8, 4)
+        or (args.world_size, args.ga) not in {(8, 2), (4, 4)}
         or args.num_workers != 0
         or getattr(args, "full_segment_prefetch", False)
         or getattr(args, "transform_rng_mode", "legacy_global") != "legacy_global"
     ):
-        raise ValueError("Matched No-TTT freezes T16/B8/GA2/world8 and synchronous legacy-global transforms")
+        raise ValueError(
+            "Matched No-TTT requires T16/B8/K4, (world8,GA2) or (world4,GA4), "
+            "num-workers=0 and synchronous legacy-global transforms"
+        )
     if any(
         type(value) is not int or value <= 0
         for value in (args.t, args.b, args.ga, args.k, args.world_size, args.max_iter, args.save_iter)
