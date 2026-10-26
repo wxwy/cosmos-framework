@@ -330,3 +330,37 @@ def test_no_ttt_passive_telemetry_records_consumer_source_without_fake_fast_stat
     assert record["state_fingerprint_sampled"] is False
     assert "committed_fast_state_sha256" not in record
     assert not any("local_read" in error for error in observer._errors)
+
+
+def test_world4_ga4_four_rank_packed_consumer_budget_and_frontier():
+    # Real ExactWindowRankPlanner + Producer + No-TTT window, with four
+    # logical ranks and four GA members per rank. No CUDA/model/DCP invoked.
+    _, _, catalog, producer = _setup((16,) * 128, t=16)
+    all_rank_episode_sets = []
+    total_consumers = 0
+    for rank in range(4):
+        planner = ExactWindowRankPlanner(catalog, rank=rank, world_size=4, b_stream=8, active_ga=4)
+        window = module.MatchedNoTTTWindow(Model(), planner)
+        window.begin()
+        assert window.plan.member_counts == (128, 128, 128, 128)
+        rank_episodes = set()
+        weights = []
+        for member_requests in window.plan.members:
+            segments = tuple(producer.produce(request) for request in member_requests)
+            payloads, positions = window.pack(segments)
+            assert len(payloads) == len(positions) == 128
+            assert all(p["action_raw"].shape == (17, 15) for p in payloads)
+            assert all(p["cached_latent_required"] for p in payloads)
+            rank_episodes.update(request.episode.uid for request in member_requests)
+            total_consumers += len(payloads)
+            weights.append(len(payloads) / window.plan.n_window)
+            window.member += 1
+        assert sum(weights) == 1.0
+        window.finish()
+        assert all(slot.next_segment_id == 4 for slot in window.live.frontier.slots)
+        all_rank_episode_sets.append(rank_episodes)
+    # Rank-partitioned episodes never overlap between physical workers.
+    for left in range(4):
+        for right in range(left + 1, 4):
+            assert all_rank_episode_sets[left].isdisjoint(all_rank_episode_sets[right])
+    assert total_consumers == 2048 == 8 * 8 * 16 * 2
