@@ -1,4 +1,4 @@
-"""Pure CLI/identity contract for the opt-in No-TTT CPU DataLoader."""
+"""Pure runtime-only options for the No-TTT CPU DataLoader, never a training identity."""
 
 from dataclasses import asdict, dataclass
 
@@ -60,7 +60,7 @@ def profile_from_args(args):
         getattr(args, "no_ttt", False) is not True
         or (args.world_size, args.ga, args.b, args.t) != (4, 4, 8, 16)
         or not args.job_name.startswith("no_ttt_")
-        or not args.job_name.endswith(f"_mpw{workers}_world4_ga4")
+        or not args.job_name.endswith("_world4_ga4")
     ):
-        raise ValueError("multiprocess loader requires a NEW no_ttt_*_mpwN_world4_ga4 profile")
+        raise ValueError("multiprocess loader requires No-TTT world4/GA4/B8/T16 job namespace")
     return profile
