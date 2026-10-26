@@ -13,8 +13,8 @@ class LoaderProfile:
     max_cache_bytes: int = 2 * 1024**3
 
     def __post_init__(self):
-        if type(self.workers) is not int or self.workers not in (0, 1, 2, 4):
-            raise ValueError("No-TTT loader workers must be 0/1/2/4")
+        if type(self.workers) is not int or self.workers not in (0, 1, 2, 4, 8):
+            raise ValueError("No-TTT loader workers must be 0/1/2/4/8")
         if type(self.persistent_workers) is not bool:
             raise ValueError("persistent_workers must be boolean")
         if self.workers == 0:
