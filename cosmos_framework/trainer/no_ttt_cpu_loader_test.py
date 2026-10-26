@@ -268,7 +268,7 @@ def test_zero_worker_options_fail(kwargs):
 
 @pytest.mark.parametrize("workers", [2, 8])
 @pytest.mark.parametrize(
-    "change", [{"no_ttt": False}, {"world_size": 8}, {"ga": 2}, {"job_name": "no_ttt_formal_world4_ga4"}]
+    "change", [{"no_ttt": False}, {"world_size": 8}, {"ga": 2}, {"job_name": "no_ttt_wrong_world8_ga2"}]
 )
 def test_cli_worker_profile_rejects_old_job_and_other_routes(change, workers):
     args = SimpleNamespace(
@@ -283,6 +283,20 @@ def test_cli_worker_profile_rejects_old_job_and_other_routes(change, workers):
     args.__dict__.update(change)
     with pytest.raises(ValueError, match="NEW"):
         profile_from_args(args)
+
+
+@pytest.mark.parametrize("workers", [1, 2, 4, 8])
+def test_optin_workers_are_allowed_on_original_world4_nott_job(workers):
+    args = SimpleNamespace(
+        no_ttt=True,
+        world_size=4,
+        ga=4,
+        b=8,
+        t=16,
+        job_name="no_ttt_packed128_droid_fresh_30k_world4_ga4",
+        no_ttt_loader_workers=workers,
+    )
+    assert profile_from_args(args).workers == workers
 
 
 def test_real_synthetic_cache_factory_spawn_mmap_and_native_raw_values(tmp_path):
