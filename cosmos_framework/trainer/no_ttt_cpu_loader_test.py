@@ -54,7 +54,7 @@ def assert_closed(loader):
     assert all(row["exitcode"] is not None and not Path(f"/proc/{row['pid']}").exists() for row in loader.last_cleanup)
 
 
-@pytest.mark.parametrize("workers", [1, 2, 4])
+@pytest.mark.parametrize("workers", [1, 2, 4, 8])
 @pytest.mark.parametrize("world,count", [(1, 17), (1, 64), (4, 17), (4, 64)])
 @torch.enable_grad()
 def test_true_spawned_workers_match_legacy_ga4_rank_order_partial_and_rng(workers, world, count):
@@ -254,7 +254,7 @@ def test_wrong_request_order_and_partial_spawn_failure_are_closed(monkeypatch):
     assert_closed(loader)
 
 
-@pytest.mark.parametrize("workers", [-1, 3, 8, True, "2"])
+@pytest.mark.parametrize("workers", [-1, 3, 5, 16, True, "2"])
 def test_bad_worker_count_rejected(workers):
     with pytest.raises(ValueError):
         LoaderProfile(workers)
@@ -266,12 +266,13 @@ def test_zero_worker_options_fail(kwargs):
         LoaderProfile(**kwargs)
 
 
+@pytest.mark.parametrize("workers", [2, 8])
 @pytest.mark.parametrize(
     "change", [{"no_ttt": False}, {"world_size": 8}, {"ga": 2}, {"job_name": "no_ttt_formal_world4_ga4"}]
 )
-def test_cli_worker_profile_rejects_old_job_and_other_routes(change):
+def test_cli_worker_profile_rejects_old_job_and_other_routes(change, workers):
     args = SimpleNamespace(
-        no_ttt=True, world_size=4, ga=4, b=8, t=16, job_name="no_ttt_new_mpw2_world4_ga4", no_ttt_loader_workers=2
+        no_ttt=True, world_size=4, ga=4, b=8, t=16, job_name=f"no_ttt_new_mpw{workers}_world4_ga4", no_ttt_loader_workers=workers
     )
     args.__dict__.update(change)
     with pytest.raises(ValueError, match="NEW"):
