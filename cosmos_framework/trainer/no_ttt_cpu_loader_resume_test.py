@@ -33,9 +33,8 @@ def make(rank=0, workers=1):
     result.config = SimpleNamespace(trainer=SimpleNamespace(grad_accum_iter=4, distributed_parallelism="fsdp"))
     result.callbacks = _Hooks()
     result.training_timer = lambda name: nullcontext()
-    result.bind_grouped_stream(
-        planner, producer, config_digest="config", loader_profile=LoaderProfile(workers, 1, True, 60)
-    )
+    options = {"loader_profile": LoaderProfile(workers, 1, True, 60)} if workers else {}
+    result.bind_grouped_stream(planner, producer, config_digest="config", **options)
     result.cpu_loader_observer = lambda _: None
     model = NoisyModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.00001, momentum=0.9)
@@ -89,7 +88,7 @@ def test_four_logical_ranks_full_cpu_state_100_resume101_500():
                     }
                 )
             )
-            assert checkpoint["dataloader"]["format"] == trainer_module.LOADER_FORMAT
+            assert checkpoint["dataloader"]["format"] == trainer_module.FORMAT
             assert set(checkpoint) == {"model", "optim", "scheduler", "scaler", "dataloader", "trainer"}
             for i in range(100, 500):
                 step(source, i)
@@ -129,13 +128,14 @@ def test_four_logical_ranks_full_cpu_state_100_resume101_500():
                 other[0]._no_ttt_loader.close()
 
 
-def test_eight_worker_same_profile_checkpoint_cpu_roundtrip_and_old_count_rejection():
-    """New mpw8 Job may resume its own state, never silently resume with mpw2."""
+@pytest.mark.parametrize("from_workers,to_workers", [(0, 8), (8, 0), (8, 2), (2, 8)])
+def test_worker_count_changes_resume_same_committed_state_without_changing_training(from_workers, to_workers):
+    """Transport count does not affect checkpoint schema, GA chronology or model/RNG state."""
     random.seed(83)
     np.random.seed(83)
     torch.manual_seed(83)
-    source = make(rank=0, workers=8)
-    resumed = mismatched = None
+    source = make(rank=0, workers=from_workers)
+    resumed = None
     try:
         step(source, 0)
         checkpoint = pickle.loads(
@@ -152,8 +152,8 @@ def test_eight_worker_same_profile_checkpoint_cpu_roundtrip_and_old_count_reject
                 }
             )
         )
-        assert checkpoint["dataloader"]["format"] == trainer_module.LOADER_FORMAT
-        assert checkpoint["dataloader"]["loader_profile"]["workers"] == 8
+        assert checkpoint["dataloader"]["format"] == trainer_module.FORMAT
+        assert "loader_profile" not in checkpoint["dataloader"]
         step(source, 1)
         expected_model = source[1].net.moe_gen.detach().clone()
         expected_trace = list(source[1].seen[4:])
@@ -161,9 +161,10 @@ def test_eight_worker_same_profile_checkpoint_cpu_roundtrip_and_old_count_reject
         expected_scheduler = deepcopy(source[3].state_dict())
         expected_momentum = source[2].state[source[1].net.moe_gen]["momentum_buffer"].clone()
         expected_rng = (random.getstate(), np.random.get_state(), torch.get_rng_state().clone())
-        source[0]._no_ttt_loader.close()  # Avoid overlapping eight-worker pools in this CPU fixture.
+        if source[0]._no_ttt_loader is not None:
+            source[0]._no_ttt_loader.close()  # Never overlap two process pools.
 
-        resumed = make(rank=0, workers=8)
+        resumed = make(rank=0, workers=to_workers)
         resumed[1].load_state_dict(checkpoint["model"])
         resumed[2].load_state_dict(checkpoint["optim"])
         resumed[3].load_state_dict(checkpoint["scheduler"])
@@ -188,24 +189,14 @@ def test_eight_worker_same_profile_checkpoint_cpu_roundtrip_and_old_count_reject
         assert np.array_equal(np.random.get_state()[1], expected_rng[1][1])
         assert np.random.get_state()[2:] == expected_rng[1][2:]
         torch.testing.assert_close(torch.get_rng_state(), expected_rng[2], rtol=0, atol=0)
-        resumed[0]._no_ttt_loader.close()
-
-        mismatched = make(rank=0, workers=2)
-        mismatched[0].callbacks._callbacks[0].load_state_dict(checkpoint["dataloader"])
-        mismatched[0]._resume_required = True
-        with pytest.raises(ValueError, match="No-TTT"):
-            step(mismatched, 1)
-        assert mismatched[1].seen == [] and mismatched[0]._no_ttt_loader.context.processes == []
     finally:
-        source[0]._no_ttt_loader.close()
-        if resumed is not None:
+        if source[0]._no_ttt_loader is not None:
+            source[0]._no_ttt_loader.close()
+        if resumed is not None and resumed[0]._no_ttt_loader is not None:
             resumed[0]._no_ttt_loader.close()
-        if mismatched is not None:
-            mismatched[0]._no_ttt_loader.close()
-
 
 @pytest.mark.parametrize(
-    "damage", ["workers", "prefetch", "rank", "world", "seed", "config", "corpus", "source", "format", "sidecar"]
+    "damage", ["rank", "world", "seed", "config", "corpus", "source", "format", "sidecar"]
 )
 def test_wrong_checkpoint_profile_never_starts_workers_or_native_model(damage):
     source = make()
@@ -214,9 +205,7 @@ def test_wrong_checkpoint_profile_never_starts_workers_or_native_model(damage):
         saved = deepcopy(source[0].callbacks._callbacks[0].state_dict())
     finally:
         source[0]._no_ttt_loader.close()
-    if damage in ("workers", "prefetch"):
-        saved["loader_profile"][{"workers": "workers", "prefetch": "prefetch_factor"}[damage]] = 2
-    elif damage in ("rank", "world", "seed"):
+    if damage in ("rank", "world", "seed"):
         index = {"rank": 0, "world": 1, "seed": 2}[damage]
         values = list(saved["profile"])
         values[index] += 1
@@ -227,7 +216,7 @@ def test_wrong_checkpoint_profile_never_starts_workers_or_native_model(damage):
         ] = "wrong"
     else:
         saved[damage] = "wrong"
-    target = make()
+    target = make(workers=2)  # Different worker count must not bypass hard identity validation.
     try:
         target[0].callbacks._callbacks[0].load_state_dict(saved)
         target[0]._resume_required = True
