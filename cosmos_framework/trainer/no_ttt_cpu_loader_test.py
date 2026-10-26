@@ -270,7 +270,7 @@ def test_zero_worker_options_fail(kwargs):
 @pytest.mark.parametrize(
     "change", [{"no_ttt": False}, {"world_size": 8}, {"ga": 2}, {"job_name": "no_ttt_wrong_world8_ga2"}]
 )
-def test_cli_worker_profile_rejects_old_job_and_other_routes(change, workers):
+def test_cli_worker_profile_rejects_invalid_job_or_geometry(change, workers):
     args = SimpleNamespace(
         no_ttt=True,
         world_size=4,
@@ -281,7 +281,7 @@ def test_cli_worker_profile_rejects_old_job_and_other_routes(change, workers):
         no_ttt_loader_workers=workers,
     )
     args.__dict__.update(change)
-    with pytest.raises(ValueError, match="NEW"):
+    with pytest.raises(ValueError, match="requires No-TTT world4/GA4/B8/T16"):
         profile_from_args(args)
 
 
@@ -299,7 +299,10 @@ def test_optin_workers_are_allowed_on_original_world4_nott_job(workers):
     assert profile_from_args(args).workers == workers
 
 
-def test_real_synthetic_cache_factory_spawn_mmap_and_native_raw_values(tmp_path):
+def test_real_synthetic_cache_factory_spawn_mmap_and_native_raw_values(tmp_path, monkeypatch):
+    # The existing local LeRobot helper sets this env var in the parent process.
+    # Register it with pytest's monkeypatch so the autouse env guard stays clean.
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     from cosmos_framework.data.generator.action.datasets.action_sft_dataset import ActionSFTDataset
     from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cached_sft_test import _raw, roots
     from cosmos_framework.model.generator.mot.robocasa_exact_window_local import ExactWindowLocalCatalog
