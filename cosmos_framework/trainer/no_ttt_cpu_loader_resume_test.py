@@ -129,6 +129,79 @@ def test_four_logical_ranks_full_cpu_state_100_resume101_500():
                 other[0]._no_ttt_loader.close()
 
 
+def test_eight_worker_same_profile_checkpoint_cpu_roundtrip_and_old_count_rejection():
+    """New mpw8 Job may resume its own state, never silently resume with mpw2."""
+    random.seed(83)
+    np.random.seed(83)
+    torch.manual_seed(83)
+    source = make(rank=0, workers=8)
+    resumed = mismatched = None
+    try:
+        step(source, 0)
+        checkpoint = pickle.loads(
+            pickle.dumps(
+                {
+                    "model": source[1].state_dict(),
+                    "optim": source[2].state_dict(),
+                    "scheduler": source[3].state_dict(),
+                    "scaler": source[4].state_dict(),
+                    "dataloader": source[0].callbacks._callbacks[0].state_dict(),
+                    "python_rng": random.getstate(),
+                    "numpy_rng": np.random.get_state(),
+                    "torch_rng": torch.get_rng_state(),
+                }
+            )
+        )
+        assert checkpoint["dataloader"]["format"] == trainer_module.LOADER_FORMAT
+        assert checkpoint["dataloader"]["loader_profile"]["workers"] == 8
+        step(source, 1)
+        expected_model = source[1].net.moe_gen.detach().clone()
+        expected_trace = list(source[1].seen[4:])
+        expected_frontier = source[0]._grouped_window.live
+        expected_scheduler = deepcopy(source[3].state_dict())
+        expected_momentum = source[2].state[source[1].net.moe_gen]["momentum_buffer"].clone()
+        expected_rng = (random.getstate(), np.random.get_state(), torch.get_rng_state().clone())
+
+        resumed = make(rank=0, workers=8)
+        resumed[1].load_state_dict(checkpoint["model"])
+        resumed[2].load_state_dict(checkpoint["optim"])
+        resumed[3].load_state_dict(checkpoint["scheduler"])
+        resumed[4].load_state_dict(checkpoint["scaler"])
+        resumed[0].callbacks._callbacks[0].load_state_dict(checkpoint["dataloader"])
+        resumed[0]._resume_required = True
+        random.seed(999)
+        np.random.seed(999)
+        torch.manual_seed(999)
+        random.setstate(checkpoint["python_rng"])
+        np.random.set_state(checkpoint["numpy_rng"])
+        torch.set_rng_state(checkpoint["torch_rng"])
+        step(resumed, 1)
+        torch.testing.assert_close(resumed[1].net.moe_gen, expected_model, rtol=0, atol=0)
+        assert resumed[1].seen == expected_trace
+        assert resumed[0]._grouped_window.live == expected_frontier
+        assert resumed[3].state_dict() == expected_scheduler
+        torch.testing.assert_close(
+            resumed[2].state[resumed[1].net.moe_gen]["momentum_buffer"], expected_momentum, rtol=0, atol=0
+        )
+        assert random.getstate() == expected_rng[0]
+        assert np.array_equal(np.random.get_state()[1], expected_rng[1][1])
+        assert np.random.get_state()[2:] == expected_rng[1][2:]
+        torch.testing.assert_close(torch.get_rng_state(), expected_rng[2], rtol=0, atol=0)
+
+        mismatched = make(rank=0, workers=2)
+        mismatched[0].callbacks._callbacks[0].load_state_dict(checkpoint["dataloader"])
+        mismatched[0]._resume_required = True
+        with pytest.raises(ValueError, match="No-TTT"):
+            step(mismatched, 1)
+        assert mismatched[1].seen == [] and mismatched[0]._no_ttt_loader.context.processes == []
+    finally:
+        source[0]._no_ttt_loader.close()
+        if resumed is not None:
+            resumed[0]._no_ttt_loader.close()
+        if mismatched is not None:
+            mismatched[0]._no_ttt_loader.close()
+
+
 @pytest.mark.parametrize(
     "damage", ["workers", "prefetch", "rank", "world", "seed", "config", "corpus", "source", "format", "sidecar"]
 )
