@@ -67,6 +67,53 @@ def test_digest_separates_no_ttt_but_preserves_legacy_identity_when_absent(tmp_p
     assert digest() != baseline_digest
 
 
+def test_all_worker_counts_share_strict_training_and_config_identity(tmp_path):
+    """Loader processes only change launch/runtime telemetry, never model/data state identity."""
+    catalog, config, _, _ = _config(tmp_path, ga=4)
+    config.model.config.local_memory_enabled = False
+    config.model.config.parallelism.data_parallel_shard_degree = 4
+    config.optimizer.keys_to_select = list(phase5.GENERATION_KEYS)
+    config.checkpoint.strict_resume = True
+    config.data_setting = SimpleNamespace(seed=123)
+    args = _args(
+        tmp_path,
+        "--no-ttt",
+        "--world-size",
+        "4",
+        "--ga",
+        "4",
+        "--job-name",
+        "no_ttt_packed128_droid_fresh_30k_world4_ga4",
+    )
+    report = {
+        "cache_manifest_sha256": catalog.manifest_digest,
+        "cache_corpus_digest": catalog.cache_corpus_digest,
+        "source_binding_digest": catalog.source_binding_digest,
+        "model_witnesses": {"droid": "synthetic"},
+        "transform_rng_mode": "legacy_global",
+    }
+    digest = phase5.config_digest(catalog, config, b_stream=8, active_ga=4, witnesses=report["model_witnesses"])
+    baseline = phase5.training_identity(args, config, report)
+    frozen = phase5._json_digest({"phase5_digest": digest, "training_identity": baseline})
+    assert "no_ttt_cpu_loader" not in baseline
+    for workers, factor, persistent, timeout in (
+        (0, None, None, None),
+        (1, 1, True, 120),
+        (2, 2, False, 30),
+        (4, 1, True, 90),
+        (8, 2, True, 180),
+    ):
+        args.no_ttt_loader_workers = workers
+        args.no_ttt_prefetch_factor = factor
+        args.no_ttt_persistent_workers = persistent
+        args.no_ttt_loader_timeout_s = timeout
+        current = phase5.training_identity(args, config, report)
+        assert current == baseline
+        assert phase5._json_digest({"phase5_digest": digest, "training_identity": current}) == frozen
+    config.optimizer.lr *= 2
+    assert phase5.training_identity(args, config, report) != baseline
+
+
 def test_no_ttt_namespace_resume_rejects_mode_switch_without_touching_assets(tmp_path):
     args = _args(tmp_path, "--no-ttt", "--job-name", "no_ttt_formal")
     report = _report(args, {"training_profile": "matched_no_ttt_v1"})
