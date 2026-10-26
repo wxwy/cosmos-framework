@@ -128,6 +128,78 @@ def test_mismatched_no_ttt_geometry_rejected_before_runtime(tmp_path, monkeypatc
         phase5.preflight(args)
 
 
+@pytest.mark.parametrize(("world_size", "ga"), [(8, 2), (4, 4)])
+def test_both_matched_no_ttt_profiles_pass_geometry_gate_before_real_assets(
+    tmp_path, monkeypatch, world_size, ga
+):
+    args = _args(
+        tmp_path,
+        "--no-ttt",
+        "--job-name",
+        f"no_ttt_world{world_size}_ga{ga}",
+        "--world-size",
+        str(world_size),
+        "--ga",
+        str(ga),
+    )
+
+    def admitted():
+        raise RuntimeError("reached CUDA/runtime asset preflight")
+
+    monkeypatch.setattr(phase5, "_load_runtime", admitted)
+    with pytest.raises(RuntimeError, match="reached CUDA/runtime"):
+        phase5.preflight(args)
+
+
+@pytest.mark.parametrize(("world_size", "ga"), [(4, 2), (8, 4), (2, 8), (4, 8)])
+def test_no_ttt_rejects_unreviewed_world_ga_pairs_before_runtime(
+    tmp_path, monkeypatch, world_size, ga
+):
+    args = _args(
+        tmp_path,
+        "--no-ttt",
+        "--job-name",
+        f"no_ttt_world{world_size}_ga{ga}",
+        "--world-size",
+        str(world_size),
+        "--ga",
+        str(ga),
+    )
+
+    def forbidden():
+        pytest.fail("invalid profile reached CUDA/runtime preflight")
+
+    monkeypatch.setattr(phase5, "_load_runtime", forbidden)
+    with pytest.raises(ValueError, match="Matched No-TTT"):
+        phase5.preflight(args)
+
+
+def test_four_gpu_ga4_overlay_keeps_generation_optimizer_and_2048_global_budget(tmp_path):
+    _, config, _, _ = _config(tmp_path)
+    config.model.config.ema = SimpleNamespace(enabled=True)
+    config.model.config.compile = SimpleNamespace(enabled=True)
+    config.model.config.activation_checkpointing = SimpleNamespace(mode="selective")
+    contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(_catalog(tmp_path / "cache"))
+    args = _args(
+        tmp_path, "--no-ttt", "--job-name", "no_ttt_packed128_4gpu",
+        "--world-size", "4", "--ga", "4",
+    )
+    phase5.overlay_config(config, args, contract)
+    assert config.model.config.local_memory_enabled is False
+    assert config.trainer.type is MatchedNoTTTTrainer
+    assert config.model.config.parallelism.data_parallel_shard_degree == 4
+    assert config.model.config.parallelism.data_parallel_replicate_degree == 1
+    assert config.trainer.grad_accum_iter == 4
+    assert config.optimizer.keys_to_select == list(phase5.GENERATION_KEYS)
+    assert config.optimizer.lr == 5e-5
+    assert config.optimizer.lr_multipliers == {key: 5.0 for key in phase5.ACTION_KEYS}
+    assert config.trainer.max_iter == 30000
+    assert config.scheduler.cycle_lengths == [30000]
+    assert config.scheduler.warm_up_steps == [500]
+    assert config.checkpoint.save_iter == 100
+    assert (4 * 8 * 16 * 4) == (8 * 8 * 16 * 2) == 2048
+
+
 def test_missing_index_retains_original_value_error(tmp_path):
     args = _args(tmp_path, "--no-ttt", "--job-name", "no_ttt_formal")
     args.dataset_index_root = None
