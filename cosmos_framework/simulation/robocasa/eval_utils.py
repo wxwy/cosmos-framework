@@ -139,9 +139,9 @@ def b64_png(img: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def reset_local_memory(server_url: str, session_id: str, timeout: float) -> None:
+def reset_local_memory(server_url: str, session_id: str, timeout: float, *, http_session=None) -> None:
     payload = {"_local_memory_command": "reset", "session_id": session_id}
-    resp = requests.post(
+    resp = (http_session or requests).post(
         f"{server_url}/predict",
         json=payload,
         headers={"Content-Type": "application/json"},
@@ -162,13 +162,14 @@ def predict(
     timeout: float,
     state: list[float] | None = None,
     local_memory: dict | None = None,
+    http_session=None,
 ) -> dict:
     payload = {"image": b64_png(composite), "prompt": prompt, "domain_name": "robocasa", "image_size": image_size}
     if state is not None:
         payload["state"] = state
     if local_memory is not None:
         payload["local_memory"] = local_memory
-    resp = requests.post(
+    resp = (http_session or requests).post(
         f"{server_url}/predict", json=payload, headers={"Content-Type": "application/json"}, timeout=timeout
     )
     resp.raise_for_status()

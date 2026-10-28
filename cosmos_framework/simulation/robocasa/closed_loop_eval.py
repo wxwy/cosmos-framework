@@ -269,6 +269,11 @@ def run_policy(
     on_action: Callable[[dict], None] | None = None,
     on_cleanup: Callable[[dict], None] | None = None,
     on_progress: Callable[[dict], None] | None = None,
+    initial_observation=None,
+    success_check: Callable | None = None,
+    on_frame: Callable | None = None,
+    language_instruction: str | None = None,
+    http_client=None,
 ) -> tuple[bool, int, str]:
     rollout_error: BaseException | None = None
     frames, generated = [], []
@@ -300,19 +305,24 @@ def run_policy(
 
     try:
         observe("environment_initialization")
-        obs = env.reset()
+        obs = env.reset() if initial_observation is None else initial_observation
         if local_memory_client is not None:
             local_memory_client.begin(0, image_size=image_size)
-        try:
-            prompt = env.get_ep_meta().get("lang", "") or ""
-        except Exception:
-            prompt = ""
+        if language_instruction is not None:
+            prompt = language_instruction
+        else:
+            try:
+                prompt = env.get_ep_meta().get("lang", "") or ""
+            except Exception:
+                prompt = ""
         observe("environment_initialization", instruction=prompt)
         init_comp = compose(obs).astype(np.uint8)
         if save_png is not None:
             with open(save_png, "xb") as handle:
                 Image.fromarray(init_comp).save(handle, format="PNG")
         frames = [init_comp] if save_video is not None else []
+        if on_frame is not None:
+            on_frame(init_comp)
         replans = 0
         streak, queue, success, done_steps = 0, [], False, max_steps
         observe("executing")
@@ -331,6 +341,7 @@ def run_policy(
                     timeout,
                     state=state_token,
                     local_memory=local_payload,
+                    **({"http_session": http_client} if http_client is not None else {}),
                 )
                 prediction_ms = (time.monotonic() - prediction_t0) * 1000.0
                 progress_predictions += 1
@@ -415,7 +426,9 @@ def run_policy(
                 local_memory_client.record_completed(0, pre_composite, canonical_raw15)
             if save_video is not None:
                 frames.append(compose(obs).astype(np.uint8))
-            if check_success(env):
+            if on_frame is not None:
+                on_frame(compose(obs).astype(np.uint8))
+            if (success_check or check_success)(env):
                 streak += 1
                 if streak >= latch:
                     success, done_steps = True, step + 1
@@ -449,7 +462,12 @@ def run_policy(
             if local_memory_client is not None:
                 session_id = local_memory_client.end(0)
                 if session_id is not None:
-                    reset_local_memory(server_url, session_id, timeout)
+                    reset_local_memory(
+                        server_url,
+                        session_id,
+                        timeout,
+                        **({"http_session": http_client} if http_client is not None else {}),
+                    )
         except Exception as error:
             cleanup_error = error
             observe("local_cleanup", event="error", error=f"{type(error).__name__}: {error}"[:2048])
