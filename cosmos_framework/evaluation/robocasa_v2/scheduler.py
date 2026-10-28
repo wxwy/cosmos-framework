@@ -105,11 +105,8 @@ class RoundScheduler:
                         self.resume_scan.append((task, ep, disposition))
                         self.cursor += 1
                         continue
-                    # Sticky task/env ownership avoids serializing all work onto
-                    # one GPU or recreating task contexts for every round.
-                    target = self.workers[self.cursor % len(self.workers)]
-                    if worker != target:
-                        return None
+                    # Any idle physical Slot may consume the next logical item.
+                    # Task environments are switched by the bounded Slot owner.
                     if task not in self.store.active_tasks:
                         self.store.begin_task(task)
                     ticket = uuid.uuid4().hex

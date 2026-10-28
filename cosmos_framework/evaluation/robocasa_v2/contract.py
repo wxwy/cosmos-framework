@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass, field
 
 SCHEMA = "psm_robocasa_eval_v2"
-SAMPLING = "continuous_reset_with_explicit_resume_stream_v2"
+SAMPLING = "dynamic_slot_environment_seed_then_continuous_reset_v3"
 RESUME = "retry_missing_episode_no_scene_reproduction_v2"
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -71,6 +71,8 @@ def build_manifest(*, tasks, episodes, seed, horizons, experiment, formal=False)
         "scope": "formal900" if formal else "subset",
         "protocol": {
             "sampling": SAMPLING,
+            "resource_architecture": "one_reusable_sim_slot_per_gpu_phase_a",
+            "seed_field": "logical_task_stream; actual environment seed in sampling provenance",
             "schedule": "episode_major_frozen_order_round_barrier_v1",
             "resume": RESUME,
             "success_latch": 1,
@@ -172,6 +174,7 @@ def result_record(
     worker_id="0" * 32,
     seed=None,
     reset_index=None,
+    sampling=None,
 ):
     validate_manifest(manifest)
     if task not in manifest["tasks"]:
@@ -203,6 +206,8 @@ def result_record(
         "elapsed_seconds": elapsed_seconds,
         **observation,
     }
+    if sampling is not None:
+        row["sampling"] = sampling
     validate_result(manifest, row)
     return row
 
@@ -234,13 +239,27 @@ def validate_result(manifest, row):
     }
     if (
         not isinstance(row, dict)
-        or set(row) != base_keys
+        or set(row) not in (base_keys, base_keys | {"sampling"})
         or row["schema"] != SCHEMA
         or row["prototype_only"] is not False
         or row["manifest_digest"] != manifest["digest"]
         or row["task"] not in manifest["tasks"]
     ):
         raise ValueError("invalid Episode identity/schema")
+    if "sampling" in row:
+        sample = row["sampling"]
+        if (
+            not isinstance(sample, dict)
+            or set(sample)
+            != {"environment_id", "actual_seed", "environment_reset_index", "physical_slot_id", "protocol"}
+            or sample["protocol"] != SAMPLING
+        ):
+            raise ValueError("invalid native environment sampling provenance")
+        for name in ("environment_id", "physical_slot_id"):
+            if not isinstance(sample[name], str) or not re.fullmatch(r"[0-9a-f]{32}", sample[name]):
+                raise ValueError("invalid physical environment/Slot identity")
+        integer(sample["actual_seed"], 0, 2**32 - 1, "environment seed")
+        integer(sample["environment_reset_index"], 0, 100000, "environment reset index")
     integer(row["episode"], 0, manifest["episodes_per_task"] - 1, "episode")
     integer(row["generation"], 0, 100000, "generation")
     integer(row["replans"], 0, 100000, "replans")

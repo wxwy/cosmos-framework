@@ -97,6 +97,8 @@ def validate(directory, row):
     for k in ("task", "episode", "attempt_id", "stream_id", "seed", "reset_index", "manifest_digest"):
         if scene.get(k) != row[k]:
             raise ValueError("scene source identity mismatch")
+    if "sampling" in row and scene.get("sampling") != row["sampling"]:
+        raise ValueError("native sampling provenance contradicts Core result")
     if scene.get("initial_success") is not False:
         raise ValueError("scene not admitted")
     result = {}

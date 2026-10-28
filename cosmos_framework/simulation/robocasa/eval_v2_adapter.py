@@ -69,7 +69,7 @@ class NativeEpisode:
                 "resource_proof": proof,
             }
 
-    def execute(self, attempt, *, reset_index, directory):
+    def execute(self, attempt, *, reset_index, directory, sampling=None, phase_callback=None):
         if not self.admitted or self.observation is None:
             raise ValueError("scene must be admitted before policy/Local")
         self.admitted = False
@@ -77,6 +77,8 @@ class NativeEpisode:
         directory.mkdir(parents=True, exist_ok=False)
         scene = {k: attempt[k] for k in ("task", "episode", "attempt_id", "stream_id", "seed", "manifest_digest")}
         scene.update(initial_success=False, reset_index=reset_index)
+        if sampling is not None:
+            scene["sampling"] = sampling
         metadata = self.env.get_ep_meta()
         instruction = metadata.get("lang")
         if not isinstance(instruction, str) or not instruction.strip():
@@ -92,6 +94,7 @@ class NativeEpisode:
         outcome = EnvironmentOutcome(self.settings["horizon"])
         replans = 0
         cleanup = None
+        first_local = None
         media_errors = []
         try:
             sink = self.media_factory(
@@ -126,7 +129,7 @@ class NativeEpisode:
                 actions.flush()
 
             def prediction(result, latency):
-                nonlocal replans
+                nonlocal replans, first_local
                 if not isinstance(result.get("action"), list) or len(result["action"]) != 16:
                     raise ValueError("Action Server must return exactly16 raw15 actions")
                 value = {
@@ -136,6 +139,8 @@ class NativeEpisode:
                     "local_memory": result.get("local_memory"),
                     "latency_ms": latency,
                 }
+                if first_local is None:
+                    first_local = value["local_memory"]
                 predictions.write(json.dumps(value, allow_nan=False) + "\n")
                 predictions.flush()
                 media_call("prediction", replans, result)
@@ -147,6 +152,8 @@ class NativeEpisode:
                 atomic_json(directory / "local_memory.json", value)
 
             def progress(value):
+                if phase_callback is not None:
+                    phase_callback(value.get("stage"))
                 # Rate-limit non-authoritative UI writes; Core actions/predictions
                 # are flushed independently and never inferred from UI state.
                 now = time.monotonic()
@@ -198,6 +205,12 @@ class NativeEpisode:
                 except OSError:
                     pass
         return {
+            "local_session": {
+                "session_id": cleanup["session_id"],
+                "episode_id": first_local["episode_id"],
+                "start_frontier": first_local["consumer_step"],
+                "reset_ack": cleanup["reset_ok"],
+            },
             "observation": observation,
             "instruction": prompt,
             "replans": replans,

@@ -15,11 +15,12 @@ from cosmos_framework.evaluation.robocasa_v2.wire import receive, send
 
 
 def serve(channel, cfg, *, factory=None):
-    # Optional factory is for CPU tests; production CLI cannot select/import one.
+    # Factory is a Python CPU test boundary, never selectable via production CLI.
     from cosmos_framework.simulation.robocasa import closed_loop_eval as native
     from cosmos_framework.simulation.robocasa.eval_v2_adapter import NativeEpisode
+    from cosmos_framework.simulation.robocasa.eval_v2_slot import SimSlot
 
-    env = None
+    slot = None
     os.set_inheritable(channel.fileno(), False)
     try:
         if factory is None:
@@ -33,42 +34,31 @@ def serve(channel, cfg, *, factory=None):
                 "worker": Path(__file__),
                 "native": Path(native.__file__),
                 "adapter": Path(sys.modules[NativeEpisode.__module__].__file__),
+                "slot": Path(sys.modules[SimSlot.__module__].__file__),
             }
-            expected = cfg["source_files"]
-            if set(expected) != set(modules):
+            if set(cfg["source_files"]) != set(modules):
                 raise ValueError("incomplete native source witnesses")
             for name, file in modules.items():
+                expected = cfg["source_files"][name]
                 if (
-                    str(file.resolve()) != expected[name]["path"]
-                    or hashlib.sha256(file.read_bytes()).hexdigest() != expected[name]["sha256"]
+                    str(file.resolve()) != expected["path"]
+                    or hashlib.sha256(file.read_bytes()).hexdigest() != expected["sha256"]
                 ):
                     raise ValueError("native import origin/source mismatch")
-            runtime = native.verify_runtime(SimpleNamespace(**cfg["runtime_args"]), cfg["task"])
-            if runtime is None or runtime["protocol"]["official_horizons"][cfg["task"]] != cfg["settings"]["horizon"]:
-                raise ValueError("missing/incorrect authoritative runtime horizon")
-            if (
-                hashlib.sha256((Path(cfg["dataset_dir"]) / "extras/dataset_meta.json").read_bytes()).hexdigest()
-                != cfg["metadata_sha256"]
+            runtime = native.verify_runtime(SimpleNamespace(**cfg["runtime_args"]), next(iter(cfg["tasks"])))
+            if runtime is None or any(
+                runtime["protocol"]["official_horizons"][task] != spec["horizon"] for task, spec in cfg["tasks"].items()
             ):
-                raise ValueError("Task metadata changed before environment construction")
-            env = native.make_env(
-                cfg["dataset_dir"],
-                256,
-                obj_split="target",
-                layout_style=native.ATOMIC_SEEN_LAYOUT_STYLE,
-                seed=cfg["seed"],
-            )
-        else:
-            env = factory()
-        adapter = NativeEpisode(env, cfg["settings"])
+                raise ValueError("missing/incorrect authoritative runtime horizons")
+        slot = SimSlot(cfg, factory=factory)
         send(
             channel,
             {
                 "kind": "READY",
                 "nonce": cfg["nonce"],
                 "pid": os.getpid(),
-                "task": cfg["task"],
-                "stream_id": cfg["stream_id"],
+                "physical_slot_id": cfg["physical_slot_id"],
+                "state": slot.state,
                 "runtime_digest": runtime["digest"] if factory is None else "CPU_TEST_FACTORY",
             },
         )
@@ -78,33 +68,29 @@ def serve(channel, cfg, *, factory=None):
                 raise ValueError("actor request identity mismatch")
             op = message.get("op")
             response = {"request_id": message["request_id"], "nonce": cfg["nonce"]}
-            if op == "initialize":
-                response.update(adapter.initialize())
-            elif op == "execute":
-                attempt = message["attempt"]
-                if (
-                    attempt["task"] != cfg["task"]
-                    or attempt["stream_id"] != cfg["stream_id"]
-                    or attempt["seed"] != cfg["seed"]
-                ):
-                    raise ValueError("foreign Episode attempt")
-                directory = Path(message["directory"]).resolve()
-                expected = (
-                    Path(cfg["work_root"]).resolve() / f"ep_{attempt['episode']:03d}" / "work" / attempt["attempt_id"]
+            if op == "start_episode":
+                response.update(
+                    slot.start_episode(
+                        message["attempt"], grant=message.get("grant"), health_only=message.get("health_only", False)
+                    )
                 )
-                if directory != expected:
-                    raise ValueError("output outside owned work area")
-                response.update(adapter.execute(attempt, reset_index=message["reset_index"], directory=directory))
+            elif op == "initialize":
+                response.update(slot.initialize())
+            elif op == "finish_without_session":
+                response.update(slot.finish_without_session())
+            elif op == "execute":
+                response.update(
+                    slot.execute(message["attempt"], reset_index=message["reset_index"], directory=message["directory"])
+                )
             elif op == "close":
-                env.close()
-                env = None
-                send(channel, dict(response, closed=True))
+                response.update(slot.close())
+                send(channel, response)
                 return
             else:
                 raise ValueError("unknown actor operation")
             send(channel, response)
     except EOFError:
-        pass  # Coordinator died; no new work. Native env is closed below.
+        pass
     except BaseException as error:
         try:
             send(channel, {"kind": "FATAL", "nonce": cfg["nonce"], "error": f"{type(error).__name__}: {error}"})
@@ -112,8 +98,8 @@ def serve(channel, cfg, *, factory=None):
             pass
         raise
     finally:
-        if env is not None:
-            env.close()
+        if slot is not None:
+            slot.close()
         channel.close()
 
 

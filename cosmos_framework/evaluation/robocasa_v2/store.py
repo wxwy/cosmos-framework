@@ -351,7 +351,7 @@ class Store:
                 set(v) != {"task", "stream_id", "worker_id", "lease_id", "seed", "manifest_digest", "kind", "time_ns"}
                 or v["task"] != task
                 or v["manifest_digest"] != self.manifest["digest"]
-                or v["kind"] not in ("initial_continuous_reset", "resume_new_stream_no_scene_reproduction")
+                or v["kind"] not in ("initial_dynamic_slot_stream", "resume_dynamic_slot_stream")
             ):
                 raise ValueError("foreign stream")
             for key in ("stream_id", "worker_id", "lease_id"):
@@ -404,6 +404,64 @@ class Store:
             raise ValueError("invalid cleanup receipt")
         return value
 
+    def allocate_environment(self, task, physical_slot_id):
+        """Durable per-Task environment seed sequence, including Resume rebuilds.
+
+        Called under the coordinator's Slot startup lock. A claimed but unused
+        grant is retained and consumes its seed, so crashes never reuse it.
+        """
+        self._lease()
+        identifier(physical_slot_id)
+        self._healthy_stream(task)
+        directory = self._internal(task) / "environments"
+        prior = records(directory)
+        ordinals = [v["ordinal"] for v in prior]
+        if sorted(ordinals) != list(range(len(prior))):
+            raise ValueError("environment grant sequence damaged")
+        ordinal = len(prior)
+        if ordinal >= 2**32:
+            raise ValueError("environment seed space exhausted")
+        value = {
+            "task": task,
+            "environment_id": uuid.uuid4().hex,
+            "physical_slot_id": physical_slot_id,
+            "ordinal": ordinal,
+            "seed": (self.manifest["seed"] + ordinal) % 2**32,
+            "manifest_digest": self.manifest["digest"],
+        }
+        save(directory / f"{value['environment_id']}.json", value)
+        return value
+
+    def _check_sampling(self, a, sampling):
+        grant = load(self._internal(a["task"]) / "environments" / f"{identifier(sampling['environment_id'])}.json")
+        if (
+            grant["task"] != a["task"]
+            or grant["manifest_digest"] != self.manifest["digest"]
+            or grant["seed"] != sampling["actual_seed"]
+            or grant["physical_slot_id"] != sampling["physical_slot_id"]
+        ):
+            raise ValueError("scene sampling contradicts durable environment seed grant")
+
+    def bind_sampling(self, a, sampling):
+        self._lease()
+        self._attempt(a)
+        if self.active_attempts.get((a["task"], a["episode"])) != a or self.events(a)[-1]["kind"] != "ADMITTED":
+            raise ValueError("owned admitted scene required for sampling binding")
+        self._check_sampling(a, sampling)
+        save(
+            self._ledger(a["task"], a["episode"]) / "sampling" / f"{a['attempt_id']}.json",
+            {"attempt": a, "sampling": sampling},
+        )
+
+    def _validate_sampling(self, a, row):
+        if "sampling" in row:
+            self._check_sampling(a, row["sampling"])
+            if load(self._ledger(a["task"], a["episode"]) / "sampling" / f"{a['attempt_id']}.json") != {
+                "attempt": a,
+                "sampling": row["sampling"],
+            }:
+                raise ValueError("Core sampling is not the admitted scene")
+
     def begin_task(self, task, *, seed=None, recovery_only=False):
         self._lease()
         if task in self.active_tasks:
@@ -421,7 +479,7 @@ class Store:
             "lease_id": self.lease_id,
             "seed": self.manifest["seed"] if not previous else secrets.randbits(32),
             "manifest_digest": self.manifest["digest"],
-            "kind": "initial_continuous_reset" if not previous else "resume_new_stream_no_scene_reproduction",
+            "kind": "initial_dynamic_slot_stream" if not previous else "resume_dynamic_slot_stream",
             "time_ns": time.time_ns(),
         }
         if seed is not None:
@@ -606,6 +664,7 @@ class Store:
         events = self.events(a)
         if not events or events[-1]["kind"] != "ADMITTED" or row["reset_index"] != events[-1]["data"]["reset_index"]:
             raise ValueError("Core result lacks admitted scene")
+        self._validate_sampling(a, row)
         if row["outcome"] not in ("success", "failure"):
             raise ValueError("only valid environment outcomes can Core Commit")
         return row
@@ -817,6 +876,7 @@ class Store:
         work = self._ledger(*key) / "work" / a["attempt_id"]
         if staging != work or not staging.is_dir():
             raise ValueError("owned attempt staging required")
+        self._validate_sampling(a, row)
         inventory = validate(staging, row)
         save(staging / "core_inventory.json", {"row_digest": digest(row), "files": inventory})
         save(staging / "result.json", row)
@@ -1075,7 +1135,7 @@ class Store:
                     {
                         "stream_id": s["stream_id"],
                         "worker_id": s["worker_id"],
-                        "actual_seed": s["seed"],
+                        "logical_stream_seed": s["seed"],
                         "kind": s["kind"],
                     }
                     for s in self._streams(task)
