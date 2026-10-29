@@ -85,6 +85,14 @@ from cosmos_framework.inference.common.init import init_output_dir
 from cosmos_framework.inference.inference import OmniInference
 from cosmos_framework.inference.robocasa_composite_visual import prepare_robocasa_composite_frame
 from cosmos_framework.inference.robocasa_local_memory_policy import RoboCasaLocalMemoryPolicyAdapter
+from cosmos_framework.inference.robocasa_session_transactions import (
+    MAX_BODY,
+    Reply,
+    SessionTransactions,
+    identifier,
+    json_bytes,
+    strict_json,
+)
 from cosmos_framework.scripts.action_policy_server_utils import (
     DEFAULT_FALLBACK_OUTPUT_DIR,
     disable_runtime_ema_for_frozen_config,
@@ -519,6 +527,13 @@ class ActionServerArgs(pydantic.BaseModel):
     """Online V3 Local-TTT mode. Formal Local-TTT evaluation must use ``required``."""
     local_memory_max_sessions: int = 64
     """Maximum concurrent online Local-TTT episode sessions."""
+    transaction_profile: Literal["legacy", "b1"] = "legacy"
+    """Opt-in Phase B transaction/B1 API. Does not enable multi-Sim or B>1."""
+    transaction_owner_token_file: Path | None = None
+    transaction_run_lease: str | None = None
+    transaction_manifest_digest: str | None = None
+    transaction_slot_id: str | None = None
+    transaction_timeout_s: float = 600.0
 
     # ----- prompt format ------------------------------------------------------
     format_prompt_as_json: bool | None = None
@@ -596,15 +611,89 @@ class ActionServerConfig:
     checkpoint_dir: str
 
 
+def _transaction_options(args):
+    fields = (
+        args.transaction_owner_token_file,
+        args.transaction_run_lease,
+        args.transaction_manifest_digest,
+        args.transaction_slot_id,
+    )
+    if args.transaction_profile == "legacy":
+        if any(value is not None for value in fields):
+            raise ValueError("transaction identity options require explicit transaction_profile=b1")
+        return None
+    if (
+        args.local_memory_mode != "required"
+        or args.local_memory_max_sessions != 1
+        or args.action_chunk_size != 16
+        or any(value is None for value in fields)
+    ):
+        raise ValueError(
+            "B1 transaction profile requires required Local-TTT, one Slot, explicit H16 and complete identity"
+        )
+    token_path = Path(args.transaction_owner_token_file)
+    if token_path.stat().st_mode & 0o077 or token_path.stat().st_size > 256:
+        raise ValueError("transaction owner capability file must be private and bounded")
+    if getattr(args, "run_validation", False):
+        raise ValueError("transaction profile cannot execute training/developer validation")
+    if (
+        not isinstance(args.transaction_manifest_digest, str)
+        or len(args.transaction_manifest_digest) != 64
+        or any(c not in "0123456789abcdef" for c in args.transaction_manifest_digest)
+    ):
+        raise ValueError("transaction manifest SHA256 required before model initialization")
+    timeout = getattr(args, "transaction_timeout_s", 600.0)
+    if not 0 < timeout <= 6000:
+        raise ValueError("finite bounded transaction timeout required")
+    return dict(
+        owner_token=identifier(token_path.read_text().strip(), limit=256),
+        run_lease=identifier(args.transaction_run_lease),
+        manifest_digest=args.transaction_manifest_digest,
+        slot_ids=(identifier(args.transaction_slot_id, limit=64),),
+        timeout_s=timeout,
+    )
+
+
+def transaction_dispatch(service, method, path, record=None, headers=None) -> Reply:
+    actor = getattr(service, "transactions", None)
+    if actor is None:
+        return Reply(404, json_bytes({"error": "transaction profile not enabled"}))
+    record, headers = ({} if record is None else record), ({} if headers is None else headers)
+    if method == "POST" and path == "/v2/session/register":
+        return actor.register(record, headers.get("X-Cosmos-Owner", ""))
+    if method == "POST" and path == "/v2/inference" and set(record) == {"lease", "payload"}:
+        return actor.submit(record["lease"], record["payload"])
+    if method == "POST" and path == "/v2/inference/ack" and set(record) == {"lease", "request_key", "payload_sha256"}:
+        return actor.acknowledge(record["lease"], record["request_key"], record["payload_sha256"])
+    if method == "POST" and path == "/v2/session/end" and set(record) == {"lease"}:
+        return actor.end(record["lease"])
+    if method == "GET" and path.startswith("/v2/inference/"):
+        key = path.removeprefix("/v2/inference/")
+        assignment = headers.get("X-Cosmos-Assignment", "")
+        sha = headers.get("X-Cosmos-Payload-SHA256", "")
+        if len(assignment) > 4096 or any(
+            len(v) != 64 or any(c not in "0123456789abcdef" for c in v) for v in (key, sha)
+        ):
+            raise ValueError("bounded assignment and exact inference digests required")
+        return actor.result(strict_json(assignment.encode()), key, sha)
+    raise ValueError("unsupported transaction operation/schema")
+
+
 class ActionModelService:
     def __init__(self, args: ActionServerArgs) -> None:
+        transaction_options = _transaction_options(args)
+        self.transactions = None
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for OmniMoTModel inference in this repo.")
+        if transaction_options is not None and torch.cuda.device_count() != 1:
+            raise ValueError("B1 transaction increment requires exactly one visible model GPU")
 
         # OmniInference internally calls into FSDP / DTensor parallelize utilities
         # that expect a process group; create a single-rank PG when not under
         # torchrun (init_script() only inits the PG when WORLD_SIZE>1).
         maybe_init_distributed()
+        if transaction_options is not None and torch.distributed.get_world_size() != 1:
+            raise ValueError("B1 transaction increment requires a single-rank model owner")
 
         setup_overrides = args.build_setup_overrides()
         setup_args = setup_overrides.build_setup()
@@ -765,6 +854,22 @@ class ActionModelService:
             max_sessions=int(args.local_memory_max_sessions),
         )
         log.info(f"[action-server] local_memory={self.local_memory_adapter.info()}")
+        if transaction_options is not None:
+            if (
+                self.cfg.action_chunk_size != 16
+                or self.raw_action_dim != 15
+                or not self.requires_state
+                or self.local_memory_adapter.info()["k_local"] != 4
+                or self.local_memory_adapter.info()["local_dim"] != 32
+            ):
+                raise ValueError("B1 transaction profile requires resolved raw15/state15/H16/K4/local32")
+            self.transactions = SessionTransactions(
+                self.local_memory_adapter,
+                self._transaction_action,
+                self._transaction_quiesce,
+                model_lock=self._lock,
+                **transaction_options,
+            )
 
         if args.run_validation:
             self._run_developer_validation()
@@ -894,6 +999,11 @@ class ActionModelService:
         params.json without needing to know CLI flags.
         """
         return {
+            "session_transactions": (
+                self.transactions.info()
+                if getattr(self, "transactions", None) is not None
+                else {"enabled": False, "profile": "legacy"}
+            ),
             "run_name": self.cfg.experiment_name,
             "checkpoint": self.cfg.checkpoint_dir,
             "config_file": str(self.setup_args.config_file),
@@ -1025,6 +1135,44 @@ class ActionModelService:
             action_t_d[0, : state_token.shape[0]] = state_token
         return action_t_d
 
+    def _single_policy_batch(self, prep):
+        return {
+            self._input_video_key(): [[prep["video_padded"]]],
+            **make_batched_action_processing_fields(
+                ActionProcessingRecord(raw_action_dim=self.raw_action_dim, action_normalizer=None), batch_size=1
+            ),
+            "action": [[self._build_action_input(prep["state_token"])]],
+            "mode": ["wam"],
+            "ai_caption": [prep["augmented_prompt"]],
+            "prompt": [prep["augmented_prompt"]],
+            "conditioning_fps": [torch.tensor(self.cfg.fps, dtype=torch.long)],
+            "image_size": prep["padded_image_size"].unsqueeze(0).to(device="cuda"),
+            "domain_id": [torch.tensor(get_domain_id(prep["domain_name"]), dtype=torch.long)],
+            "sequence_plan": [prep["sequence_plan"]],
+        }
+
+    def _transaction_action(self, req, update):
+        prep = self._prep_policy_item(req)
+        with torch.inference_mode():
+            samples = self.model.generate_samples_from_batch(
+                self._single_policy_batch(prep),
+                guidance=self.cfg.guidance,
+                seed=[self.cfg.seed],
+                num_steps=self.cfg.num_steps,
+                has_negative_prompt=False,
+                _local_memory_prefixes=self.local_memory_adapter.prefixes(update),
+            )
+        if len(samples["action"]) != 1:
+            raise ValueError("B1 native output cardinality mismatch")
+        action = self._denormalize_action(samples["action"][0].float().squeeze(0))
+        if prep["state_token"] is not None:
+            action = action[1:]
+        return action.detach().cpu().tolist()
+
+    def _transaction_quiesce(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     def predict_policy_batch(self, reqs: list[dict[str, Any]]) -> dict[str, Any]:
         """Batched policy inference: N requests -> ONE diffusion forward (batch_size=N).
 
@@ -1098,6 +1246,8 @@ class ActionModelService:
 
         All action dimensions are returned. Video is the decoded predicted rollout as base64 PNGs.
         """
+        if getattr(self, "transactions", None) is not None:
+            raise ValueError("use the owned /v2 Session API; legacy /predict cannot bypass transaction ownership")
         t0 = time.monotonic()
         command = req.get("_local_memory_command")
         if command is not None:
@@ -1334,7 +1484,9 @@ class _ActionHandler(BaseHTTPRequestHandler):
     server: ThreadingHTTPServer  # type: ignore[assignment]
 
     def _send_json(self, status_code: int, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload).encode("utf-8")
+        self._send_bytes(status_code, json.dumps(payload).encode("utf-8"))
+
+    def _send_bytes(self, status_code: int, body: bytes) -> None:
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         # Avoid caches/proxies returning stale results.
@@ -1348,8 +1500,52 @@ class _ActionHandler(BaseHTTPRequestHandler):
             # Avoid noisy tracebacks; nothing to do server-side.
             return
 
+    def _transaction(self, method):
+        service = getattr(self.server, "service")
+        if getattr(service, "transactions", None) is None:
+            self._send_json(404, {"error": "transaction profile not enabled"})
+            return
+        if not service.transactions.http_slots.acquire(blocking=False):
+            self._send_json(503, {"error": "bounded transaction HTTP capacity exhausted"})
+            return
+        try:
+            self._transaction_owned(method, service)
+        finally:
+            service.transactions.http_slots.release()
+
+    def _transaction_owned(self, method, service):
+        try:
+            record = None
+            if method == "POST":
+                if (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower() != "application/json":
+                    self._send_json(415, {"error": "Content-Type must be application/json"})
+                    return
+                length = int(self.headers.get("Content-Length") or "0")
+                if not 0 < length <= MAX_BODY + 8192:
+                    self._send_json(413, {"error": "bounded transaction body required"})
+                    return
+                self.connection.settimeout(min(30.0, service.transactions.timeout_s))
+                raw = self.rfile.read(length)
+                if len(raw) != length:
+                    raise ValueError("truncated transaction body")
+                record = strict_json(raw)
+            reply = transaction_dispatch(service, method, self.path, record, self.headers)
+        except (ValueError, TypeError, KeyError) as error:
+            self._send_json(400, {"error": str(error)})
+            return
+        except RuntimeError as error:
+            self._send_json(409, {"error": str(error)})
+            return
+        except Exception:
+            log.exception("transaction HTTP operation failed")
+            self._send_json(500, {"error": "transaction HTTP operation failed"})
+            return
+        self._send_bytes(reply.status, reply.body)
+
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/info":
+        if self.path.startswith("/v2/"):
+            self._transaction("GET")
+        elif self.path == "/info":
             service: ActionModelService = getattr(self.server, "service")  # type: ignore[attr-defined]
             self._send_json(200, service.get_info())
         elif self.path == "/":
@@ -1358,6 +1554,9 @@ class _ActionHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "Not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path.startswith("/v2/"):
+            self._transaction("POST")
+            return
         if self.path not in ("/", "/predict", "/predict_batch"):
             self._send_json(404, {"error": "Not found"})
             return
@@ -1476,7 +1675,15 @@ def serve(args: ActionServerArgs) -> None:
 
     httpd: ThreadingHTTPServer = ThreadingHTTPServer((args.host, int(args.port)), _ActionHandler)
     setattr(httpd, "service", service)
-    httpd.serve_forever()
+    if service.transactions is None:
+        httpd.serve_forever()
+        return
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+        if service.transactions is not None and not service.transactions.close():
+            log.error("Session actor cleanup unproven; owned-process decommission is required")
 
 
 def main() -> None:

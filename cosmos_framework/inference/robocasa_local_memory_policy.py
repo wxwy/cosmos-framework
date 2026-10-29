@@ -14,6 +14,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from cosmos_framework.inference.local_memory_online import OnlineLocalMemory, OnlineMemoryRequest, OnlineMemoryUpdate
+from cosmos_framework.inference.local_memory_state import CachedMemoryResponse, MemorySnapshot
 from cosmos_framework.inference.robocasa_composite_visual import (
     encode_current_composite_visual96,
     prepare_robocasa_composite_frame,
@@ -67,7 +68,6 @@ class RoboCasaLocalMemoryPolicyAdapter:
         if mode not in ("off", "required"):
             raise ValueError("V3 Local Memory mode must be off or required")
         self.service, self.mode, self.decode_image = service, mode, decode_image
-        self._visual_records: dict[str, _VisualRecord] = {}
         self._visual_pending: dict[str, _PreparedUpdate] = {}
         self._lock = threading.RLock()
         self.memory: OnlineLocalMemory | None = None
@@ -94,6 +94,18 @@ class RoboCasaLocalMemoryPolicyAdapter:
                 max_sessions=max_sessions,
                 max_evidence_steps=max_evidence_steps,
             )
+            self.memory.paired = True
+            self._lock = self.memory.store.lock
+
+    @property
+    def snapshot(self) -> MemorySnapshot:
+        if self.memory is None:
+            raise RuntimeError("Local-TTT is off")
+        return self.memory.store.snapshot
+
+    @property
+    def _visual_records(self):
+        return self.snapshot.visual
 
     def _row(self, row: Any, expected: int) -> tuple[torch.Tensor, torch.Tensor]:
         if not isinstance(row, dict) or set(row) != {"source_step", "composite_image", "executed_action"}:
@@ -200,7 +212,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
             self._visual_pending[request.session_id] = update
             return update
 
-    def commit(self, update: _PreparedUpdate | None) -> None:
+    def commit(self, update: _PreparedUpdate | None, response: CachedMemoryResponse | None = None) -> None:
         if update is None:
             return
         assert self.memory is not None
@@ -208,8 +220,19 @@ class RoboCasaLocalMemoryPolicyAdapter:
         with self._lock:
             if self._visual_pending.get(session_id) is not update:
                 raise RuntimeError("Local-TTT visual commit requires exact pending capability")
-            self.memory.commit(update.memory)
-            self._visual_records[session_id] = update.visual_replacement
+            self.memory.validate_commit(update.memory)
+            snapshot = self.snapshot
+            responses = dict(snapshot.responses)
+            responses.pop(session_id, None)
+            if response is not None:
+                responses[session_id] = response
+            replacement = MemorySnapshot.build(
+                {**snapshot.fast, session_id: update.memory.replacement},
+                {**snapshot.visual, session_id: update.visual_replacement},
+                responses,
+            )
+            self.memory.store.snapshot = replacement
+            del self.memory._pending[session_id]
             del self._visual_pending[session_id]
 
     def abort(self, update: _PreparedUpdate | None) -> None:
@@ -225,10 +248,9 @@ class RoboCasaLocalMemoryPolicyAdapter:
         if self.memory is None:
             return
         with self._lock:
-            if session_id in self._visual_pending:
+            if session_id in self._visual_pending or session_id in self.memory._pending:
                 raise RuntimeError("cannot reset Local-TTT visual session during pending generation")
-            self.memory.reset_session(session_id)
-            self._visual_records.pop(session_id, None)
+            self.memory.store.snapshot = self.snapshot.without(session_id)
 
     def prefixes(self, update: _PreparedUpdate | None) -> tuple[torch.Tensor | None, ...] | None:
         return None if update is None else (update.memory.token,)

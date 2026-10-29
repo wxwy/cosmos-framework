@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 
+from cosmos_framework.inference.local_memory_state import MemorySnapshot, MemoryStateStore
 from cosmos_framework.model.generator.mot.local_evidence import (
     CANONICAL_EVIDENCE_FEATURE_CONFIG,
     ContinualTTTFastState,
@@ -85,9 +85,14 @@ class OnlineLocalMemory:
         self.action_dim = action_dim
         self.max_sessions = int(max_sessions)
         self.max_evidence_steps = int(max_evidence_steps)
-        self._records: dict[str, _Record] = {}
+        self.store = MemoryStateStore()
+        self.paired = False
         self._pending: dict[str, OnlineMemoryUpdate] = {}
-        self._lock = threading.RLock()
+        self._lock = self.store.lock
+
+    @property
+    def _records(self):
+        return self.store.snapshot.fast
 
     @staticmethod
     def _detach_state(state: ContinualTTTFastState) -> ContinualTTTFastState:
@@ -178,8 +183,8 @@ class OnlineLocalMemory:
                     raise ValueError("completed Local-TTT evidence must be contiguous and exactly-once")
                 visual = visual.to(device)
                 action = action.to(device)
-                state = previous.state
-                token = previous.token
+                state = None if previous.state is None else self._detach_state(previous.state)
+                token = None if previous.token is None else previous.token.detach().clone()
                 self.core.reset_telemetry()
                 if self.scan_local_memory is not None:
                     for start in range(0, len(expected), self.core.ttt_tbptt_steps):
@@ -249,14 +254,23 @@ class OnlineLocalMemory:
 
     def commit(self, update: OnlineMemoryUpdate) -> None:
         with self._lock:
-            if (
-                update.owner is not self
-                or self._pending.get(update.session_id) is not update
-                or self._records.get(update.session_id) is not update.previous
-            ):
-                raise RuntimeError("online Local-TTT commit requires exact pending capability")
-            self._records[update.session_id] = update.replacement
+            if self.paired:
+                raise RuntimeError("paired Local-TTT must commit through its visual transaction owner")
+            self.validate_commit(update)
+            snapshot = self.store.snapshot
+            replacement = MemorySnapshot.build(
+                {**snapshot.fast, update.session_id: update.replacement}, snapshot.visual, snapshot.responses
+            )
+            self.store.snapshot = replacement
             del self._pending[update.session_id]
+
+    def validate_commit(self, update: OnlineMemoryUpdate) -> None:
+        if (
+            update.owner is not self
+            or self._pending.get(update.session_id) is not update
+            or self._records.get(update.session_id) is not update.previous
+        ):
+            raise RuntimeError("online Local-TTT commit requires exact pending capability")
 
     def abort(self, update: OnlineMemoryUpdate) -> None:
         with self._lock:
@@ -265,9 +279,11 @@ class OnlineLocalMemory:
 
     def reset_session(self, session_id: str) -> None:
         with self._lock:
+            if self.paired:
+                raise RuntimeError("paired Local-TTT must reset through its visual transaction owner")
             if session_id in self._pending:
                 raise RuntimeError("cannot reset Local-TTT during pending generation")
-            self._records.pop(session_id, None)
+            self.store.snapshot = self.store.snapshot.without(session_id)
 
     def info(self) -> dict[str, object]:
         with self._lock:
