@@ -53,7 +53,13 @@ def mkdir(path):
             raise ValueError("directory required")
         return
     mkdir(path.parent)
-    path.mkdir()
+    try:
+        path.mkdir()
+    except FileExistsError:
+        # A concurrent creator may have won; accept only a real directory.
+        path = safe(path)
+        if not path.is_dir():
+            raise ValueError("directory required")
     sync_dir(path.parent)
 
 
