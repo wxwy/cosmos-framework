@@ -52,6 +52,14 @@ def step(state, iteration):
 @pytest.fixture(autouse=True)
 def cpu_boundaries(monkeypatch):
     monkeypatch.setattr(loader_module.RawRecipe, "from_producer", classmethod(lambda cls, p, c: SyntheticRecipe()))
+    # This pre-existing oracle deliberately uses an arbitrary three-RNG
+    # Transform and reduced B1 geometry. Keep its explicit RAW backend seam;
+    # the known production JSON pipeline is exercised by async_loader_test.
+    monkeypatch.setattr(
+        trainer_module,
+        "NoTTTAsyncLoader",
+        lambda producer, profile, planner: loader_module.NoTTTCpuLoader(producer, profile),
+    )
     monkeypatch.setattr(trainer_module, "collate_grouped_native_batch", lambda payloads: {"payloads": payloads})
     monkeypatch.setattr(trainer_module.misc, "to", lambda value, **kwargs: value)
     # Native config fixtures may leave inference grad mode disabled globally.
@@ -195,9 +203,8 @@ def test_worker_count_changes_resume_same_committed_state_without_changing_train
         if resumed is not None and resumed[0]._no_ttt_loader is not None:
             resumed[0]._no_ttt_loader.close()
 
-@pytest.mark.parametrize(
-    "damage", ["rank", "world", "seed", "config", "corpus", "source", "format", "sidecar"]
-)
+
+@pytest.mark.parametrize("damage", ["rank", "world", "seed", "config", "corpus", "source", "format", "sidecar"])
 def test_wrong_checkpoint_profile_never_starts_workers_or_native_model(damage):
     source = make()
     try:
