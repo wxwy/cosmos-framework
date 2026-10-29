@@ -276,3 +276,18 @@ def test_http_capacity_refusal_does_not_parse_or_schedule():
     handler._send_json = lambda code, value: replies.append((code, value))
     handler.do_POST()
     assert replies[0][0] == 503
+
+
+def test_lost_device_cannot_skip_required_gpu_quiescence(monkeypatch):
+    obj = server.ActionModelService.__new__(server.ActionModelService)
+    called = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    def failed_drain():
+        called.append(True)
+        raise RuntimeError("injected lost-device drain failure")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", failed_drain)
+    with pytest.raises(RuntimeError, match="lost-device drain failure"):
+        obj._transaction_quiesce()
+    assert called == [True]

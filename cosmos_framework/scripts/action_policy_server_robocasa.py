@@ -1170,8 +1170,9 @@ class ActionModelService:
         return action.detach().cpu().tolist()
 
     def _transaction_quiesce(self):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # This service is constructed only with one GPU. Device loss must raise,
+        # not silently turn an unproven drain into positive Session cleanup.
+        torch.cuda.synchronize()
 
     def predict_policy_batch(self, reqs: list[dict[str, Any]]) -> dict[str, Any]:
         """Batched policy inference: N requests -> ONE diffusion forward (batch_size=N).
