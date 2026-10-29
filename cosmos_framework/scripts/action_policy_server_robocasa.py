@@ -91,6 +91,7 @@ from cosmos_framework.inference.robocasa_session_transactions import (
     SessionTransactions,
     identifier,
     json_bytes,
+    monotonic_clock_domain,
     strict_json,
 )
 from cosmos_framework.scripts.action_policy_server_utils import (
@@ -645,6 +646,7 @@ def _transaction_options(args):
     timeout = getattr(args, "transaction_timeout_s", 600.0)
     if not 0 < timeout <= 6000:
         raise ValueError("finite bounded transaction timeout required")
+    monotonic_clock_domain()  # Fail before native model initialization if comparability is unproven.
     return dict(
         owner_token=identifier(token_path.read_text().strip(), limit=256),
         run_lease=identifier(args.transaction_run_lease),
@@ -661,8 +663,8 @@ def transaction_dispatch(service, method, path, record=None, headers=None) -> Re
     record, headers = ({} if record is None else record), ({} if headers is None else headers)
     if method == "POST" and path == "/v2/session/register":
         return actor.register(record, headers.get("X-Cosmos-Owner", ""))
-    if method == "POST" and path == "/v2/inference" and set(record) == {"lease", "payload"}:
-        return actor.submit(record["lease"], record["payload"])
+    if method == "POST" and path == "/v2/inference" and set(record) == {"lease", "payload", "budget"}:
+        return actor.submit(record["lease"], record["payload"], budget=record["budget"])
     if method == "POST" and path == "/v2/inference/ack" and set(record) == {"lease", "request_key", "payload_sha256"}:
         return actor.acknowledge(record["lease"], record["request_key"], record["payload_sha256"])
     if method == "POST" and path == "/v2/session/end" and set(record) == {"lease"}:
@@ -1533,6 +1535,9 @@ class _ActionHandler(BaseHTTPRequestHandler):
             reply = transaction_dispatch(service, method, self.path, record, self.headers)
         except (ValueError, TypeError, KeyError) as error:
             self._send_json(400, {"error": str(error)})
+            return
+        except TimeoutError as error:
+            self._send_json(408, {"error": str(error)})
             return
         except RuntimeError as error:
             self._send_json(409, {"error": str(error)})

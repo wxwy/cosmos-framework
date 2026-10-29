@@ -12,12 +12,14 @@ import json
 import logging
 import math
 import secrets
+import sys
 import threading
 import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from cosmos_framework.inference.local_memory_state import CachedMemoryResponse
@@ -57,6 +59,51 @@ def identifier(value: Any, *, limit=128) -> str:
 
 def digest(value: Any) -> str:
     return hashlib.sha256(json_bytes(value)).hexdigest()
+
+
+def monotonic_clock_domain() -> str:
+    """Prove Linux same-boot/same-monotonic-offset comparability, including containers.
+
+    Arbitrary remote monotonic clocks are unsupported. Missing kernel evidence is
+    an error, never a wall-clock or receive-time budget fallback.
+    """
+    info = time.get_clock_info("monotonic")
+    if sys.platform != "linux" or not info.monotonic or info.implementation != "clock_gettime(CLOCK_MONOTONIC)":
+        raise ValueError("proven Linux CLOCK_MONOTONIC domain required")
+
+    def read(path):
+        with Path(path).open("rb") as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise ValueError("bounded kernel clock identity required")
+        return raw.decode("ascii")
+
+    boot = str(uuid.UUID(read("/proc/sys/kernel/random/boot_id").strip()))
+    rows = [line.split() for line in read("/proc/self/timens_offsets").splitlines()]
+    offsets = [row for row in rows if row and row[0] == "monotonic"]
+    if len(offsets) != 1 or len(offsets[0]) != 3:
+        raise ValueError("kernel monotonic namespace offset required")
+    seconds, nanos = map(int, offsets[0][1:])
+    if not 0 <= nanos < 10**9:
+        raise ValueError("invalid kernel monotonic offset")
+    return digest({"clock": "linux.CLOCK_MONOTONIC", "boot_id": boot, "offset_ns": seconds * 10**9 + nanos})
+
+
+def original_deadline(budget: dict, domain: str, now: float, timeout_s: float) -> float:
+    if not isinstance(budget, dict) or set(budget) != {"clock_domain", "started_at", "deadline"}:
+        raise ValueError("exact original prediction budget required")
+    if budget["clock_domain"] != domain:
+        raise ValueError("prediction clock domain mismatch")
+    start, end = budget["started_at"], budget["deadline"]
+    if any(
+        type(value) not in (int, float) or abs(value) > 10**15 or not math.isfinite(value) for value in (start, end)
+    ):
+        raise ValueError("finite original prediction budget required")
+    if start < 0 or start > now or end <= start or end > start + timeout_s:
+        raise ValueError("invalid original prediction budget or exceeds Server cap")
+    if end <= now:
+        raise TimeoutError("original prediction deadline exhausted before admission")
+    return end
 
 
 @dataclass(frozen=True)
@@ -129,6 +176,7 @@ class SessionTransactions:
         self.run_lease, self.manifest_digest = identifier(run_lease), manifest_digest
         self.slot_ids = tuple(identifier(slot, limit=64) for slot in slot_ids)
         self.timeout_s, self.max_bytes, self.clock = timeout_s, max_bytes, clock
+        self.clock_domain = monotonic_clock_domain()
         self.server_epoch = uuid.uuid4().hex
         self._lock = threading.RLock()
         self._model_lock = model_lock if model_lock is not None else threading.Lock()
@@ -166,6 +214,7 @@ class SessionTransactions:
                 "stopping": self._stopping,
                 "generated_media": "unsupported_in_b1_increment",
                 "timeout_s": self.timeout_s,
+                "prediction_clock_domain": self.clock_domain,
                 "max_encoded_bytes": self.max_bytes,
                 "max_item_bytes": MAX_BODY,
                 "max_http_requests": len(self.slot_ids) + 1,
@@ -203,7 +252,7 @@ class SessionTransactions:
             if current is not None:
                 expected = {key: getattr(current, key) for key in record}
                 if record == expected:
-                    return self._reply(200, {"lease": asdict(current)})
+                    return self._reply(200, {"lease": asdict(current), "prediction_clock_domain": self.clock_domain})
                 raise ValueError("previous physical Slot assignment has not received End ACK")
             if record["generation"] <= self._generations[slot]:
                 raise ValueError("stale Slot generation")
@@ -218,7 +267,7 @@ class SessionTransactions:
             self._generations[slot] = lease.generation
             self._leases[slot] = lease
             self._failed.pop(slot, None)
-            return self._reply(200, {"lease": asdict(lease)})
+            return self._reply(200, {"lease": asdict(lease), "prediction_clock_domain": self.clock_domain})
 
     def _lease(self, proof: dict, *, closed=False) -> SessionLease:
         if not isinstance(proof, dict) or set(proof) != set(SessionLease.__dataclass_fields__):
@@ -256,7 +305,8 @@ class SessionTransactions:
             ticket.payload, ticket.update = {}, None
             self._changed.notify_all()
 
-    def submit(self, proof: dict, payload: dict) -> Reply:
+    def submit(self, proof: dict, payload: dict, *, budget: dict) -> Reply:
+        deadline = original_deadline(budget, self.clock_domain, self.clock(), self.timeout_s)
         raw = json_bytes(payload)
         if len(raw) > MAX_BODY:
             raise ValueError("encoded inference item exceeds bound")
@@ -298,7 +348,9 @@ class SessionTransactions:
                 raise ValueError("one queued/inflight/undelivered request per physical Slot")
             if sum(item.size for item in self._tickets.values()) + len(raw) > self.max_bytes:
                 raise RuntimeError("bounded encoded-request capacity exhausted")
-            ticket = _Ticket(key, payload_sha, lease, payload, len(raw), self.clock() + self.timeout_s)
+            # Include body validation/serialization/lock wait in the SAME original budget.
+            original_deadline(budget, self.clock_domain, self.clock(), self.timeout_s)
+            ticket = _Ticket(key, payload_sha, lease, payload, len(raw), deadline)
             self._tickets[key] = ticket
             try:
                 self._executor.submit(self._execute, ticket)

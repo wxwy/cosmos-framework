@@ -4,6 +4,7 @@ import io
 import json
 import sys
 import threading
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlsplit
@@ -15,10 +16,12 @@ import torch
 from cosmos_framework.inference.robocasa_session_transactions import SessionTransactions
 from cosmos_framework.inference.robocasa_session_transactions_test import (
     ack,
+    clock_kernel,  # noqa: F401 - shared explicit kernel fixture used by pytest
     make_adapter,
     payload,
     register,
     registration,
+    submit,
     wait_result,
 )
 from cosmos_framework.inference.robocasa_transaction_client import TransactionPolicyClient
@@ -86,7 +89,7 @@ def test_native_b1_action_and_real_fast_state_match_legacy_inputs(monkeypatch):
     try:
         lease = register(actor)
         for request in (payload(lease), payload(lease, 2, 0, 7)):
-            current = wait_result(actor, lease, actor.submit(lease, request))
+            current = wait_result(actor, lease, submit(actor, lease, request))
             reference = legacy.predict_policy(request)
             torch.testing.assert_close(
                 torch.tensor(current.json()["action"]), torch.tensor(reference["action"]), rtol=0, atol=0
@@ -291,3 +294,429 @@ def test_lost_device_cannot_skip_required_gpu_quiescence(monkeypatch):
     with pytest.raises(RuntimeError, match="lost-device drain failure"):
         obj._transaction_quiesce()
     assert called == [True]
+
+
+class BudgetClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def pause(self, amount):
+        self.now += amount
+
+
+def settled(actor):
+    with actor._changed:
+        assert actor._changed.wait_for(
+            lambda: not actor._busy and all(t.quiescent for t in actor._tickets.values()), timeout=5
+        ), actor.info()
+
+
+@pytest.mark.parametrize("hot", [False, True])
+def test_original_budget_delayed_upload_cannot_commit_after_client_timeout(monkeypatch, hot):
+    obj, clock = service(monkeypatch), BudgetClock()
+    entered, release = threading.Event(), threading.Event()
+    original_generate = obj._transaction_action
+    delayed = [False]
+
+    def generate(request, update):
+        if delayed[0]:
+            entered.set()
+            assert release.wait(5)
+            clock.now = 1.2
+        return original_generate(request, update)
+
+    actor = SessionTransactions(
+        obj.local_memory_adapter,
+        generate,
+        lambda: None,
+        owner_token="cpu-owner",
+        run_lease="run",
+        manifest_digest="a" * 64,
+        slot_ids=("slot0",),
+        model_lock=obj._lock,
+        timeout_s=1,
+        clock=clock,
+    )
+    obj.transactions = actor
+
+    class DelayedUpload(DirectTransport):
+        def request(self, method, url, *, timeout, json=None, headers=None):
+            path = urlsplit(url).path
+            if delayed[0] and path == "/v2/inference":
+                clock.now = 0.8
+            reply = super().request(method, url, timeout=timeout, json=json, headers=headers)
+            if path == "/v2/inference":
+                if delayed[0]:
+                    assert entered.wait(5)
+                    clock.now = 1.0
+                else:
+                    settled(actor)
+            return reply
+
+    client = TransactionPolicyClient(
+        "http://cpu", timeout_s=1, clock=clock, pause=clock.pause, transport=DelayedUpload(obj)
+    )
+    try:
+        lease = client.register(registration(), "cpu-owner")
+        if hot:
+            client.predict(payload(lease))
+            clock.now = 0.0
+        before = obj.local_memory_adapter.snapshot
+        delayed[0] = True
+        try:
+            with pytest.raises(TimeoutError, match="original transaction deadline"):
+                client.predict(payload(lease, 1, 0) if hot else payload(lease))
+        finally:
+            release.set()
+            settled(actor)
+        assert obj.local_memory_adapter.snapshot is before
+        assert actor.info()["tickets"] == 0 and actor.info()["encoded_bytes"] == 0
+        assert actor._failed["slot0"]["error_type"] == "RuntimeError"
+        client.end()
+        assert client.lease is None
+    finally:
+        release.set()
+        assert actor.close()
+
+
+@pytest.fixture
+def budget_rig(monkeypatch):
+    obj, clock = service(monkeypatch), BudgetClock()
+    actor = SessionTransactions(
+        obj.local_memory_adapter,
+        obj._transaction_action,
+        lambda: None,
+        owner_token="cpu-owner",
+        run_lease="run",
+        manifest_digest="a" * 64,
+        slot_ids=("slot0",),
+        model_lock=obj._lock,
+        timeout_s=1,
+        clock=clock,
+    )
+    obj.transactions = actor
+
+    class Transport(DirectTransport):
+        before = None
+        after = None
+
+        def __init__(self):
+            super().__init__(obj)
+            self.records = []
+
+        def request(self, method, url, *, timeout, json=None, headers=None):
+            path = urlsplit(url).path
+            # Preserve the actual wire envelope, not references to mutable kwargs.
+            self.records.append((path, deepcopy(json)))
+            if self.before:
+                self.before(path, json)
+            try:
+                reply = super().request(method, url, timeout=timeout, json=json, headers=headers)
+            finally:
+                if path == "/v2/inference":
+                    settled(actor)
+            if self.after:
+                self.after(path, reply)
+            return reply
+
+    transport = Transport()
+    client = TransactionPolicyClient("http://cpu", timeout_s=1, clock=clock, pause=clock.pause, transport=transport)
+    lease = client.register(registration(), "cpu-owner")
+    yield obj, actor, clock, transport, client, lease
+    assert actor.close()
+
+
+@pytest.mark.parametrize("lost", ["before_accept", "after_accept", "ack", "none"])
+def test_original_budget_delay_retry_ack_and_postack_replay(budget_rig, lost):
+    obj, actor, clock, transport, client, lease = budget_rig
+    seen = []
+
+    def before(path, body):
+        if path == "/v2/inference" and not seen:
+            seen.append(body["budget"].copy())
+            clock.now += 0.25
+            if lost == "before_accept":
+                raise requests.ConnectionError("injected request lost before first arrival")
+
+    transport.before = before
+    if lost in ("after_accept", "ack"):
+        transport.drop.add("/v2/inference" if lost == "after_accept" else "/v2/inference/ack")
+    result = client.predict(payload(lease))
+    assert 0.25 <= clock.now < 1
+    posted = [body["budget"] for path, body in transport.records if path == "/v2/inference"]
+    assert posted and all(b == seen[0] for b in posted)
+    assert seen[0] == {"clock_domain": actor.clock_domain, "started_at": 0.0, "deadline": 1.0}
+    assert len(obj.native_calls) == 1 and actor.info()["tickets"] == 0
+    snapshot = obj.local_memory_adapter.snapshot
+    clock.now = 3  # A NEW read budget permits replay, never new execution/commit.
+    assert client.predict(payload(lease)) == result
+    assert obj.local_memory_adapter.snapshot is snapshot
+    assert len(obj.native_calls) == 1 and actor.info()["tickets"] == actor.info()["encoded_bytes"] == 0
+    client.end()
+
+
+@pytest.mark.parametrize("stage", ["upload", "generation", "device_drain"])
+def test_original_budget_exhaustion_rejects_before_publication(budget_rig, stage):
+    obj, actor, clock, transport, client, lease = budget_rig
+    snapshot = obj.local_memory_adapter.snapshot
+    if stage == "upload":
+        transport.before = lambda path, body: setattr(clock, "now", 1.1) if path == "/v2/inference" else None
+    elif stage == "generation":
+        original = actor.generate
+
+        def late_generation(request, update):
+            value = original(request, update)
+            clock.now = 1.1
+            return value
+
+        actor.generate = late_generation
+    else:
+        actor.quiesce = lambda: setattr(clock, "now", 1.1)
+    with pytest.raises(TimeoutError, match="original .*deadline"):
+        client.predict(payload(lease))
+    assert obj.local_memory_adapter.snapshot is snapshot
+    assert len(obj.native_calls) == (0 if stage == "upload" else 1)
+    assert actor.info()["tickets"] == actor.info()["encoded_bytes"] == 0
+    assert actor.info()["quarantined"] is False
+    client.end()
+
+
+@pytest.mark.parametrize("stage", ["response", "ack"])
+def test_response_or_ack_after_original_deadline_is_not_client_success(budget_rig, stage):
+    obj, actor, clock, transport, client, lease = budget_rig
+
+    def delay(path, reply):
+        if path == ("/v2/inference" if stage == "response" else "/v2/inference/ack"):
+            clock.now = 1.1
+
+    transport.after = delay
+    with pytest.raises(TimeoutError, match="original transaction deadline"):
+        client.predict(payload(lease))
+    assert len(obj.native_calls) == 1  # Commit happened in budget; do not fake rollback of a committed result.
+    snapshot = obj.local_memory_adapter.snapshot
+    transport.after = None
+    clock.now = 2
+    if stage == "ack":
+        client.predict(payload(lease))  # ACK already released Ticket; cached replay is a new read budget.
+        assert actor.info()["tickets"] == 0
+    else:
+        # Undelivered expired work cannot be renewed by a new predict call.
+        with pytest.raises(RuntimeError, match="cancelled/expired"):
+            client.predict(payload(lease))
+    assert obj.local_memory_adapter.snapshot is snapshot and len(obj.native_calls) == 1
+    client.end()
+
+
+@pytest.mark.parametrize(
+    "change", ["missing", "domain", "future", "expired", "nonfinite", "huge_int", "bool", "too_large", "extra"]
+)
+def test_dispatcher_rejects_missing_or_invalid_original_budget_without_allocation(budget_rig, change):
+    obj, actor, clock, transport, client, lease = budget_rig
+    record = {
+        "lease": lease,
+        "payload": payload(lease),
+        "budget": {
+            "clock_domain": actor.clock_domain,
+            "started_at": 0,
+            "deadline": 1,
+        },
+    }
+    if change == "missing":
+        del record["budget"]
+    elif change == "domain":
+        record["budget"]["clock_domain"] = "foreign-boot-or-time-namespace"
+    elif change == "future":
+        record["budget"]["started_at"] = 0.5
+    elif change == "expired":
+        clock.now = 1
+    elif change == "nonfinite":
+        record["budget"]["deadline"] = float("nan")
+    elif change == "huge_int":
+        record["budget"]["deadline"] = 10**1000
+    elif change == "bool":
+        record["budget"]["deadline"] = True
+    elif change == "too_large":
+        record["budget"]["deadline"] = 2
+    else:
+        record["budget"]["remaining_timeout"] = 1
+    snapshot = obj.local_memory_adapter.snapshot
+    with pytest.raises((ValueError, TimeoutError)):
+        server.transaction_dispatch(obj, "POST", "/v2/inference", record)
+    assert obj.local_memory_adapter.snapshot is snapshot and len(obj.native_calls) == 0
+    assert actor.info()["tickets"] == actor.info()["encoded_bytes"] == 0
+
+
+def test_registration_foreign_clock_domain_cannot_be_used_for_prediction(budget_rig):
+    obj, actor, clock, transport, client, lease = budget_rig
+    client.end()
+    client.clock_domain = "foreign-host"
+    with pytest.raises(ValueError, match="clock domain mismatch"):
+        client.register(registration(generation=2), "cpu-owner")
+    assert not obj.native_calls
+    with pytest.raises(RuntimeError, match="ownership unresolved"):
+        client.end()
+
+
+@pytest.mark.parametrize("which", ["boot", "offset", "clock"])
+def test_missing_clock_comparability_evidence_fails_closed(monkeypatch, which):
+    from cosmos_framework.inference import robocasa_session_transactions as module
+
+    if which == "clock":
+        monkeypatch.setattr(
+            module.time, "get_clock_info", lambda _: SimpleNamespace(monotonic=True, implementation="other")
+        )
+    else:
+        original = module.Path.open
+
+        def missing(path, *args, **kwargs):
+            if (which == "boot" and path.name == "boot_id") or (which == "offset" and path.name == "timens_offsets"):
+                raise OSError("kernel clock identity unavailable")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(module.Path, "open", missing)
+    with pytest.raises((ValueError, OSError)):
+        module.monotonic_clock_domain()
+
+
+def test_encoding_time_is_part_of_original_prediction_budget(budget_rig, monkeypatch):
+    from cosmos_framework.inference import robocasa_transaction_client as module
+
+    obj, actor, clock, transport, client, lease = budget_rig
+    encode = module.json_bytes
+
+    def slow_encode(value):
+        if "image" in value:
+            clock.now += 0.8
+        return encode(value)
+
+    monkeypatch.setattr(module, "json_bytes", slow_encode)
+    client.predict(payload(lease))
+    posted = [body["budget"] for path, body in transport.records if path == "/v2/inference"]
+    assert posted == [{"clock_domain": actor.clock_domain, "started_at": 0, "deadline": 1}]
+    assert len(obj.native_calls) == 1
+    client.end()
+
+
+def test_expired_original_budget_has_explicit_http_408(budget_rig):
+    obj, actor, clock, transport, client, lease = budget_rig
+    body = json.dumps(
+        {
+            "lease": lease,
+            "payload": payload(lease),
+            "budget": {
+                "clock_domain": actor.clock_domain,
+                "started_at": 0,
+                "deadline": 1,
+            },
+        }
+    ).encode()
+    clock.now = 1.1
+    handler = server._ActionHandler.__new__(server._ActionHandler)
+    handler.server = SimpleNamespace(service=obj)
+    handler.path = "/v2/inference"
+    handler.headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+    handler.rfile = io.BytesIO(body)
+    handler.connection = SimpleNamespace(settimeout=lambda _: None)
+    replies = []
+    handler._send_json = lambda code, value: replies.append((code, value))
+    handler.do_POST()
+    assert len(replies) == 1 and replies[0][0] == 408
+    assert "original prediction deadline" in replies[0][1]["error"]
+    assert actor.info()["tickets"] == 0 and not obj.native_calls
+
+
+def test_lost_first_response_inflight_retry_retains_original_ticket_deadline(monkeypatch):
+    obj, clock = service(monkeypatch), BudgetClock()
+    entered, release = threading.Event(), threading.Event()
+    native = obj._transaction_action
+
+    def generate(request, update):
+        entered.set()
+        assert release.wait(5)
+        clock.now = 1.1
+        return native(request, update)
+
+    actor = SessionTransactions(
+        obj.local_memory_adapter,
+        generate,
+        lambda: None,
+        owner_token="cpu-owner",
+        run_lease="run",
+        manifest_digest="a" * 64,
+        slot_ids=("slot0",),
+        model_lock=obj._lock,
+        timeout_s=1,
+        clock=clock,
+    )
+    obj.transactions = actor
+    budgets, original_ticket = [], []
+
+    class LostInflight(DirectTransport):
+        def request(self, method, url, *, timeout, json=None, headers=None):
+            path = urlsplit(url).path
+            if path == "/v2/inference":
+                budgets.append(deepcopy(json["budget"]))
+                if len(budgets) == 1:
+                    clock.now = 0.4
+                    super().request(method, url, timeout=timeout, json=json, headers=headers)
+                    assert entered.wait(5)
+                    with actor._lock:
+                        original_ticket.append(next(iter(actor._tickets.values())))
+                    raise requests.ConnectionError("first response lost while Generation inflight")
+                reply = super().request(method, url, timeout=timeout, json=json, headers=headers)
+                with actor._lock:
+                    assert next(iter(actor._tickets.values())) is original_ticket[0]
+                    assert original_ticket[0].deadline == 1.0
+                release.set()
+                settled(actor)
+                return reply
+            return super().request(method, url, timeout=timeout, json=json, headers=headers)
+
+    client = TransactionPolicyClient(
+        "http://cpu", timeout_s=1, clock=clock, pause=clock.pause, transport=LostInflight(obj)
+    )
+    try:
+        lease = client.register(registration(), "cpu-owner")
+        before = obj.local_memory_adapter.snapshot
+        with pytest.raises(TimeoutError, match="original transaction deadline"):
+            client.predict(payload(lease))
+        assert len(budgets) == 2 and budgets[0] == budgets[1]
+        assert obj.local_memory_adapter.snapshot is before
+        assert len(obj.native_calls) == 1 and actor.info()["tickets"] == 0
+        client.end()
+    finally:
+        release.set()
+        assert actor.close()
+
+
+@pytest.mark.parametrize("change", ["boot", "offset", "malformed_boot", "duplicate_offset", "bad_nanos"])
+def test_clock_identity_distinguishes_host_and_namespace_and_rejects_invalid_kernel_records(monkeypatch, change):
+    from cosmos_framework.inference import robocasa_session_transactions as module
+
+    baseline = module.monotonic_clock_domain()
+    original = module.Path.open
+
+    def changed(path, *args, **kwargs):
+        if path.name == "boot_id":
+            if change == "boot":
+                return io.BytesIO(b"2cad22db-2388-4a3d-a652-785ed624fb60\n")
+            if change == "malformed_boot":
+                return io.BytesIO(b"invalid\n")
+        if path.name == "timens_offsets":
+            if change == "offset":
+                return io.BytesIO(b"monotonic 10 0\nboottime 0 0\n")
+            if change == "duplicate_offset":
+                return io.BytesIO(b"monotonic 0 0\nmonotonic 0 0\n")
+            if change == "bad_nanos":
+                return io.BytesIO(b"monotonic 0 1000000000\n")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "open", changed)
+    if change in ("boot", "offset"):
+        assert module.monotonic_clock_domain() != baseline
+    else:
+        with pytest.raises(ValueError):
+            module.monotonic_clock_domain()

@@ -10,7 +10,12 @@ from typing import Callable
 
 import requests
 
-from cosmos_framework.inference.robocasa_session_transactions import PROTOCOL, digest, json_bytes
+from cosmos_framework.inference.robocasa_session_transactions import (
+    PROTOCOL,
+    digest,
+    json_bytes,
+    monotonic_clock_domain,
+)
 
 
 class TransactionPolicyClient:
@@ -28,6 +33,7 @@ class TransactionPolicyClient:
         self.base_url, self.timeout_s = base_url.rstrip("/"), timeout_s
         self.transport = transport if transport is not None else requests.Session()
         self.clock, self.pause = clock, pause
+        self.clock_domain = monotonic_clock_domain()
         self.lease = None
         self._registration_pending = False
 
@@ -41,10 +47,14 @@ class TransactionPolicyClient:
                 break
             except (requests.Timeout, requests.ConnectionError):
                 self.pause(min(0.02, max(0, deadline - self.clock())))
+        if self.clock() >= deadline:
+            raise TimeoutError("original transaction deadline exhausted during transport")
         if response.status_code not in (200, 202):
             self.last_error = response.json()
             raise RuntimeError(f"transaction API rejected request: HTTP {response.status_code}: {self.last_error}")
         value = response.json()
+        if self.clock() >= deadline:
+            raise TimeoutError("original transaction deadline exhausted during response decoding")
         if not isinstance(value, dict):
             raise ValueError("transaction JSON object required")
         return response.status_code, value
@@ -60,6 +70,8 @@ class TransactionPolicyClient:
             json=registration,
             headers={"X-Cosmos-Owner": owner_token},
         )
+        if value.get("prediction_clock_domain") != self.clock_domain:
+            raise ValueError("registration prediction clock domain mismatch")
         lease = value.get("lease")
         if not isinstance(lease, dict) or any(lease.get(k) != v for k, v in registration.items()):
             raise ValueError("registration ACK identity mismatch")
@@ -68,6 +80,10 @@ class TransactionPolicyClient:
         return dict(lease)
 
     def predict(self, payload: dict):
+        # Freeze before encoding/upload; retries reuse these exact absolute values.
+        started_at = self.clock()
+        deadline = started_at + self.timeout_s
+        budget = {"clock_domain": self.clock_domain, "started_at": started_at, "deadline": deadline}
         if self.lease is None:
             raise RuntimeError("register a fresh admitted Episode first")
         raw = json_bytes(payload)
@@ -78,8 +94,9 @@ class TransactionPolicyClient:
             {"protocol": PROTOCOL, **{k: v for k, v in self.lease.items() if k != "capability"}, "frontier": frontier}
         )
         expected_sha = hashlib.sha256(raw).hexdigest()
-        deadline = self.clock() + self.timeout_s
-        status, result = self._call("POST", "/v2/inference", deadline, json={"lease": self.lease, "payload": payload})
+        status, result = self._call(
+            "POST", "/v2/inference", deadline, json={"lease": self.lease, "payload": payload, "budget": budget}
+        )
         while status == 202:
             if result.get("request_key") != expected_key or result.get("payload_sha256") != expected_sha:
                 raise ValueError("inference Ticket binding mismatch")
