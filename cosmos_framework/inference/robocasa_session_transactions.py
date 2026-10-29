@@ -311,7 +311,7 @@ class SessionTransactions:
         if len(raw) > MAX_BODY:
             raise ValueError("encoded inference item exceeds bound")
         payload = strict_json(raw)  # Freeze caller-owned structures before admission.
-        if set(payload) != {"image", "prompt", "domain_name", "image_size", "state", "local_memory"}:
+        if not self._payload_keys_valid(payload):
             raise ValueError("B1 policy payload requires observation/state/local evidence; media must be off")
         local = payload["local_memory"]
         if not isinstance(local, dict) or type(local.get("consumer_step")) is not int:
@@ -353,11 +353,17 @@ class SessionTransactions:
             ticket = _Ticket(key, payload_sha, lease, payload, len(raw), deadline)
             self._tickets[key] = ticket
             try:
-                self._executor.submit(self._execute, ticket)
+                self._schedule(ticket)
             except BaseException:
                 del self._tickets[key]
                 raise
             return self._pending(ticket)
+
+    def _payload_keys_valid(self, payload):
+        return set(payload) == {"image", "prompt", "domain_name", "image_size", "state", "local_memory"}
+
+    def _schedule(self, ticket):
+        self._executor.submit(self._execute, ticket)
 
     def _pending(self, ticket):
         return self._reply(

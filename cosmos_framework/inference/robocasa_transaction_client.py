@@ -25,11 +25,16 @@ class TransactionPolicyClient:
         *,
         timeout_s=600.0,
         transport=None,
+        batch_profile=False,
+        max_batch_size=1,
         clock=time.monotonic,
         pause: Callable[[float], None] = time.sleep,
     ):
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("positive client deadline required")
+        if type(max_batch_size) is not int or not 1 <= max_batch_size <= 8:
+            raise ValueError("bounded native batch cap required")
+        self.batch_profile, self.max_batch_size = batch_profile, max_batch_size
         self.base_url, self.timeout_s = base_url.rstrip("/"), timeout_s
         self.transport = transport if transport is not None else requests.Session()
         self.clock, self.pause = clock, pause
@@ -44,6 +49,9 @@ class TransactionPolicyClient:
                 raise TimeoutError("original transaction deadline exhausted")
             try:
                 response = self.transport.request(method, self.base_url + path, timeout=remaining, **kwargs)
+                if response.status_code in (429, 503):
+                    self.pause(min(0.02, max(0, deadline - self.clock())))
+                    continue
                 break
             except (requests.Timeout, requests.ConnectionError):
                 self.pause(min(0.02, max(0, deadline - self.clock())))
@@ -78,6 +86,35 @@ class TransactionPolicyClient:
         self.lease = lease
         self._registration_pending = False
         return dict(lease)
+
+    def bind_assignment(self, ack):
+        """Adopt only the coordinator's exact registration ACK, never auto-register."""
+        from cosmos_framework.inference.robocasa_session_transactions import SessionLease
+
+        if self.lease is not None or self._registration_pending:
+            raise RuntimeError("previous assignment unresolved")
+        if not isinstance(ack, dict) or ack.get("prediction_clock_domain") != self.clock_domain:
+            raise ValueError("assignment clock domain mismatch")
+        lease = ack.get("lease")
+        if not isinstance(lease, dict) or set(lease) != set(SessionLease.__dataclass_fields__):
+            raise ValueError("exact coordinator assignment required")
+        self.lease = json.loads(json_bytes(lease))
+        return dict(self.lease)
+
+    def _batch_valid(self, batch):
+        if not self.batch_profile:
+            return batch == {"size": 1, "index": 0}
+        return (
+            isinstance(batch, dict)
+            and set(batch) == {"id", "size", "index"}
+            and isinstance(batch["id"], str)
+            and len(batch["id"]) == 32
+            and all(c in "0123456789abcdef" for c in batch["id"])
+            and type(batch["size"]) is int
+            and 1 <= batch["size"] <= self.max_batch_size
+            and type(batch["index"]) is int
+            and 0 <= batch["index"] < batch["size"]
+        )
 
     def predict(self, payload: dict):
         # Freeze before encoding/upload; retries reuse these exact absolute values.
@@ -125,7 +162,7 @@ class TransactionPolicyClient:
             local.get("session_id") != self.lease["session_id"]
             or local.get("episode_id") != self.lease["episode_id"]
             or local.get("consumer_step") != frontier
-            or result.get("native_batch") != {"size": 1, "index": 0}
+            or not self._batch_valid(result.get("native_batch"))
             or not isinstance(action, list)
             or len(action) != 16
             or any(not isinstance(row, list) or len(row) != 15 for row in action)

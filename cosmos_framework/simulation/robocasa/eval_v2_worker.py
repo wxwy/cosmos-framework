@@ -36,6 +36,10 @@ def serve(channel, cfg, *, factory=None):
                 "adapter": Path(sys.modules[NativeEpisode.__module__].__file__),
                 "slot": Path(sys.modules[SimSlot.__module__].__file__),
             }
+            if cfg["settings"].get("execution_profile") == "phase_b":
+                from cosmos_framework.simulation.robocasa import eval_v2_transactions
+
+                modules["transactions"] = Path(eval_v2_transactions.__file__)
             if set(cfg["source_files"]) != set(modules):
                 raise ValueError("incomplete native source witnesses")
             for name, file in modules.items():
@@ -80,7 +84,13 @@ def serve(channel, cfg, *, factory=None):
                 response.update(slot.finish_without_session())
             elif op == "execute":
                 response.update(
-                    slot.execute(message["attempt"], reset_index=message["reset_index"], directory=message["directory"])
+                    slot.execute(
+                        message["attempt"],
+                        reset_index=message["reset_index"],
+                        directory=message["directory"],
+                        transaction_assignment=message.get("transaction_assignment"),
+                        episode_deadline=message.get("episode_deadline"),
+                    )
                 )
             elif op == "close":
                 response.update(slot.close())

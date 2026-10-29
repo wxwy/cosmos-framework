@@ -30,7 +30,7 @@ def integer(value, minimum, maximum, name):
     return value
 
 
-def build_manifest(*, tasks, episodes, seed, horizons, experiment, formal=False):
+def build_manifest(*, tasks, episodes, seed, horizons, experiment, formal=False, execution=None):
     tasks = list(tasks)
     if (
         not tasks
@@ -91,6 +91,28 @@ def build_manifest(*, tasks, episodes, seed, horizons, experiment, formal=False)
             "media_participates_in_SR": False,
         },
     }
+    if execution is not None:
+        if (
+            not isinstance(execution, dict)
+            or set(execution)
+            != {"profile", "gpu_ids", "sims_per_gpu", "max_infer_batch_size", "batch_wait_ms", "noise"}
+            or execution["profile"] != "phase_b_native_batch_v1"
+            or execution["noise"] != "literal_cfg_seed_per_sample_v1"
+        ):
+            raise ValueError("exact native batch execution identity required")
+        integer(execution["sims_per_gpu"], 1, 8, "M")
+        integer(execution["max_infer_batch_size"], 1, 8, "B")
+        integer(execution["batch_wait_ms"], 1, 1000, "batch_wait_ms")
+        gpus = execution["gpu_ids"]
+        if (
+            not isinstance(gpus, list)
+            or not gpus
+            or len(set(gpus)) != len(gpus)
+            or any(type(g) is not int or g < 0 for g in gpus)
+        ):
+            raise ValueError("distinct physical GPUs required")
+        body["execution"] = execution
+        body["protocol"]["resource_architecture"] = "multi_reusable_sim_slots_one_native_model_owner_per_gpu_phase_b"
     return json.loads(canonical({**body, "digest": digest(body)}))
 
 
@@ -104,6 +126,7 @@ def validate_manifest(value):
         horizons=value["horizons"],
         experiment=value["experiment"],
         formal=value["scope"] == "formal900",
+        execution=value.get("execution"),
     )
     if value != expected:
         raise ValueError("invalid immutable manifest or protocol")

@@ -69,7 +69,17 @@ class NativeEpisode:
                 "resource_proof": proof,
             }
 
-    def execute(self, attempt, *, reset_index, directory, sampling=None, phase_callback=None):
+    def execute(
+        self,
+        attempt,
+        *,
+        reset_index,
+        directory,
+        sampling=None,
+        phase_callback=None,
+        transaction_assignment=None,
+        episode_deadline=None,
+    ):
         if not self.admitted or self.observation is None:
             raise ValueError("scene must be admitted before policy/Local")
         self.admitted = False
@@ -96,6 +106,18 @@ class NativeEpisode:
         cleanup = None
         first_local = None
         media_errors = []
+        transactional = None
+        if self.settings.get("execution_profile") == "phase_b":
+            from cosmos_framework.simulation.robocasa.eval_v2_transactions import PolicyTransport
+
+            transactional = PolicyTransport(self.settings, transaction_assignment, episode_deadline)
+            client, http_client = transactional.local, transactional
+        else:
+            if transaction_assignment is not None:
+                raise ValueError("legacy path cannot accept transactional assignment")
+            client = RoboCasaLocalMemoryClient(enabled=True)
+            http_client = requests.Session()
+            http_client.trust_env = False
         try:
             sink = self.media_factory(
                 directory / "media",
@@ -115,9 +137,6 @@ class NativeEpisode:
                 if len(media_errors) < 16:
                     media_errors.append(repr(error))
 
-        client = RoboCasaLocalMemoryClient(enabled=True)
-        http_client = requests.Session()
-        http_client.trust_env = False
         start = time.monotonic()
         with (
             (directory / "actions.jsonl").open("x") as actions,
@@ -139,11 +158,29 @@ class NativeEpisode:
                     "local_memory": result.get("local_memory"),
                     "latency_ms": latency,
                 }
+                if transactional is not None:
+                    value["transaction"] = {
+                        k: result[k]
+                        for k in (
+                            "protocol",
+                            "request_key",
+                            "payload_sha256",
+                            "assignment",
+                            "frontier",
+                            "native_batch",
+                            "media",
+                        )
+                    }
+                if transactional is not None and "timing" in result:
+                    value["transaction"]["timing"] = result["timing"]
                 if first_local is None:
                     first_local = value["local_memory"]
                 predictions.write(json.dumps(value, allow_nan=False) + "\n")
                 predictions.flush()
-                media_call("prediction", replans, result)
+                if transactional is None:
+                    media_call("prediction", replans, result)
+                else:
+                    transactional.media(result, replans, lambda i, r: media_call("prediction", i, r))
                 replans += 1
 
             def cleaned(value):
@@ -189,7 +226,14 @@ class NativeEpisode:
                     raise RuntimeError("Local cleanup did not acknowledge reset")
                 observation = outcome.finish(normal=True, cleanup_ok=True)
             finally:
-                http_client.close()
+                close_error = None
+                try:
+                    http_client.close()
+                except BaseException as error:
+                    close_error = error
+                finally:
+                    if transactional is not None:
+                        media_errors.extend(transactional.media_diagnostics()["errors"])
                 # Native loop has already attempted end+reset. Media cannot delay
                 # that cleanup or replace a valid scientific outcome.
                 for f in (actions, predictions):
@@ -200,10 +244,14 @@ class NativeEpisode:
                 except Exception as e:
                     media = {"errors": [repr(e)], "forced_encoder_cleanup": True}
                 media["parent_errors"] = media_errors
+                if transactional is not None:
+                    media["transaction_fetch"] = transactional.media_diagnostics()
                 try:
                     atomic_json(directory / "media_diagnostics.json", media)
                 except OSError:
                     pass
+                if close_error is not None:
+                    raise close_error
         return {
             "local_session": {
                 "session_id": cleanup["session_id"],
@@ -215,6 +263,7 @@ class NativeEpisode:
             "instruction": prompt,
             "replans": replans,
             "elapsed_seconds": time.monotonic() - start,
-            "media_process_fault": media.get("forced_encoder_cleanup", False),
+            "media_process_fault": media.get("forced_encoder_cleanup", False)
+            or (transactional is not None and transactional.media_process_fault),
             "media_helper_pids": media.get("helper_pids", []),
         }

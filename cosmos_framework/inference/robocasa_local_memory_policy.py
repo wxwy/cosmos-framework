@@ -215,25 +215,35 @@ class RoboCasaLocalMemoryPolicyAdapter:
     def commit(self, update: _PreparedUpdate | None, response: CachedMemoryResponse | None = None) -> None:
         if update is None:
             return
+        self.commit_many(((update, response),))
+
+    def commit_many(self, members) -> None:
+        """Prevalidate/allocate every participant, then publish ONE snapshot."""
         assert self.memory is not None
-        session_id = update.memory.session_id
+        members = tuple(members)
+        if not members:
+            raise ValueError("nonempty Local batch commit required")
         with self._lock:
-            if self._visual_pending.get(session_id) is not update:
-                raise RuntimeError("Local-TTT visual commit requires exact pending capability")
-            self.memory.validate_commit(update.memory)
+            sessions = [update.memory.session_id for update, _ in members]
+            if len(set(sessions)) != len(sessions):
+                raise ValueError("duplicate Session in atomic batch")
+            for update, _ in members:
+                if self._visual_pending.get(update.memory.session_id) is not update:
+                    raise RuntimeError("Local-TTT visual commit requires exact pending capability")
+                self.memory.validate_commit(update.memory)
             snapshot = self.snapshot
-            responses = dict(snapshot.responses)
-            responses.pop(session_id, None)
-            if response is not None:
-                responses[session_id] = response
-            replacement = MemorySnapshot.build(
-                {**snapshot.fast, session_id: update.memory.replacement},
-                {**snapshot.visual, session_id: update.visual_replacement},
-                responses,
-            )
+            fast, visual, responses = dict(snapshot.fast), dict(snapshot.visual), dict(snapshot.responses)
+            for update, response in members:
+                session_id = update.memory.session_id
+                fast[session_id], visual[session_id] = update.memory.replacement, update.visual_replacement
+                responses.pop(session_id, None)
+                if response is not None:
+                    responses[session_id] = response
+            replacement = MemorySnapshot.build(fast, visual, responses)
             self.memory.store.snapshot = replacement
-            del self.memory._pending[session_id]
-            del self._visual_pending[session_id]
+            for session_id in sessions:
+                del self.memory._pending[session_id]
+                del self._visual_pending[session_id]
 
     def abort(self, update: _PreparedUpdate | None) -> None:
         if update is None:

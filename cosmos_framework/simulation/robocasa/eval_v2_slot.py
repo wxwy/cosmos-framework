@@ -151,7 +151,7 @@ class SimSlot:
         self._state("CLEAN")
         return {"state": self.state, "session_opened": False}
 
-    def execute(self, attempt, *, reset_index, directory):
+    def execute(self, attempt, *, reset_index, directory, transaction_assignment=None, episode_deadline=None):
         if self.state != "ADMISSION" or not self.engine.admitted or attempt != self.attempt:
             raise ValueError("unadmitted/stale/cross-Slot Episode")
         expected = (
@@ -173,8 +173,31 @@ class SimSlot:
                 elif name == "local_cleanup":
                     self._state("SESSION_CLOSING")
 
+            extra = {}
+            if self.cfg["settings"].get("execution_profile") == "phase_b":
+                lease = transaction_assignment["lease"]
+                if any(
+                    lease.get(k) != v
+                    for k, v in {
+                        "run_lease": self.cfg["coordinator_lease_id"],
+                        "manifest_digest": self.cfg["manifest_digest"],
+                        "slot_id": self.cfg["physical_slot_id"],
+                        "task": attempt["task"],
+                        "episode_index": attempt["episode"],
+                        "attempt_id": attempt["attempt_id"],
+                    }.items()
+                ):
+                    raise ValueError("foreign coordinator transactional assignment")
+                extra = dict(transaction_assignment=transaction_assignment, episode_deadline=episode_deadline)
+            elif transaction_assignment is not None:
+                raise ValueError("legacy Slot cannot use transactional assignment")
             response = self.engine.execute(
-                attempt, reset_index=reset_index, directory=directory, sampling=self.sampling(), phase_callback=phase
+                attempt,
+                reset_index=reset_index,
+                directory=directory,
+                sampling=self.sampling(),
+                phase_callback=phase,
+                **extra,
             )
             session = response["local_session"]
             if (

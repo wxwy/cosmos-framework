@@ -83,6 +83,11 @@ from cosmos_framework.inference.common.args import CheckpointOverrides, ConfigFi
 from cosmos_framework.inference.common.config import deserialize_config_dict
 from cosmos_framework.inference.common.init import init_output_dir
 from cosmos_framework.inference.inference import OmniInference
+from cosmos_framework.inference.robocasa_batch_transactions import (
+    BatchedSessionTransactions,
+    BatchOutput,
+    MediaCandidate,
+)
 from cosmos_framework.inference.robocasa_composite_visual import prepare_robocasa_composite_frame
 from cosmos_framework.inference.robocasa_local_memory_policy import RoboCasaLocalMemoryPolicyAdapter
 from cosmos_framework.inference.robocasa_session_transactions import (
@@ -528,13 +533,16 @@ class ActionServerArgs(pydantic.BaseModel):
     """Online V3 Local-TTT mode. Formal Local-TTT evaluation must use ``required``."""
     local_memory_max_sessions: int = 64
     """Maximum concurrent online Local-TTT episode sessions."""
-    transaction_profile: Literal["legacy", "b1"] = "legacy"
+    transaction_profile: Literal["legacy", "b1", "batch"] = "legacy"
     """Opt-in Phase B transaction/B1 API. Does not enable multi-Sim or B>1."""
     transaction_owner_token_file: Path | None = None
     transaction_run_lease: str | None = None
     transaction_manifest_digest: str | None = None
     transaction_slot_id: str | None = None
     transaction_timeout_s: float = 600.0
+    transaction_slot_ids: str | None = None
+    transaction_max_batch_size: int = 1
+    transaction_batch_wait_ms: float = 20.0
 
     # ----- prompt format ------------------------------------------------------
     format_prompt_as_json: bool | None = None
@@ -613,24 +621,45 @@ class ActionServerConfig:
 
 
 def _transaction_options(args):
+    batch = args.transaction_profile == "batch"
+    slot_text = getattr(args, "transaction_slot_ids", None)
     fields = (
         args.transaction_owner_token_file,
         args.transaction_run_lease,
         args.transaction_manifest_digest,
-        args.transaction_slot_id,
+        slot_text if batch else args.transaction_slot_id,
     )
     if args.transaction_profile == "legacy":
-        if any(value is not None for value in fields):
-            raise ValueError("transaction identity options require explicit transaction_profile=b1")
+        if (
+            any(value is not None for value in fields)
+            or slot_text is not None
+            or getattr(args, "transaction_max_batch_size", 1) != 1
+            or getattr(args, "transaction_batch_wait_ms", 20) != 20
+        ):
+            raise ValueError("transaction identity options require explicit transaction_profile=b1/batch")
         return None
+    if batch:
+        if args.transaction_slot_id is not None or not isinstance(slot_text, str):
+            raise ValueError("batch profile requires exact physical Slot list")
+        slots = tuple(slot_text.split(","))
+    else:
+        if (
+            slot_text is not None
+            or getattr(args, "transaction_max_batch_size", 1) != 1
+            or getattr(args, "transaction_batch_wait_ms", 20) != 20
+        ):
+            raise ValueError("multi-Slot/batch options require explicit batch profile")
+        slots = (args.transaction_slot_id,)
     if (
         args.local_memory_mode != "required"
-        or args.local_memory_max_sessions != 1
+        or args.local_memory_max_sessions != len(slots)
+        or not 1 <= len(slots) <= 8
+        or len(set(slots)) != len(slots)
         or args.action_chunk_size != 16
-        or any(value is None for value in fields)
+        or any(v is None for v in fields)
     ):
         raise ValueError(
-            "B1 transaction profile requires required Local-TTT, one Slot, explicit H16 and complete identity"
+            "B1 transaction profile requires required Local-TTT, exact Slots, explicit H16 and complete identity"
         )
     token_path = Path(args.transaction_owner_token_file)
     if token_path.stat().st_mode & 0o077 or token_path.stat().st_size > 256:
@@ -646,14 +675,21 @@ def _transaction_options(args):
     timeout = getattr(args, "transaction_timeout_s", 600.0)
     if not 0 < timeout <= 6000:
         raise ValueError("finite bounded transaction timeout required")
-    monotonic_clock_domain()  # Fail before native model initialization if comparability is unproven.
-    return dict(
+    monotonic_clock_domain()
+    options = dict(
         owner_token=identifier(token_path.read_text().strip(), limit=256),
         run_lease=identifier(args.transaction_run_lease),
         manifest_digest=args.transaction_manifest_digest,
-        slot_ids=(identifier(args.transaction_slot_id, limit=64),),
+        slot_ids=tuple(identifier(slot, limit=64) for slot in slots),
         timeout_s=timeout,
     )
+    if batch:
+        cap = getattr(args, "transaction_max_batch_size", 1)
+        wait = getattr(args, "transaction_batch_wait_ms", 20.0)
+        if type(cap) is not int or not 1 <= cap <= 8 or type(wait) not in (int, float) or not 1 <= wait <= 1000:
+            raise ValueError("bounded native batch/wait required")
+        options.update(max_batch_size=cap, batch_wait_ms=wait)
+    return options
 
 
 def transaction_dispatch(service, method, path, record=None, headers=None) -> Reply:
@@ -667,16 +703,27 @@ def transaction_dispatch(service, method, path, record=None, headers=None) -> Re
         return actor.submit(record["lease"], record["payload"], budget=record["budget"])
     if method == "POST" and path == "/v2/inference/ack" and set(record) == {"lease", "request_key", "payload_sha256"}:
         return actor.acknowledge(record["lease"], record["request_key"], record["payload_sha256"])
+    if (
+        method == "POST"
+        and path == "/v2/media/ack"
+        and set(record) == {"lease", "request_key", "payload_sha256"}
+        and hasattr(actor, "media_ack")
+    ):
+        return actor.media_ack(record["lease"], record["request_key"], record["payload_sha256"])
     if method == "POST" and path == "/v2/session/end" and set(record) == {"lease"}:
         return actor.end(record["lease"])
-    if method == "GET" and path.startswith("/v2/inference/"):
-        key = path.removeprefix("/v2/inference/")
+    if method == "GET" and (path.startswith("/v2/inference/") or path.startswith("/v2/media/")):
+        key = path.rsplit("/", 1)[-1]
         assignment = headers.get("X-Cosmos-Assignment", "")
         sha = headers.get("X-Cosmos-Payload-SHA256", "")
         if len(assignment) > 4096 or any(
             len(v) != 64 or any(c not in "0123456789abcdef" for c in v) for v in (key, sha)
         ):
             raise ValueError("bounded assignment and exact inference digests required")
+        if path.startswith("/v2/media/"):
+            if not hasattr(actor, "media_result"):
+                raise ValueError("media unsupported by this profile")
+            return actor.media_result(strict_json(assignment.encode()), key, sha)
         return actor.result(strict_json(assignment.encode()), key, sha)
     raise ValueError("unsupported transaction operation/schema")
 
@@ -865,13 +912,23 @@ class ActionModelService:
                 or self.local_memory_adapter.info()["local_dim"] != 32
             ):
                 raise ValueError("B1 transaction profile requires resolved raw15/state15/H16/K4/local32")
-            self.transactions = SessionTransactions(
-                self.local_memory_adapter,
-                self._transaction_action,
-                self._transaction_quiesce,
-                model_lock=self._lock,
-                **transaction_options,
-            )
+            if args.transaction_profile == "batch":
+                self.transactions = BatchedSessionTransactions(
+                    self.local_memory_adapter,
+                    self._transaction_batch,
+                    self._transaction_quiesce,
+                    decode_media=self._transaction_decode_media,
+                    model_lock=self._lock,
+                    **transaction_options,
+                )
+            else:
+                self.transactions = SessionTransactions(
+                    self.local_memory_adapter,
+                    self._transaction_action,
+                    self._transaction_quiesce,
+                    model_lock=self._lock,
+                    **transaction_options,
+                )
 
         if args.run_validation:
             self._run_developer_validation()
@@ -1170,6 +1227,85 @@ class ActionModelService:
         if prep["state_token"] is not None:
             action = action[1:]
         return action.detach().cpu().tolist()
+
+    def _transaction_batch(self, reqs, updates):
+        preps = [self._prep_policy_item(r) for r in reqs]
+        n = len(preps)
+        if n != len(updates) or not n:
+            raise ValueError("native batch request/prefix cardinality mismatch")
+        batch = {
+            self._input_video_key(): [[p["video_padded"]] for p in preps],
+            **make_batched_action_processing_fields(
+                ActionProcessingRecord(raw_action_dim=self.raw_action_dim, action_normalizer=None), batch_size=n
+            ),
+            "action": [[self._build_action_input(p["state_token"])] for p in preps],
+            "mode": ["wam"] * n,
+            "ai_caption": [p["augmented_prompt"] for p in preps],
+            "prompt": [p["augmented_prompt"] for p in preps],
+            "conditioning_fps": [torch.tensor(self.cfg.fps, dtype=torch.long) for _ in preps],
+            "image_size": torch.stack([p["padded_image_size"] for p in preps]).to(device="cuda"),
+            "domain_id": [torch.tensor(get_domain_id(p["domain_name"]), dtype=torch.long) for p in preps],
+            "sequence_plan": [p["sequence_plan"] for p in preps],
+        }
+        with torch.inference_mode():
+            samples = self.model.generate_samples_from_batch(
+                batch,
+                guidance=self.cfg.guidance,
+                seed=[self.cfg.seed] * n,
+                num_steps=self.cfg.num_steps,
+                has_negative_prompt=False,
+                _local_memory_prefixes=tuple(self.local_memory_adapter.prefixes(u)[0] for u in updates),
+            )
+        if len(samples["action"]) != n:
+            raise ValueError("native batch action cardinality mismatch")
+        actions = []
+        for prep, value in zip(preps, samples["action"], strict=True):
+            value = self._denormalize_action(value.float().squeeze(0))
+            if prep["state_token"] is not None:
+                value = value[1:]
+            actions.append(value.detach().cpu().tolist())
+        room, byte_room = self.transactions.media_room()
+        media = []
+        for i, (req, prep) in enumerate(zip(reqs, preps, strict=True)):
+            candidate = None
+            if req.get("media") and room:
+                try:
+                    latent = samples["vision"][i]
+                    size = (
+                        latent.numel() * latent.element_size()
+                        + prep["padded_image_size"].numel() * prep["padded_image_size"].element_size()
+                    )
+                    if 0 < size <= byte_room:
+                        candidate = MediaCandidate(
+                            (latent.detach().cpu().clone(), prep["padded_image_size"].detach().cpu().clone()), size
+                        )
+                        room -= 1
+                        byte_room -= size
+                except Exception as error:
+                    log.warning("Optional media spool dropped: %s", type(error).__name__)
+            media.append(candidate)
+        return BatchOutput(actions, tuple(media))
+
+    def _transaction_decode_media(self, value):
+        latent, padded = value
+        with torch.inference_mode():
+            video = self.model.decode(latent.to(device="cuda")).squeeze(0)
+            video = remove_reflection_padding(video, padded)
+        if video.ndim != 4 or video.shape[1] > 65 or video.shape[-1] * video.shape[-2] > 2 * 1024**2:
+            raise ValueError("bounded optional video dimensions required")
+        encoded = []
+        total = 0
+        for frame in _video_tensor_to_pil_images(video):
+            buf = io.BytesIO()
+            frame.save(buf, format="PNG")
+            item = base64.b64encode(buf.getvalue()).decode("ascii")
+            total += len(item)
+            if total > 32 * 1024**2:
+                raise ValueError("bounded optional video payload exceeded")
+            encoded.append(item)
+        if not encoded:
+            raise ValueError("empty optional generated video")
+        return encoded
 
     def _transaction_quiesce(self):
         # This service is constructed only with one GPU. Device loss must raise,
