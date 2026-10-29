@@ -173,9 +173,9 @@ class AsyncRecipe:
         copied = deepcopy(kwargs)
         copied["tokenizer_config"] = local_config
         result = cls(
-            str(raw.catalog.cache_root),
-            str(source.source_root),
-            str(index.root),
+            str(Path(raw.catalog.cache_root).resolve()),
+            str(Path(source.source_root).resolve()),
+            str(Path(index.root).resolve()),
             index.trusted_training,
             local_config,
             copied,

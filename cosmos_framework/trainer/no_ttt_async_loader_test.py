@@ -182,16 +182,25 @@ def test_actual_source_transform_next_member_and_next_window_overlap(tmp_path):
     )
     sync_trace = []
     sync_frontier = planner.initial_frontier()
+    sync_started = time.monotonic()
     for iteration in range(3):
         plan = planner.plan_window(sync_frontier)
         for member, requests in enumerate(plan.members):
             for request in requests:
-                _, stage_events = sync_state.prepare(request)
+                segment, stage_events = sync_state.prepare(request)
                 sync_trace.extend(stage_events)
+                for payload in segment.consumer_payload[0]:
+                    if payload is not None and random.random() < recipe.rate:
+                        payload[recipe.caption_key] = ""
+                        payload[recipe.token_key] = sync_state.empty_tokens.clone()
+            model_draws()
             started = time.monotonic()
-            hashlib.sha256(b"synchronous_fake_compute" * 1024).digest()
+            digest = b"fake_gpu_only"
+            while time.monotonic() - started < 0.13:
+                digest = hashlib.sha256(digest * 128).digest()
             sync_trace.append({"stage": "fake_gpu_compute", "start": started, "end": time.monotonic()})
         sync_frontier = plan.candidate_frontier
+    sync_wall_ms = (time.monotonic() - sync_started) * 1000
     assert all(
         min(a["end"], b["end"]) <= max(a["start"], b["start"])
         for a in sync_trace
@@ -208,6 +217,11 @@ def test_actual_source_transform_next_member_and_next_window_overlap(tmp_path):
         "async_trace": events + compute_events,
         "sync_trace": sync_trace,
         "main_wait_ms": sum(r["raw_wait_host_ms"] for r in result[4]),
+        "async_window_wall_ms_including_pool_startup": sum(
+            r["step_window_host_wall_ms_before_telemetry"] for r in result[4]
+        ),
+        "sync_source_transform_compute_wall_ms": sync_wall_ms,
+        "performance_claim": "CPU_FAKE_ONLY_NOT_GPU_THROUGHPUT",
     }
     path = tmp_path / "overlap_trace.json"
     path.write_text(json.dumps(report, indent=2))

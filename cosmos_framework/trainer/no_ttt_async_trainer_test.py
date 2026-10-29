@@ -147,7 +147,11 @@ def _step(state, iteration):
     trainer, model, *optim = state
     planner = trainer._grouped_planner
     before = (
-        trainer._grouped_window.live.frontier if hasattr(trainer, "_grouped_window") else planner.initial_frontier()
+        trainer._grouped_window.live.frontier
+        if hasattr(trainer, "_grouped_window")
+        else trainer._pending_grouped_resume["frontier"]
+        if trainer._pending_grouped_resume is not None
+        else planner.initial_frontier()
     )
     expected = planner.plan_window(before).candidate_frontier
     for member in range(4):

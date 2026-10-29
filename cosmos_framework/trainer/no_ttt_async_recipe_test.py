@@ -4,6 +4,7 @@ import pickle
 import random
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -74,6 +75,29 @@ def _same(left, right):
             _same(a, b)
     else:
         assert left == right
+
+
+def test_worker_recipe_freezes_resolved_data_roots_before_alias_can_change(real_recipe, tmp_path):
+    producer, original = real_recipe
+    raw = producer.catalog.raw
+    links = {}
+    for name, target in (
+        ("cache", original.cache_root),
+        ("source", original.source_root),
+        ("index", original.index_root),
+    ):
+        path = tmp_path / f"{name}_alias"
+        path.symlink_to(target, target_is_directory=True)
+        links[name] = path
+    raw.catalog.cache_root = links["cache"]
+    raw.source_reader.source_root = links["source"]
+    raw.source_reader.verified_index.root = links["index"]
+    frozen = AsyncRecipe.from_producer(producer, LoaderProfile(2, 1, True, 60))
+    for name in links:
+        assert getattr(frozen, f"{name}_root") == str(Path(getattr(original, f"{name}_root")).resolve())
+        links[name].unlink()
+        links[name].symlink_to(tmp_path / "missing_alternate_tree", target_is_directory=True)
+    assert frozen.build().producer.catalog.manifest_digest == producer.catalog.manifest_digest
 
 
 @pytest.mark.parametrize("seed", [1, 2, 7])
