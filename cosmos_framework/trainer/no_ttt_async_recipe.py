@@ -16,6 +16,7 @@ import pickle
 import time
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -214,6 +215,7 @@ class AsyncRecipe:
             ExactWindowSegmentProducer,
         )
         from cosmos_framework.trainer.no_ttt_cpu_loader import MappedEpisodeReader
+        from cosmos_framework.trainer.no_ttt_worker_source import VerifiedWorkerLeRobotDataset
 
         if torch.cuda.is_initialized() or os.environ.get("CUDA_VISIBLE_DEVICES") != "":
             raise RuntimeError("async worker reconstruction requires CPU-only startup")
@@ -225,7 +227,17 @@ class AsyncRecipe:
             verify_files=not self.trusted_training,
         )
         catalog = RoboCasaExactWindowCacheCatalog(self.cache_root, verified_index=index)
-        source = RoboCasaExactWindowSourceReader(catalog, self.source_root, verified_index=index)
+        source = RoboCasaExactWindowSourceReader(
+            catalog,
+            self.source_root,
+            verified_index=index,
+            dataset_factory=partial(
+                VerifiedWorkerLeRobotDataset,
+                verified_index=index,
+                max_episodes=max(1, 8 // self.workers),
+                max_bytes=self.max_cache_bytes,
+            ),
+        )
         if (
             catalog.corpus_digest != self.cache_digest
             or catalog.manifest_sha256 != self.manifest_digest

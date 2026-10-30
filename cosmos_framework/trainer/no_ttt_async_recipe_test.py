@@ -1,12 +1,15 @@
 """Synthetic local files and real Source/Cache/Transform; fake CPU text processor."""
 
+import json
 import pickle
 import random
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -33,6 +36,35 @@ class FakeProcessor:
     def tokenize_text(self, caption, **kwargs):
         assert kwargs == {"is_video": False, "use_system_prompt": False}
         return [11, *caption.encode(), 12]
+
+
+@dataclass(frozen=True)
+class _CpuTextRecipe:
+    """Spawn-safe fixture; only processor vocabulary is synthetic, not Source."""
+
+    inner: AsyncRecipe
+
+    @property
+    def rate(self):
+        return self.inner.rate
+
+    @property
+    def caption_key(self):
+        return self.inner.caption_key
+
+    @property
+    def token_key(self):
+        return self.inner.token_key
+
+    def build(self):
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("worker called full LeRobot construction")
+
+        LeRobotDataset.__init__ = forbidden
+        text_tokenizer.lazy_instantiate = lambda config: FakeProcessor(config["tokenizer_type"])
+        return self.inner.build()
 
 
 @pytest.fixture
@@ -219,3 +251,102 @@ def test_worker_source_and_transform_must_remain_rng_neutral(real_recipe):
     worker.producer.catalog.wrapped_sft._transform = wrong
     with pytest.raises(ValueError, match="must not consume"):
         worker.prepare(request)
+
+
+def test_first_worker_recipe_build_never_calls_full_lerobot_constructor(real_recipe, monkeypatch):
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    producer, recipe = real_recipe
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("full eager LeRobotDataset construction is forbidden in async workers")
+
+    monkeypatch.setattr(LeRobotDataset, "__init__", forbidden)
+    monkeypatch.setattr(LeRobotDataset, "load_hf_dataset", forbidden)
+    worker = recipe.build()
+    rows = worker.producer.catalog.raw.source_reader.dataset.hf_dataset
+    assert not rows.cache
+    planner = ExactWindowRankPlanner(producer.catalog, rank=0, world_size=1, b_stream=1, active_ga=1)
+    request = planner.plan_window(planner.initial_frontier()).members[0][0]
+    segment, events = worker.prepare(request)
+    assert int(segment.consumer_valid.sum()) == request.valid_count
+    assert list(rows.cache) == [0]
+    assert [event["stage"] for event in events] == ["cpu_source", "cpu_transform"]
+
+
+def test_spawned_real_recipe_source_transform_cfg_and_cross_window_cleanup(real_recipe, tmp_path):
+    from cosmos_framework.trainer.no_ttt_async_loader import NoTTTAsyncLoader
+    from cosmos_framework.trainer.no_ttt_async_loader_test import consume, equal_tree, seed
+
+    initial, original_recipe = real_recipe
+    # B8/GA4 requires 16 distinct two-segment Episodes per Window. Enlarge only
+    # this temporary fixture; never bypass the production native-profile guard.
+    cache, root = Path(original_recipe.cache_root), Path(original_recipe.source_root)
+    manifest_file = cache / "dataset_manifest.json"
+    manifest = json.loads(manifest_file.read_text())
+    first_record = manifest["tasks"][0]["episodes"][0]
+    payload = torch.load(cache / "tasks/Pick_Mug/episodes/episode_000000.pt", weights_only=True)
+    parquet_file = root / "data/chunk-000/file-000.parquet"
+    first_rows = pq.read_table(parquet_file).slice(0, 19).to_pylist()
+    rows, metadata, records = [], [], []
+    for ep in range(16):
+        record = deepcopy(first_record)
+        record["episode_index"] = ep
+        records.append(record)
+        copied = deepcopy(payload)
+        for window in copied["windows"].values():
+            window["global_row_indices"] += 19 * ep
+        torch.save(copied, cache / f"tasks/Pick_Mug/episodes/episode_{ep:06d}.pt")
+        for row in deepcopy(first_rows):
+            row["index"] += 19 * ep
+            row["episode_index"] = ep
+            rows.append(row)
+        metadata.append(
+            {
+                "length": 19,
+                "dataset_from_index": 100 + 19 * ep,
+                "dataset_to_index": 119 + 19 * ep,
+                "data/chunk_index": 0,
+                "data/file_index": 0,
+            }
+        )
+    manifest["tasks"][0]["episodes"] = records
+    manifest["episode_count"], manifest["window_count"] = 16, 48
+    manifest_file.write_text(json.dumps(manifest))
+    pq.write_table(pa.Table.from_pylist(rows), parquet_file, row_group_size=19)
+    pq.write_table(pa.Table.from_pylist(metadata), root / "meta/episodes/chunk-000/file-000.parquet")
+    info_file = root / "meta/info.json"
+    info = json.loads(info_file.read_text())
+    info["total_episodes"], info["total_frames"] = 16, 16 * 19
+    info_file.write_text(json.dumps(info))
+    dataset = get_action_robocasa_exact_window_cached_sft_dataset(
+        cache_root=cache,
+        source_root=root,
+        tokenizer_config=initial.catalog.wrapped_sft._transform.text_tokenizer.args["tokenizer_config"],
+        cfg_dropout_rate=0.5,
+    )
+    index = VerifiedExactWindowIndex.build(
+        tmp_path / "native_index", cache_catalog=dataset._dataset.catalog, source_reader=dataset._dataset.source_reader
+    )
+    dataset._dataset.source_reader.verified_index = index
+    producer = ExactWindowSegmentProducer(
+        ExactWindowLocalCatalog(dataset, ttt_tbptt_steps=2), config_digest="test_config"
+    )
+    recipe = AsyncRecipe.from_producer(producer, LoaderProfile(2, 1, True, 120))
+    planner = ExactWindowRankPlanner(producer.catalog, rank=0, world_size=1, b_stream=8, active_ga=4)
+    seed()
+    reference = consume(producer, planner)
+    seed()
+    loader = NoTTTAsyncLoader(producer, LoaderProfile(2, 1, True, 120), planner, recipe=_CpuTextRecipe(recipe))
+    loader.file_witnesses = True  # real temporary source/cache files; retain production guards
+    try:
+        actual = consume(producer, planner, loader=loader)
+        equal_tree(reference[:4], actual[:4])
+        assert len(actual[4]) == 3 and loader.preview is not None
+        assert all(len(row["worker_pids"]) == 2 for row in actual[4])
+        assert all(row["source_read_ms"] == row["transform_host_ms"] == 0 for row in actual[4])
+        assert all(row["worker_source_ms_sum"] > 0 and row["worker_transform_ms_sum"] > 0 for row in actual[4])
+    finally:
+        loader.close()
+    assert len(loader.last_cleanup) == 2
+    assert all(row["exitcode"] is not None and not Path(f"/proc/{row['pid']}").exists() for row in loader.last_cleanup)
