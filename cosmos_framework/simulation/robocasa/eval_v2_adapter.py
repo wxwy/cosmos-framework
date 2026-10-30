@@ -185,6 +185,17 @@ class NativeEpisode:
 
             def cleaned(value):
                 nonlocal cleanup
+                if transactional is not None and client is None:
+                    # Common Session End is mandatory even when no Local client
+                    # exists. Never turn a failed End into an episode success.
+                    transactional.end()
+                    value = {
+                        **value,
+                        "session_id": transactional.lease["session_id"],
+                        "reset_ok": True,
+                        "local_memory_mode": "off",
+                        "local_state": "not_instantiated",
+                    }
                 cleanup = value
                 atomic_json(directory / "local_memory.json", value)
 
@@ -255,8 +266,8 @@ class NativeEpisode:
         return {
             "local_session": {
                 "session_id": cleanup["session_id"],
-                "episode_id": first_local["episode_id"],
-                "start_frontier": first_local["consumer_step"],
+                "episode_id": first_local["episode_id"] if client is not None else transactional.lease["episode_id"],
+                "start_frontier": first_local["consumer_step"] if client is not None else 0,
                 "reset_ack": cleanup["reset_ok"],
             },
             "observation": observation,

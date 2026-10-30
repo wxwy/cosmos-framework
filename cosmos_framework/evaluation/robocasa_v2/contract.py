@@ -30,7 +30,11 @@ def integer(value, minimum, maximum, name):
     return value
 
 
-def build_manifest(*, tasks, episodes, seed, horizons, experiment, formal=False, execution=None):
+def build_manifest(
+    *, tasks, episodes, seed, horizons, experiment, formal=False, execution=None, local_memory="required"
+):
+    if local_memory not in ("off", "required"):
+        raise ValueError("explicit off|required Local-TTT mode required")
     tasks = list(tasks)
     if (
         not tasks
@@ -86,7 +90,7 @@ def build_manifest(*, tasks, episodes, seed, horizons, experiment, formal=False,
             "observation_frames": 17,
             "fps": 20,
             "camera": "left_wrist",
-            "local_memory": "required",
+            "local_memory": local_memory,
             "success_authority": "env._check_success",
             "media_participates_in_SR": False,
         },
@@ -127,6 +131,7 @@ def validate_manifest(value):
         experiment=value["experiment"],
         formal=value["scope"] == "formal900",
         execution=value.get("execution"),
+        local_memory=value["protocol"]["local_memory"],
     )
     if value != expected:
         raise ValueError("invalid immutable manifest or protocol")

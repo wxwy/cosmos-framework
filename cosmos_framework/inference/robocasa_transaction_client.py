@@ -11,10 +11,11 @@ from typing import Callable
 import requests
 
 from cosmos_framework.inference.robocasa_session_transactions import (
-    PROTOCOL,
     digest,
     json_bytes,
     monotonic_clock_domain,
+    protocol_for_mode,
+    request_frontier,
 )
 
 
@@ -27,6 +28,7 @@ class TransactionPolicyClient:
         transport=None,
         batch_profile=False,
         max_batch_size=1,
+        local_memory_mode="required",
         clock=time.monotonic,
         pause: Callable[[float], None] = time.sleep,
     ):
@@ -35,6 +37,8 @@ class TransactionPolicyClient:
         if type(max_batch_size) is not int or not 1 <= max_batch_size <= 8:
             raise ValueError("bounded native batch cap required")
         self.batch_profile, self.max_batch_size = batch_profile, max_batch_size
+        self.mode = local_memory_mode
+        self.protocol = protocol_for_mode(self.mode)
         self.base_url, self.timeout_s = base_url.rstrip("/"), timeout_s
         self.transport = transport if transport is not None else requests.Session()
         self.clock, self.pause = clock, pause
@@ -80,6 +84,7 @@ class TransactionPolicyClient:
         )
         if value.get("prediction_clock_domain") != self.clock_domain:
             raise ValueError("registration prediction clock domain mismatch")
+        self._check_mode(value)
         lease = value.get("lease")
         if not isinstance(lease, dict) or any(lease.get(k) != v for k, v in registration.items()):
             raise ValueError("registration ACK identity mismatch")
@@ -95,11 +100,23 @@ class TransactionPolicyClient:
             raise RuntimeError("previous assignment unresolved")
         if not isinstance(ack, dict) or ack.get("prediction_clock_domain") != self.clock_domain:
             raise ValueError("assignment clock domain mismatch")
+        self._check_mode(ack)
         lease = ack.get("lease")
         if not isinstance(lease, dict) or set(lease) != set(SessionLease.__dataclass_fields__):
             raise ValueError("exact coordinator assignment required")
         self.lease = json.loads(json_bytes(lease))
         return dict(self.lease)
+
+    def _check_mode(self, value):
+        # Existing required v1 ACKs remain readable. The new No-TTT protocol
+        # requires an explicit mode/profile, never an automatic fallback.
+        if self.mode == "off" and ("local_memory_mode" not in value or "profile" not in value):
+            raise ValueError("explicit No-TTT assignment mode/profile required")
+        if (value.get("local_memory_mode", "required"), value.get("profile", self.protocol)) != (
+            self.mode,
+            self.protocol,
+        ):
+            raise ValueError("assignment Local-TTT mode/profile mismatch")
 
     def _batch_valid(self, batch):
         if not self.batch_profile:
@@ -126,9 +143,13 @@ class TransactionPolicyClient:
         raw = json_bytes(payload)
         # Frozen bytes prevent retry/ACK from binding a later-mutated caller object.
         payload = json.loads(raw)
-        frontier = payload["local_memory"]["consumer_step"]
+        frontier = request_frontier(payload, self.mode)
         expected_key = digest(
-            {"protocol": PROTOCOL, **{k: v for k, v in self.lease.items() if k != "capability"}, "frontier": frontier}
+            {
+                "protocol": self.protocol,
+                **{k: v for k, v in self.lease.items() if k != "capability"},
+                "frontier": frontier,
+            }
         )
         expected_sha = hashlib.sha256(raw).hexdigest()
         status, result = self._call(
@@ -149,7 +170,7 @@ class TransactionPolicyClient:
             )
         identity = {k: v for k, v in self.lease.items() if k != "capability"}
         if (
-            result.get("protocol") != PROTOCOL
+            result.get("protocol") != self.protocol
             or result.get("request_key") != expected_key
             or result.get("payload_sha256") != expected_sha
             or result.get("assignment") != identity
@@ -158,10 +179,17 @@ class TransactionPolicyClient:
             raise ValueError("committed inference identity mismatch")
         local = result.get("local_memory", {})
         action = result.get("action")
+        local_valid = (
+            (
+                local.get("session_id") == self.lease["session_id"]
+                and local.get("episode_id") == self.lease["episode_id"]
+                and local.get("consumer_step") == frontier
+            )
+            if self.mode == "required"
+            else ("local_memory" not in result and result.get("local_memory_mode") == "off")
+        )
         if (
-            local.get("session_id") != self.lease["session_id"]
-            or local.get("episode_id") != self.lease["episode_id"]
-            or local.get("consumer_step") != frontier
+            not local_valid
             or not self._batch_valid(result.get("native_batch"))
             or not isinstance(action, list)
             or len(action) != 16

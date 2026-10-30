@@ -49,8 +49,11 @@ def read_lines(path, count):
     return values
 
 
-def validate(directory, row):
+def validate(directory, row, *, local_memory="required"):
     from cosmos_framework.evaluation.robocasa_v2.store import read
+    from cosmos_framework.inference.robocasa_session_transactions import protocol_for_mode
+
+    protocol = protocol_for_mode(local_memory)
 
     directory = Path(directory)
     actions = read_lines(directory / "actions.jsonl", row["steps"])
@@ -60,27 +63,56 @@ def validate(directory, row):
     session = None
     for i, p in enumerate(predictions):
         status = p.get("local_memory", {})
-        if p.get("replan") != i or p.get("source_step") != i * 16 or not isinstance(status, dict):
+        if p.get("replan") != i or p.get("source_step") != i * 16:
             raise ValueError("prediction frontier mismatch")
+        if local_memory == "off":
+            transaction = p.get("transaction", {})
+            assignment = transaction.get("assignment", {})
+            if (
+                status is not None
+                or transaction.get("protocol") != protocol
+                or transaction.get("frontier") != i
+                or any(
+                    assignment.get(key) != row[target]
+                    for key, target in (
+                        ("manifest_digest", "manifest_digest"),
+                        ("task", "task"),
+                        ("episode_index", "episode"),
+                        ("attempt_id", "attempt_id"),
+                    )
+                )
+                or not isinstance(assignment.get("session_id"), str)
+                or not isinstance(assignment.get("episode_id"), str)
+            ):
+                raise ValueError("No-TTT transaction acknowledgement mismatch")
+            current_session = assignment["session_id"]
+        else:
+            if not isinstance(status, dict):
+                raise ValueError("prediction frontier mismatch")
+            if status.get("consumer_step") != p["source_step"] or not isinstance(status.get("session_id"), str):
+                raise ValueError("Local acknowledgement mismatch")
+            current_session = status["session_id"]
         if (
             not isinstance(p.get("action"), list)
             or len(p["action"]) != 16
             or not all(finite_vector(x, 15) for x in p["action"])
         ):
             raise ValueError("prediction raw15 mismatch")
-        if status.get("consumer_step") != p["source_step"] or not isinstance(status.get("session_id"), str):
-            raise ValueError("Local acknowledgement mismatch")
-        session = session or status["session_id"]
-        if session != status["session_id"]:
-            raise ValueError("cross-Episode Local session")
+        session = session or current_session
+        if session != current_session:
+            raise ValueError("cross-Episode inference session")
     for i, a in enumerate(actions):
         if (
             a.get("source_step") != i
             or a.get("evidence_completed") is not True
             or not all(
                 finite_vector(a.get(k), n)
-                for k, n in [("predicted_raw15", 15), ("canonical_executed_raw15", 15), ("submitted_env12", 12)]
+                for k, n in (
+                    [("predicted_raw15", 15), ("submitted_env12", 12)]
+                    + ([("canonical_executed_raw15", 15)] if local_memory == "required" else [])
+                )
             )
+            or (local_memory == "off" and a.get("canonical_executed_raw15") is not None)
         ):
             raise ValueError("completed raw15/env12 action evidence missing")
         if a["predicted_raw15"] != predictions[i // 16]["action"][i % 16]:
@@ -93,6 +125,10 @@ def validate(directory, row):
         or cleanup.get("rollout_error") is not None
     ):
         raise ValueError("Local reset acknowledgement missing")
+    if local_memory == "off" and (
+        cleanup.get("local_memory_mode") != "off" or cleanup.get("local_state") != "not_instantiated"
+    ):
+        raise ValueError("No-TTT common Session End acknowledgement missing")
     scene = read(directory / "scene_provenance.json")
     for k in ("task", "episode", "attempt_id", "stream_id", "seed", "reset_index", "manifest_digest"):
         if scene.get(k) != row[k]:

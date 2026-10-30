@@ -19,10 +19,10 @@ from cosmos_framework.inference.local_memory_state import CachedMemoryResponse
 from cosmos_framework.inference.robocasa_session_transactions import (
     MAX_BODY,
     MAX_RESPONSE,
-    PROTOCOL,
     Reply,
     SessionTransactions,
     json_bytes,
+    request_frontier,
 )
 
 
@@ -117,7 +117,7 @@ class BatchedSessionTransactions(SessionTransactions):
             return super()._payload_keys_valid(payload)
         media = payload["media"]
         return (
-            set(payload) == {"image", "prompt", "domain_name", "image_size", "state", "local_memory", "media"}
+            super()._payload_keys_valid({k: v for k, v in payload.items() if k != "media"})
             and isinstance(media, dict)
             and set(media) == {"replan"}
             and type(media["replan"]) is int
@@ -199,7 +199,8 @@ class BatchedSessionTransactions(SessionTransactions):
                         self._fence(t)
                 prepare_start = time.monotonic()
                 for t in members:
-                    t.update = self.adapter.prepare(t.payload)
+                    if self.mode == "required":
+                        t.update = self.adapter.prepare(t.payload)
                     t.state = "PREPARED"
                 with self._lock:
                     for t in members:
@@ -241,13 +242,14 @@ class BatchedSessionTransactions(SessionTransactions):
                             media = {"status": "pending", "ticket": t.key}
                     body = json_bytes(
                         {
-                            "protocol": PROTOCOL,
+                            "protocol": self.protocol,
+                            "local_memory_mode": self.mode,
                             "request_key": t.key,
                             "payload_sha256": t.payload_sha256,
                             "assignment": t.lease.identity(),
-                            "frontier": t.payload["local_memory"]["consumer_step"],
+                            "frontier": request_frontier(t.payload, self.mode),
                             "action": action,
-                            "local_memory": self.adapter.status(t.update),
+                            **self._response_local(t.update),
                             "native_batch": {"id": batch_id, "size": len(members), "index": i},
                             "timing": {
                                 "queue_ms": max(0, prepare_start - t.queued_at) * 1000,
@@ -270,7 +272,7 @@ class BatchedSessionTransactions(SessionTransactions):
                     histogram[len(members)] += 1
                     batches = self._batches + 1
                     jobs = {**self._media, **new_jobs}  # Respect End/ACK removals while generating.
-                    self.adapter.commit_many(tuple((t.update, c) for t, c in zip(members, caches, strict=True)))
+                    self._commit_responses(members, caches, batch=True)
                     committed = True
                     self._media = jobs
                     self._batches = batches
@@ -280,7 +282,7 @@ class BatchedSessionTransactions(SessionTransactions):
             except BaseException as error:
                 for t in members:
                     stage = t.state
-                    if not committed:
+                    if not committed and self.mode == "required":
                         try:
                             self.adapter.abort(t.update)
                         except BaseException:
