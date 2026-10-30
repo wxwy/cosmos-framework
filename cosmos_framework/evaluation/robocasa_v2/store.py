@@ -29,6 +29,7 @@ from cosmos_framework.evaluation.robocasa_v2.contract import (
 
 MAX_JSON = 256 * 1024
 MAX_REPORT = 16 * 1024 * 1024
+MAX_RUNTIME_PROBE = 64 * 1024 * 1024
 
 
 def safe(path):
@@ -122,6 +123,15 @@ def write_report(path, value):
     if Path(path).name != "summary.json":
         raise ValueError("report limit cannot be used for Core/ledger records")
     _publish(path, value, replace=True, limit=MAX_REPORT)
+
+
+def write_runtime_probe(path, value):
+    """Append bounded diagnostics only within the runtime probe namespace."""
+    path = safe(path)
+    if path.parent.name != "runtime_probe" or path.parent.parent.name != "_internal" or path.suffix != ".json":
+        raise ValueError("runtime probe UUID JSON path required")
+    identifier(path.stem)
+    _publish(path, value, limit=MAX_RUNTIME_PROBE)
 
 
 def sealed(value):
