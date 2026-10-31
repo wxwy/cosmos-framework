@@ -106,6 +106,8 @@ class NativeEpisode:
         cleanup = None
         first_local = None
         media_errors = []
+        limit = self.settings.get("rollout_mp4_first_n_per_task")
+        rollout_enabled = self.settings.get("save_rollout_mp4", True) and (limit is None or attempt["episode"] < limit)
         transactional = None
         if self.settings.get("execution_profile") == "phase_b":
             from cosmos_framework.simulation.robocasa.eval_v2_transactions import PolicyTransport
@@ -121,7 +123,7 @@ class NativeEpisode:
         try:
             sink = self.media_factory(
                 directory / "media",
-                rollout=self.settings.get("save_rollout_mp4", True),
+                rollout=rollout_enabled,
                 generated=self.settings.get("save_generated_video", "none"),
                 grace_s=self.settings.get("encoder_grace_s", 2.0),
             )
@@ -255,6 +257,8 @@ class NativeEpisode:
                 except Exception as e:
                     media = {"errors": [repr(e)], "forced_encoder_cleanup": True}
                 media["parent_errors"] = media_errors
+                media["rollout_requested"] = rollout_enabled
+                media["rollout_mp4_first_n_per_task"] = limit
                 if transactional is not None:
                     media["transaction_fetch"] = transactional.media_diagnostics()
                 try:
