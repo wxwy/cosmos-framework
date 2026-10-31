@@ -25,6 +25,7 @@ from cosmos_framework.model.generator.mot.robocasa_exact_window_local import (
 from cosmos_framework.trainer import ImaginaireTrainer
 from cosmos_framework.trainer.local_memory_grouped import GroupedLocalMemoryTrainer, collate_grouped_native_batch
 from cosmos_framework.trainer.local_memory_grouped_resume import require_dcp_grouped_resume_component
+from cosmos_framework.trainer.no_ttt_async_loader import NoTTTAsyncLoader
 from cosmos_framework.utils import misc
 from cosmos_framework.utils.callback import Callback
 
@@ -149,6 +150,8 @@ class NoTTTFrontierCallback(Callback):
         ):
             raise RuntimeError("No-TTT checkpoint requires a committed optimizer boundary")
         trainer._grouped_planner.validate_frontier(window.live.frontier)
+        if loader is not None and hasattr(loader, "checkpoint_boundary"):
+            loader.checkpoint_boundary()
         return {
             "format": FORMAT,  # Transport-independent; compatible with existing workers=0 checkpoints.
             **_binding(trainer),
@@ -226,9 +229,7 @@ class MatchedNoTTTTrainer(ImaginaireTrainer):
         self._resume_required = self._no_ttt_failed = False
         self._no_ttt_loader = None
         if loader_profile is not None and loader_profile.workers:
-            from cosmos_framework.trainer.no_ttt_cpu_loader import NoTTTCpuLoader
-
-            self._no_ttt_loader = NoTTTCpuLoader(producer, loader_profile)
+            self._no_ttt_loader = NoTTTAsyncLoader(producer, loader_profile, planner)
         self.callbacks._callbacks.insert(0, NoTTTFrontierCallback(self))
 
     def train(self, model, dataloader_train, dataloader_val):

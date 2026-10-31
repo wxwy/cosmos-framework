@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -192,7 +193,7 @@ def get_action_robocasa_exact_window_cached_sft_dataset(
     source_reader = RoboCasaExactWindowSourceReader(catalog, source_root, verified_index=verified_index)
     raw = RoboCasaExactWindowCachedDataset(catalog, source_reader, contract)
     install_rank_shared_reader(raw)
-    transform = ActionTransformPipeline(
+    transform_kwargs = dict(
         tokenizer_config=tokenizer_config,
         cfg_dropout_rate=cfg_dropout_rate,
         max_action_dim=contract.max_action_dim,
@@ -202,9 +203,13 @@ def get_action_robocasa_exact_window_cached_sft_dataset(
         append_idle_frames=True,
         format_prompt_as_json=True,
     )
+    transform = ActionTransformPipeline(**transform_kwargs)
     if raw.compact_cached_video:
         transform.video_resize = CachedGeometryResize(transform.video_resize, tuple(raw._canvas_geometry))
     sft = ActionSFTDataset(raw, transform, resolution=None)
+    # CPU-loader reconstruction metadata only; no instantiated processor/model.
+    # Legacy workers=0 keeps this exact pipeline and its original global RNG.
+    sft._no_ttt_transform_recipe = deepcopy(transform_kwargs)
     sft.summary = raw.summary
     if iterable_shuffle:
         from cosmos_framework.data.generator.action.datasets.action_sft_dataset import ActionIterableShuffleDataset

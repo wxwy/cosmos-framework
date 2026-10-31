@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import make_dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,19 @@ from examples.psm_wma_robocasa_corrected_phase5_test import _config
 from examples.psm_wma_robocasa_matched_no_ttt import NoTTTPlanObserver
 from examples.psm_wma_robocasa_phase5_f0_test import Serializer, _args, _report
 from examples.psm_wma_robocasa_phase5_f0_test import _config as lifecycle_config
+
+
+def _structured_identity_fixture(value):
+    """Use supported structured config records; never relax production identity."""
+    if isinstance(value, SimpleNamespace):
+        values = {key: _structured_identity_fixture(item) for key, item in vars(value).items()}
+        record = make_dataclass("IdentityConfigFixture", [(key, object) for key in values])
+        return record(**values)
+    if isinstance(value, dict):
+        return {key: _structured_identity_fixture(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_structured_identity_fixture(item) for item in value)
+    return value
 
 
 def test_overlay_only_removes_local_and_keeps_data_loss_optimizer_schedule(tmp_path):
@@ -75,6 +89,7 @@ def test_all_worker_counts_share_strict_training_and_config_identity(tmp_path):
     config.optimizer.keys_to_select = list(phase5.GENERATION_KEYS)
     config.checkpoint.strict_resume = True
     config.data_setting = SimpleNamespace(seed=123)
+    config = _structured_identity_fixture(config)
     args = _args(
         tmp_path,
         "--no-ttt",
@@ -85,6 +100,8 @@ def test_all_worker_counts_share_strict_training_and_config_identity(tmp_path):
         "--job-name",
         "no_ttt_packed128_droid_fresh_30k_world4_ga4",
     )
+    args.dataset_index_root.mkdir(parents=True)
+    (args.dataset_index_root / "receipt.json").write_text("{}")
     report = {
         "cache_manifest_sha256": catalog.manifest_digest,
         "cache_corpus_digest": catalog.cache_corpus_digest,
@@ -368,9 +385,7 @@ def test_existing_formal_nottt4_resume_skips_job_identity_without_rewriting_chec
     resumed_digest = phase5._json_digest({"phase5_digest": "a" * 64, "training_identity": selected})
     assert resumed_digest == old_digest
     if historical_root_child:
-        assert old_digest != phase5._json_digest(
-            {"phase5_digest": "a" * 64, "training_identity": current_runtime}
-        )
+        assert old_digest != phase5._json_digest({"phase5_digest": "a" * 64, "training_identity": current_runtime})
     assert {p.relative_to(job): p.read_bytes() for p in job.rglob("*") if p.is_file()} == before
 
 

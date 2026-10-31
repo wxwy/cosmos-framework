@@ -43,6 +43,20 @@ class LoaderProfile:
             **asdict(self),
         }
 
+    def async_identity(self):
+        """Runtime provenance only; never part of training/frontier identity."""
+        return {
+            **self.identity(),
+            "schema": "nottt_cpu_async_dataloader_v1",
+            "source_reader": "worker_offline_verified_source",
+            "transform": "worker_conditioned_parent_ordered_cfg_selection",
+            "max_prepared_windows": 2,
+            "max_inflight_packets": self.workers * (self.prefetch_factor or 0),
+            "max_inflight_encoded_bytes": self.workers * (self.prefetch_factor or 0) * self.max_packet_bytes,
+            "rank_mmap_budget_bytes": self.workers * self.max_cache_bytes,
+            "worker_mmap_budget_bytes": self.max_cache_bytes,
+        }
+
 
 def profile_from_args(args):
     workers = getattr(args, "no_ttt_loader_workers", 0)
