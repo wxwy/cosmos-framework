@@ -63,9 +63,10 @@ class PolicyTransport:
             transport=self.http,
             batch_profile=True,
             max_batch_size=settings["max_infer_batch_size"],
+            local_memory_mode=settings.get("local_memory_mode", "required"),
         )
         self.lease = self.client.bind_assignment(assignment)
-        self.local = AssignedLocalMemoryClient(self.lease)
+        self.local = AssignedLocalMemoryClient(self.lease) if self.client.mode == "required" else None
         self._failed, self._ended, self.replan = False, False, 0
         self._last_delivered = -1
         self._stop = threading.Event()
@@ -90,7 +91,12 @@ class PolicyTransport:
             return _Response({"local_memory": {"status": "reset", "session_id": self.lease["session_id"]}})
         if self._failed or self._ended:
             raise RuntimeError("failed/closed Episode requires explicit End and new Attempt")
-        frontier = json.get("local_memory", {}).get("consumer_step")
+        if self.client.mode == "off":
+            if "local_memory" in json or "inference" in json:
+                raise ValueError("No-TTT native payload cannot supply Local or transaction ownership")
+            frontier = self.replan
+        else:
+            frontier = json.get("local_memory", {}).get("consumer_step")
         if type(frontier) is not int or frontier <= self._last_delivered:
             self._failed = True
             raise ValueError("native Episode cannot execute a delivered frontier twice")
@@ -100,6 +106,12 @@ class PolicyTransport:
             raise TimeoutError("original Episode deadline exhausted")
         self.client.timeout_s = min(timeout, self.settings["predict_timeout_s"], remaining)
         record = dict(json)
+        if self.client.mode == "off":
+            record["inference"] = {
+                "session_id": self.lease["session_id"],
+                "episode_id": self.lease["episode_id"],
+                "request_index": frontier,
+            }
         mode = self.settings.get("save_generated_video", "none")
         if mode == "all" or (mode == "first" and self.replan == 0):
             record["media"] = {"replan": self.replan}

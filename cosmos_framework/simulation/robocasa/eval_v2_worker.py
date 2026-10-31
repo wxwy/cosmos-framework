@@ -63,6 +63,7 @@ def serve(channel, cfg, *, factory=None):
                 "pid": os.getpid(),
                 "physical_slot_id": cfg["physical_slot_id"],
                 "state": slot.state,
+                "local_memory_mode": cfg["settings"].get("local_memory_mode", "required"),
                 "runtime_digest": runtime["digest"] if factory is None else "CPU_TEST_FACTORY",
             },
         )

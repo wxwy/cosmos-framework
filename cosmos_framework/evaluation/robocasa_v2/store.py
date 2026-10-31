@@ -29,6 +29,7 @@ from cosmos_framework.evaluation.robocasa_v2.contract import (
 
 MAX_JSON = 256 * 1024
 MAX_REPORT = 16 * 1024 * 1024
+MAX_RUNTIME_PROBE = 64 * 1024 * 1024
 
 
 def safe(path):
@@ -122,6 +123,15 @@ def write_report(path, value):
     if Path(path).name != "summary.json":
         raise ValueError("report limit cannot be used for Core/ledger records")
     _publish(path, value, replace=True, limit=MAX_REPORT)
+
+
+def write_runtime_probe(path, value):
+    """Append bounded diagnostics only within the runtime probe namespace."""
+    path = safe(path)
+    if path.parent.name != "runtime_probe" or path.parent.parent.name != "_internal" or path.suffix != ".json":
+        raise ValueError("runtime probe UUID JSON path required")
+    identifier(path.stem)
+    _publish(path, value, limit=MAX_RUNTIME_PROBE)
 
 
 def sealed(value):
@@ -692,7 +702,10 @@ class Store:
             return copy.deepcopy(cached[1])
         row = self._read_result(task, ep)
         inventory = load(path.parent / "core_inventory.json")
-        if inventory != {"row_digest": digest(row), "files": validate(path.parent, row)}:
+        if inventory != {
+            "row_digest": digest(row),
+            "files": validate(path.parent, row, local_memory=self.manifest["protocol"]["local_memory"]),
+        }:
             raise ValueError("Core evidence inventory mismatch")
         self._rowcache[(task, ep)] = (stamps, copy.deepcopy(row))
         return row
@@ -883,7 +896,7 @@ class Store:
         if staging != work or not staging.is_dir():
             raise ValueError("owned attempt staging required")
         self._validate_sampling(a, row)
-        inventory = validate(staging, row)
+        inventory = validate(staging, row, local_memory=self.manifest["protocol"]["local_memory"])
         save(staging / "core_inventory.json", {"row_digest": digest(row), "files": inventory})
         save(staging / "result.json", row)
         sync_dir(staging)

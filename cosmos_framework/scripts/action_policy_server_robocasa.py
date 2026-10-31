@@ -651,16 +651,14 @@ def _transaction_options(args):
             raise ValueError("multi-Slot/batch options require explicit batch profile")
         slots = (args.transaction_slot_id,)
     if (
-        args.local_memory_mode != "required"
+        args.local_memory_mode not in ("off", "required")
         or args.local_memory_max_sessions != len(slots)
         or not 1 <= len(slots) <= 8
         or len(set(slots)) != len(slots)
         or args.action_chunk_size != 16
         or any(v is None for v in fields)
     ):
-        raise ValueError(
-            "B1 transaction profile requires required Local-TTT, exact Slots, explicit H16 and complete identity"
-        )
+        raise ValueError("transaction profile requires explicit mode, exact Slots, explicit H16 and complete identity")
     token_path = Path(args.transaction_owner_token_file)
     if token_path.stat().st_mode & 0o077 or token_path.stat().st_size > 256:
         raise ValueError("transaction owner capability file must be private and bounded")
@@ -774,6 +772,18 @@ class ActionModelService:
         assert isinstance(pipe.setup_args, OmniSetupArgs)
         self.setup_args: OmniSetupArgs = pipe.setup_args
         self.experiment_config: dict = _load_introspection_config_dict(self.setup_args)
+        if transaction_options is not None:
+            from cosmos_framework.inference.robocasa_transaction_mode import validate_model_mode
+
+            validate_model_mode(
+                self.model,
+                self.experiment_config,
+                self.setup_args.checkpoint_path,
+                args.local_memory_mode,
+                use_ema_weights=(
+                    self.setup_args.config_file_type == ConfigFileType.MODULE and self.setup_args.use_ema_weights
+                ),
+            )
 
         # Resolve action_chunk_size: CLI arg > experiment config > default.
         if args.action_chunk_size is not None:
@@ -908,8 +918,13 @@ class ActionModelService:
                 self.cfg.action_chunk_size != 16
                 or self.raw_action_dim != 15
                 or not self.requires_state
-                or self.local_memory_adapter.info()["k_local"] != 4
-                or self.local_memory_adapter.info()["local_dim"] != 32
+                or (
+                    args.local_memory_mode == "required"
+                    and (
+                        self.local_memory_adapter.info()["k_local"] != 4
+                        or self.local_memory_adapter.info()["local_dim"] != 32
+                    )
+                )
             ):
                 raise ValueError("B1 transaction profile requires resolved raw15/state15/H16/K4/local32")
             if args.transaction_profile == "batch":
@@ -1212,6 +1227,7 @@ class ActionModelService:
 
     def _transaction_action(self, req, update):
         prep = self._prep_policy_item(req)
+        local_kwargs = self._transaction_prefixes([update], batch=False)
         with torch.inference_mode():
             samples = self.model.generate_samples_from_batch(
                 self._single_policy_batch(prep),
@@ -1219,7 +1235,7 @@ class ActionModelService:
                 seed=[self.cfg.seed],
                 num_steps=self.cfg.num_steps,
                 has_negative_prompt=False,
-                _local_memory_prefixes=self.local_memory_adapter.prefixes(update),
+                **local_kwargs,
             )
         if len(samples["action"]) != 1:
             raise ValueError("B1 native output cardinality mismatch")
@@ -1254,7 +1270,7 @@ class ActionModelService:
                 seed=[self.cfg.seed] * n,
                 num_steps=self.cfg.num_steps,
                 has_negative_prompt=False,
-                _local_memory_prefixes=tuple(self.local_memory_adapter.prefixes(u)[0] for u in updates),
+                **self._transaction_prefixes(updates, batch=True),
             )
         if len(samples["action"]) != n:
             raise ValueError("native batch action cardinality mismatch")
@@ -1285,6 +1301,14 @@ class ActionModelService:
                     log.warning("Optional media spool dropped: %s", type(error).__name__)
             media.append(candidate)
         return BatchOutput(actions, tuple(media))
+
+    def _transaction_prefixes(self, updates, *, batch):
+        if self.local_memory_adapter.mode == "off":
+            if any(update is not None for update in updates):
+                raise ValueError("No-TTT cannot carry Local updates")
+            return {}  # Do not call prefixes or inject even an empty Local kwarg.
+        prefixes = tuple(self.local_memory_adapter.prefixes(u)[0] for u in updates)
+        return {"_local_memory_prefixes": prefixes}
 
     def _transaction_decode_media(self, value):
         latent, padded = value

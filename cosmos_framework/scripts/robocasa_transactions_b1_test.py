@@ -216,7 +216,7 @@ def test_transaction_profile_fail_closed_preflight_before_model_load(tmp_path, c
     )
     assert server._transaction_options(args)["slot_ids"] == ("slot0",)
     if change == "mode":
-        args.local_memory_mode = "off"
+        args.local_memory_mode = "auto"
     elif change == "sessions":
         args.local_memory_max_sessions = 2
     elif change == "horizon":

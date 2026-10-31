@@ -25,8 +25,38 @@ from typing import Any, Callable
 from cosmos_framework.inference.local_memory_state import CachedMemoryResponse
 
 PROTOCOL = "robocasa.session-transactions.b1.v1"
+NO_TTT_PROTOCOL = "robocasa.session-transactions.no-ttt.v1"
 MAX_BODY = 32 * 1024**2
 MAX_RESPONSE = 1024**2
+
+
+def protocol_for_mode(mode):
+    if mode not in ("off", "required"):
+        raise ValueError("explicit off|required Local-TTT mode required")
+    return PROTOCOL if mode == "required" else NO_TTT_PROTOCOL
+
+
+def request_frontier(payload, mode):
+    """No-TTT has a transaction sequence, never a fabricated Local frontier."""
+    if mode == "required":
+        local = payload.get("local_memory")
+        if not isinstance(local, dict):
+            raise ValueError("Local evidence object required")
+        value = local.get("consumer_step")
+    else:
+        inference = payload.get("inference")
+        if not isinstance(inference, dict) or set(inference) != {"session_id", "episode_id", "request_index"}:
+            raise ValueError("exact No-TTT inference identity required")
+        value = inference["request_index"]
+    if type(value) is not int or value < 0 or (mode == "off" and value > 100000):
+        raise ValueError("bounded integer inference frontier required")
+    return value
+
+
+@dataclass(frozen=True)
+class _CommittedResponse:
+    frontier: int
+    response: CachedMemoryResponse
 
 
 def json_bytes(value: Any) -> bytes:
@@ -163,8 +193,10 @@ class SessionTransactions:
         max_bytes=128 * 1024**2,
         clock=time.monotonic,
     ):
-        if adapter.mode != "required" or adapter.memory is None:
-            raise ValueError("Session transactions require real required-mode Local-TTT")
+        self.mode = adapter.mode
+        self.protocol = protocol_for_mode(self.mode)
+        if (adapter.memory is not None) != (self.mode == "required"):
+            raise ValueError("transaction mode must match actual Local-TTT capability")
         if not 1 <= len(slot_ids) <= 8 or len(set(slot_ids)) != len(slot_ids):
             raise ValueError("one to eight distinct bounded physical Slot identities required")
         if not math.isfinite(timeout_s) or timeout_s <= 0 or type(max_bytes) is not int or max_bytes <= 0:
@@ -188,6 +220,7 @@ class SessionTransactions:
         self._closing: set[str] = set()
         self._failed: dict[str, dict] = {}
         self._tickets: dict[str, _Ticket] = {}
+        self._responses: dict[str, _CommittedResponse] = {}
         self._busy = False
         self._quarantined = False
         self._stopping = False
@@ -200,7 +233,8 @@ class SessionTransactions:
         with self._lock:
             return {
                 "enabled": True,
-                "profile": PROTOCOL,
+                "profile": self.protocol,
+                "local_memory_mode": self.mode,
                 "server_epoch": self.server_epoch,
                 "run_lease": self.run_lease,
                 "manifest_digest": self.manifest_digest,
@@ -223,6 +257,17 @@ class SessionTransactions:
     def _healthy(self):
         if self._quarantined or self._stopping:
             raise RuntimeError("transaction actor unavailable; owned Server recovery required")
+
+    def _registration_reply(self, lease):
+        return self._reply(
+            200,
+            {
+                "lease": asdict(lease),
+                "prediction_clock_domain": self.clock_domain,
+                "local_memory_mode": self.mode,
+                "profile": self.protocol,
+            },
+        )
 
     def register(self, record: dict, owner_token: str) -> Reply:
         if not secrets.compare_digest(owner_token, self.owner_token):
@@ -252,7 +297,7 @@ class SessionTransactions:
             if current is not None:
                 expected = {key: getattr(current, key) for key in record}
                 if record == expected:
-                    return self._reply(200, {"lease": asdict(current), "prediction_clock_domain": self.clock_domain})
+                    return self._registration_reply(current)
                 raise ValueError("previous physical Slot assignment has not received End ACK")
             if record["generation"] <= self._generations[slot]:
                 raise ValueError("stale Slot generation")
@@ -267,7 +312,7 @@ class SessionTransactions:
             self._generations[slot] = lease.generation
             self._leases[slot] = lease
             self._failed.pop(slot, None)
-            return self._reply(200, {"lease": asdict(lease), "prediction_clock_domain": self.clock_domain})
+            return self._registration_reply(lease)
 
     def _lease(self, proof: dict, *, closed=False) -> SessionLease:
         if not isinstance(proof, dict) or set(proof) != set(SessionLease.__dataclass_fields__):
@@ -313,19 +358,18 @@ class SessionTransactions:
         payload = strict_json(raw)  # Freeze caller-owned structures before admission.
         if not self._payload_keys_valid(payload):
             raise ValueError("B1 policy payload requires observation/state/local evidence; media must be off")
-        local = payload["local_memory"]
-        if not isinstance(local, dict) or type(local.get("consumer_step")) is not int:
-            raise ValueError("integer Local consumer frontier required")
-        frontier = local["consumer_step"]
-        if frontier < 0 or not isinstance(local.get("evidence"), list) or len(local["evidence"]) > 16:
+        frontier = request_frontier(payload, self.mode)
+        local = payload["local_memory"] if self.mode == "required" else payload["inference"]
+        if self.mode == "required" and (not isinstance(local.get("evidence"), list) or len(local["evidence"]) > 16):
             raise ValueError("completed evidence must be bounded by H16")
         payload_sha = hashlib.sha256(raw).hexdigest()
         with self._lock:
             lease = self._lease(proof)
             if (local.get("session_id"), local.get("episode_id")) != (lease.session_id, lease.episode_id):
                 raise ValueError("Local evidence belongs to another assignment")
-            key = digest({"protocol": PROTOCOL, **lease.identity(), "frontier": frontier})
-            cached = self.adapter.snapshot.responses.get(lease.session_id)
+            key = digest({"protocol": self.protocol, **lease.identity(), "frontier": frontier})
+            previous = self._responses.get(lease.session_id)
+            cached = previous.response if previous else None
             if cached is not None and cached.request_key == key and cached.payload_sha256 != payload_sha:
                 raise ValueError("request identity reused with changed payload")
             ticket = self._tickets.get(key)
@@ -336,13 +380,12 @@ class SessionTransactions:
             self._usable(lease)
             if cached is not None and cached.request_key == key:
                 return Reply(200, cached.body)  # Post-ACK replay never creates a new Ticket.
-            previous = self.adapter.snapshot.fast.get(lease.session_id)
-            if previous is not None and frontier <= previous.consumer_step:
+            if previous is not None and frontier <= previous.frontier:
                 raise ValueError("stale or evicted evidence frontier")
             if previous is None:
-                if frontier != 0 or local["evidence"]:
+                if frontier != 0 or (self.mode == "required" and local["evidence"]):
                     raise ValueError("fresh Episode must start at frontier0 without evidence")
-            elif frontier - previous.consumer_step != len(local["evidence"]):
+            elif frontier - previous.frontier != (len(local["evidence"]) if self.mode == "required" else 1):
                 raise ValueError("bounded contiguous completed evidence required")
             if any(item.lease.slot_id == lease.slot_id for item in self._tickets.values()):
                 raise ValueError("one queued/inflight/undelivered request per physical Slot")
@@ -360,7 +403,31 @@ class SessionTransactions:
             return self._pending(ticket)
 
     def _payload_keys_valid(self, payload):
-        return set(payload) == {"image", "prompt", "domain_name", "image_size", "state", "local_memory"}
+        state_key = "local_memory" if self.mode == "required" else "inference"
+        return set(payload) == {"image", "prompt", "domain_name", "image_size", "state", state_key}
+
+    def _commit_responses(self, members, caches, *, batch=False):
+        # Allocate the complete transaction publication BEFORE any Local commit.
+        # Readers/End/ACK use this same actor lock; no response is visible early.
+        replacement = dict(self._responses)
+        for ticket, cached in zip(members, caches, strict=True):
+            replacement[ticket.lease.session_id] = _CommittedResponse(
+                request_frontier(ticket.payload, self.mode), cached
+            )
+        if self.mode == "required":
+            if batch:
+                self.adapter.commit_many(tuple((t.update, c) for t, c in zip(members, caches, strict=True)))
+            else:
+                self.adapter.commit(members[0].update, caches[0])
+        self._responses = replacement
+
+    def _reset_session(self, session_id):
+        if self.mode == "required":
+            self.adapter.reset(session_id)
+        self._responses.pop(session_id, None)
+
+    def _response_local(self, update):
+        return {"local_memory": self.adapter.status(update)} if self.mode == "required" else {}
 
     def _schedule(self, ticket):
         self._executor.submit(self._execute, ticket)
@@ -390,7 +457,8 @@ class SessionTransactions:
             self._expire(ticket)
             if not ticket.quiescent:
                 return self._pending(ticket)
-        cached = self.adapter.snapshot.responses.get(lease.session_id)
+        entry = self._responses.get(lease.session_id)
+        cached = entry.response if entry else None
         if cached is None or cached.request_key != key:
             raise ValueError("no retained committed response for this inference")
         if cached.payload_sha256 != payload_sha:
@@ -425,7 +493,7 @@ class SessionTransactions:
                 return self._reply(202, {"acknowledged": False, "state": "draining", **lease.identity()})
             for ticket in owned:
                 self._release(ticket)
-            self.adapter.reset(lease.session_id)
+            self._reset_session(lease.session_id)
             del self._leases[lease.slot_id]
             self._closed[lease.slot_id] = lease
             self._closing.remove(lease.slot_id)
@@ -445,7 +513,8 @@ class SessionTransactions:
                     self._busy = True
                     ticket.state = "SEALED"
                     self._fence(ticket)
-                ticket.update = self.adapter.prepare(ticket.payload)
+                if self.mode == "required":
+                    ticket.update = self.adapter.prepare(ticket.payload)
                 with self._lock:
                     ticket.state = "PREPARED"
                     self._fence(ticket)
@@ -458,16 +527,16 @@ class SessionTransactions:
                     or any(type(v) not in (float, int) or not math.isfinite(v) for row in action for v in row)
                 ):
                     raise ValueError("generation must return finite [16,15] raw actions")
-                status = self.adapter.status(ticket.update)
                 body = json_bytes(
                     {
-                        "protocol": PROTOCOL,
+                        "protocol": self.protocol,
+                        "local_memory_mode": self.mode,
                         "request_key": ticket.key,
                         "payload_sha256": ticket.payload_sha256,
                         "assignment": ticket.lease.identity(),
-                        "frontier": ticket.payload["local_memory"]["consumer_step"],
+                        "frontier": request_frontier(ticket.payload, self.mode),
                         "action": action,
-                        "local_memory": status,
+                        **self._response_local(ticket.update),
                         "native_batch": {"size": 1, "index": 0},
                         "media": {"status": "disabled"},
                     }
@@ -480,12 +549,12 @@ class SessionTransactions:
                 with self._lock:
                     ticket.state = "VALIDATED"
                     self._fence(ticket)
-                    self.adapter.commit(ticket.update, cached)
+                    self._commit_responses([ticket], [cached])
                     committed = True
                     ticket.state = "COMMITTED"
             except BaseException as error:
                 stage = ticket.state
-                if not committed:
+                if not committed and self.mode == "required":
                     try:
                         self.adapter.abort(ticket.update)
                     except BaseException:
@@ -543,7 +612,7 @@ class SessionTransactions:
                     for ticket in tuple(self._tickets.values()):
                         self._release(ticket)
                     for lease in tuple(self._leases.values()):
-                        self.adapter.reset(lease.session_id)
+                        self._reset_session(lease.session_id)
                         self._closed[lease.slot_id] = lease
                     self._leases.clear()
                     self._closing.clear()
