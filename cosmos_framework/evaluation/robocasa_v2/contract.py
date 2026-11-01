@@ -31,7 +31,16 @@ def integer(value, minimum, maximum, name):
 
 
 def build_manifest(
-    *, tasks, episodes, seed, horizons, experiment, formal=False, execution=None, local_memory="required"
+    *,
+    tasks,
+    episodes,
+    seed,
+    horizons,
+    experiment,
+    formal=False,
+    execution=None,
+    local_memory="required",
+    rendering=None,
 ):
     if local_memory not in ("off", "required"):
         raise ValueError("explicit off|required Local-TTT mode required")
@@ -117,6 +126,23 @@ def build_manifest(
             raise ValueError("distinct physical GPUs required")
         body["execution"] = execution
         body["protocol"]["resource_architecture"] = "multi_reusable_sim_slots_one_native_model_owner_per_gpu_phase_b"
+    if rendering is not None:
+        if (
+            not isinstance(rendering, dict)
+            or set(rendering) != {"backend", "gpu_ids"}
+            or rendering["backend"] not in ("egl", "osmesa")
+            or not isinstance(rendering["gpu_ids"], list)
+            or any(type(g) is not int or g < 0 for g in rendering["gpu_ids"])
+            or (rendering["backend"] == "osmesa" and rendering["gpu_ids"])
+            or (rendering["backend"] == "egl" and not rendering["gpu_ids"])
+            or (
+                rendering["backend"] == "egl"
+                and execution is not None
+                and len(rendering["gpu_ids"]) != len(execution["gpu_ids"])
+            )
+        ):
+            raise ValueError("exact render backend/physical GPU policy required")
+        body["rendering"] = rendering
     return json.loads(canonical({**body, "digest": digest(body)}))
 
 
@@ -132,6 +158,7 @@ def validate_manifest(value):
         formal=value["scope"] == "formal900",
         execution=value.get("execution"),
         local_memory=value["protocol"]["local_memory"],
+        rendering=value.get("rendering"),
     )
     if value != expected:
         raise ValueError("invalid immutable manifest or protocol")

@@ -255,7 +255,7 @@ class NativeEpisode:
                 try:
                     media = sink.close() if sink is not None else {"errors": media_errors}
                 except Exception as e:
-                    media = {"errors": [repr(e)], "forced_encoder_cleanup": True}
+                    media = {"errors": [repr(e)], "forced_encoder_cleanup": True, "process_cleanup_failed": True}
                 media["parent_errors"] = media_errors
                 media["rollout_requested"] = rollout_enabled
                 media["rollout_mp4_first_n_per_task"] = limit
@@ -278,7 +278,7 @@ class NativeEpisode:
             "instruction": prompt,
             "replans": replans,
             "elapsed_seconds": time.monotonic() - start,
-            "media_process_fault": media.get("forced_encoder_cleanup", False)
+            "media_process_fault": media.get("process_cleanup_failed", media.get("forced_encoder_cleanup", False))
             or (transactional is not None and transactional.media_process_fault),
             "media_helper_pids": media.get("helper_pids", []),
         }

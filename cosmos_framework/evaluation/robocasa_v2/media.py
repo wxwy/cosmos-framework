@@ -2,10 +2,54 @@
 
 from __future__ import annotations
 
+import errno
 import multiprocessing as mp
 import os
+import threading
 from pathlib import Path
 from queue import Full
+
+
+def _diagnostic(errors, error):
+    if len(errors) < 16:
+        errors.append(repr(error)[:2048] if not isinstance(error, str) else error[:2048])
+
+
+class _ReaderClose:
+    """Parent-only close shared with QueueFeederThread, installed after spawn.
+
+    Connection.close() is idempotent but not thread-safe: its _handle test and
+    os.close can interleave. Serializing both callers prevents the sentinel path
+    from raising EBADF and then incorrectly releasing Queue's semaphore.
+    """
+
+    def __init__(self, close, errors, grace):
+        self.close, self.errors, self.grace = close, errors, grace
+        self.lock = threading.Lock()
+        self.done = self.failed = False
+
+    def __call__(self):
+        if not self.lock.acquire(timeout=self.grace):
+            self.failed = True
+            _diagnostic(self.errors, "encoder reader close lock did not quiesce")
+            return
+        try:
+            if self.done:
+                return
+            try:
+                self.close()
+            except OSError as error:
+                # EBADF is a descriptor diagnostic, never evidence that a
+                # process died. Actual encoder/feeder liveness is checked later.
+                self.failed = self.failed or error.errno != errno.EBADF
+                _diagnostic(self.errors, error)
+            except Exception as error:
+                self.failed = True
+                _diagnostic(self.errors, error)
+            finally:
+                self.done = True
+        finally:
+            self.lock.release()
 
 
 def _guarded_encoder(target, args, parent):
@@ -77,6 +121,9 @@ class MediaSink:
         self.process = None
         self.forced = False
         self.helpers = []
+        self._closed = False
+        self._result = None
+        self._reader_guard = None
         if rollout or generated != "none":
             ctx = mp.get_context("spawn")
             self.queue = ctx.Queue(maxsize=4)
@@ -92,20 +139,30 @@ class MediaSink:
             )
             try:
                 self.process.start()
+                # Install only after Queue was pickled into the child, before
+                # the first parent put() can start its feeder. No stdlib patch.
+                self._reader_guard = _ReaderClose(self.queue._reader.close, self.errors, self.grace_s)
+                self.queue._reader.close = self._reader_guard
             except Exception as e:
-                self.errors.append(repr(e))
-                self.process = None
-                self.queue.close()
-                self.queue = None
+                _diagnostic(self.errors, e)
+                if self.process.pid is None:
+                    self.process = None
+                if self._reader_guard is None:
+                    self._reader_guard = _ReaderClose(self.queue._reader.close, self.errors, self.grace_s)
+                    self.queue._reader.close = self._reader_guard
+                self.close()
 
     def _submit(self, kind, payload):
+        if self._closed:
+            self.dropped += 1
+            return
         if self.queue is None:
             return
         try:
             if self.process is None or not self.process.is_alive():
                 raise RuntimeError("encoder exited")
             self.queue.put_nowait((kind, payload))
-        except (Full, RuntimeError, OSError) as e:
+        except (Full, RuntimeError, OSError, ValueError) as e:
             self.dropped += 1
             if len(self.errors) < 16:
                 self.errors.append(type(e).__name__ + ": " + str(e))
@@ -132,35 +189,73 @@ class MediaSink:
             self._submit("prediction", (index, video))
 
     def close(self):
+        if self._result is not None:
+            return dict(self._result, errors=list(self._result["errors"]), helper_pids=list(self.helpers))
+        self._closed = True
+        encoder_alive = feeder_alive = fd_failed = False
         if self.process is not None:
             try:
                 self.queue.put_nowait(None)
-            except (Full, OSError):
+            except (Full, OSError, ValueError) as error:
                 self.dropped += 1
+                _diagnostic(self.errors, error)
             self.process.join(self.grace_s)
             if self.process.is_alive():
                 self.forced = True
-                self.process.terminate()
+                try:
+                    self.process.terminate()
+                except ProcessLookupError:
+                    pass
                 self.process.join(self.grace_s)
             if self.process.is_alive():
-                self.process.kill()
+                try:
+                    self.process.kill()
+                except ProcessLookupError:
+                    pass
                 self.process.join(self.grace_s)
-            if self.process.is_alive():
-                raise RuntimeError("owned encoder survived SIGKILL")
-            if self.process.exitcode != 0:
-                self.errors.append(f"encoder exit {self.process.exitcode}")
-            self.queue.cancel_join_thread()
-            self.queue.close()
-            self.queue._reader.close()
-            if self.queue._thread is not None:
-                self.queue._thread.join(self.grace_s)
-                if self.queue._thread.is_alive():
-                    self.forced = True
-                    self.errors.append("encoder feeder thread did not stop")
-        return {
+            encoder_alive = self.process.is_alive()
+            if encoder_alive:
+                _diagnostic(self.errors, "owned encoder survived SIGKILL")
+            elif self.process.exitcode != 0:
+                _diagnostic(self.errors, f"encoder exit {self.process.exitcode}")
+        if self.queue is not None:
+            try:
+                self.queue.cancel_join_thread()  # Never an unbounded join at interpreter exit.
+                self.queue.close()
+            except (OSError, ValueError) as error:
+                _diagnostic(self.errors, error)
+            feeder = self.queue._thread
+            if feeder is not None:
+                feeder.join(self.grace_s)  # Normal path: feeder owns reader_close().
+            if feeder is not None and feeder.is_alive():
+                # A dead consumer can leave send_bytes blocked on a full pipe.
+                # Use the SAME serialized close as the feeder, then wait again.
+                self.forced = True
+                self._reader_guard()
+                feeder.join(self.grace_s)
+            feeder_alive = feeder is not None and feeder.is_alive()
+            if feeder_alive:
+                _diagnostic(self.errors, "encoder feeder thread did not stop")
+            else:
+                try:
+                    self.queue._reader.close()
+                    self.queue._writer.close()
+                except OSError as error:
+                    fd_failed = error.errno != errno.EBADF
+                    _diagnostic(self.errors, error)
+                if self._reader_guard is not None:
+                    fd_failed = fd_failed or self._reader_guard.failed
+                    # Drop the instance override only after the feeder is gone;
+                    # this breaks its Connection/guard reference cycle.
+                    del self.queue._reader.close
+        self._result = {
             "dropped": self.dropped,
-            "errors": self.errors,
+            "errors": list(self.errors),
             "independent_of_SR": True,
             "forced_encoder_cleanup": self.forced,
-            "helper_pids": self.helpers,
+            "process_cleanup_failed": encoder_alive or feeder_alive or fd_failed,
+            "encoder_alive": encoder_alive,
+            "feeder_alive": feeder_alive,
+            "helper_pids": list(self.helpers),
         }
+        return dict(self._result, errors=list(self._result["errors"]))
