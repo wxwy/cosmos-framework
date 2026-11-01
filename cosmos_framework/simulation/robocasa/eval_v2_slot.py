@@ -9,6 +9,7 @@ from cosmos_framework.evaluation.robocasa_v2.contract import SAMPLING
 from cosmos_framework.evaluation.robocasa_v2.store import identifier, load
 from cosmos_framework.simulation.robocasa import closed_loop_eval as native
 from cosmos_framework.simulation.robocasa.eval_v2_adapter import NativeEpisode
+from cosmos_framework.simulation.robocasa.render_devices import verify_current
 
 
 class SimSlot:
@@ -133,6 +134,12 @@ class SimSlot:
         self._state("RESETTING")
         self.reset_index += 1  # Includes failed and initially successful scene samples.
         value = self.engine.initialize()
+        if value.get("error") is None and self.cfg.get("rendering", {}).get("backend") == "egl":
+            try:
+                value["rendering"] = verify_current(self.cfg["rendering"])
+            except BaseException:
+                self._state("FAILED_QUARANTINED")
+                raise
         self._state("FAILED_QUARANTINED" if value.get("error") and not value.get("safe_to_retry") else "ADMISSION")
         return dict(value, sampling=self.sampling())
 

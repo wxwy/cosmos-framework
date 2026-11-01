@@ -17,6 +17,7 @@ from cosmos_framework.evaluation.robocasa_v2.wire import receive, send
 def serve(channel, cfg, *, factory=None):
     # Factory is a Python CPU test boundary, never selectable via production CLI.
     from cosmos_framework.simulation.robocasa import closed_loop_eval as native
+    from cosmos_framework.simulation.robocasa import render_devices
     from cosmos_framework.simulation.robocasa.eval_v2_adapter import NativeEpisode
     from cosmos_framework.simulation.robocasa.eval_v2_slot import SimSlot
 
@@ -35,6 +36,7 @@ def serve(channel, cfg, *, factory=None):
                 "native": Path(native.__file__),
                 "adapter": Path(sys.modules[NativeEpisode.__module__].__file__),
                 "slot": Path(sys.modules[SimSlot.__module__].__file__),
+                "rendering": Path(render_devices.__file__),
             }
             if cfg["settings"].get("execution_profile") == "phase_b":
                 from cosmos_framework.simulation.robocasa import eval_v2_transactions
@@ -49,6 +51,9 @@ def serve(channel, cfg, *, factory=None):
                     or hashlib.sha256(file.read_bytes()).hexdigest() != expected["sha256"]
                 ):
                     raise ValueError("native import origin/source mismatch")
+        rendering = render_devices.configure(cfg["rendering"])
+        cfg["rendering"] = rendering
+        if factory is None:
             runtime = native.verify_runtime(SimpleNamespace(**cfg["runtime_args"]), next(iter(cfg["tasks"])))
             if runtime is None or any(
                 runtime["protocol"]["official_horizons"][task] != spec["horizon"] for task, spec in cfg["tasks"].items()
@@ -65,6 +70,7 @@ def serve(channel, cfg, *, factory=None):
                 "state": slot.state,
                 "local_memory_mode": cfg["settings"].get("local_memory_mode", "required"),
                 "runtime_digest": runtime["digest"] if factory is None else "CPU_TEST_FACTORY",
+                "rendering": rendering,
             },
         )
         while True:
