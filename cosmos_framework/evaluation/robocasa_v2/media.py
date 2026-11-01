@@ -223,6 +223,7 @@ class MediaSink:
                 self.queue.cancel_join_thread()  # Never an unbounded join at interpreter exit.
                 self.queue.close()
             except (OSError, ValueError) as error:
+                fd_failed = True
                 _diagnostic(self.errors, error)
             feeder = self.queue._thread
             if feeder is not None:
@@ -241,7 +242,7 @@ class MediaSink:
                     self.queue._reader.close()
                     self.queue._writer.close()
                 except OSError as error:
-                    fd_failed = error.errno != errno.EBADF
+                    fd_failed = fd_failed or error.errno != errno.EBADF
                     _diagnostic(self.errors, error)
                 if self._reader_guard is not None:
                     fd_failed = fd_failed or self._reader_guard.failed
