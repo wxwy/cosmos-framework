@@ -27,6 +27,10 @@ from cosmos_framework.inference.robocasa_session_transactions import (
     request_frontier,
 )
 
+# Reservation frontiers are bounded to0..100000 by the existing wire contract.
+# Retain only identity digests, never videos/receipts, until acknowledged End.
+MAX_MEDIA_REPLAY_RECORDS = 100001
+
 
 @dataclass(frozen=True)
 class MediaCandidate:
@@ -147,9 +151,10 @@ class BatchedSessionTransactions(SessionTransactions):
             self._usable(lease)
             if key != digest({"protocol": self.protocol, **lease.identity(), "frontier": frontier}):
                 raise ValueError("media reservation request identity mismatch")
-            acknowledged = self._acked_media.get(lease.session_id)
-            if acknowledged is not None and acknowledged[0] == key:
-                if acknowledged[1] != payload_sha or acknowledged[3] != replan:
+            history = self._acked_media.get(lease.session_id, {})
+            acknowledged = history.get(key)
+            if acknowledged is not None:
+                if acknowledged[0] != payload_sha or acknowledged[2] != replan:
                     raise ValueError("acknowledged media reservation identity reused")
                 return self._reply(
                     200, {"reserved": True, "already_saved": True, "request_key": key, "payload_sha256": payload_sha}
@@ -160,6 +165,18 @@ class BatchedSessionTransactions(SessionTransactions):
                 if job.ticket.lease != lease or job.ticket.payload_sha256 != payload_sha or job.replan != replan:
                     raise ValueError("media reservation identity reused")
                 return self._reply(200, {"reserved": True, "request_key": key, "payload_sha256": payload_sha})
+            reserved = sum(j.required and j.ticket.lease == lease for j in self._media.values())
+            if len(history) + reserved >= MAX_MEDIA_REPLAY_RECORDS:
+                return self._reply(
+                    200,
+                    {
+                        "reserved": False,
+                        "media": {
+                            "status": "MEDIA_INCOMPLETE",
+                            "error": "bounded Episode media replay history exhausted",
+                        },
+                    },
+                )
             if self.decode_media is None:
                 return self._reply(
                     200, {"reserved": False, "media": {"status": "MEDIA_INCOMPLETE", "error": "decoder unavailable"}}
@@ -585,10 +602,9 @@ class BatchedSessionTransactions(SessionTransactions):
                         or len(receipt["sha256"]) != 64
                     ):
                         raise ValueError("strict media ACK requires matching durable VIDEO_SAVED receipt")
-                    self._acked_media[lease.session_id] = (key, sha, digest(receipt), job.replan)
+                    self._acked_media.setdefault(lease.session_id, {})[key] = (sha, digest(receipt), job.replan)
                 del self._media[key]
-            elif receipt is not None and self._acked_media.get(lease.session_id) != (
-                key,
+            elif receipt is not None and self._acked_media.get(lease.session_id, {}).get(key) != (
                 sha,
                 digest(receipt),
                 receipt.get("index"),
@@ -607,9 +623,11 @@ class BatchedSessionTransactions(SessionTransactions):
         with self._lock:
             lease = self._lease(proof, closed=True)
             self._cancel_media(lease)
-            self._acked_media.pop(lease.session_id, None)
             self._changed.notify_all()
-            return super().end(proof)
+            reply = super().end(proof)
+            if reply.json().get("acknowledged") is True:
+                self._acked_media.pop(lease.session_id, None)
+            return reply
 
     def close(self, timeout_s=10):
         with self._lock:
