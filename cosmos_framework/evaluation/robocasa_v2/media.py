@@ -1,13 +1,18 @@
-"""Bounded optional encoder subprocess. Never decodes media in the SR path."""
+"""Bounded diagnostic encoder; all-mode durable completion is independent of SR."""
 
 from __future__ import annotations
 
 import errno
+import json
 import multiprocessing as mp
 import os
+import socket
 import threading
+import time
 from pathlib import Path
 from queue import Full
+
+from cosmos_framework.evaluation.robocasa_v2.generated_video import canonical, read_receipt, sha, write_generated
 
 
 def _diagnostic(errors, error):
@@ -64,7 +69,7 @@ def _guarded_encoder(target, args, parent):
     target(*args)
 
 
-def _encode(queue, directory, fps, rollout):
+def _encode(queue, directory, fps, rollout, acknowledgements=None):
     # Encoder gets neither CUDA visibility nor a Local session. Parent waits only
     # AFTER native Local cleanup, and forcibly reaps stalled encoders.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -90,6 +95,23 @@ def _encode(queue, directory, fps, rollout):
                 if writer is None:
                     writer = imageio.get_writer(directory / "rollout.mp4", fps=fps)
                 writer.append_data(data)
+            elif kind == "strict_prediction":
+                index, binding = data["index"], data["binding"]
+                try:
+                    receipt = write_generated(directory, data, fps)
+                    ack = {"status": "VIDEO_SAVED", "index": index, "binding_sha256": receipt["binding_sha256"]}
+                except Exception as error:
+                    ack = {
+                        "status": "VIDEO_FAILED",
+                        "index": index,
+                        "binding_sha256": sha(binding),
+                        "error": repr(error)[:1024],
+                    }
+                # One atomic, bounded local datagram; never an unbounded feeder.
+                raw = canonical(ack)
+                if len(raw) > 4096:
+                    raise ValueError("bounded Encoder completion datagram required")
+                acknowledgements.send(raw)
             elif kind == "prediction":
                 index, video = data
                 target = directory / "generated"
@@ -113,7 +135,18 @@ def _encode(queue, directory, fps, rollout):
 
 
 class MediaSink:
-    def __init__(self, directory, *, rollout=True, generated="none", fps=20, grace_s=2.0, target=None):
+    def __init__(
+        self,
+        directory,
+        *,
+        rollout=True,
+        generated="none",
+        fps=20,
+        grace_s=2.0,
+        target=None,
+        drain_timeout_s=300.0,
+        identity=None,
+    ):
         self.generated, self.rollout, self.grace_s = generated, rollout, grace_s
         self.dropped = 0
         self.errors = []
@@ -121,6 +154,16 @@ class MediaSink:
         self.process = None
         self.forced = False
         self.helpers = []
+        self.directory = Path(directory)
+        self.strict = generated == "all"
+        self.drain_timeout_s = drain_timeout_s
+        if type(drain_timeout_s) not in (int, float) or not 0 < drain_timeout_s <= 3600:
+            raise ValueError("finite bounded media drain timeout required")
+        self.identity = dict(identity or {})
+        self.saved, self.pending = {}, {}
+        self.incomplete = False
+        self._ack = self._ack_sender = None
+        self._drain_deadline = None
         self._closed = False
         self._result = None
         self._reader_guard = None
@@ -128,17 +171,25 @@ class MediaSink:
             ctx = mp.get_context("spawn")
             self.queue = ctx.Queue(maxsize=4)
             self.queue._ignore_epipe = True
+            if self.strict:
+                self._ack, self._ack_sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                self._ack_sender.settimeout(min(grace_s, drain_timeout_s))
             from multiprocessing import resource_tracker
 
             if resource_tracker._resource_tracker._pid is not None:
                 self.helpers.append(resource_tracker._resource_tracker._pid)
+            arguments = (self.queue, str(directory), fps, rollout)
+            if self.strict:
+                arguments += (self._ack_sender,)
             self.process = ctx.Process(
                 target=_guarded_encoder,
-                args=(target or _encode, (self.queue, str(directory), fps, rollout), os.getpid()),
+                args=(target or _encode, arguments, os.getpid()),
                 daemon=True,
             )
             try:
                 self.process.start()
+                if self._ack_sender is not None:
+                    self._ack_sender.close()
                 # Install only after Queue was pickled into the child, before
                 # the first parent put() can start its feeder. No stdlib patch.
                 self._reader_guard = _ReaderClose(self.queue._reader.close, self.errors, self.grace_s)
@@ -185,8 +236,72 @@ class MediaSink:
             ):
                 if len(self.errors) < 16:
                     self.errors.append("missing/oversized optional generated video")
+                if self.strict:
+                    self.incomplete = True
+                    raise RuntimeError("MEDIA_INCOMPLETE: missing/oversized generated video")
                 return
+            if self.strict:
+                return self._save_prediction(index, video, result.get("_media_binding"), result.get("_media_deadline"))
             self._submit("prediction", (index, video))
+
+    def _save_prediction(self, index, video, transfer, upstream_deadline=None):
+        binding = {"episode": self.identity, "index": index, "transfer": transfer, "video_sha256": sha(video)}
+        if index in self.saved:
+            try:
+                return read_receipt(self.directory, index, binding)
+            except Exception as error:
+                self.incomplete = True
+                _diagnostic(self.errors, "MEDIA_INCOMPLETE: replay: " + repr(error))
+                raise RuntimeError("MEDIA_INCOMPLETE: receipt replay mismatch") from error
+        if self._closed or self.incomplete or type(index) is not int or not 0 <= index <= 100000:
+            self.incomplete = True
+            raise RuntimeError("MEDIA_INCOMPLETE: Encoder closed/failed or invalid replan")
+        deadline = time.monotonic() + self.drain_timeout_s
+        if upstream_deadline is not None:
+            deadline = min(deadline, upstream_deadline)
+        self._drain_deadline = deadline
+        self.pending[index] = binding
+        try:
+            while True:
+                if self.process is None or not self.process.is_alive():
+                    raise RuntimeError("Encoder exited before VIDEO_SAVED")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Encoder queue deadline exhausted")
+                try:
+                    self.queue.put(
+                        ("strict_prediction", {"index": index, "video": video, "binding": binding}),
+                        timeout=min(0.05, remaining),
+                    )
+                    break
+                except Full:
+                    continue
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Encoder VIDEO_SAVED deadline exhausted")
+                self._ack.settimeout(min(0.05, remaining))
+                try:
+                    raw = self._ack.recv(4097)
+                except socket.timeout:
+                    if self.process is None or not self.process.is_alive():
+                        raise RuntimeError("Encoder exited before VIDEO_SAVED")
+                    continue
+                if len(raw) > 4096:
+                    raise ValueError("oversized Encoder acknowledgement")
+                ack = json.loads(raw)
+                if ack.get("index") != index or ack.get("binding_sha256") != sha(binding):
+                    raise ValueError("foreign/late Encoder acknowledgement")
+                if ack.get("status") != "VIDEO_SAVED":
+                    raise RuntimeError("Encoder VIDEO_FAILED: " + str(ack.get("error")))
+                receipt = read_receipt(self.directory, index, binding)
+                self.saved[index] = receipt
+                del self.pending[index]
+                return receipt
+        except Exception as error:
+            self.incomplete = True
+            _diagnostic(self.errors, "MEDIA_INCOMPLETE: " + repr(error))
+            raise RuntimeError("MEDIA_INCOMPLETE: " + str(error)) from error
 
     def close(self):
         if self._result is not None:
@@ -195,13 +310,20 @@ class MediaSink:
         encoder_alive = feeder_alive = fd_failed = False
         if self.process is not None:
             try:
-                self.queue.put_nowait(None)
+                if self.strict:
+                    deadline = self._drain_deadline or (time.monotonic() + self.drain_timeout_s)
+                    self.queue.put(None, timeout=max(0, deadline - time.monotonic()))
+                else:
+                    self.queue.put_nowait(None)
             except (Full, OSError, ValueError) as error:
                 self.dropped += 1
                 _diagnostic(self.errors, error)
-            self.process.join(self.grace_s)
+            self.process.join(max(0, deadline - time.monotonic()) if self.strict else self.grace_s)
             if self.process.is_alive():
                 self.forced = True
+                if self.strict:
+                    self.incomplete = True
+                    _diagnostic(self.errors, "MEDIA_INCOMPLETE: Encoder drain deadline exhausted")
                 try:
                     self.process.terminate()
                 except ProcessLookupError:
@@ -249,6 +371,9 @@ class MediaSink:
                     # Drop the instance override only after the feeder is gone;
                     # this breaks its Connection/guard reference cycle.
                     del self.queue._reader.close
+        for channel in (self._ack, self._ack_sender):
+            if channel is not None:
+                channel.close()
         self._result = {
             "dropped": self.dropped,
             "errors": list(self.errors),
@@ -259,4 +384,11 @@ class MediaSink:
             "feeder_alive": feeder_alive,
             "helper_pids": list(self.helpers),
         }
+        if self.strict:
+            self._result["generated_media"] = {
+                "status": "MEDIA_INCOMPLETE" if self.incomplete or self.pending else "COMPLETE",
+                "saved": sorted(self.saved),
+                "pending": sorted(self.pending),
+                "encoder_done_receipts": len(self.saved),
+            }
         return dict(self._result, errors=list(self._result["errors"]))

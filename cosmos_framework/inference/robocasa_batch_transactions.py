@@ -2,7 +2,7 @@
 
 Only Local preparation may iterate. Each sealed microbatch invokes generate_many
 once and publishes all Fast/Visual/Response entries in one snapshot. Media is
-bounded CPU spool, decoded on the SAME executor only when inference is idle.
+bounded CPU spool on the SAME executor; strict all-media gets decode priority.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import traceback
 import uuid
 from collections import Counter
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from cosmos_framework.inference.local_memory_state import CachedMemoryResponse
 from cosmos_framework.inference.robocasa_session_transactions import (
@@ -21,6 +22,7 @@ from cosmos_framework.inference.robocasa_session_transactions import (
     MAX_RESPONSE,
     Reply,
     SessionTransactions,
+    digest,
     json_bytes,
     request_frontier,
 )
@@ -46,11 +48,26 @@ class _Media:
     state: str = "QUEUED"
     body: bytes | None = None
     cancelled: bool = False
+    required: bool = False
+    replan: int = 0
+    charge: int = 0
+    error: str | None = None
 
 
 class BatchedSessionTransactions(SessionTransactions):
     def __init__(
-        self, adapter, generate_many, quiesce, *, max_batch_size=2, batch_wait_ms=20, decode_media=None, **kwargs
+        self,
+        adapter,
+        generate_many,
+        quiesce,
+        *,
+        max_batch_size=2,
+        batch_wait_ms=20,
+        decode_media=None,
+        media_spool_max_jobs=4,
+        media_spool_max_bytes=512 * 1024**2,
+        media_drain_timeout_s=300.0,
+        **kwargs,
     ):
         if type(max_batch_size) is not int or not 1 <= max_batch_size <= 8:
             raise ValueError("native batch cap must be1..8")
@@ -60,9 +77,21 @@ class BatchedSessionTransactions(SessionTransactions):
             or not 1 <= batch_wait_ms <= 1000
         ):
             raise ValueError("bounded batch wait1..1000ms required")
+        if (
+            type(media_spool_max_jobs) is not int
+            or not 1 <= media_spool_max_jobs <= 64
+            or type(media_spool_max_bytes) is not int
+            or not 1 <= media_spool_max_bytes <= 2**31
+            or type(media_drain_timeout_s) not in (int, float)
+            or not 0 < media_drain_timeout_s <= 3600
+        ):
+            raise ValueError("bounded positive media spool/drain settings required")
         super().__init__(adapter, None, quiesce, **kwargs)
         self.generate_many, self.decode_media = generate_many, decode_media
         self.max_batch_size, self.wait_s = max_batch_size, batch_wait_ms / 1000
+        self.media_spool_max_jobs, self.media_spool_max_bytes = media_spool_max_jobs, media_spool_max_bytes
+        self.media_drain_timeout_s = media_drain_timeout_s
+        self._acked_media = {}
         self._queue, self._enqueued, self._media = [], {}, {}
         self._pumping = False
         self._batch_histogram = Counter()
@@ -85,12 +114,93 @@ class BatchedSessionTransactions(SessionTransactions):
                     j.candidate.size if j.candidate else len(j.body or b"") for j in self._media.values()
                 ),
                 "generated_media": "bounded_cpu_spool_same_model_executor",
+                "media_spool_max_jobs": self.media_spool_max_jobs,
+                "media_spool_max_bytes": self.media_spool_max_bytes,
+                "media_drain_timeout_s": self.media_drain_timeout_s,
+                "strict_media_item_bytes": min(MAX_BODY, self.media_spool_max_bytes),
             }
 
     def media_room(self):
         with self._lock:
-            used = self.info()["media_cpu_bytes"]
-            return max(0, 2 - len(self._media)), max(0, 128 * 1024**2 - used)
+            for key, job in list(self._media.items()):
+                if self.clock() >= job.deadline and key not in self._tickets and job.state != "DECODING":
+                    del self._media[key]
+            used = sum(
+                j.charge or (j.candidate.size if j.candidate else len(j.body or b"")) for j in self._media.values()
+            )
+            return max(0, self.media_spool_max_jobs - len(self._media)), max(0, self.media_spool_max_bytes - used)
+
+    def reserve_media(self, proof, key, payload_sha, replan, frontier):
+        """Nonblocking control admission; the client waits, never this executor."""
+        if (
+            type(replan) is not int
+            or not 0 <= replan <= 100000
+            or type(frontier) is not int
+            or not 0 <= frontier <= 100000
+            or not isinstance(payload_sha, str)
+            or len(payload_sha) != 64
+            or any(c not in "0123456789abcdef" for c in payload_sha)
+        ):
+            raise ValueError("bounded media reservation identity required")
+        with self._lock:
+            lease = self._lease(proof)
+            self._usable(lease)
+            if key != digest({"protocol": self.protocol, **lease.identity(), "frontier": frontier}):
+                raise ValueError("media reservation request identity mismatch")
+            acknowledged = self._acked_media.get(lease.session_id)
+            if acknowledged is not None and acknowledged[0] == key:
+                if acknowledged[1] != payload_sha or acknowledged[3] != replan:
+                    raise ValueError("acknowledged media reservation identity reused")
+                return self._reply(
+                    200, {"reserved": True, "already_saved": True, "request_key": key, "payload_sha256": payload_sha}
+                )
+            self.media_room()
+            job = self._media.get(key)
+            if job is not None:
+                if job.ticket.lease != lease or job.ticket.payload_sha256 != payload_sha or job.replan != replan:
+                    raise ValueError("media reservation identity reused")
+                return self._reply(200, {"reserved": True, "request_key": key, "payload_sha256": payload_sha})
+            if self.decode_media is None:
+                return self._reply(
+                    200, {"reserved": False, "media": {"status": "MEDIA_INCOMPLETE", "error": "decoder unavailable"}}
+                )
+            room, byte_room = self.media_room()
+            charge = min(MAX_BODY, self.media_spool_max_bytes)
+            if room < 1 or byte_room < charge:
+                return self._reply(429, {"reserved": False, "media": {"status": "backpressure"}})
+            ticket = SimpleNamespace(key=key, payload_sha256=payload_sha, lease=lease)
+            self._media[key] = _Media(
+                ticket,
+                None,
+                self.clock() + self.media_drain_timeout_s,
+                state="RESERVED",
+                required=True,
+                replan=replan,
+                charge=charge,
+            )
+            return self._reply(200, {"reserved": True, "request_key": key, "payload_sha256": payload_sha})
+
+    def media_capture_budget(self, payload):
+        if not payload.get("media", {}).get("required"):
+            return 0
+        payload_sha = digest(payload)
+        with self._lock:
+            return next(
+                (
+                    j.charge
+                    for j in self._media.values()
+                    if j.required
+                    and j.ticket.payload_sha256 == payload_sha
+                    and j.state in ("RESERVED", "CAPTURING")
+                    and not j.cancelled
+                ),
+                0,
+            )
+
+    def _release(self, ticket):
+        super()._release(ticket)
+        if ticket.state != "COMMITTED":
+            self._media.pop(ticket.key, None)
 
     def submit(self, proof, payload, *, budget):
         # Independent malformed requests must fail before sealing valid peers.
@@ -119,7 +229,7 @@ class BatchedSessionTransactions(SessionTransactions):
         return (
             super()._payload_keys_valid({k: v for k, v in payload.items() if k != "media"})
             and isinstance(media, dict)
-            and set(media) == {"replan"}
+            and (set(media) == {"replan"} or (set(media) == {"replan", "required"} and media["required"] is True))
             and type(media["replan"]) is int
             and 0 <= media["replan"] <= 100000
         )
@@ -143,7 +253,14 @@ class BatchedSessionTransactions(SessionTransactions):
     def _pump(self):
         while True:
             with self._changed:
-                if self._queue:
+                # Strict clients cannot fetch until decode runs. Prioritize these
+                # bounded jobs so a busy inference queue cannot starve completion.
+                strict_job = next((j for j in self._media.values() if j.required and j.state == "QUEUED"), None)
+                if strict_job is not None:
+                    members, job = None, strict_job
+                    job.state = "DECODING"
+                    self._busy = True
+                elif self._queue:
                     oldest = self._queue[0]
                     remaining = min(
                         self.wait_s - (time.monotonic() - self._enqueued[oldest.key]), oldest.deadline - self.clock()
@@ -197,6 +314,8 @@ class BatchedSessionTransactions(SessionTransactions):
                     for t in members:
                         t.state = "SEALED"
                         self._fence(t)
+                        if t.key in self._media and self._media[t.key].required:
+                            self._media[t.key].state = "CAPTURING"
                 prepare_start = time.monotonic()
                 for t in members:
                     if self.mode == "required":
@@ -229,8 +348,43 @@ class BatchedSessionTransactions(SessionTransactions):
                     candidate = media_candidates[i] if media_candidates else None
                     media = {"status": "disabled"}
                     if t.payload.get("media"):
-                        media = {"status": "dropped", "reason": "bounded_spool_unavailable"}
-                        if (
+                        required = t.payload["media"].get("required", False)
+                        if required:
+                            with self._lock:
+                                reservation = self._media.get(t.key)
+                                valid = (
+                                    reservation is not None
+                                    and reservation.required
+                                    and reservation.ticket.lease == t.lease
+                                    and reservation.ticket.payload_sha256 == t.payload_sha256
+                                )
+                            media = {
+                                "status": "MEDIA_INCOMPLETE",
+                                "reason": "reserved media candidate unavailable/oversized",
+                            }
+                            if (
+                                valid
+                                and candidate is not None
+                                and 0 < candidate.size <= reservation.charge
+                                and self.decode_media is not None
+                            ):
+                                new_jobs[t.key] = _Media(
+                                    t,
+                                    candidate,
+                                    self.clock() + self.media_drain_timeout_s,
+                                    required=True,
+                                    replan=reservation.replan,
+                                    charge=reservation.charge,
+                                )
+                                media = {
+                                    "status": "pending",
+                                    "ticket": t.key,
+                                    "required": True,
+                                    "deadline": new_jobs[t.key].deadline,
+                                }
+                        else:
+                            media = {"status": "dropped", "reason": "bounded_spool_unavailable"}
+                        if not required and (
                             candidate is not None
                             and room > 0
                             and 0 < candidate.size <= byte_room
@@ -272,6 +426,9 @@ class BatchedSessionTransactions(SessionTransactions):
                     histogram[len(members)] += 1
                     batches = self._batches + 1
                     jobs = {**self._media, **new_jobs}  # Respect End/ACK removals while generating.
+                    for t in members:
+                        if t.payload.get("media", {}).get("required") and t.key not in new_jobs:
+                            jobs.pop(t.key, None)
                     self._commit_responses(members, caches, batch=True)
                     committed = True
                     self._media = jobs
@@ -336,19 +493,27 @@ class BatchedSessionTransactions(SessionTransactions):
                 else:
                     video = self.decode_media(job.candidate.value)
                     value = {"status": "ready", "video": video}
+                    if job.required:
+                        value.update(replan=job.replan, assignment=job.ticket.lease.identity())
                 body = json_bytes(
                     {"request_key": job.ticket.key, "payload_sha256": job.ticket.payload_sha256, "media": value}
                 )
                 if len(body) > MAX_BODY:
                     raise ValueError("bounded media response exceeded")
+                if job.required and len(body) > job.charge:
+                    raise ValueError("decoded media exceeds reserved byte budget")
             except Exception as error:
-                body = json_bytes(
-                    {
-                        "request_key": job.ticket.key,
-                        "payload_sha256": job.ticket.payload_sha256,
-                        "media": {"status": "error", "error": str(error)[:1024]},
-                    }
-                )
+                if job.required:
+                    job.error = str(error)[:1024]
+                    body = None  # Failure metadata is not cached video data.
+                else:
+                    body = json_bytes(
+                        {
+                            "request_key": job.ticket.key,
+                            "payload_sha256": job.ticket.payload_sha256,
+                            "media": {"status": "error", "error": str(error)[:1024]},
+                        }
+                    )
             finally:
                 try:
                     self.quiesce()
@@ -361,7 +526,7 @@ class BatchedSessionTransactions(SessionTransactions):
             elif job.cancelled or self.clock() >= job.deadline or self._stopping:
                 self._media.pop(job.ticket.key, None)
             else:
-                job.body, job.candidate, job.state = body, None, "READY"
+                job.body, job.candidate, job.state = body, None, "FAILED" if job.error else "READY"
             self._busy = not drained
             self._changed.notify_all()
 
@@ -373,23 +538,62 @@ class BatchedSessionTransactions(SessionTransactions):
                 return self._reply(200, {"request_key": key, "payload_sha256": sha, "media": {"status": "unavailable"}})
             if job.ticket.lease != lease or job.ticket.payload_sha256 != sha:
                 raise ValueError("foreign media identity")
-            if self.clock() >= job.deadline and job.state != "DECODING":
+            if self.clock() >= job.deadline and job.state not in ("DECODING", "CAPTURING"):
                 self._media.pop(key, None)
                 return self._reply(200, {"request_key": key, "payload_sha256": sha, "media": {"status": "expired"}})
+            if job.error:
+                return self._reply(
+                    200,
+                    {
+                        "request_key": key,
+                        "payload_sha256": sha,
+                        "media": {"status": "MEDIA_INCOMPLETE", "error": job.error},
+                    },
+                )
             return (
                 Reply(200, job.body)
                 if job.body
                 else self._reply(202, {"request_key": key, "payload_sha256": sha, "media": {"status": "pending"}})
             )
 
-    def media_ack(self, proof, key, sha):
+    def media_ack(self, proof, key, sha, receipt=None):
         with self._lock:
-            self._lease(proof)
+            lease = self._lease(proof)
             if key in self._media:
                 job = self._media[key]
                 if job.ticket.lease != self._lease(proof) or job.ticket.payload_sha256 != sha or job.state != "READY":
                     raise ValueError("invalid media ACK")
+                if job.required:
+                    transfer = {
+                        "assignment": lease.identity(),
+                        "request_key": key,
+                        "payload_sha256": sha,
+                        "replan": job.replan,
+                    }
+                    if (
+                        not isinstance(receipt, dict)
+                        or len(json_bytes(receipt)) > 16384
+                        or receipt.get("status") != "VIDEO_SAVED"
+                        or receipt.get("index") != job.replan
+                        or receipt.get("binding", {}).get("transfer") != transfer
+                        or receipt.get("path") != f"generated/replan_{job.replan:04d}.mp4"
+                        or type(receipt.get("frames")) is not int
+                        or not 1 <= receipt["frames"] <= 65
+                        or type(receipt.get("bytes")) is not int
+                        or receipt["bytes"] <= 0
+                        or not isinstance(receipt.get("sha256"), str)
+                        or len(receipt["sha256"]) != 64
+                    ):
+                        raise ValueError("strict media ACK requires matching durable VIDEO_SAVED receipt")
+                    self._acked_media[lease.session_id] = (key, sha, digest(receipt), job.replan)
                 del self._media[key]
+            elif receipt is not None and self._acked_media.get(lease.session_id) != (
+                key,
+                sha,
+                digest(receipt),
+                receipt.get("index"),
+            ):
+                raise ValueError("unknown or changed strict media ACK replay")
             return self._reply(200, {"acknowledged": True, "request_key": key})
 
     def _cancel_media(self, lease=None):
@@ -403,6 +607,7 @@ class BatchedSessionTransactions(SessionTransactions):
         with self._lock:
             lease = self._lease(proof, closed=True)
             self._cancel_media(lease)
+            self._acked_media.pop(lease.session_id, None)
             self._changed.notify_all()
             return super().end(proof)
 

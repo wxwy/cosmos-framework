@@ -230,3 +230,70 @@ def test_foreign_optional_media_is_diagnostic_and_never_invalidates_actions(make
     )
     assert not delivered and client.media_diagnostics()["predictions"]["0"]["status"] == "invalid_media_binding"
     client.close()
+
+
+@pytest.mark.parametrize("decode_failure", [False, True])
+def test_strict_media_preserves_real_Local_fast_updates_prefix_and_End_ACK(
+    tmp_path, monkeypatch, make_native, decode_failure
+):
+    obj, actor = make_native(1, 1)
+    lease = register(actor)
+    calls = []
+    original = obj.model.generate_samples_from_batch
+
+    def valid_actions(batch, **kwargs):
+        value = original(batch, **kwargs)
+        action = torch.zeros(1, 17, 64)
+        raw = [0.2, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5]
+        action[:, 1:, :15] = torch.tensor(raw) * 2 - 1
+        value["action"] = [action.clone()]
+        calls.append(actor.adapter.snapshot)
+        return value
+
+    obj.model.generate_samples_from_batch = valid_actions
+    obj.local_memory_adapter.decode_image = lambda data: torch.from_numpy(
+        np.array(Image.open(io.BytesIO(base64.b64decode(data))), copy=True)
+    ).permute(2, 0, 1)
+    image = io.BytesIO()
+    Image.new("RGB", (32, 32), "green").save(image, format="PNG")
+    encoded = base64.b64encode(image.getvalue()).decode()
+
+    def decode(_):
+        if decode_failure:
+            raise OSError("injected media failure, not Local failure")
+        return [encoded]
+
+    actor.decode_media = decode
+    from cosmos_framework.simulation.robocasa import eval_v2_transactions
+
+    assigned = facade(obj, actor, lease, mode="all")
+    assigned.media_timeout_s = 10
+    monkeypatch.setattr(eval_v2_transactions, "PolicyTransport", lambda *a: assigned)
+    monkeypatch.setattr(native, "build_state_token", lambda _: [0.0] * 15)
+    cfg = {**settings("all"), "media_drain_timeout_s": 10}
+    episode = adapter_module.NativeEpisode(FakeEnv(), cfg)
+    assert episode.initialize()["initial_success"] is False
+    result = episode.execute(
+        dict(
+            task="CloseFridge",
+            episode=0,
+            generation=1,
+            attempt_id="attempt-1",
+            stream_id="stream",
+            seed=0,
+            manifest_digest="a" * 64,
+        ),
+        reset_index=0,
+        directory=tmp_path / "episode",
+        transaction_assignment={"lease": lease},
+        episode_deadline=time.monotonic() + 30,
+    )
+    assert result["observation"]["environment_success"] is True
+    assert result["replans"] == len(obj.native_calls) == len(calls) == 2
+    assert calls[0] is not calls[1]  # A real Local publication preceded replan 1.
+    assert [c["has_local"] for c in obj.native_calls] == [[False], [True]]
+    assert result["local_session"]["reset_ack"] is True and actor.info()["sessions"] == 0
+    assert not obj.local_memory_adapter.snapshot.fast and not result["media_process_fault"]
+    media = result["generated_media_completion"]
+    assert media["status"] == ("MEDIA_INCOMPLETE" if decode_failure else "COMPLETE")
+    assert media["saved"] == (0 if decode_failure else 2)

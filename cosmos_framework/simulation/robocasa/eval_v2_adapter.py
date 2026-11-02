@@ -121,11 +121,19 @@ class NativeEpisode:
             http_client = requests.Session()
             http_client.trust_env = False
         try:
+            strict = self.settings.get("save_generated_video") == "all"
+            media_options = {}
+            if strict:
+                media_options = {
+                    "drain_timeout_s": self.settings.get("media_drain_timeout_s", 300.0),
+                    "identity": {k: attempt[k] for k in ("task", "episode", "attempt_id", "generation")},
+                }
             sink = self.media_factory(
                 directory / "media",
                 rollout=rollout_enabled,
                 generated=self.settings.get("save_generated_video", "none"),
                 grace_s=self.settings.get("encoder_grace_s", 2.0),
+                **media_options,
             )
         except Exception as error:
             media_errors.append(repr(error))
@@ -134,10 +142,17 @@ class NativeEpisode:
         def media_call(method, *args):
             try:
                 if sink is not None:
-                    getattr(sink, method)(*args)
+                    return getattr(sink, method)(*args)
             except Exception as error:
                 if len(media_errors) < 16:
                     media_errors.append(repr(error))
+
+        def generated(index, result):
+            if strict:
+                if sink is None:
+                    raise RuntimeError("MEDIA_INCOMPLETE: Encoder unavailable")
+                return sink.prediction(index, result)
+            return media_call("prediction", index, result)
 
         start = time.monotonic()
         with (
@@ -182,7 +197,7 @@ class NativeEpisode:
                 if transactional is None:
                     media_call("prediction", replans, result)
                 else:
-                    transactional.media(result, replans, lambda i, r: media_call("prediction", i, r))
+                    transactional.media(result, replans, generated)
                 replans += 1
 
             def cleaned(value):
@@ -261,6 +276,42 @@ class NativeEpisode:
                 media["rollout_mp4_first_n_per_task"] = limit
                 if transactional is not None:
                     media["transaction_fetch"] = transactional.media_diagnostics()
+                completion = None
+                if strict:
+                    saved = media.get("generated_media", {}).get("saved", [])
+                    acknowledged = (
+                        media["transaction_fetch"].get("completion", {}).get("acknowledged", 0)
+                        if transactional is not None
+                        else len(saved)
+                    )
+                    missing = sorted(set(range(replans)) - set(saved))
+                    complete = (
+                        not missing
+                        and len(saved) == replans
+                        and acknowledged == replans
+                        and media.get("generated_media", {}).get("status") == "COMPLETE"
+                        and (
+                            transactional is None
+                            or media["transaction_fetch"].get("completion", {}).get("status") == "COMPLETE"
+                        )
+                    )
+                    completion = {
+                        "schema": "psm_generated_media_completion_v1",
+                        "status": "COMPLETE" if complete else "MEDIA_INCOMPLETE",
+                        "task": attempt["task"],
+                        "episode": attempt["episode"],
+                        "attempt_id": attempt["attempt_id"],
+                        "expected": replans,
+                        "saved": len(saved),
+                        "acknowledged": acknowledged,
+                        "server_ack_required": transactional is not None,
+                        "missing": missing,
+                    }
+                    media["generated_media_completion"] = completion
+                    try:
+                        atomic_json(directory / "generated_media_completion.json", completion)
+                    except OSError as error:
+                        media_errors.append("MEDIA_INCOMPLETE: completion record: " + repr(error))
                 try:
                     atomic_json(directory / "media_diagnostics.json", media)
                 except OSError:
@@ -281,4 +332,5 @@ class NativeEpisode:
             "media_process_fault": media.get("process_cleanup_failed", media.get("forced_encoder_cleanup", False))
             or (transactional is not None and transactional.media_process_fault),
             "media_helper_pids": media.get("helper_pids", []),
+            **({"generated_media_completion": completion} if strict else {}),
         }

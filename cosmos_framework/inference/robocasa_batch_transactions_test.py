@@ -309,7 +309,8 @@ def test_optional_media_cannot_block_action_commit_or_SR_and_is_bounded(make_nat
     reqs = [{**payload(l), "media": {"replan": 0}} for l in leases]
     results = group(actor, leases, reqs)
     assert len(obj.native_calls) == 1 and all(r.status == 200 for r in results)
-    assert actor.info()["media_jobs"] <= 2 and actor.info()["media_cpu_bytes"] <= 128 * 1024**2
+    assert actor.info()["media_jobs"] <= actor.media_spool_max_jobs == 4
+    assert actor.info()["media_cpu_bytes"] <= actor.media_spool_max_bytes == 512 * 1024**2
     for l, r in zip(leases, results, strict=True):
         ack(actor, l, r)
         data = r.json()
@@ -483,15 +484,17 @@ def test_optional_spool_failure_or_mapping_error_preserves_valid_actions(make_na
     obj, actor = make_native(2, 2)
     leases = [register(actor, f"slot{i}") for i in range(2)]
     generate = obj.model.generate_samples_from_batch
+    copies = []
 
     class Unavailable:
         def numel(self):
-            return 128 * 1024**2 if fault == "spool_bytes" else 1
+            return actor.media_spool_max_bytes // 4 + 1 if fault == "spool_bytes" else 1
 
         def element_size(self):
             return 4
 
         def detach(self):
+            copies.append(True)
             raise OSError("injected CPU spool copy failure")
 
     def broken(batch, **kwargs):
@@ -508,6 +511,10 @@ def test_optional_spool_failure_or_mapping_error_preserves_valid_actions(make_na
     assert len(obj.native_calls) == 1 and all(r.status == 200 for r in results)
     assert all(r.json()["media"]["status"] == "dropped" for r in results)
     assert actor.info()["media_jobs"] == 0
+    if fault == "spool_bytes":
+        assert not copies  # Oversize must be rejected BEFORE copying to CPU.
+    elif fault == "spool_copy":
+        assert len(copies) == 2
 
 
 def test_batch_options_cannot_be_ignored_by_legacy_or_B1_preflight(tmp_path):

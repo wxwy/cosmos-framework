@@ -16,6 +16,7 @@ from cosmos_framework.evaluation.robocasa_v2.wire import receive, send
 
 def serve(channel, cfg, *, factory=None):
     # Factory is a Python CPU test boundary, never selectable via production CLI.
+    from cosmos_framework.evaluation.robocasa_v2 import generated_video, media
     from cosmos_framework.simulation.robocasa import closed_loop_eval as native
     from cosmos_framework.simulation.robocasa import render_devices
     from cosmos_framework.simulation.robocasa.eval_v2_adapter import NativeEpisode
@@ -37,6 +38,8 @@ def serve(channel, cfg, *, factory=None):
                 "adapter": Path(sys.modules[NativeEpisode.__module__].__file__),
                 "slot": Path(sys.modules[SimSlot.__module__].__file__),
                 "rendering": Path(render_devices.__file__),
+                "media": Path(media.__file__),
+                "generated_video": Path(generated_video.__file__),
             }
             if cfg["settings"].get("execution_profile") == "phase_b":
                 from cosmos_framework.simulation.robocasa import eval_v2_transactions

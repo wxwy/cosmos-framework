@@ -543,6 +543,9 @@ class ActionServerArgs(pydantic.BaseModel):
     transaction_slot_ids: str | None = None
     transaction_max_batch_size: int = 1
     transaction_batch_wait_ms: float = 20.0
+    media_spool_max_jobs: int = 4
+    media_spool_max_bytes: int = 512 * 1024**2
+    media_drain_timeout_s: float = 300.0
 
     # ----- prompt format ------------------------------------------------------
     format_prompt_as_json: bool | None = None
@@ -686,7 +689,27 @@ def _transaction_options(args):
         wait = getattr(args, "transaction_batch_wait_ms", 20.0)
         if type(cap) is not int or not 1 <= cap <= 8 or type(wait) not in (int, float) or not 1 <= wait <= 1000:
             raise ValueError("bounded native batch/wait required")
-        options.update(max_batch_size=cap, batch_wait_ms=wait)
+        jobs, size, drain = (
+            getattr(args, "media_spool_max_jobs", 4),
+            getattr(args, "media_spool_max_bytes", 512 * 1024**2),
+            getattr(args, "media_drain_timeout_s", 300.0),
+        )
+        if (
+            type(jobs) is not int
+            or not 1 <= jobs <= 64
+            or type(size) is not int
+            or not 1 <= size <= 2**31
+            or type(drain) not in (int, float)
+            or not 0 < drain <= 3600
+        ):
+            raise ValueError("bounded positive media spool/drain settings required")
+        options.update(
+            max_batch_size=cap,
+            batch_wait_ms=wait,
+            media_spool_max_jobs=jobs,
+            media_spool_max_bytes=size,
+            media_drain_timeout_s=drain,
+        )
     return options
 
 
@@ -703,10 +726,22 @@ def transaction_dispatch(service, method, path, record=None, headers=None) -> Re
         return actor.acknowledge(record["lease"], record["request_key"], record["payload_sha256"])
     if (
         method == "POST"
+        and path == "/v2/media/reserve"
+        and set(record) == {"lease", "request_key", "payload_sha256", "replan", "frontier"}
+        and hasattr(actor, "reserve_media")
+    ):
+        return actor.reserve_media(
+            record["lease"], record["request_key"], record["payload_sha256"], record["replan"], record["frontier"]
+        )
+    if (
+        method == "POST"
         and path == "/v2/media/ack"
-        and set(record) == {"lease", "request_key", "payload_sha256"}
+        and set(record)
+        in ({"lease", "request_key", "payload_sha256"}, {"lease", "request_key", "payload_sha256", "receipt"})
         and hasattr(actor, "media_ack")
     ):
+        if "receipt" in record:
+            return actor.media_ack(record["lease"], record["request_key"], record["payload_sha256"], record["receipt"])
         return actor.media_ack(record["lease"], record["request_key"], record["payload_sha256"])
     if method == "POST" and path == "/v2/session/end" and set(record) == {"lease"}:
         return actor.end(record["lease"])
@@ -1284,19 +1319,22 @@ class ActionModelService:
         media = []
         for i, (req, prep) in enumerate(zip(reqs, preps, strict=True)):
             candidate = None
-            if req.get("media") and room:
+            required = req.get("media", {}).get("required", False)
+            budget = self.transactions.media_capture_budget(req) if required else byte_room
+            if req.get("media") and ((required and budget > 0) or (not required and room)):
                 try:
                     latent = samples["vision"][i]
                     size = (
                         latent.numel() * latent.element_size()
                         + prep["padded_image_size"].numel() * prep["padded_image_size"].element_size()
                     )
-                    if 0 < size <= byte_room:
+                    if 0 < size <= budget:
                         candidate = MediaCandidate(
                             (latent.detach().cpu().clone(), prep["padded_image_size"].detach().cpu().clone()), size
                         )
-                        room -= 1
-                        byte_room -= size
+                        if not required:
+                            room -= 1
+                            byte_room -= size
                 except Exception as error:
                     log.warning("Optional media spool dropped: %s", type(error).__name__)
             media.append(candidate)
