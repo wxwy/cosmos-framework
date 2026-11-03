@@ -104,9 +104,7 @@ class EGLDevices:
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.POINTER(ctypes.c_int),
         )
-        self.query_string = self._optional(
-            b"eglQueryDeviceStringEXT", ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int
-        )
+        self.query_string = self._optional(b"eglQueryDeviceStringEXT", ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int)
         self.query_cuda = self._optional(
             b"eglQueryDeviceAttribEXT",
             ctypes.c_uint,
@@ -286,23 +284,14 @@ def configure(plan, *, api=None):
 def verify_current(proof, *, api=None):
     if proof["backend"] != "egl":
         return proof
-    if (
-        os.environ.get("MUJOCO_GL") != "egl"
-        or os.environ.get("MUJOCO_EGL_DEVICE_ID") != str(proof["egl_device_index"])
-    ):
+    if os.environ.get("MUJOCO_GL") != "egl" or os.environ.get("MUJOCO_EGL_DEVICE_ID") != str(proof["egl_device_index"]):
         raise RuntimeError("render environment changed after physical device attestation")
     # No full device enumeration / CUDA PCI subprocess on every scene reset.
     driver = api or EGLDevices()
     current = driver.current()
-    if (
-        current["handle"] is not None
-        and current["handle"] != proof["egl_device_handle"]
-    ):
+    if current["handle"] is not None and current["handle"] != proof["egl_device_handle"]:
         raise RuntimeError("actual EGL context uses a different physical GPU")
-    if (
-        current.get("pci_bus_id") is not None
-        and current["pci_bus_id"] != proof["expected_device"]["pci_bus_id"]
-    ):
+    if current.get("pci_bus_id") is not None and current["pci_bus_id"] != proof["expected_device"]["pci_bus_id"]:
         raise RuntimeError("actual EGL context has a different physical PCI identity")
     if (
         current.get("cuda_device") is not None
