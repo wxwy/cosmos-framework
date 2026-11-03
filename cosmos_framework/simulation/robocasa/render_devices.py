@@ -37,7 +37,12 @@ class EGLDevices:
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.POINTER(ctypes.c_int),
         )
-        self.query_string = self._function(b"eglQueryDeviceStringEXT", ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int)
+        try:
+            self.query_string = self._function(
+                b"eglQueryDeviceStringEXT", ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int
+            )
+        except RuntimeError:
+            self.query_string = None
         try:
             self.query_display = self._function(
                 b"eglQueryDisplayAttribEXT", ctypes.c_uint, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_ssize_t)
@@ -55,6 +60,8 @@ class EGLDevices:
     def _describe(self, device):
         # Optional EGL_EXT_device_drm / EGL_EXT_device_drm_render_node identity.
         # A missing extension is not evidence of physical GPU placement.
+        if self.query_string is None:
+            raise RuntimeError("EGL DRM device strings unsupported")
         for attribute in (0x3377, 0x3233):
             raw = self.query_string(device, attribute)
             self.lib.eglGetError()  # Do not leave an unsupported-attribute error for the vendor.
