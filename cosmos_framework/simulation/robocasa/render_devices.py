@@ -53,8 +53,8 @@ class EGLDevices:
         return ctypes.CFUNCTYPE(result, *arguments)(address)
 
     def _describe(self, device):
-        # EGL_EXT_device_drm / EGL_EXT_device_drm_render_node. A missing DRM
-        # identity is BLOCKED, never an excuse to assume ordinal N == GPU N.
+        # Optional EGL_EXT_device_drm / EGL_EXT_device_drm_render_node identity.
+        # A missing extension is not evidence of physical GPU placement.
         for attribute in (0x3377, 0x3233):
             raw = self.query_string(device, attribute)
             self.lib.eglGetError()  # Do not leave an unsupported-attribute error for the vendor.
@@ -67,7 +67,7 @@ class EGLDevices:
                     return normalize_pci(pci), str(node)
                 except (OSError, ValueError):
                     continue
-        raise RuntimeError("EGL physical PCI identity unavailable; no ordinal fallback")
+        raise RuntimeError("EGL physical PCI identity unavailable")
 
     def inventory(self):
         count = ctypes.c_int()
@@ -82,7 +82,7 @@ class EGLDevices:
             try:
                 pci, node = self._describe(device)
             except RuntimeError:
-                pci = node = None  # Software/unidentifiable devices cannot be selected.
+                pci = node = None  # Unknown physical identity; ordinal remains selectable.
             result.append({"egl_device_index": index, "handle": device, "pci_bus_id": pci, "device_node": node})
         return result
 
@@ -185,7 +185,7 @@ def verify_current(proof, *, api=None):
     if proof["backend"] != "egl":
         return proof
     if os.environ.get("MUJOCO_GL") != "egl" or os.environ.get("MUJOCO_EGL_DEVICE_ID") != str(proof["egl_device_index"]):
-        raise RuntimeError("render environment changed after physical device attestation")
+        raise RuntimeError("render environment changed after EGL device selection")
     driver = api or EGLDevices()
     if proof["protocol"] == "egl_index_unverified_v1":
         # Check the current Context exists. If the vendor exposes a device handle,
