@@ -286,7 +286,10 @@ def configure(plan, *, api=None):
 def verify_current(proof, *, api=None):
     if proof["backend"] != "egl":
         return proof
-    if os.environ.get("MUJOCO_GL") != "egl" or os.environ.get("MUJOCO_EGL_DEVICE_ID") != str(proof["egl_device_index"]):
+    if (
+        os.environ.get("MUJOCO_GL") != "egl"
+        or os.environ.get("MUJOCO_EGL_DEVICE_ID") != str(proof["egl_device_index"])
+    ):
         raise RuntimeError("render environment changed after physical device attestation")
     # No full device enumeration / CUDA PCI subprocess on every scene reset.
     driver = api or EGLDevices()
