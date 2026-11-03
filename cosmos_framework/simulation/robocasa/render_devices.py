@@ -45,7 +45,11 @@ class EGLDevices:
             self.query_string = None
         try:
             self.query_display = self._function(
-                b"eglQueryDisplayAttribEXT", ctypes.c_uint, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_ssize_t)
+                b"eglQueryDisplayAttribEXT",
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_ssize_t),
             )
         except RuntimeError:
             # Some EGL stacks can create a Context without exposing display-device identity.
@@ -124,7 +128,10 @@ def validate_proof(proof, plan, *, context=False):
         if type(index) is not int or index < 0 or (context and proof.get("context_verified") is not True):
             raise ValueError("invalid EGL device/context proof")
         if proof.get("protocol") == "egl_physical_pci_v1":
-            if proof.get("physical_identity_verified") is not True or proof.get("actual_device") != plan["expected_device"]:
+            if (
+                proof.get("physical_identity_verified") is not True
+                or proof.get("actual_device") != plan["expected_device"]
+            ):
                 raise ValueError("unproven physical EGL device")
         elif proof.get("protocol") == "egl_index_unverified_v1":
             # Be honest: an EGL ordinal is NOT evidence of a physical GPU mapping.
