@@ -1203,16 +1203,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         packed_tokens_action, per_token_domain_id = self.pack_action(
             action.tokens, action.token_shapes, action.domain_id
         )
-        # Flow interpolation keeps actions in FP32; cast here to match the action encoder's model dtype.
-        packed_tokens_action = packed_tokens_action.to(target_dtype)  # [B_action*T_action,action_dim]
-        packed_tokens_action = self.action2llm(
-            packed_tokens_action, per_token_domain_id
-        )  # [B_action*T_action,hidden_size]
-
-        if self.config.enable_action_modality_embedding:
-            packed_tokens_action = packed_tokens_action + self.action_modality_embed.view(
-                1, -1
-            )  # [B_action*T_action,hidden_size]
+        packed_tokens_action = self._project_action_tokens(packed_tokens_action, per_token_domain_id, target_dtype)
 
         has_noisy_actions = has_noisy_tokens(action)
         if has_noisy_actions:
@@ -1231,6 +1222,29 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         packed_sequence[action.sequence_indexes] = (
             packed_tokens_action  # [B_action*T_action,hidden_size] scattered into [N_total,hidden_size]
         )
+
+    def _project_action_tokens(
+        self,
+        packed_tokens_action: torch.Tensor,
+        per_token_domain_id: torch.Tensor,
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compile the tensor projection without per-sample Python packing metadata.
+
+        Dynamic tensor shapes do not make list lengths dynamic. Keep packing,
+        timestep metadata and noisy-index assembly in the _encode_action caller.
+        """
+        # Flow interpolation keeps actions in FP32; cast here to match the action encoder's model dtype.
+        packed_tokens_action = packed_tokens_action.to(target_dtype)  # [B_action*T_action,action_dim]
+        packed_tokens_action = self.action2llm(
+            packed_tokens_action, per_token_domain_id
+        )  # [B_action*T_action,hidden_size]
+
+        if self.config.enable_action_modality_embedding:
+            packed_tokens_action = packed_tokens_action + self.action_modality_embed.view(
+                1, -1
+            )  # [B_action*T_action,hidden_size]
+        return packed_tokens_action
 
     def _decode_action(
         self,
