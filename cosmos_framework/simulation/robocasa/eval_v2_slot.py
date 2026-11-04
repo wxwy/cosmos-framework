@@ -71,6 +71,8 @@ class SimSlot:
         if any(attempt[k] != stream[k] for k in ("worker_id", "seed", "lease_id", "manifest_digest")):
             raise ValueError("foreign logical stream")
         if not health_only:
+            if attempt.get("physical_slot_id", self.cfg["physical_slot_id"]) != self.cfg["physical_slot_id"]:
+                raise ValueError("foreign physical Slot attempt")
             from cosmos_framework.evaluation.robocasa_v2.contract import integer
 
             ep = integer(attempt["episode"], 0, self.cfg["episodes_per_task"] - 1, "Episode")
@@ -149,7 +151,7 @@ class SimSlot:
             "actual_seed": self.grant["seed"],
             "environment_reset_index": self.reset_index,
             "physical_slot_id": self.cfg["physical_slot_id"],
-            "protocol": SAMPLING,
+            "protocol": self.cfg["settings"].get("sampling_protocol", SAMPLING),
         }
 
     def finish_without_session(self):

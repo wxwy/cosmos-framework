@@ -245,7 +245,7 @@ class NativeEpisode:
                     on_progress=progress,
                     language_instruction=instruction,
                     http_client=http_client,
-                    on_frame=lambda frame: media_call("frame", frame),
+                    on_frame=(lambda frame: media_call("frame", frame)) if rollout_enabled else None,
                     video_fps=20,
                 )
                 if steps != len(outcome.checks) or success != any(outcome.checks):

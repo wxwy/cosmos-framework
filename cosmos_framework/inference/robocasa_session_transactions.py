@@ -30,6 +30,12 @@ MAX_BODY = 32 * 1024**2
 MAX_RESPONSE = 1024**2
 
 
+def transaction_capacity(profile):
+    if profile not in ("legacy8", "streaming32"):
+        raise ValueError("explicit transaction capacity profile required")
+    return 32 if profile == "streaming32" else 8
+
+
 def protocol_for_mode(mode):
     if mode not in ("off", "required"):
         raise ValueError("explicit off|required Local-TTT mode required")
@@ -192,13 +198,16 @@ class SessionTransactions:
         timeout_s=600.0,
         max_bytes=128 * 1024**2,
         clock=time.monotonic,
+        capacity_profile="legacy8",
     ):
         self.mode = adapter.mode
         self.protocol = protocol_for_mode(self.mode)
         if (adapter.memory is not None) != (self.mode == "required"):
             raise ValueError("transaction mode must match actual Local-TTT capability")
-        if not 1 <= len(slot_ids) <= 8 or len(set(slot_ids)) != len(slot_ids):
-            raise ValueError("one to eight distinct bounded physical Slot identities required")
+        self.capacity_profile = capacity_profile
+        capacity = transaction_capacity(capacity_profile)
+        if not 1 <= len(slot_ids) <= capacity or len(set(slot_ids)) != len(slot_ids):
+            raise ValueError(f"one to {capacity} distinct bounded physical Slot identities required")
         if not math.isfinite(timeout_s) or timeout_s <= 0 or type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError("positive finite transaction bounds required")
         if len(manifest_digest) != 64 or any(c not in "0123456789abcdef" for c in manifest_digest):
@@ -240,6 +249,7 @@ class SessionTransactions:
                 "manifest_digest": self.manifest_digest,
                 "slot_ids": list(self.slot_ids),
                 "max_native_batch": 1,
+                "capacity_profile": self.capacity_profile,
                 "sessions": len(self._leases),
                 "tickets": len(self._tickets),
                 "encoded_bytes": sum(ticket.size for ticket in self._tickets.values()),
@@ -266,6 +276,7 @@ class SessionTransactions:
                 "prediction_clock_domain": self.clock_domain,
                 "local_memory_mode": self.mode,
                 "profile": self.protocol,
+                "capacity_profile": self.capacity_profile,
             },
         )
 

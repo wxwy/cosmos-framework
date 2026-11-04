@@ -16,6 +16,7 @@ from cosmos_framework.inference.robocasa_session_transactions import (
     monotonic_clock_domain,
     protocol_for_mode,
     request_frontier,
+    transaction_capacity,
 )
 
 
@@ -29,14 +30,18 @@ class TransactionPolicyClient:
         batch_profile=False,
         max_batch_size=1,
         local_memory_mode="required",
+        capacity_profile="legacy8",
+        cancelled=None,
         clock=time.monotonic,
         pause: Callable[[float], None] = time.sleep,
     ):
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("positive client deadline required")
-        if type(max_batch_size) is not int or not 1 <= max_batch_size <= 8:
+        if type(max_batch_size) is not int or not 1 <= max_batch_size <= transaction_capacity(capacity_profile):
             raise ValueError("bounded native batch cap required")
         self.batch_profile, self.max_batch_size = batch_profile, max_batch_size
+        self.capacity_profile = capacity_profile
+        self.cancelled = cancelled or (lambda: False)
         self.mode = local_memory_mode
         self.protocol = protocol_for_mode(self.mode)
         self.base_url, self.timeout_s = base_url.rstrip("/"), timeout_s
@@ -48,6 +53,8 @@ class TransactionPolicyClient:
 
     def _call(self, method, path, deadline, **kwargs):
         while True:
+            if self.cancelled():
+                raise RuntimeError("coordinator cancelled transaction")
             remaining = deadline - self.clock()
             if remaining <= 0:
                 raise TimeoutError("original transaction deadline exhausted")
@@ -108,6 +115,8 @@ class TransactionPolicyClient:
         return dict(self.lease)
 
     def _check_mode(self, value):
+        if value.get("capacity_profile", "legacy8") != self.capacity_profile:
+            raise ValueError("assignment transaction capacity profile mismatch")
         # Existing required v1 ACKs remain readable. The new No-TTT protocol
         # requires an explicit mode/profile, never an automatic fallback.
         if self.mode == "off" and ("local_memory_mode" not in value or "profile" not in value):

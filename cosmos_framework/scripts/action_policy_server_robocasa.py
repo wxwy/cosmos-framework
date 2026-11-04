@@ -98,6 +98,7 @@ from cosmos_framework.inference.robocasa_session_transactions import (
     json_bytes,
     monotonic_clock_domain,
     strict_json,
+    transaction_capacity,
 )
 from cosmos_framework.scripts.action_policy_server_utils import (
     DEFAULT_FALLBACK_OUTPUT_DIR,
@@ -542,6 +543,7 @@ class ActionServerArgs(pydantic.BaseModel):
     transaction_timeout_s: float = 600.0
     transaction_slot_ids: str | None = None
     transaction_max_batch_size: int = 1
+    transaction_capacity_profile: Literal["legacy8", "streaming32"] = "legacy8"
     transaction_batch_wait_ms: float = 20.0
     media_spool_max_jobs: int = 4
     media_spool_max_bytes: int = 512 * 1024**2
@@ -625,6 +627,10 @@ class ActionServerConfig:
 
 def _transaction_options(args):
     batch = args.transaction_profile == "batch"
+    capacity_profile = getattr(args, "transaction_capacity_profile", "legacy8")
+    capacity = transaction_capacity(capacity_profile)
+    if not batch and capacity_profile != "legacy8":
+        raise ValueError("streaming capacity requires explicit batch profile")
     slot_text = getattr(args, "transaction_slot_ids", None)
     fields = (
         args.transaction_owner_token_file,
@@ -656,7 +662,7 @@ def _transaction_options(args):
     if (
         args.local_memory_mode not in ("off", "required")
         or args.local_memory_max_sessions != len(slots)
-        or not 1 <= len(slots) <= 8
+        or not 1 <= len(slots) <= capacity
         or len(set(slots)) != len(slots)
         or args.action_chunk_size != 16
         or any(v is None for v in fields)
@@ -683,11 +689,12 @@ def _transaction_options(args):
         manifest_digest=args.transaction_manifest_digest,
         slot_ids=tuple(identifier(slot, limit=64) for slot in slots),
         timeout_s=timeout,
+        capacity_profile=capacity_profile,
     )
     if batch:
         cap = getattr(args, "transaction_max_batch_size", 1)
         wait = getattr(args, "transaction_batch_wait_ms", 20.0)
-        if type(cap) is not int or not 1 <= cap <= 8 or type(wait) not in (int, float) or not 1 <= wait <= 1000:
+        if type(cap) is not int or not 1 <= cap <= capacity or type(wait) not in (int, float) or not 1 <= wait <= 1000:
             raise ValueError("bounded native batch/wait required")
         jobs, size, drain = (
             getattr(args, "media_spool_max_jobs", 4),

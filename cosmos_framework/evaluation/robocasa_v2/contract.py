@@ -12,6 +12,19 @@ from dataclasses import dataclass, field
 
 SCHEMA = "psm_robocasa_eval_v2"
 SAMPLING = "dynamic_slot_environment_seed_then_continuous_reset_v3"
+ROUND_SCHEDULE = "episode_major_frozen_order_round_barrier_v1"
+STREAMING_SCHEDULE = "streaming_task_affinity_v2"
+STREAMING_SAMPLING = "independent_slot_environment_seed_then_continuous_reset_v4"
+STREAMING_RESOURCE_FIELDS = frozenset(
+    (
+        "max_owned_gpu_bytes",
+        "sim_startup_rss_bytes",
+        "sim_startup_gpu_bytes",
+        "server_startup_rss_bytes",
+        "server_startup_gpu_bytes",
+        "initialization_concurrency",
+    )
+)
 RESUME = "retry_missing_episode_no_scene_reproduction_v2"
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -27,6 +40,25 @@ def digest(value):
 def integer(value, minimum, maximum, name):
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError(f"invalid {name}")
+    return value
+
+
+def streaming(manifest):
+    return manifest["protocol"]["schedule"] == STREAMING_SCHEDULE
+
+
+def validate_streaming_resources(value):
+    if not isinstance(value, dict) or set(value) != STREAMING_RESOURCE_FIELDS:
+        raise ValueError("explicit complete streaming_resources budget required")
+    for key, entry in value.items():
+        integer(
+            entry,
+            0 if key == "sim_startup_gpu_bytes" else 1,
+            32 if key == "initialization_concurrency" else 2**63 - 1,
+            key,
+        )
+    if any(value[k] > value["max_owned_gpu_bytes"] for k in ("server_startup_gpu_bytes", "sim_startup_gpu_bytes")):
+        raise ValueError("startup GPU reservation exceeds owned GPU budget")
     return value
 
 
@@ -86,7 +118,7 @@ def build_manifest(
             "sampling": SAMPLING,
             "resource_architecture": "one_reusable_sim_slot_per_gpu_phase_a",
             "seed_field": "logical_task_stream; actual environment seed in sampling provenance",
-            "schedule": "episode_major_frozen_order_round_barrier_v1",
+            "schedule": ROUND_SCHEDULE,
             "resume": RESUME,
             "success_latch": 1,
             "scene_admission": "reject_initial_success_bounded_v1",
@@ -105,16 +137,18 @@ def build_manifest(
         },
     }
     if execution is not None:
+        is_streaming = isinstance(execution, dict) and execution.get("scheduling") == STREAMING_SCHEDULE
+        extra = {"scheduling", "resources", "max_rss_bytes"} if is_streaming else set()
         if (
             not isinstance(execution, dict)
             or set(execution)
-            != {"profile", "gpu_ids", "sims_per_gpu", "max_infer_batch_size", "batch_wait_ms", "noise"}
+            != {"profile", "gpu_ids", "sims_per_gpu", "max_infer_batch_size", "batch_wait_ms", "noise"} | extra
             or execution["profile"] != "phase_b_native_batch_v1"
             or execution["noise"] != "literal_cfg_seed_per_sample_v1"
         ):
             raise ValueError("exact native batch execution identity required")
-        integer(execution["sims_per_gpu"], 1, 8, "M")
-        integer(execution["max_infer_batch_size"], 1, 8, "B")
+        integer(execution["sims_per_gpu"], 1, 32 if is_streaming else 8, "M")
+        integer(execution["max_infer_batch_size"], 1, 32 if is_streaming else 8, "B")
         integer(execution["batch_wait_ms"], 1, 1000, "batch_wait_ms")
         gpus = execution["gpu_ids"]
         if (
@@ -126,6 +160,10 @@ def build_manifest(
             raise ValueError("distinct physical GPUs required")
         body["execution"] = execution
         body["protocol"]["resource_architecture"] = "multi_reusable_sim_slots_one_native_model_owner_per_gpu_phase_b"
+        if is_streaming:
+            validate_streaming_resources(execution["resources"])
+            integer(execution["max_rss_bytes"], 1, 2**63 - 1, "max_rss_bytes")
+            body["protocol"].update(schedule=STREAMING_SCHEDULE, sampling=STREAMING_SAMPLING)
     if rendering is not None:
         if (
             not isinstance(rendering, dict)
@@ -252,7 +290,7 @@ def result_record(
         "generation": generation,
         "stream_id": stream_id,
         "seed": manifest["seed"] if seed is None else seed,
-        "sampling_mode": SAMPLING,
+        "sampling_mode": manifest["protocol"]["sampling"],
         "reset_index": episode if reset_index is None else reset_index,
         "attempt_id": attempt_id,
         "worker_id": worker_id,
@@ -301,13 +339,15 @@ def validate_result(manifest, row):
         or row["task"] not in manifest["tasks"]
     ):
         raise ValueError("invalid Episode identity/schema")
+    if streaming(manifest) and "sampling" not in row:
+        raise ValueError("streaming Core requires physical Slot sampling provenance")
     if "sampling" in row:
         sample = row["sampling"]
         if (
             not isinstance(sample, dict)
             or set(sample)
             != {"environment_id", "actual_seed", "environment_reset_index", "physical_slot_id", "protocol"}
-            or sample["protocol"] != SAMPLING
+            or sample["protocol"] != manifest["protocol"]["sampling"]
         ):
             raise ValueError("invalid native environment sampling provenance")
         for name in ("environment_id", "physical_slot_id"):
@@ -319,7 +359,7 @@ def validate_result(manifest, row):
     integer(row["generation"], 0, 100000, "generation")
     integer(row["replans"], 0, 100000, "replans")
     if (
-        row["sampling_mode"] != SAMPLING
+        row["sampling_mode"] != manifest["protocol"]["sampling"]
         or type(row["seed"]) is not int
         or not 0 <= row["seed"] < 2**32
         or type(row["reset_index"]) is not int

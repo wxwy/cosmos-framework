@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,12 +16,16 @@ from cosmos_framework.evaluation.robocasa_v2.wire import receive, send
 
 
 def serve(channel, cfg, *, factory=None):
+    started = time.perf_counter()
+    timings = {}
     # Factory is a Python CPU test boundary, never selectable via production CLI.
     from cosmos_framework.evaluation.robocasa_v2 import generated_video, media
     from cosmos_framework.simulation.robocasa import closed_loop_eval as native
     from cosmos_framework.simulation.robocasa import render_devices
     from cosmos_framework.simulation.robocasa.eval_v2_adapter import NativeEpisode
     from cosmos_framework.simulation.robocasa.eval_v2_slot import SimSlot
+
+    timings["imports"] = (time.perf_counter() - started) * 1000
 
     slot = None
     os.set_inheritable(channel.fileno(), False)
@@ -54,19 +59,24 @@ def serve(channel, cfg, *, factory=None):
                     or hashlib.sha256(file.read_bytes()).hexdigest() != expected["sha256"]
                 ):
                     raise ValueError("native import origin/source mismatch")
+        stage = time.perf_counter()
         rendering = render_devices.configure(cfg["rendering"])
+        timings["render_proof"] = (time.perf_counter() - stage) * 1000
         cfg["rendering"] = rendering
         if factory is None:
+            stage = time.perf_counter()
             runtime = native.verify_runtime(SimpleNamespace(**cfg["runtime_args"]), next(iter(cfg["tasks"])))
             if runtime is None or any(
                 runtime["protocol"]["official_horizons"][task] != spec["horizon"] for task, spec in cfg["tasks"].items()
             ):
                 raise ValueError("missing/incorrect authoritative runtime horizons")
+            timings["vendor_attestation"] = (time.perf_counter() - stage) * 1000
         slot = SimSlot(cfg, factory=factory)
         send(
             channel,
             {
                 "kind": "READY",
+                "startup_timing_ms": timings,
                 "nonce": cfg["nonce"],
                 "pid": os.getpid(),
                 "physical_slot_id": cfg["physical_slot_id"],
@@ -82,6 +92,7 @@ def serve(channel, cfg, *, factory=None):
                 raise ValueError("actor request identity mismatch")
             op = message.get("op")
             response = {"request_id": message["request_id"], "nonce": cfg["nonce"]}
+            stage = time.perf_counter()
             if op == "start_episode":
                 response.update(
                     slot.start_episode(
@@ -108,6 +119,7 @@ def serve(channel, cfg, *, factory=None):
                 return
             else:
                 raise ValueError("unknown actor operation")
+            response["operation_ms"] = (time.perf_counter() - stage) * 1000
             send(channel, response)
     except EOFError:
         pass

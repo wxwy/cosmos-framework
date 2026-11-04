@@ -12,7 +12,7 @@ import math
 import time
 import traceback
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -25,6 +25,7 @@ from cosmos_framework.inference.robocasa_session_transactions import (
     digest,
     json_bytes,
     request_frontier,
+    transaction_capacity,
 )
 
 # Reservation frontiers are bounded to0..100000 by the existing wire contract.
@@ -73,8 +74,9 @@ class BatchedSessionTransactions(SessionTransactions):
         media_drain_timeout_s=300.0,
         **kwargs,
     ):
-        if type(max_batch_size) is not int or not 1 <= max_batch_size <= 8:
-            raise ValueError("native batch cap must be1..8")
+        capacity = transaction_capacity(kwargs.get("capacity_profile", "legacy8"))
+        if type(max_batch_size) is not int or not 1 <= max_batch_size <= capacity:
+            raise ValueError(f"native batch cap must be1..{capacity}")
         if (
             type(batch_wait_ms) not in (int, float)
             or not math.isfinite(batch_wait_ms)
@@ -101,9 +103,13 @@ class BatchedSessionTransactions(SessionTransactions):
         self._batch_histogram = Counter()
         self._batches = 0
         self._queue_high_water = 0
+        self._queue_wait_ms = deque(maxlen=4096)
+        self._generate_ms = deque(maxlen=4096)
+        self._requests_finished = 0
 
     def info(self):
         with self._lock:
+            waits = sorted(self._queue_wait_ms)
             return {
                 **super().info(),
                 "execution_profile": "session_native_batch_v1",
@@ -113,6 +119,14 @@ class BatchedSessionTransactions(SessionTransactions):
                 "batch_histogram": dict(self._batch_histogram),
                 "queued": len(self._queue),
                 "queue_high_water": self._queue_high_water,
+                "queue_wait_p50_ms": waits[int((len(waits) - 1) * 0.5)] if waits else None,
+                "queue_wait_p95_ms": waits[int((len(waits) - 1) * 0.95)] if waits else None,
+                "batch_generate_ms": {
+                    "count": self._batches,
+                    "recent_max": max(self._generate_ms, default=None),
+                    "recent_mean": sum(self._generate_ms) / len(self._generate_ms) if self._generate_ms else None,
+                },
+                "requests_finished": self._requests_finished,
                 "media_jobs": len(self._media),
                 "media_cpu_bytes": sum(
                     j.candidate.size if j.candidate else len(j.body or b"") for j in self._media.values()
@@ -268,12 +282,13 @@ class BatchedSessionTransactions(SessionTransactions):
                 raise
 
     def _pump(self):
+        last_was_media = False
         while True:
             with self._changed:
                 # Strict clients cannot fetch until decode runs. Prioritize these
                 # bounded jobs so a busy inference queue cannot starve completion.
                 strict_job = next((j for j in self._media.values() if j.required and j.state == "QUEUED"), None)
-                if strict_job is not None:
+                if strict_job is not None and (not self._queue or not last_was_media):
                     members, job = None, strict_job
                     job.state = "DECODING"
                     self._busy = True
@@ -313,8 +328,10 @@ class BatchedSessionTransactions(SessionTransactions):
                     job.state = "DECODING"
                     self._busy = True  # Reserve media ownership before releasing admission lock.
             if members:
+                last_was_media = False
                 self._execute_many(members)
             else:
+                last_was_media = True
                 self._decode(job)
             with self._lock:
                 if self._quarantined:
@@ -451,6 +468,9 @@ class BatchedSessionTransactions(SessionTransactions):
                     self._media = jobs
                     self._batches = batches
                     self._batch_histogram = histogram
+                    self._queue_wait_ms.extend(max(0, prepare_start - t.queued_at) * 1000 for t in members)
+                    self._generate_ms.append((generated - prepared) * 1000)
+                    self._requests_finished += len(members)
                     for t in members:
                         t.state = "COMMITTED"
             except BaseException as error:

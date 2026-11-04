@@ -9,7 +9,9 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections import deque
 
+from cosmos_framework.evaluation.robocasa_v2.contract import streaming
 from cosmos_framework.evaluation.robocasa_v2.store import save
 
 OWNER_PENDING = ("skipped_init_error", "scene_admission_exhausted")
@@ -45,6 +47,8 @@ class MeasuredLock:
 
 class RoundScheduler:
     def __init__(self, store, workers):
+        if type(self) is RoundScheduler and streaming(store.manifest):
+            raise ValueError("streaming manifest requires its versioned scheduler")
         store._lease()
         if store.scheduler_attached:
             raise ValueError("another scheduler owns coordinator")
@@ -178,3 +182,97 @@ class RoundScheduler:
     @property
     def done(self):
         return not self.cancelled and self.round == self.store.manifest["episodes_per_task"] and not self.inflight
+
+
+class StreamingScheduler(RoundScheduler):
+    """Bounded Task affinity without a round barrier; the same commit authority."""
+
+    def __init__(self, store, slots):
+        if not streaming(store.manifest):
+            raise ValueError("streaming scheduler requires the v2 manifest")
+        if len(set(slots.values())) != len(slots):
+            raise ValueError("distinct physical Slot identities required")
+        super().__init__(store, list(slots))
+        self.slots = dict(slots)
+        self.pending = {
+            task: deque(range(store.manifest["episodes_per_task"])) for task in store.manifest["task_order"]
+        }
+        self.dispatched = dict.fromkeys(self.pending, 0)
+        self.affinity = {}
+        self.fair_cursor = 0
+
+    def dispatch(self, worker):
+        with self._lock:
+            self._check()
+            if worker not in self.slots or worker in self.inflight:
+                raise ValueError("unknown or busy physical worker")
+            tasks = list(self.pending)
+            for task in tasks:
+                queue = self.pending[task]
+                while queue:
+                    ep = queue[0]
+                    disposition = self._disposition(task, ep)
+                    if disposition == "execute":
+                        break
+                    queue.popleft()
+                    self._record(disposition, {"task": task, "episode": ep})
+                    self.resume_scan.append((task, ep, disposition))
+            eligible = [task for task in tasks if self.pending[task]]
+            if not eligible:
+                return None
+            last, streak = self.affinity.get(worker, (None, 0))
+            if last in eligible and streak < 4:
+                task = last
+            else:
+                order = tasks[self.fair_cursor :] + tasks[: self.fair_cursor]
+                task = min(eligible, key=lambda t: (self.dispatched[t], order.index(t)))
+            ep = self.pending[task][0]
+            if task not in self.store.active_tasks:
+                self.store.begin_task(task)
+            ticket = uuid.uuid4().hex
+            key = (task, ep)
+            self.store.dispatch_tickets[key] = ticket
+            self.store.dispatch_slots[key] = self.slots[worker]
+            try:
+                attempt = self.store.begin_episode(task, ep, dispatch_ticket=ticket)
+            except BaseException:
+                self.store.dispatch_tickets.pop(key, None)
+                self.store.dispatch_slots.pop(key, None)
+                raise
+            claim = dict(
+                dispatch_id=ticket,
+                physical_worker=worker,
+                task=task,
+                episode=ep,
+                attempt=attempt,
+                invocation=self.invocation,
+            )
+            self._record("DISPATCH", claim)
+            self.inflight[worker] = claim
+            self.pending[task].popleft()
+            self.dispatched[task] += 1
+            self.affinity[worker] = (task, streak + 1 if last == task else 1)
+            self.fair_cursor = (tasks.index(task) + 1) % len(tasks)
+            self.resume_scan.append((task, ep, "execute"))
+            return claim
+
+    def _owned(self, claim):
+        self._check()
+        worker = claim["physical_worker"]
+        if (
+            self.inflight.get(worker) != claim
+            or claim["invocation"] != self.invocation
+            or claim["attempt"]["physical_slot_id"] != self.slots[worker]
+        ):
+            raise ValueError("stale/duplicate/misrouted scheduler claim")
+
+    def finish(self, claim):
+        super().finish(claim)
+        # Slot tickets contain no replay authority after the terminal receipt.
+        with self._lock:
+            self.store.dispatch_slots.pop((claim["task"], claim["episode"]), None)
+
+    @property
+    def done(self):
+        with self._lock:
+            return not self.cancelled and not self.inflight and not any(self.pending.values())

@@ -64,6 +64,7 @@ class PolicyTransport:
             batch_profile=True,
             max_batch_size=settings["max_infer_batch_size"],
             local_memory_mode=settings.get("local_memory_mode", "required"),
+            capacity_profile=settings.get("capacity_profile", "legacy8"),
         )
         self.lease = self.client.bind_assignment(assignment)
         self.local = AssignedLocalMemoryClient(self.lease) if self.client.mode == "required" else None

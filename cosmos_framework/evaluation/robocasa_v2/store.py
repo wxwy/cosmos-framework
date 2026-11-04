@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import stat
+import threading
 import time
 import uuid
 from collections import deque
@@ -23,6 +24,7 @@ from cosmos_framework.evaluation.robocasa_v2.contract import (
     canonical,
     digest,
     integer,
+    streaming,
     validate_manifest,
     validate_result,
 )
@@ -210,6 +212,19 @@ def timed(name):
     return decorate
 
 
+def metadata(method):
+    """Serialize v2 ledger transactions, never simulator/HTTP/model work."""
+
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        if not streaming(self.manifest):
+            return method(self, *args, **kwargs)
+        with self._metadata_lock:
+            return method(self, *args, **kwargs)
+
+    return call
+
+
 class Store:
     """Single coordinator; all worker responses require current leased attempt tokens.
 
@@ -226,20 +241,26 @@ class Store:
         self.fault = fault or (lambda stage: None)
         self.scheduler_attached = False
         self.dispatch_tickets = {}
+        self.dispatch_slots = {}
+        self._metadata_lock = threading.RLock()
+        self._metrics_lock = threading.Lock()
         self._rowcache = {}
         self._reset_counts = {}
         self._timings = {}
         self._read_baseline = dict(READ_METRICS)
 
     def record_timing(self, name, seconds, ok=True):
-        entry = self._timings.setdefault(name, {"count": 0, "failed": 0, "samples": deque(maxlen=4096)})
-        entry["count"] += 1
-        entry["failed"] += not ok
-        entry["samples"].append(seconds * 1000)
+        with self._metrics_lock:
+            entry = self._timings.setdefault(name, {"count": 0, "failed": 0, "samples": deque(maxlen=4096)})
+            entry["count"] += 1
+            entry["failed"] += not ok
+            entry["samples"].append(seconds * 1000)
 
     def metrics(self):
         result = {}
-        for name, entry in self._timings.items():
+        with self._metrics_lock:
+            snapshot = {name: dict(entry, samples=tuple(entry["samples"])) for name, entry in self._timings.items()}
+        for name, entry in snapshot.items():
             values = sorted(entry["samples"])
             if not values:
                 continue
@@ -294,6 +315,7 @@ class Store:
                 self.active_attempts.clear()
                 self.scheduler_attached = False
                 self.dispatch_tickets.clear()
+                self.dispatch_slots.clear()
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
@@ -400,12 +422,22 @@ class Store:
             or proof["local_sessions_closed"] is not True
         ):
             raise ValueError("unsafe cleanup: ownership/session proof required")
+        return self._complete_cleanup(stream, proof)
+
+    @metadata
+    def _complete_cleanup(self, stream, proof):
+        # The potentially slow ownership probe ran outside the metadata lock.
+        self._lease()
+        task, stream_id = stream["task"], stream["stream_id"]
+        if self._stream(task, stream_id) != stream:
+            raise ValueError("cleanup stream identity changed")
         value = {"stream": stream, "proof": proof, "time_ns": time.time_ns()}
         path = self._internal(task) / "cleanup" / f"{stream_id}.json"
         if safe(path).exists():
             return load(path)
         save(path, value)
-        self.active_tasks.pop(task, None)
+        if self.active_tasks.get(task, {}).get("stream_id") == stream_id:
+            self.active_tasks.pop(task, None)
         self.active_attempts = {k: a for k, a in self.active_attempts.items() if a["stream_id"] != stream_id}
         return value
 
@@ -420,10 +452,11 @@ class Store:
             raise ValueError("invalid cleanup receipt")
         return value
 
+    @metadata
     def allocate_environment(self, task, physical_slot_id):
         """Durable per-Task environment seed sequence, including Resume rebuilds.
 
-        Called under the coordinator's Slot startup lock. A claimed but unused
+        Serialized by the v2 metadata lock (v1: coordinator setup lock). An unused
         grant is retained and consumes its seed, so crashes never reuse it.
         """
         self._lease()
@@ -455,9 +488,11 @@ class Store:
             or grant["manifest_digest"] != self.manifest["digest"]
             or grant["seed"] != sampling["actual_seed"]
             or grant["physical_slot_id"] != sampling["physical_slot_id"]
+            or (streaming(self.manifest) and a["physical_slot_id"] != sampling["physical_slot_id"])
         ):
             raise ValueError("scene sampling contradicts durable environment seed grant")
 
+    @metadata
     def bind_sampling(self, a, sampling):
         self._lease()
         self._attempt(a)
@@ -478,6 +513,7 @@ class Store:
             }:
                 raise ValueError("Core sampling is not the admitted scene")
 
+    @metadata
     def begin_task(self, task, *, seed=None, recovery_only=False):
         self._lease()
         if task in self.active_tasks:
@@ -523,6 +559,7 @@ class Store:
                     "authorization",
                     "time_ns",
                 }
+                | ({"physical_slot_id"} if streaming(self.manifest) else set())
                 or a["generation"] != i
                 or type(a["generation"]) is not int
                 or a["task"] != task
@@ -530,6 +567,8 @@ class Store:
                 or a["manifest_digest"] != self.manifest["digest"]
             ):
                 raise ValueError("invalid attempt claim/order")
+            if streaming(self.manifest):
+                identifier(a["physical_slot_id"])
             if a["authorization"] is not None:
                 auth = a["authorization"]
                 identifier(auth["id"])
@@ -588,6 +627,7 @@ class Store:
         )
         self.fault("after_event_" + kind)
 
+    @metadata
     def _healthy_stream(self, task, *, allow_fault=False):
         stream = self.active_tasks.get(task)
         if stream is None or stream["lease_id"] != self.lease_id or self._cleaned(task, stream["stream_id"]):
@@ -685,6 +725,7 @@ class Store:
             raise ValueError("only valid environment outcomes can Core Commit")
         return row
 
+    @metadata
     def _result(self, task, ep):
         from cosmos_framework.evaluation.robocasa_v2.evidence import FILES, validate
 
@@ -710,6 +751,7 @@ class Store:
         self._rowcache[(task, ep)] = (stamps, copy.deepcopy(row))
         return row
 
+    @metadata
     def rows(self, task):
         directory = safe(self._task(task) / "episodes")
         if not directory.exists():
@@ -732,6 +774,7 @@ class Store:
                 values.append(row)
         return values  # Deliberately permits gaps, unlike superseded r1.
 
+    @metadata
     def slot(self, task, ep):
         row = self._result(task, ep)
         if row is not None:
@@ -741,6 +784,7 @@ class Store:
             state = dict(state, status="interrupted")
         return {**state, "result": None}
 
+    @metadata
     def authorize_retry(self, task, ep, *, owner_ref):
         self._lease()
         if not isinstance(owner_ref, str) or not owner_ref.strip():
@@ -764,6 +808,7 @@ class Store:
         return available[0] if available else None
 
     @timed("claim")
+    @metadata
     def begin_episode(self, task, ep, *, dispatch_ticket=None):
         self._lease()
         if self.scheduler_attached and (
@@ -777,7 +822,7 @@ class Store:
         permit = self._permit(task, ep)
         if status in ("skipped_init_error", "scene_admission_exhausted") and permit is None:
             raise ValueError("Owner authorization required, no automatic skip retry")
-        for i in range(ep):
+        for i in range(ep) if not streaming(self.manifest) else ():
             earlier = self.slot(task, i)
             if earlier["result"] is None and (
                 earlier["status"] not in ("skipped_init_error", "scene_admission_exhausted") or self._permit(task, i)
@@ -799,11 +844,16 @@ class Store:
             authorization=permit,
             time_ns=time.time_ns(),
         )
+        if streaming(self.manifest):
+            if not self.scheduler_attached or (task, ep) not in self.dispatch_slots:
+                raise ValueError("streaming physical Slot authority required")
+            a["physical_slot_id"] = identifier(self.dispatch_slots[(task, ep)])
         save(self._ledger(task, ep) / "attempts" / f"{len(attempts):06d}.json", a)
         self.fault("after_attempt_claim")
         self.active_attempts[(task, ep)] = a
         return a
 
+    @metadata
     def begin_initialization(self, a):
         state = self._admission_state(a["task"], a["episode"])
         if state["status"] in ("admitted", "skipped_init_error", "scene_admission_exhausted", "invalid"):
@@ -829,6 +879,7 @@ class Store:
         self._event(a, "INIT_BEGIN", data)
         return data
 
+    @metadata
     def initialization_outcome(self, a, *, initial_success=None, error=None, stage=None, safe_to_retry=False):
         events = self.events(a)
         if not events or events[-1]["kind"] != "INIT_BEGIN":
@@ -862,12 +913,14 @@ class Store:
             self._event(a, "DEGENERATE_INITIAL_SUCCESS" if bool(initial_success) else "ADMITTED", data)
         return self._admission_state(a["task"], a["episode"])
 
+    @metadata
     def finish_invalid(self, a, reason):
         self.record_process_error(a["task"], "core_invalid", reason, attempt=a)
         self.fault("after_invalid_fault_before_event")
         self._event(a, "INVALID", {"reason": reason})
 
     @timed("core_commit")
+    @metadata
     def commit(self, row, *, staging, dispatch_ticket=None):
         self._lease()
         if self.scheduler_attached and (
@@ -918,6 +971,7 @@ class Store:
         stream = self._stream(task, stream_id)
         return self._record_fault(stream, stage, message, None)
 
+    @metadata
     def record_process_error(self, task, stage, message, *, attempt=None):
         self._lease()
         stream = self.active_tasks.get(task)
@@ -925,6 +979,7 @@ class Store:
             raise ValueError("owned stream required for process fault")
         return self._record_fault(stream, stage, message, attempt)
 
+    @metadata
     def _record_fault(self, stream, stage, message, attempt):
         task = stream["task"]
         if not all(isinstance(x, str) and x for x in (stage, message)):
@@ -971,6 +1026,7 @@ class Store:
         save(self._internal(task) / "recovery" / f"{value['id']}.json", value)
         return value
 
+    @metadata
     def resolve_error(self, task, error_id, certificate, *, replacement=None):
         self._lease()
         identifier(error_id)
@@ -1002,7 +1058,18 @@ class Store:
             "mode": mode,
             "time_ns": time.time_ns(),
         }
-        save(self._internal(task) / "resolutions" / f"{error_id}.json", value)
+        path = self._internal(task) / "resolutions" / f"{error_id}.json"
+        if streaming(self.manifest) and safe(path).exists():
+            prior = load(path)
+            self._validate_resolution(task, error, prior)
+            if (
+                prior["replacement"] != replacement
+                or prior["mode"] != mode
+                or prior["certificate"]["new"] != cert["new"]
+            ):
+                raise ValueError("conflicting concurrent fault resolution")
+            return prior
+        save(path, value)
         return value
 
     def _validate_resolution(self, task, error, value):
@@ -1043,6 +1110,7 @@ class Store:
         ):
             raise ValueError("fault resolution replacement mismatch")
 
+    @metadata
     def errors(self, task):
         values = []
         for e in records(self._internal(task) / "errors"):
@@ -1078,6 +1146,7 @@ class Store:
             values.append({**e, "resolution": r})
         return values
 
+    @metadata
     def summary(self):
         expected = self.manifest["episodes_per_task"]
         for path in (self.root / "tasks").iterdir():
@@ -1210,6 +1279,7 @@ class Store:
         }, indexed
 
     @timed("rebuild_views")
+    @metadata
     def publish_views(self):
         self._lease()
         report, rows = self.summary()
