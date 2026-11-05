@@ -1203,16 +1203,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         packed_tokens_action, per_token_domain_id = self.pack_action(
             action.tokens, action.token_shapes, action.domain_id
         )
-        # Flow interpolation keeps actions in FP32; cast here to match the action encoder's model dtype.
-        packed_tokens_action = packed_tokens_action.to(target_dtype)  # [B_action*T_action,action_dim]
-        packed_tokens_action = self.action2llm(
-            packed_tokens_action, per_token_domain_id
-        )  # [B_action*T_action,hidden_size]
-
-        if self.config.enable_action_modality_embedding:
-            packed_tokens_action = packed_tokens_action + self.action_modality_embed.view(
-                1, -1
-            )  # [B_action*T_action,hidden_size]
+        packed_tokens_action = self._project_action_tokens(packed_tokens_action, per_token_domain_id, target_dtype)
 
         has_noisy_actions = has_noisy_tokens(action)
         if has_noisy_actions:
@@ -1231,6 +1222,29 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         packed_sequence[action.sequence_indexes] = (
             packed_tokens_action  # [B_action*T_action,hidden_size] scattered into [N_total,hidden_size]
         )
+
+    def _project_action_tokens(
+        self,
+        packed_tokens_action: torch.Tensor,
+        per_token_domain_id: torch.Tensor,
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compile the tensor projection without per-sample Python packing metadata.
+
+        Dynamic tensor shapes do not make list lengths dynamic. Keep packing,
+        timestep metadata and noisy-index assembly in the _encode_action caller.
+        """
+        # Flow interpolation keeps actions in FP32; cast here to match the action encoder's model dtype.
+        packed_tokens_action = packed_tokens_action.to(target_dtype)  # [B_action*T_action,action_dim]
+        packed_tokens_action = self.action2llm(
+            packed_tokens_action, per_token_domain_id
+        )  # [B_action*T_action,hidden_size]
+
+        if self.config.enable_action_modality_embedding:
+            packed_tokens_action = packed_tokens_action + self.action_modality_embed.view(
+                1, -1
+            )  # [B_action*T_action,hidden_size]
+        return packed_tokens_action
 
     def _decode_action(
         self,
@@ -1252,7 +1266,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             preds_action = self.action2llm(preds_action, dummy_domain_id)  # [1,hidden_size]
             if self.config.enable_action_modality_embedding:
                 preds_action = preds_action + self.action_modality_embed.view(1, -1)  # [1,hidden_size]
-            preds_action = self.llm2action(preds_action, dummy_domain_id)  # [1,action_dim]
+            preds_action = self._project_action_predictions(preds_action, dummy_domain_id)  # [1,action_dim]
             # Return a list of per-sample zero tensors with correct shapes (e.g. (T, action_dim)),
             # so downstream code (_get_velocity, compute_flow_matching_loss) that iterates over preds_action
             # gets properly-shaped tensors. Without this, the dummy tensor (1, action_dim)
@@ -1293,11 +1307,23 @@ class Cosmos3VFMNetwork(PreTrainedModel):
                 )
             per_token_domain_id = torch.cat(domain_ids, dim=0)
 
-            preds_action = self.llm2action(
+            preds_action = self._project_action_predictions(
                 action_hidden_states, per_token_domain_id
             )  # [total_noisy_action_tokens,action_dim]
             preds_action = self.unpack_action(preds_action, action.token_shapes, action.noisy_frame_indexes)
             output_dict.update(preds_action=preds_action)
+
+    def _project_action_predictions(
+        self,
+        action_hidden_states: torch.Tensor,
+        per_token_domain_id: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compile the decoder projection without sample lists or output mutation.
+
+        The caller retains noisy-token/domain alignment, unpacking and the
+        no-noisy dummy graph, including its zero-valued gradient connection.
+        """
+        return self.llm2action(action_hidden_states, per_token_domain_id)
 
     def _encode_sound(
         self,

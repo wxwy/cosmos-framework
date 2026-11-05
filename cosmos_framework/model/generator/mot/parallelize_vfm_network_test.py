@@ -20,12 +20,12 @@ import pytest
 import torch
 from torch import nn
 
-from cosmos_framework.utils.helper_test import RunIf
 from cosmos_framework.configs.base.defaults.activation_checkpointing import ActivationCheckpointingConfig
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
 from cosmos_framework.model.generator.mot import parallelize_vfm_network as module
 from cosmos_framework.model.generator.mot.modeling_utils import TimestepEmbedder
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import apply_ac
+from cosmos_framework.utils.helper_test import RunIf
 
 pytestmark = [pytest.mark.L0]
 
@@ -209,7 +209,13 @@ def test_vfm_heads_follow_the_cuda_graph_scope(
 ) -> None:
     """Forward-scope capture records the heads inside the AR forward: no nested CUDA-graph trees,
     static shapes (no host staging in the wrapper); other configurations keep the dynamic graph."""
-    heads = ["_encode_text", "_encode_vision", "_encode_action", "_decode_vision", "_decode_action"]
+    heads = [
+        "_encode_text",
+        "_encode_vision",
+        "_project_action_tokens",
+        "_decode_vision",
+        "_project_action_predictions",
+    ]
     model = SimpleNamespace(**{name: object() for name in heads})
     seen: list[dict] = []
 

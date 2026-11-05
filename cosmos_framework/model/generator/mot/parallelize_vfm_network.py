@@ -17,9 +17,12 @@ def apply_compile(model: torch.nn.Module, config: CompileConfig):
     """Apply torch.compile to the VFM encode/decode heads.
 
     The MoT-side ``compile_dynamic`` knob on ``CompileConfig`` intentionally
-    does **not** propagate here.  The VFM encode/decode paths have no graph
-    breaks and their input shapes are stable across a prompt, so we always
-    trace them as a single dynamic graph (``fullgraph=True, dynamic=True``).
+    does **not** propagate here. Tensor regions are traced with
+    ``fullgraph=True, dynamic=True``. Action packing and noisy-index metadata
+    stay outside compilation: Python list lengths otherwise specialize once
+    per batch/layout even with dynamic tensor shapes. Compile only the action
+    tensor projection. Action decoding likewise keeps sample routing, unpacking
+    and dummy graph orchestration outside its tensor-only projection.
     This keeps AR inference (which sets ``compile_dynamic=False`` on MoT for
     shape-specialized kernels) from accidentally regressing the VFM compile.
     """
@@ -45,9 +48,9 @@ def apply_compile(model: torch.nn.Module, config: CompileConfig):
 
     model._encode_text = torch.compile(model._encode_text, **compile_options)
     model._encode_vision = torch.compile(model._encode_vision, **compile_options)
-    model._encode_action = torch.compile(model._encode_action, **compile_options)
+    model._project_action_tokens = torch.compile(model._project_action_tokens, **compile_options)
     model._decode_vision = torch.compile(model._decode_vision, **compile_options)
-    model._decode_action = torch.compile(model._decode_action, **compile_options)
+    model._project_action_predictions = torch.compile(model._project_action_predictions, **compile_options)
     return model
 
 
