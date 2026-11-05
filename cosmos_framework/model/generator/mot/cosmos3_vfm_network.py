@@ -1266,7 +1266,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             preds_action = self.action2llm(preds_action, dummy_domain_id)  # [1,hidden_size]
             if self.config.enable_action_modality_embedding:
                 preds_action = preds_action + self.action_modality_embed.view(1, -1)  # [1,hidden_size]
-            preds_action = self.llm2action(preds_action, dummy_domain_id)  # [1,action_dim]
+            preds_action = self._project_action_predictions(preds_action, dummy_domain_id)  # [1,action_dim]
             # Return a list of per-sample zero tensors with correct shapes (e.g. (T, action_dim)),
             # so downstream code (_get_velocity, compute_flow_matching_loss) that iterates over preds_action
             # gets properly-shaped tensors. Without this, the dummy tensor (1, action_dim)
@@ -1307,11 +1307,23 @@ class Cosmos3VFMNetwork(PreTrainedModel):
                 )
             per_token_domain_id = torch.cat(domain_ids, dim=0)
 
-            preds_action = self.llm2action(
+            preds_action = self._project_action_predictions(
                 action_hidden_states, per_token_domain_id
             )  # [total_noisy_action_tokens,action_dim]
             preds_action = self.unpack_action(preds_action, action.token_shapes, action.noisy_frame_indexes)
             output_dict.update(preds_action=preds_action)
+
+    def _project_action_predictions(
+        self,
+        action_hidden_states: torch.Tensor,
+        per_token_domain_id: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compile the decoder projection without sample lists or output mutation.
+
+        The caller retains noisy-token/domain alignment, unpacking and the
+        no-noisy dummy graph, including its zero-valued gradient connection.
+        """
+        return self.llm2action(action_hidden_states, per_token_domain_id)
 
     def _encode_sound(
         self,

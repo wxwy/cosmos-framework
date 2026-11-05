@@ -21,7 +21,8 @@ def apply_compile(model: torch.nn.Module, config: CompileConfig):
     ``fullgraph=True, dynamic=True``. Action packing and noisy-index metadata
     stay outside compilation: Python list lengths otherwise specialize once
     per batch/layout even with dynamic tensor shapes. Compile only the action
-    tensor projection, leaving the other encode/decode heads unchanged.
+    tensor projection. Action decoding likewise keeps sample routing, unpacking
+    and dummy graph orchestration outside its tensor-only projection.
     This keeps AR inference (which sets ``compile_dynamic=False`` on MoT for
     shape-specialized kernels) from accidentally regressing the VFM compile.
     """
@@ -49,7 +50,7 @@ def apply_compile(model: torch.nn.Module, config: CompileConfig):
     model._encode_vision = torch.compile(model._encode_vision, **compile_options)
     model._project_action_tokens = torch.compile(model._project_action_tokens, **compile_options)
     model._decode_vision = torch.compile(model._decode_vision, **compile_options)
-    model._decode_action = torch.compile(model._decode_action, **compile_options)
+    model._project_action_predictions = torch.compile(model._project_action_predictions, **compile_options)
     return model
 
 
