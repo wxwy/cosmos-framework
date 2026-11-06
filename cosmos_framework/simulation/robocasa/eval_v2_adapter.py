@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -254,6 +255,7 @@ class NativeEpisode:
                     raise RuntimeError("Local cleanup did not acknowledge reset")
                 observation = outcome.finish(normal=True, cleanup_ok=True)
             finally:
+                primary_error = sys.exc_info()[1]
                 close_error = None
                 try:
                     http_client.close()
@@ -262,6 +264,23 @@ class NativeEpisode:
                 finally:
                     if transactional is not None:
                         media_errors.extend(transactional.media_diagnostics()["errors"])
+                    if client is not None and callable(getattr(client, "pipeline_stats", None)):
+                        profile = client.pipeline_stats()
+                        if profile.get("enabled"):
+                            # Diagnostic-only artifact: Core validity and results
+                            # remain governed by the unchanged commit path.
+                            profile = {
+                                "schema": "psm_local_pipeline_profile_v1",
+                                "client": profile,
+                                "elapsed_seconds": time.monotonic() - start,
+                                "sim_steps": len(outcome.checks),
+                                "replans": replans,
+                                "core_commit_validated": False,
+                            }
+                            try:
+                                atomic_json(directory / "local_pipeline_profile.json", profile)
+                            except OSError as error:
+                                media_errors.append("Local profiling write: " + repr(error))
                 # Native loop has already attempted end+reset. Media cannot delay
                 # that cleanup or replace a valid scientific outcome.
                 for f in (actions, predictions):
@@ -317,7 +336,17 @@ class NativeEpisode:
                 except OSError:
                     pass
                 if close_error is not None:
-                    raise close_error
+                    if primary_error is not None and getattr(client, "streaming_enabled", False):
+                        diagnostic = "Local pipeline cleanup: " + repr(close_error)[:2048]
+                        annotate = getattr(primary_error, "add_note", None)
+                        if callable(annotate):
+                            annotate(diagnostic)
+                        else:
+                            # The package also supports Python 3.10. Diagnostics
+                            # must never turn into an AttributeError over the primary.
+                            primary_error.local_pipeline_cleanup_error = diagnostic
+                    else:
+                        raise close_error
         return {
             "local_session": {
                 "session_id": cleanup["session_id"],

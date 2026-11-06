@@ -384,7 +384,14 @@ def run_policy(
                 queue = acts[:action_horizon] if action_horizon > 0 else list(acts)
 
             a = np.asarray(queue.pop(0))
+            timing_sink = (
+                local_memory_client.record_step_timing
+                if getattr(local_memory_client, "streaming_enabled", False)
+                else None
+            )
+            composite_start = time.perf_counter() if timing_sink is not None else None
             pre_composite = compose(obs).astype(np.uint8) if local_memory_client is not None else None
+            composite_seconds = time.perf_counter() - composite_start if timing_sink is not None else None
             if USE_BASE_ACTION:
                 want = _ACTION_DIM_BY_ENCODING[BASE_ENCODING]
                 if a.shape[-1] != want:
@@ -404,7 +411,10 @@ def run_policy(
                     )
                 env_action = decode_10d_to_env12(a, False)
 
+            sim_start = time.perf_counter() if timing_sink is not None else None
             obs, reward, env_done, info = env.step(env_action)
+            if timing_sink is not None:
+                timing_sink(composite_seconds, time.perf_counter() - sim_start)
             progress_steps = step + 1
             if on_action is not None:
                 on_action(

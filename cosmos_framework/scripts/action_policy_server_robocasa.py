@@ -53,6 +53,7 @@ import json
 import threading
 import time
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -83,12 +84,17 @@ from cosmos_framework.inference.common.args import CheckpointOverrides, ConfigFi
 from cosmos_framework.inference.common.config import deserialize_config_dict
 from cosmos_framework.inference.common.init import init_output_dir
 from cosmos_framework.inference.inference import OmniInference
+from cosmos_framework.inference.local_memory_pipeline_timing import PipelineTiming
 from cosmos_framework.inference.robocasa_batch_transactions import (
     BatchedSessionTransactions,
     BatchOutput,
     MediaCandidate,
 )
-from cosmos_framework.inference.robocasa_composite_visual import prepare_robocasa_composite_frame
+from cosmos_framework.inference.robocasa_composite_visual import (
+    PreparedCompositeFrame,
+    capture_policy_current_visuals,
+    prepare_robocasa_composite_frame,
+)
 from cosmos_framework.inference.robocasa_local_memory_policy import RoboCasaLocalMemoryPolicyAdapter
 from cosmos_framework.inference.robocasa_session_transactions import (
     MAX_BODY,
@@ -729,6 +735,13 @@ def transaction_dispatch(service, method, path, record=None, headers=None) -> Re
         return actor.register(record, headers.get("X-Cosmos-Owner", ""))
     if method == "POST" and path == "/v2/inference" and set(record) == {"lease", "payload", "budget"}:
         return actor.submit(record["lease"], record["payload"], budget=record["budget"])
+    if (
+        method == "POST"
+        and path == "/v2/local-memory/completed"
+        and set(record) == {"lease", "payload"}
+        and callable(getattr(actor, "completed", None))
+    ):
+        return actor.completed(record["lease"], record["payload"])
     if method == "POST" and path == "/v2/inference/ack" and set(record) == {"lease", "request_key", "payload_sha256"}:
         return actor.acknowledge(record["lease"], record["request_key"], record["payload_sha256"])
     if (
@@ -953,6 +966,11 @@ class ActionModelService:
             mode=args.local_memory_mode,
             decode_image=lambda value: _decode_base64_png_to_rgb_uint8(value),
             max_sessions=int(args.local_memory_max_sessions),
+            pipeline_enabled=bool(
+                transaction_options is not None
+                and args.transaction_profile == "batch"
+                and args.local_memory_mode == "required"
+            ),
         )
         log.info(f"[action-server] local_memory={self.local_memory_adapter.info()}")
         if transaction_options is not None:
@@ -1305,15 +1323,32 @@ class ActionModelService:
             "domain_id": [torch.tensor(get_domain_id(p["domain_name"]), dtype=torch.long) for p in preps],
             "sequence_plan": [p["sequence_plan"] for p in preps],
         }
-        with torch.inference_mode():
-            samples = self.model.generate_samples_from_batch(
-                batch,
-                guidance=self.cfg.guidance,
-                seed=[self.cfg.seed] * n,
-                num_steps=self.cfg.num_steps,
-                has_negative_prompt=False,
-                **self._transaction_prefixes(updates, batch=True),
+        pipeline = bool(getattr(self.local_memory_adapter, "pipeline_enabled", False))
+        timing = PipelineTiming(self.model.tensor_kwargs_fp32["device"]) if pipeline else None
+        current = (
+            capture_policy_current_visuals(
+                self.model.tokenizer_vision_gen,
+                [
+                    PreparedCompositeFrame(p["img_chw_uint8"], p["video_padded"][:, :1], p["padded_image_size"])
+                    for p in preps
+                ],
+                image_sizes=[p["image_size"] for p in preps],
             )
+            if pipeline
+            else nullcontext()
+        )
+        with torch.inference_mode(), current as captured:
+            with timing.measure("native_generation") if timing is not None else nullcontext():
+                samples = self.model.generate_samples_from_batch(
+                    batch,
+                    guidance=self.cfg.guidance,
+                    seed=[self.cfg.seed] * n,
+                    num_steps=self.cfg.num_steps,
+                    has_negative_prompt=False,
+                    **self._transaction_prefixes(updates, batch=True),
+                )
+        current_visuals = captured.current if pipeline else ()
+        device_timing = timing.finish() if timing is not None else None
         if len(samples["action"]) != n:
             raise ValueError("native batch action cardinality mismatch")
         actions = []
@@ -1345,7 +1380,7 @@ class ActionModelService:
                 except Exception as error:
                     log.warning("Optional media spool dropped: %s", type(error).__name__)
             media.append(candidate)
-        return BatchOutput(actions, tuple(media))
+        return BatchOutput(actions, tuple(media), current_visuals, device_timing)
 
     def _transaction_prefixes(self, updates, *, batch):
         if self.local_memory_adapter.mode == "off":
