@@ -13,7 +13,7 @@ import time
 import traceback
 import uuid
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
 from cosmos_framework.inference.local_memory_state import CachedMemoryResponse
@@ -25,6 +25,7 @@ from cosmos_framework.inference.robocasa_session_transactions import (
     digest,
     json_bytes,
     request_frontier,
+    strict_json,
     transaction_capacity,
 )
 
@@ -43,6 +44,8 @@ class MediaCandidate:
 class BatchOutput:
     actions: list
     media: tuple = ()
+    current_visuals: tuple = ()
+    device_timing: dict | None = None
 
 
 @dataclass(eq=False)
@@ -106,6 +109,12 @@ class BatchedSessionTransactions(SessionTransactions):
         self._queue_wait_ms = deque(maxlen=4096)
         self._generate_ms = deque(maxlen=4096)
         self._requests_finished = 0
+        self._local_pipeline = self.mode == "required" and bool(getattr(adapter, "pipeline_enabled", False))
+        if self._local_pipeline and not all(
+            callable(getattr(adapter, name, None))
+            for name in ("admit_completed", "next_completed", "run_completed", "pipeline_ready", "cancel_completed")
+        ):
+            raise ValueError("enabled Local pipeline requires complete executor/cleanup hooks")
 
     def info(self):
         with self._lock:
@@ -136,7 +145,71 @@ class BatchedSessionTransactions(SessionTransactions):
                 "media_spool_max_bytes": self.media_spool_max_bytes,
                 "media_drain_timeout_s": self.media_drain_timeout_s,
                 "strict_media_item_bytes": min(MAX_BODY, self.media_spool_max_bytes),
+                **({"local_pipeline": self.adapter.pipeline_info()} if self._local_pipeline else {}),
             }
+
+    def completed(self, proof, payload):
+        """Admit completed evidence only; this is neither policy nor state ACK."""
+        raw = json_bytes(payload)
+        if len(raw) > MAX_BODY:
+            raise ValueError("completed evidence body exceeds bound")
+        payload = strict_json(raw)
+        with self._lock:
+            lease = self._lease(proof)
+            self._usable(lease)
+            if not self._local_pipeline:
+                raise ValueError("per-frame Local pipeline is not enabled")
+            result = self.adapter.admit_completed(asdict(lease), payload)
+            try:
+                self._ensure_pump()
+            except BaseException:
+                self.adapter.cancel_completed(asdict(lease))
+                raise
+            duplicate = bool(result.get("duplicate", False))
+            return self._reply(
+                200 if duplicate else 202,
+                {
+                    "accepted": True,
+                    "session_id": lease.session_id,
+                    "episode_id": lease.episode_id,
+                    "source_step": payload["source_step"],
+                    "duplicate": duplicate,
+                },
+            )
+
+    def _ensure_pump(self):
+        # Caller holds the short actor admission lock. GPU work is never run here.
+        if not self._pumping:
+            self._pumping = True
+            try:
+                self._executor.submit(self._pump)
+            except BaseException:
+                self._pumping = False
+                raise
+
+    def _usable(self, lease):
+        failure = self._failed.get(lease.slot_id)
+        if getattr(self, "_local_pipeline", False) and failure and failure.get("failed_stage") == "LOCAL_PIPELINE":
+            # Evidence normally finishes while the Sim is still executing. If
+            # it fails before a Replan exists, there is no Ticket to poll. A
+            # subsequently authenticated request must still see that first fault.
+            raise RuntimeError(
+                f"Local completed evidence failed for {lease.session_id}, source_step={failure.get('source_step')}: "
+                f"{failure.get('error_type')}: {failure.get('error')}"
+                + ("; model executor quarantined" if self._quarantined else "")
+            )
+        return super()._usable(lease)
+
+    def _pipeline_ticket_ready(self, ticket):
+        return (
+            not self._local_pipeline
+            or ticket.cancelled
+            or self._stopping
+            or self.clock() >= ticket.deadline
+            or ticket.lease.slot_id in self._closing
+            or ticket.lease.slot_id in self._failed
+            or self.adapter.pipeline_ready(ticket.lease.session_id, request_frontier(ticket.payload, self.mode))
+        )
 
     def media_room(self):
         with self._lock:
@@ -271,35 +344,43 @@ class BatchedSessionTransactions(SessionTransactions):
         ticket.queued_at = self._enqueued[ticket.key]
         self._queue_high_water = max(self._queue_high_water, len(self._queue))
         self._changed.notify_all()
-        if not self._pumping:
-            self._pumping = True
-            try:
-                self._executor.submit(self._pump)
-            except BaseException:
-                self._queue.remove(ticket)
-                self._enqueued.pop(ticket.key)
-                self._pumping = False
-                raise
+        try:
+            self._ensure_pump()
+        except BaseException:
+            self._queue.remove(ticket)
+            self._enqueued.pop(ticket.key)
+            raise
 
     def _pump(self):
         last_was_media = False
+        last_was_completed = False
         while True:
             with self._changed:
+                ready = [ticket for ticket in self._queue if self._pipeline_ticket_ready(ticket)]
+                completed = None
+                # At most one evidence unit between runnable native/media units;
+                # if no prediction is ready, keep advancing its causal dependency.
+                has_media = any(j.state == "QUEUED" for j in self._media.values())
+                if self._local_pipeline and (not last_was_completed or (not ready and not has_media)):
+                    completed = self.adapter.next_completed()
                 # Strict clients cannot fetch until decode runs. Prioritize these
                 # bounded jobs so a busy inference queue cannot starve completion.
                 strict_job = next((j for j in self._media.values() if j.required and j.state == "QUEUED"), None)
-                if strict_job is not None and (not self._queue or not last_was_media):
+                if completed is not None:
+                    members, job = None, None
+                    self._busy = True
+                elif strict_job is not None and (not ready or not last_was_media):
                     members, job = None, strict_job
                     job.state = "DECODING"
                     self._busy = True
-                elif self._queue:
-                    oldest = self._queue[0]
+                elif ready:
+                    oldest = ready[0]
                     remaining = min(
                         self.wait_s - (time.monotonic() - self._enqueued[oldest.key]), oldest.deadline - self.clock()
                     )
                     if (
                         not oldest.cancelled
-                        and len(self._queue) < min(self.max_batch_size, len(self.slot_ids))
+                        and len(ready) < min(self.max_batch_size, len(self.slot_ids))
                         and remaining > 0
                         and not self._stopping
                     ):
@@ -310,11 +391,14 @@ class BatchedSessionTransactions(SessionTransactions):
                         (
                             t
                             for t in self._queue
-                            if t.cancelled or self.clock() >= t.deadline or t.lease.slot_id in self._closing
+                            if t.cancelled
+                            or self.clock() >= t.deadline
+                            or t.lease.slot_id in self._closing
+                            or (self._local_pipeline and t.lease.slot_id in self._failed)
                         ),
                         None,
                     )
-                    members = [stale] if stale else self._queue[: self.max_batch_size]
+                    members = [stale] if stale else ready[: self.max_batch_size]
                     for ticket in members:
                         self._queue.remove(ticket)
                         self._enqueued.pop(ticket.key, None)
@@ -323,20 +407,90 @@ class BatchedSessionTransactions(SessionTransactions):
                     members = None
                     job = next((j for j in self._media.values() if j.state == "QUEUED"), None)
                     if job is None:
+                        if self._queue:
+                            # Never seal and wait for our own executor's Future.
+                            # A missing dependency is bounded by the original ticket
+                            # deadline and wakes immediately on evidence admission.
+                            self._changed.wait(0.01)
+                            continue
                         self._pumping = False
                         return
                     job.state = "DECODING"
                     self._busy = True  # Reserve media ownership before releasing admission lock.
-            if members:
+            if completed is not None:
+                last_was_completed = True
+                self._execute_completed(completed)
+            elif members:
+                last_was_completed = False
                 last_was_media = False
                 self._execute_many(members)
             else:
+                last_was_completed = False
                 last_was_media = True
                 self._decode(job)
             with self._lock:
                 if self._quarantined:
                     self._pumping = False
                     return
+
+    def _execute_completed(self, work):
+        """One model-owned Encode1/update unit, with the existing drain fence."""
+        drained, error_record = False, None
+        with self._model_lock:
+            try:
+                with self._lock:
+                    lease = self._lease(work.lease)
+                    self._usable(lease)
+                self.adapter.run_completed(work)
+                self.quiesce()
+                drained = True
+                with self._lock:
+                    self._usable(self._lease(work.lease))
+            except BaseException as error:
+                error_record = {
+                    "state": "ABORTED",
+                    "failed_stage": "LOCAL_PIPELINE",
+                    "error_type": type(error).__name__,
+                    "error": str(error)[:2048],
+                    "traceback": traceback.format_exc()[-16384:],
+                    "source_step": work.payload["source_step"],
+                    "assignment": {key: value for key, value in work.lease.items() if key != "capability"},
+                }
+                logging.getLogger(__name__).exception("Completed Local evidence aborted")
+            finally:
+                if not drained:
+                    try:
+                        self.quiesce()
+                        drained = True
+                    except BaseException:
+                        logging.getLogger(__name__).exception("Completed Local evidence drain unproven")
+        with self._lock:
+            if error_record is not None:
+                pending = next(
+                    (
+                        ticket
+                        for ticket in self._tickets.values()
+                        if ticket.lease.session_id == work.lease["session_id"] and ticket.state != "COMMITTED"
+                    ),
+                    None,
+                )
+                error_record.update(
+                    request_key=None if pending is None else pending.key,
+                    payload_sha256=None if pending is None else pending.payload_sha256,
+                )
+                self._failed[work.lease["slot_id"]] = {**error_record, "quiescent": drained}
+                self.adapter.cancel_completed(work.lease)
+                if drained:
+                    self.adapter.discard_completed(work)
+            if not drained:
+                self._quarantined = True
+                self._failed[work.lease["slot_id"]] = {
+                    **(error_record or {}),
+                    "state": "QUARANTINED",
+                    "quiescent": False,
+                }
+            self._busy = not drained
+            self._changed.notify_all()
 
     def _execute_many(self, members):
         committed, drained, abort_failed = False, False, False
@@ -364,6 +518,11 @@ class BatchedSessionTransactions(SessionTransactions):
                 generated = time.monotonic()
                 if not isinstance(output, BatchOutput) or len(output.actions) != len(members):
                     raise ValueError("native batch output cardinality mismatch")
+                if self._local_pipeline:
+                    if len(output.current_visuals) != len(members):
+                        raise ValueError("every Local prediction requires an exact current-frame capture")
+                    for ticket, visual in zip(members, output.current_visuals, strict=True):
+                        ticket.update = self.adapter.bind_current(ticket.update, visual)
                 media_candidates = output.media if len(output.media) == len(members) else ()
                 caches, new_jobs = [], {}
                 room, byte_room = self.media_room()
@@ -443,6 +602,7 @@ class BatchedSessionTransactions(SessionTransactions):
                                 "queue_ms": max(0, prepare_start - t.queued_at) * 1000,
                                 "batch_prepare_ms": (prepared - prepare_start) * 1000,
                                 "native_generation_ms": (generated - prepared) * 1000,
+                                **({"device": output.device_timing} if output.device_timing is not None else {}),
                             },
                             "media": media,
                         }
@@ -482,7 +642,7 @@ class BatchedSessionTransactions(SessionTransactions):
                         except BaseException:
                             abort_failed = True
                     with self._lock:
-                        self._failed[t.lease.slot_id] = {
+                        failure = {
                             "request_key": t.key,
                             "payload_sha256": t.payload_sha256,
                             "state": "QUARANTINED" if abort_failed else "ABORTED",
@@ -491,6 +651,21 @@ class BatchedSessionTransactions(SessionTransactions):
                             "error": str(error)[:2048],
                             "traceback": traceback.format_exc()[-16384:],
                         }
+                        previous_fault = self._failed.get(t.lease.slot_id)
+                        if (
+                            self._local_pipeline
+                            and previous_fault
+                            and previous_fault.get("failed_stage") == "LOCAL_PIPELINE"
+                        ):
+                            # Fencing a queued Replan must not replace the original
+                            # Encode1/scan fault with "Episode already failed".
+                            failure = {
+                                **previous_fault,
+                                "request_key": t.key,
+                                "payload_sha256": t.payload_sha256,
+                                "inference_stop_stage": stage,
+                            }
+                        self._failed[t.lease.slot_id] = failure
                         if not committed:
                             t.state = "ABORTED"
                 logging.getLogger(__name__).exception("Native batch %s aborted", batch_id)
@@ -642,6 +817,8 @@ class BatchedSessionTransactions(SessionTransactions):
     def end(self, proof):
         with self._lock:
             lease = self._lease(proof, closed=True)
+            if self._local_pipeline:
+                self.adapter.cancel_completed(asdict(lease))
             self._cancel_media(lease)
             self._changed.notify_all()
             reply = super().end(proof)
@@ -651,6 +828,8 @@ class BatchedSessionTransactions(SessionTransactions):
 
     def close(self, timeout_s=10):
         with self._lock:
+            if self._local_pipeline:
+                self.adapter.cancel_completed()
             self._cancel_media()
             self._changed.notify_all()
         return super().close(timeout_s)

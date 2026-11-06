@@ -58,6 +58,27 @@ class OnlineMemoryUpdate:
         return None if token is None else token.detach().clone()
 
 
+@dataclass(frozen=True)
+class ComputedMemoryCandidate:
+    """Private completed suffix, anchored to an exact committed record.
+
+    Computing this object neither creates a prediction capability nor publishes
+    state. Only ``prepare(..., precomputed=...)`` can enter the normal transaction.
+    """
+
+    owner: "OnlineLocalMemory"
+    previous: _Record
+    request: OnlineMemoryRequest
+    state: ContinualTTTFastState
+    token: torch.Tensor
+    fingerprint: str
+    inner_loss_sum: float
+    inner_loss_count: float
+    fast_update_sum: float
+    fast_update_count: float
+    telemetry: dict[str, float]
+
+
 class OnlineLocalMemory:
     """Per-session Local-TTT state with prepare/commit/abort semantics."""
 
@@ -137,8 +158,129 @@ class OnlineLocalMemory:
         digest.update(action.contiguous().numpy().tobytes())
         return visual, action, digest.hexdigest()
 
-    def prepare(self, request: OnlineMemoryRequest) -> OnlineMemoryUpdate:
+    def compute_completed_step(
+        self,
+        previous: _Record,
+        candidate: ComputedMemoryCandidate | None,
+        request: OnlineMemoryRequest,
+        *,
+        timing,
+    ) -> ComputedMemoryCandidate:
+        """Compute one causal step on the existing model executor, without publication."""
+        with torch.inference_mode(False):
+            visual, action, _ = self._validate(request)
+        with self._lock:
+            if self._records.get(request.session_id) is not previous or request.session_id in self._pending:
+                raise RuntimeError("completed Local-TTT candidate lost its committed anchor")
+            if request.reset or previous.episode_id != request.episode_id or len(request.source_steps) != 1:
+                raise ValueError("completed Local-TTT scan requires one continuation step")
+            if candidate is not None and (
+                candidate.owner is not self
+                or candidate.previous is not previous
+                or candidate.request.session_id != request.session_id
+                or candidate.request.episode_id != request.episode_id
+            ):
+                raise RuntimeError("foreign completed Local-TTT candidate")
+            cursor = previous.consumer_step if candidate is None else candidate.request.consumer_step
+            if request.source_steps != (cursor,) or request.consumer_step != cursor + 1:
+                raise ValueError("completed Local-TTT scan must advance exactly one step")
+        if self.scan_local_memory is None:
+            raise RuntimeError("completed pipeline requires model-owned Local scan")
+        # No Store or pipeline lock may cover model/encoder work or device waits.
+        with torch.inference_mode(False):
+            device = next(self.encoder.parameters()).device
+            state_in = previous.state if candidate is None else candidate.state
+            state_in = None if state_in is None else self._detach_state(state_in)
+            self.core.reset_telemetry()
+            with timing.measure("fast_update"), torch.enable_grad():
+                tokens, state, present = self.scan_local_memory(
+                    visual.to(device).unsqueeze(0),
+                    action.to(device).unsqueeze(0),
+                    torch.ones(1, 1, dtype=torch.bool, device=device),
+                    state_in,
+                    create_graph=False,
+                )
+            if present.shape != (1, 1) or not bool(present.all()):
+                raise RuntimeError("online model-owned Local scan dropped completed evidence")
+            state = self._detach_state(state)
+            token = tokens[0, -1].detach().float().clone()
+            self.core.validate_state(state, 1)
+            if tuple(token.shape) != (self.core.k_local, self.core.local_dim) or not torch.isfinite(token).all():
+                raise FloatingPointError("completed Local-TTT produced invalid prefix")
+            inner = self.core.drain_telemetry()
+            totals = {}
+            for name, key in (
+                ("inner_loss_sum", "ttt_inner_loss_sum"),
+                ("inner_loss_count", "ttt_inner_loss_count"),
+                ("fast_update_sum", "ttt_fast_update_norm_sum"),
+                ("fast_update_count", "ttt_fast_update_norm_count"),
+            ):
+                totals[name] = (0.0 if candidate is None else getattr(candidate, name)) + float(
+                    inner.get(key, torch.tensor(0.0)).detach().cpu()
+                )
+            source_steps = (() if candidate is None else candidate.request.source_steps) + request.source_steps
+            all_visual = visual if candidate is None else torch.cat((candidate.request.visual_summary, visual))
+            all_action = action if candidate is None else torch.cat((candidate.request.executed_action, action))
+            combined = OnlineMemoryRequest(
+                request.session_id, request.episode_id, request.consumer_step, source_steps, all_visual, all_action
+            )
+            _, _, fingerprint = self._validate(combined)
+            telemetry = {
+                "adapted_steps": float(len(source_steps)),
+                "fast_state_norm": self._state_norm(state),
+                "fast_update_norm": totals["fast_update_sum"] / totals["fast_update_count"]
+                if totals["fast_update_count"]
+                else 0.0,
+                "inner_loss_mean": totals["inner_loss_sum"] / totals["inner_loss_count"]
+                if totals["inner_loss_count"]
+                else 0.0,
+            }
+        with self._lock:
+            if self._records.get(request.session_id) is not previous or request.session_id in self._pending:
+                raise RuntimeError("completed Local-TTT candidate lost its committed anchor")
+        return ComputedMemoryCandidate(
+            self, previous, combined, state, token, fingerprint, **totals, telemetry=telemetry
+        )
+
+    def _prepare_computed(self, request: OnlineMemoryRequest, candidate: ComputedMemoryCandidate) -> OnlineMemoryUpdate:
+        # Candidate tensors can live on CUDA. Clone/validate them before taking
+        # the Store lock, then revalidate the exact committed anchor at install.
+        with torch.inference_mode(False):
+            _, _, fingerprint = self._validate(request)
+            if not isinstance(candidate, ComputedMemoryCandidate) or candidate.owner is not self:
+                raise RuntimeError("foreign completed Local-TTT candidate")
+            _, _, candidate_fingerprint = self._validate(candidate.request)
+            if fingerprint != candidate.fingerprint or fingerprint != candidate_fingerprint:
+                raise ValueError("completed Local-TTT candidate evidence changed")
+            state, token = self._detach_state(candidate.state), candidate.token.detach().float().clone()
+            self.core.validate_state(state, 1)
+            if tuple(token.shape) != (self.core.k_local, self.core.local_dim) or not torch.isfinite(token).all():
+                raise FloatingPointError("completed Local-TTT produced invalid prefix")
+        with self._lock:
+            if request.session_id in self._pending:
+                raise RuntimeError("session already has a pending Local-TTT prediction")
+            previous = self._records.get(request.session_id)
+            if candidate.previous is not previous or previous is None:
+                raise RuntimeError("completed Local-TTT candidate lost its committed anchor")
+            if request.reset or previous.episode_id != request.episode_id:
+                raise ValueError("episode changed without explicit Local-TTT reset")
+            if request.consumer_step <= previous.consumer_step:
+                raise ValueError("stale or changed-bytes Local-TTT request")
+            if request.source_steps != tuple(range(previous.consumer_step, request.consumer_step)):
+                raise ValueError("completed Local-TTT evidence must be contiguous and exactly-once")
+            replacement = _Record(request.episode_id, request.consumer_step, state, token, fingerprint)
+            update = OnlineMemoryUpdate(
+                self, request.session_id, previous, replacement, False, dict(candidate.telemetry)
+            )
+            self._pending[request.session_id] = update
+            return update
+
+    def prepare(
+        self, request: OnlineMemoryRequest, *, precomputed: ComputedMemoryCandidate | None = None
+    ) -> OnlineMemoryUpdate:
         """Stage a fast-state update; caller commits only after generation succeeds."""
+        if precomputed is not None:
+            return self._prepare_computed(request, precomputed)
         with self._lock, torch.inference_mode(False):
             visual, action, fingerprint = self._validate(request)
             if request.session_id in self._pending:
@@ -249,6 +391,29 @@ class OnlineLocalMemory:
                 False,
                 telemetry,
             )
+            self._pending[request.session_id] = update
+            return update
+
+    def prepare_replay(self, request: OnlineMemoryRequest) -> OnlineMemoryUpdate:
+        """Claim an exact pipeline replay without device waits under the Store lock."""
+        with torch.inference_mode(False):
+            _, _, fingerprint = self._validate(request)
+        with self._lock:
+            previous = self._records.get(request.session_id)
+            if previous is None or previous.fingerprint != fingerprint:
+                raise ValueError("changed or uncommitted Local-TTT replay")
+            if request.session_id in self._pending:
+                raise RuntimeError("session already has a pending Local-TTT prediction")
+        telemetry = {
+            "adapted_steps": 0.0,
+            "inner_loss_mean": 0.0,
+            "fast_state_norm": self._state_norm(previous.state),
+            "fast_update_norm": 0.0,
+        }
+        with self._lock:
+            if self._records.get(request.session_id) is not previous or request.session_id in self._pending:
+                raise RuntimeError("Local-TTT replay lost its exact committed anchor")
+            update = OnlineMemoryUpdate(self, request.session_id, previous, previous, True, telemetry)
             self._pending[request.session_id] = update
             return update
 

@@ -13,17 +13,44 @@ import time
 from collections import deque
 from urllib.parse import urlsplit
 
+import numpy as np
 import requests
 
+from cosmos_framework.inference.local_memory_pipeline_metrics import DurationWindow
+from cosmos_framework.inference.robocasa_local_memory_contract import EVIDENCE_ACTION_DIM
 from cosmos_framework.inference.robocasa_session_transactions import digest, json_bytes
 from cosmos_framework.inference.robocasa_transaction_client import TransactionPolicyClient
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
+from cosmos_framework.simulation.robocasa.local_memory_pipeline_client import CompletedEvidencePipeline
 
 
 class AssignedLocalMemoryClient(RoboCasaLocalMemoryClient):
-    def __init__(self, lease):
+    def __init__(
+        self,
+        lease,
+        *,
+        sender=None,
+        session_factory=requests.Session,
+        encode=None,
+        episode_deadline=None,
+        request_timeout_s=1.0,
+        shutdown_timeout_s=2.0,
+    ):
         super().__init__(enabled=True, max_evidence_steps=16)
         self.lease, self.begun = dict(lease), False
+        self._pipeline, self._pipeline_decided, self._frozen = None, False, None
+        self._pipeline_closing = False
+        self._pipeline_lock = threading.RLock()
+        self._step_profile = None
+        self._pipeline_options = dict(
+            sender=sender,
+            session_factory=session_factory,
+            episode_deadline=episode_deadline,
+            request_timeout_s=request_timeout_s,
+            shutdown_timeout_s=shutdown_timeout_s,
+        )
+        if encode is not None:
+            self._pipeline_options["encode"] = encode
 
     def begin(self, slot=0, **kwargs):
         if slot != 0 or self.begun:
@@ -32,6 +59,119 @@ class AssignedLocalMemoryClient(RoboCasaLocalMemoryClient):
         episode = self._get(slot)
         episode.session_id, episode.episode_id = self.lease["session_id"], self.lease["episode_id"]
         self.begun = True
+
+    def record_completed(self, slot, composite_image, executed_action15):
+        started = time.monotonic()
+        with self._pipeline_lock:
+            if self._pipeline_closing:
+                raise RuntimeError("completed-evidence pipeline is closing")
+            if self._pipeline is None:
+                return super().record_completed(slot, composite_image, executed_action15)
+            if self._frozen is not None:
+                raise RuntimeError("completed evidence cannot advance during a frozen prediction")
+            # Reuse the established RGB/raw15 validation, without synchronous PNG.
+            composite = self._image(composite_image, "composite_image")
+            action = np.asarray(executed_action15, dtype=np.float32).reshape(-1)
+            if action.shape != (EVIDENCE_ACTION_DIM,) or not np.isfinite(action).all():
+                raise ValueError("executed Local-TTT evidence action must be finite raw15")
+            episode = self._get(slot)
+            self._pipeline.submit(
+                episode.consumer_step,
+                composite,
+                action.tolist(),
+                image_size=episode.image_size,
+                preprocess_profile=episode.preprocess_profile,
+            )
+            episode.consumer_step += 1
+            self._step_profile["enqueue_cpu"].add((time.monotonic() - started) * 1000)
+
+    def payload(self, slot=0):
+        with self._pipeline_lock:
+            if self._pipeline_closing:
+                raise RuntimeError("completed-evidence pipeline is closing")
+            if self._pipeline is None:
+                return super().payload(slot)
+            episode = self._get(slot)
+            self._frozen = episode.consumer_step
+            frontier = self._frozen
+        rows = self._pipeline.wait(frontier)
+        with self._pipeline_lock:
+            if self._pipeline_closing:
+                raise RuntimeError("completed-evidence pipeline is closing")
+            episode.evidence[:] = rows
+            return super().payload(slot)
+
+    def acknowledge(self, slot, status):
+        with self._pipeline_lock:
+            if self._pipeline_closing:
+                raise RuntimeError("completed-evidence pipeline is closing")
+            episode = self._get(slot)
+            if (
+                not isinstance(status, dict)
+                or status.get("session_id") != episode.session_id
+                or status.get("episode_id") != episode.episode_id
+                or type(status.get("consumer_step")) is not int
+                or status.get("consumer_step") != episode.consumer_step
+            ):
+                raise ValueError("Local-TTT response does not acknowledge the exact completed-evidence frontier")
+            flag = status.get("pipeline")
+            if self._pipeline is not None and flag != "per_frame_v1":
+                raise ValueError("enabled completed-evidence pipeline capability changed")
+            if not self._pipeline_decided:
+                if flag not in (None, "per_frame_v1"):
+                    raise ValueError("unknown completed-evidence pipeline capability")
+                if flag == "per_frame_v1":
+                    if (
+                        episode.consumer_step != 0
+                        or not episode.first_request
+                        or self._pipeline_options["sender"] is None
+                    ):
+                        raise ValueError("pipeline requires initial policy ACK and configured transport")
+                    self._pipeline = CompletedEvidencePipeline(self.lease, **self._pipeline_options)
+                    self._step_profile = {
+                        name: DurationWindow() for name in ("composite_cpu", "sim_step_cpu", "enqueue_cpu")
+                    }
+                self._pipeline_decided = True
+            elif self._pipeline is None and flag is not None:
+                raise ValueError("completed-evidence capability changed after initial policy ACK")
+            if self._pipeline is not None:
+                self._pipeline.acknowledge(episode.consumer_step)
+            super().acknowledge(slot, status)
+            self._frozen = None
+
+    def close_pipeline(self):
+        with self._pipeline_lock:
+            pipeline = self._pipeline
+            if pipeline is not None:
+                self._pipeline_closing = True
+        if pipeline is not None:
+            pipeline.close()
+
+    def end(self, slot=0):
+        self.close_pipeline()
+        return super().end(slot)
+
+    def pipeline_stats(self):
+        with self._pipeline_lock:
+            return (
+                {"enabled": False}
+                if self._pipeline is None
+                else {
+                    "enabled": True,
+                    **self._pipeline.stats(),
+                    "sim_latencies": {name: window.summary() for name, window in self._step_profile.items()},
+                }
+            )
+
+    @property
+    def streaming_enabled(self):
+        return self._pipeline is not None
+
+    def record_step_timing(self, composite_seconds, sim_seconds):
+        with self._pipeline_lock:
+            if self._step_profile is not None:
+                self._step_profile["composite_cpu"].add(composite_seconds * 1000)
+                self._step_profile["sim_step_cpu"].add(sim_seconds * 1000)
 
 
 class _Response:
@@ -46,7 +186,18 @@ class _Response:
 
 
 class PolicyTransport:
-    def __init__(self, settings, assignment, episode_deadline, *, transport=None, media_transport=None):
+    def __init__(
+        self,
+        settings,
+        assignment,
+        episode_deadline,
+        *,
+        transport=None,
+        media_transport=None,
+        completed_sender=None,
+        completed_session_factory=requests.Session,
+        completed_encode=None,
+    ):
         if not isinstance(episode_deadline, (int, float)) or not math.isfinite(episode_deadline):
             raise ValueError("bounded coordinator Episode deadline required")
         self.settings, self.episode_deadline = settings, episode_deadline
@@ -67,7 +218,19 @@ class PolicyTransport:
             capacity_profile=settings.get("capacity_profile", "legacy8"),
         )
         self.lease = self.client.bind_assignment(assignment)
-        self.local = AssignedLocalMemoryClient(self.lease) if self.client.mode == "required" else None
+        self.local = (
+            AssignedLocalMemoryClient(
+                self.lease,
+                sender=completed_sender or self._send_completed,
+                session_factory=completed_session_factory,
+                encode=completed_encode,
+                episode_deadline=episode_deadline,
+                request_timeout_s=min(1.0, settings["predict_timeout_s"]),
+                shutdown_timeout_s=settings.get("encoder_grace_s", 2.0),
+            )
+            if self.client.mode == "required"
+            else None
+        )
         self._failed, self._ended, self.replan = False, False, 0
         self._last_delivered = -1
         self._stop = threading.Event()
@@ -84,6 +247,15 @@ class PolicyTransport:
         self._media_failed = False
         self._active_media = 0
 
+    def _send_completed(self, http, raw, timeout):
+        return http.request(
+            "POST",
+            self.base + "/v2/local-memory/completed",
+            data=raw,
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+        )
+
     def _error(self, error):
         if len(self.errors) < 16:
             self.errors.append(str(error)[:1024])
@@ -98,6 +270,9 @@ class PolicyTransport:
             return _Response({"local_memory": {"status": "reset", "session_id": self.lease["session_id"]}})
         if self._failed or self._ended:
             raise RuntimeError("failed/closed Episode requires explicit End and new Attempt")
+        if self.local is not None and self.local._pipeline_closing:
+            self._failed = True
+            raise RuntimeError("completed-evidence pipeline is closing")
         if self.client.mode == "off":
             if "local_memory" in json or "inference" in json:
                 raise ValueError("No-TTT native payload cannot supply Local or transaction ownership")
@@ -380,11 +555,28 @@ class PolicyTransport:
     def end(self):
         if self._ended:
             return
-        self.close_media()
+        pipeline_error = None
+        try:
+            if self.local is not None:
+                self.local.close_pipeline()
+        except Exception as error:
+            pipeline_error = error
+        finally:
+            self.close_media()
+        if pipeline_error is not None and self.local.pipeline_stats().get("worker_alive"):
+            raise pipeline_error
         # Cleanup has its own bounded budget; never revives inference work.
         self.client.timeout_s = self.settings["predict_timeout_s"]
-        self.client.end()
+        try:
+            self.client.end()
+        except Exception as error:
+            if pipeline_error is not None:
+                pipeline_error.cleanup_error = {"type": type(error).__name__, "message": str(error)[:1024]}
+                raise pipeline_error from error
+            raise
         self._ended = True
+        if pipeline_error is not None:
+            raise pipeline_error
 
     def close_media(self):
         if self.strict_media:
