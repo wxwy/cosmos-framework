@@ -340,6 +340,10 @@ def test_start_rejects_unsafe_or_foreign_paths(socket_root, kind):
         parent.symlink_to(foreign, target_is_directory=True)
     else:
         parent.mkdir(mode=0o755 if kind == "public_directory" else 0o700)
+        if kind == "public_directory":
+            # mkdir mode is filtered by the process umask (0077 in CPU CI).
+            parent.chmod(0o755)
+            assert stat.S_IMODE(parent.stat().st_mode) == 0o755
         if kind == "existing_socket":
             existing = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             existing.bind(str(parent / "vae.sock"))
