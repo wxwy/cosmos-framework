@@ -1,0 +1,25 @@
+{
+  "spec_version": "issue23.stage0.v1",
+  "profile": "multi_sr_throughput",
+  "execution_ready": false,
+  "runnable_config": false,
+  "result": "NOT_RUN",
+  "topology_proposed": {"sim_render_gpu_ordinals": [4, 5], "sims_per_sim_gpu": 16, "workers_per_sim_gpu": 1, "policy_gpu_ordinals": [6, 7], "policy_servers": 2, "total_sim_slots": 32, "gpu_uuids_must_be_frozen": true},
+  "invariants": {"horizon": 16, "raw_action_dim": 15, "state_dim": 15, "data_fps": 20, "policy_bmax": 8, "resume_mb_strict": true, "same_local_checkpoint_for_baseline_and_candidate": true},
+  "vae_sweep": [
+    {"bmax": 1, "wait_ms": 0},
+    {"bmax": 4, "wait_ms": 0},
+    {"bmax": 4, "wait_ms": 2},
+    {"bmax": 4, "wait_ms": 5},
+    {"bmax": 8, "wait_ms": 0},
+    {"bmax": 8, "wait_ms": 2},
+    {"bmax": 8, "wait_ms": 5}
+  ],
+  "batching": {"vae_policy_independent": true, "vae_window_origin": "validated_ready_once", "policy_window_origin": "verified_evidence_and_candidate_ready_once", "different_session_steps_allowed": true, "all_sim_barrier": false, "nonready_head_of_line_block": false},
+  "pre_run_required_unset": {"source_formal_pair": null, "checkpoint_vae_config_digests": null, "gpu_uuid_mapping": null, "matched_baseline_manifest": null, "policy_batch_wait_ms": null, "owner_hardware_gate": null},
+  "smoke": {"underlying_tasks": 18, "episodes_per_task": 2, "expected_valid": 36, "expected_invalid_errors_unresolved": 0, "proves_sr_improvement": false},
+  "comparison": {"baseline": "official_server_vae_matched_new_execution", "pr4_as_baseline": false, "reported_historical_target_ep_per_hour": 170.37, "historical_target_is_measured_here": false, "target_requires_matched_hardware_config_work": true, "throughput_non_regression": true},
+  "metrics": ["actual_bvae_bpolicy_histograms", "ready_queue_prepare_generation_p50_p95_p99", "sim_egl_step_contention", "peak_rss_vram_utilization", "steps_per_episode", "steps_per_second", "episodes_per_hour", "owned_close_and_external_isolation"],
+  "cannot_substitute_for": ["single_latency_P0", "paired_single_SR_cost_benefit"],
+  "larger_sr_requires_separate_owner_gate": true
+}

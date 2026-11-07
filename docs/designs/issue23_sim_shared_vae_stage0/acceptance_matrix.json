@@ -1,0 +1,83 @@
+{
+  "spec_version": "issue23.stage0.v1",
+  "status": "PROPOSED_DESIGN_REVIEW_REQUIRED",
+  "execution_ready": false,
+  "implementation_status": "NOT_STARTED",
+  "baseline": {
+    "root": "a77f3d4bd8a691435d1935025cc1a9766da646a1",
+    "child_gitlink": "1ca308055fc41fb69efaeb9efaa23808f164a18e",
+    "pr4_dependency": false,
+    "resume_mb_strict": true
+  },
+  "gates": [
+    {
+      "id": "P0_SINGLE_SYSTEM_COST_BENEFIT",
+      "priority": "P0",
+      "stage": 3,
+      "recipe": "recipes/single_latency.json",
+      "arms_required": ["A", "B", "C"],
+      "policy_servers": 1,
+      "sims": 1,
+      "policy_b": 1,
+      "requires": ["stage0_design_review", "stage1_cpu", "stage2_wan_parity", "stage3_code_review", "stage3_cpu", "owner_real_gpu_gate"],
+      "checks": ["first_steady_partial_separate", "same_gpu_split_gpu_separate", "p50_p95_p99_mean_ci_raw", "background_vs_critical_path", "sim_egl_contention", "checkpoint_confounding_disclosed", "paired_initial_state_sr", "18x2_is_smoke_only", "invalid_blocks_clean_gate"],
+      "result": "NOT_RUN"
+    },
+    {
+      "id": "STAGE0_DESIGN",
+      "stage": 0,
+      "checks": ["p0_first", "two_independent_recipes", "source_mapping", "bounded_protocol", "trust_and_vae_identity", "immutable_deadlines", "worker_registry_ownership", "ready_policy_batching", "paired_statistics", "no_code_or_gpu"],
+      "reviewer": "GPT_INDEPENDENT",
+      "verdict_requested": ["APPROVE_DESIGN_STAGE0", "REQUEST_CHANGES"],
+      "result": "AWAITING_INDEPENDENT_REVIEW"
+    },
+    {
+      "id": "STAGE1_STANDALONE_CPU",
+      "stage": 1,
+      "requires": ["stage0_design_review"],
+      "checks": ["real_process_fake_encoder", "b1_immediate_no_peer", "b4_b8_window_full_tail", "mixed_session_steps", "ready_timestamp_once", "bounded_fairness_no_hol", "all_capacity_states", "immutable_copy_alias_mutation", "exact_changed_retry", "signed_field_tampering_wrong_key_lease_epoch", "ordered_consume_out_of_order_results", "end_reset_restart_drain_quarantine", "deadline_no_refresh", "first_error_retained", "owned_process_external_isolation"],
+      "forbidden": ["production_policy_feature_integration", "real_gpu", "real_sim"],
+      "result": "NOT_RUN"
+    },
+    {
+      "id": "STAGE2_REAL_WAN_AND_CONTENTION",
+      "stage": 2,
+      "requires": ["stage1_cpu", "owner_real_gpu_gate"],
+      "checks": ["real_weights_and_loaded_vae_digest", "bf16_t1_b1_b4_b8", "same_input_hw_preprocess", "latent_visual96_max_abs_mean_abs", "preapproved_tolerance_only", "eager_and_actual_aot_strata", "16sim_egl_step_contention", "peak_rss_vram_util", "measured_benefit_before_integration"],
+      "failure_action": "BLOCKED_NO_FEATURE_ACTION_INTEGRATION",
+      "result": "NOT_RUN"
+    },
+    {
+      "id": "STAGE3_TRANSACTION_AND_DUAL_MODE_CPU",
+      "stage": 3,
+      "requires": ["stage2_wan_parity", "stage3_code_review"],
+      "checks": ["t16_16xt1_state_prefix_action_parity", "private_candidate_atomic_commit_abort_ack", "policy_owned_boundary_plus15", "session_isolation_causality", "trusted_encoder_attested", "end_across_two_domains", "absolute_budget_including_payload_wait", "ready_only_policy_window", "no_ttt_zero_history_worker", "legacy_server_vae_usable", "mb_resume_strict_unchanged"],
+      "result": "NOT_RUN"
+    },
+    {
+      "id": "STAGE3_MULTI_THROUGHPUT",
+      "stage": 3,
+      "recipe": "recipes/multi_sr_throughput.json",
+      "requires": ["stage3_cpu", "owner_real_gpu_gate"],
+      "checks": ["36_valid_zero_invalid_errors_unresolved", "actual_policy_and_vae_b_histograms", "matched_baseline_episodes_steps_work", "target_at_least_matched_old_throughput", "queue_prepare_generation_p50_p95_p99", "owned_close_external_isolation"],
+      "result": "NOT_RUN"
+    },
+    {
+      "id": "PAIRED_SINGLE_SR_STUDY",
+      "stage": 3,
+      "requires": ["p0_smoke", "owner_larger_sr_gate", "preregistered_effect_size_and_latency_criteria"],
+      "checks": ["same18_tasks_initial_state_seed_maxsteps", "all_planned_pairs_accounted", "task_and_equal_weight_overall_sr", "paired_00_01_10_11", "task_stratified_episode_cluster_ci", "no_historical_multi_sr_substitution", "delta_ms_and_delta_sr_joint_uncertainty", "no_nearzero_ratio_claim"],
+      "result": "NOT_RUN"
+    }
+  ],
+  "optional_ablation_D": {
+    "status": "UNSUPPORTED_NOT_RUN",
+    "requires_separate_review": true,
+    "current_off_validator_must_remain": true,
+    "must_disable": ["history_vae", "fast_weight_update", "prefix_prepare", "prefix_inject"],
+    "must_preserve": ["same_local_checkpoint", "sampler", "precision", "action_path", "session_transaction_safety"],
+    "blocks_ABC": false
+  },
+  "authorizations_now": ["stage0_docs_and_design_validation", "isolated_docs_draft_pr"],
+  "not_authorized_now": ["stage1_before_design_approval", "gpu", "long_simulation", "900ep", "merge", "official_gitlink_update", "pr4_changes", "training", "running_job_operations"]
+}
