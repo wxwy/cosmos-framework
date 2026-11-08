@@ -241,6 +241,16 @@ class UnixVAEServer:
             "owner_register": {"lease", "session_capability", "episode_deadline_ns"},
             "owner_issue": {"session_id", "chunk_id", "request_key", "source_start", "count"},
             "owner_complete": {"session_id", "chunk_id", "completed_through"},
+            "owner_boundary_skip": {
+                "lease",
+                "chunk_id",
+                "request_key",
+                "source_step",
+                "source_rgb_sha256",
+                "raw15_sha256",
+                "policy_boundary_sha256",
+                "post_step_receipt",
+            },
             "shutdown": set(),
         }
         normal_fields = {
@@ -285,6 +295,17 @@ class UnixVAEServer:
                 request["request_key"],
                 request["source_start"],
                 request["count"],
+            ), False
+        if op == "owner_boundary_skip":
+            return self.worker.owner_boundary_skip(
+                request["lease"],
+                request["chunk_id"],
+                request["request_key"],
+                request["source_step"],
+                request["source_rgb_sha256"],
+                request["raw15_sha256"],
+                request["policy_boundary_sha256"],
+                request["post_step_receipt"],
             ), False
         if op == "owner_complete":
             return self.worker.owner_complete(
@@ -514,6 +535,34 @@ class OwnerVAEClient(_Client):
         return self._owner(
             "owner_complete",
             dict(session_id=session_id, chunk_id=chunk_id, completed_through=completed_through),
+            deadline_ns,
+        )
+
+    def boundary_skip(
+        self,
+        lease,
+        chunk_id,
+        request_key,
+        source_step,
+        source_rgb_sha256,
+        raw15_sha256,
+        policy_boundary_sha256,
+        post_step_receipt,
+        deadline_ns,
+    ):
+        """Owner-only sparse advance; never returns an encoded Worker Feature."""
+        return self._owner(
+            "owner_boundary_skip",
+            dict(
+                lease=lease,
+                chunk_id=chunk_id,
+                request_key=request_key,
+                source_step=source_step,
+                source_rgb_sha256=source_rgb_sha256,
+                raw15_sha256=raw15_sha256,
+                policy_boundary_sha256=policy_boundary_sha256,
+                post_step_receipt=post_step_receipt,
+            ),
             deadline_ns,
         )
 

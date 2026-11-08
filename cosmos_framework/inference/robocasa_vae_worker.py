@@ -22,6 +22,7 @@ from cosmos_framework.inference.robocasa_vae_protocol import (
     MAX_FEATURE_WIRE_BYTES,
     EncoderDrainUnproven,
     Frame,
+    canonical_json,
     sign_feature,
     validate_frame,
     validate_identity,
@@ -40,6 +41,12 @@ def _identifier(value, name):
 
 def _ns(value, name):
     if type(value) is not int or not 0 <= value < 10**20:
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+def _sha256(value, name):
+    if type(value) is not str or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
         raise ValueError(f"invalid {name}")
     return value
 
@@ -109,6 +116,8 @@ class _Session:
     chunks: OrderedDict = field(default_factory=OrderedDict)
     jobs: dict = field(default_factory=dict)
     tombstones: OrderedDict = field(default_factory=OrderedDict)
+    boundary_tombstones: OrderedDict = field(default_factory=OrderedDict)
+    sparse_boundary: tuple[int, str, str] | None = None
     issued: int = 0
     completed: int = 0
     submitted: int = 0
@@ -270,6 +279,15 @@ class SharedVAEWorker:
                 return {"issued": True, "duplicate": True}
             if source_start != session.issued:
                 raise ValueError("issued chunks must be contiguous and never replayed")
+            if session.sparse_boundary is not None:
+                boundary, boundary_chunk, boundary_request = session.sparse_boundary
+                if (
+                    (chunk_id, request_key) != (boundary_chunk, boundary_request)
+                    or source_start != boundary + 1
+                    or count > 15
+                    or source_start + count > boundary + 16
+                ):
+                    raise ValueError("sparse history must follow its exact Policy boundary chunk")
             while len(session.chunks) >= self.config.max_chunks:
                 oldest_id, oldest = next(iter(session.chunks.items()))
                 if session.consumed < oldest.end or session.completed < oldest.end:
@@ -280,6 +298,98 @@ class SharedVAEWorker:
             self._record("ISSUE", session=session, source_start=source_start, count=count)
             self._changed.notify_all()
             return {"issued": True, "duplicate": False}
+
+    def owner_boundary_skip(
+        self,
+        lease,
+        chunk_id,
+        request_key,
+        source_step,
+        source_rgb_sha256,
+        raw15_sha256,
+        policy_boundary_sha256,
+        post_step_receipt,
+    ):
+        """Register one completed Policy-owned boundary without encoding/signing it.
+
+        The authenticated Run Owner has compared the committed Policy boundary
+        and its actual Actor success receipt before this call. This local check
+        binds their exact metadata; it neither attests env.step cryptographically
+        nor reads another process's Policy cache. Legacy continuous issuance is
+        unchanged for Sessions that never use this opt-in owner operation.
+        """
+        # Keep the standalone Worker import free of Policy/model imports. This
+        # shared validator is stdlib-only and returns detached exact metadata.
+        from cosmos_framework.inference.robocasa_feature_evidence import validate_post_step_receipt
+
+        if self.config.bmax != 1 or self.config.wait_ms != 0:
+            raise ValueError("Stage3A Policy boundary reuse requires VAE B1 with zero wait")
+        lease = validate_lease(lease)
+        chunk_id, request_key = _identifier(chunk_id, "chunk id"), _identifier(request_key, "request key")
+        if type(source_step) is not int or source_step < 0 or source_step % 16:
+            raise ValueError("only a true H16 Policy boundary may be skipped")
+        rgb_digest = _sha256(source_rgb_sha256, "source RGB digest")
+        action_digest = _sha256(raw15_sha256, "executed raw15 digest")
+        boundary_digest = _sha256(policy_boundary_sha256, "Policy boundary digest")
+        receipt = validate_post_step_receipt(post_step_receipt)
+        if (
+            receipt["lease"] != lease
+            or receipt["issued_chunk_id"] != chunk_id
+            or receipt["policy_request_key"] != request_key
+            or receipt["source_step"] != source_step
+            or receipt["source_rgb_sha256"] != rgb_digest
+            or receipt["raw15_sha256"] != action_digest
+            or receipt["clock_domain"] != self.clock_domain
+        ):
+            raise ValueError("Policy boundary and post-step receipt identity mismatch")
+        metadata = canonical_json(
+            {
+                "version": "PSM24-BOUNDARY-SKIP-v1",
+                "worker_epoch": self.worker_epoch,
+                "lease": lease,
+                "issued_chunk_id": chunk_id,
+                "policy_request_key": request_key,
+                "source_step": source_step,
+                "source_rgb_sha256": rgb_digest,
+                "raw15_sha256": action_digest,
+                "policy_boundary_sha256": boundary_digest,
+                "post_step_receipt": receipt,
+            }
+        )
+        with self._changed:
+            session = self._session(lease["session_id"])
+            self._open(session)
+            if session.lease != lease or int(receipt["episode_deadline_ns"]) != session.deadline:
+                raise ValueError("Policy boundary belongs to another registered assignment/deadline")
+            if int(receipt["step_completed_ns"]) > self.clock_ns():
+                raise ValueError("Policy boundary action completion is in the future")
+            previous = session.boundary_tombstones.get(source_step)
+            duplicate = previous is not None
+            if duplicate:
+                if previous != metadata:
+                    raise ValueError("Policy boundary replay bytes or identity changed")
+            else:
+                if (session.issued, session.completed, session.submitted, session.consumed) != (source_step,) * 4:
+                    raise ValueError("Policy boundary requires four identical exact source frontiers")
+                if session.active or session.jobs or any(job.session is session for job in self._queue):
+                    raise RuntimeError("Policy boundary requires all prior jobs acknowledged and drained")
+                if chunk_id in session.chunks:
+                    raise ValueError("Policy boundary cannot reuse an already issued chunk")
+                session.boundary_tombstones[source_step] = metadata
+                while len(session.boundary_tombstones) > self.config.max_tombstones:
+                    session.boundary_tombstones.popitem(last=False)
+                session.sparse_boundary = (source_step, chunk_id, request_key)
+                session.issued = session.completed = session.submitted = session.consumed = source_step + 1
+                self._record("POLICY_BOUNDARY_SKIP", session=session, source_step=source_step, worker_feature=False)
+                self._changed.notify_all()
+            return {
+                "boundary_skipped": True,
+                "duplicate": duplicate,
+                "source_step": source_step,
+                "frontier": source_step + 1,
+                "worker_feature": False,
+                "encoded": False,
+            }
 
     def owner_complete(self, session_id, chunk_id, completed_through):
         if type(completed_through) is not int or completed_through < 0:
@@ -496,9 +606,18 @@ class SharedVAEWorker:
                     job.session.active += 1
                     self._record("ENCODE_START", job=job, batch=batch_id)
                 self._changed.notify_all()
-            results, error, unproven = None, None, False
+            results, error, unproven, encoder_profile = None, None, False, None
             try:
-                values = self.encoder([job.frame for job in batch])
+                if any(job.session.sparse_boundary is not None for job in batch):
+                    from cosmos_framework.inference.robocasa_feature_trace import TraceRecorder, use_trace
+
+                    recorder = TraceRecorder(max_events=8, max_bytes=4096)
+                    with use_trace(recorder):
+                        values = self.encoder([job.frame for job in batch])
+                    recorder.resolve_cuda()
+                    encoder_profile = recorder.snapshot()
+                else:
+                    values = self.encoder([job.frame for job in batch])
                 if type(values) is not list or len(values) != len(batch):
                     raise ValueError("encoder output cardinality mismatch")
                 results = [
@@ -520,6 +639,8 @@ class SharedVAEWorker:
                 }
             with self._changed:
                 now = self.clock_ns()
+                if encoder_profile is not None:
+                    self._record("ENCODER_PROFILE", batch=batch_id, profile=encoder_profile)
                 if unproven:
                     self._quarantined = self._stopping = True
                     for session in self._sessions.values():
@@ -648,6 +769,7 @@ class SharedVAEWorker:
                 "items": self._items,
                 "bytes": self._bytes,
                 "tombstones": sum(len(s.tombstones) for s in self._sessions.values()),
+                "boundary_tombstones": sum(len(s.boundary_tombstones) for s in self._sessions.values()),
                 "issued_chunks": sum(len(s.chunks) for s in self._sessions.values()),
                 "batch_histogram": dict(self._histogram),
                 "dispatch_reasons": dict(self._reasons),

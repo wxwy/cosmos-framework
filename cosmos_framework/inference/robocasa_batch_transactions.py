@@ -72,15 +72,22 @@ class BatchedSessionTransactions(SessionTransactions):
         media_spool_max_jobs=4,
         media_spool_max_bytes=512 * 1024**2,
         media_drain_timeout_s=300.0,
+        single_latency_arm=None,
         **kwargs,
     ):
+        self.feature_mode = getattr(adapter, "feature_evidence_owner", None) is not None
+        if single_latency_arm not in (None, "A", "B", "C") or (single_latency_arm is not None and max_batch_size != 1):
+            raise ValueError("P0 latency profiling requires one native Policy member")
+        self.profiling_arm = single_latency_arm or ("C" if self.feature_mode else None)
+        if self.feature_mode and (adapter.mode != "required" or max_batch_size != 1 or batch_wait_ms != 0):
+            raise ValueError("Stage3A signed features require Policy B1/wait0; B4/B8 Action admission is disabled")
         capacity = transaction_capacity(kwargs.get("capacity_profile", "legacy8"))
         if type(max_batch_size) is not int or not 1 <= max_batch_size <= capacity:
             raise ValueError(f"native batch cap must be1..{capacity}")
         if (
             type(batch_wait_ms) not in (int, float)
             or not math.isfinite(batch_wait_ms)
-            or not 1 <= batch_wait_ms <= 1000
+            or not (0 <= batch_wait_ms <= 1000 if self.feature_mode else 1 <= batch_wait_ms <= 1000)
         ):
             raise ValueError("bounded batch wait1..1000ms required")
         if (
@@ -266,6 +273,87 @@ class BatchedSessionTransactions(SessionTransactions):
         )
 
     def _schedule(self, ticket):
+        if self.profiling_arm:
+            from cosmos_framework.inference.robocasa_feature_trace import TraceRecorder
+
+            ticket.profile_trace = TraceRecorder(max_events=128, max_bytes=65536)
+            ticket.profile_frontier = request_frontier(ticket.payload, self.mode)
+            ticket.profile_trace.event("policy_admission", producer="policy", arm=self.profiling_arm)
+        if self.feature_mode:
+            ticket.state = "FEATURE_PREPARING"
+            self._executor.submit(self._prepare_feature, ticket)
+            return
+        self._queue_native(ticket)
+
+    def _prepare_feature(self, ticket):
+        """Use the existing model executor; only a prepared candidate enters READY.
+
+        Admission never waits for the model while holding the actor lock. The
+        candidate remains owned by this same Ticket until native commit/abort.
+        """
+        ready, drained, abort_failed = False, False, False
+        with self._model_lock:
+            try:
+                with self._lock:
+                    self._busy = True
+                    self._fence(ticket)
+                started = time.monotonic()
+                from cosmos_framework.inference.robocasa_feature_trace import use_trace
+
+                with use_trace(ticket.profile_trace):
+                    ticket.update = self.adapter.prepare(
+                        ticket.payload,
+                        lease=ticket.lease.identity(),
+                        deadline_ns=int(ticket.deadline * 10**9),
+                        clock_domain=self.clock_domain,
+                        request_key=ticket.key,
+                    )
+                self.quiesce()
+                drained = True
+                with self._lock:
+                    self._fence(ticket)
+                    ticket.feature_prepare_ms = (time.monotonic() - started) * 1000
+                    ticket.state = "FEATURE_READY"
+                    self._queue_native(ticket)
+                    ready = True
+            except BaseException as error:
+                try:
+                    self.adapter.abort(ticket.update)
+                except BaseException:
+                    abort_failed = True
+                with self._lock:
+                    self._failed[ticket.lease.slot_id] = {
+                        "request_key": ticket.key,
+                        "payload_sha256": ticket.payload_sha256,
+                        "state": "QUARANTINED" if abort_failed else "ABORTED",
+                        "failed_stage": "FEATURE_PREPARING",
+                        "error_type": type(error).__name__,
+                        "error": str(error)[:2048],
+                        "traceback": traceback.format_exc()[-16384:],
+                    }
+                    ticket.state = "ABORTED"
+            finally:
+                if not drained:
+                    try:
+                        self.quiesce()
+                        drained = True
+                    except BaseException:
+                        pass
+        with self._lock:
+            if not drained or abort_failed:
+                self._quarantined = True
+                if ticket.lease.slot_id in self._failed:
+                    self._failed[ticket.lease.slot_id].update(state="QUARANTINED", quiescent=False)
+            else:
+                self._busy = False
+                if not ready:
+                    ticket.quiescent, ticket.update = True, None
+                    self._release(ticket)
+            self._changed.notify_all()
+
+    def _queue_native(self, ticket):
+        if getattr(ticket, "profile_trace", None) is not None:
+            ticket.profile_trace.event("policy_ready", producer="policy")
         self._queue.append(ticket)
         self._enqueued[ticket.key] = time.monotonic()
         ticket.queued_at = self._enqueued[ticket.key]
@@ -352,15 +440,30 @@ class BatchedSessionTransactions(SessionTransactions):
                             self._media[t.key].state = "CAPTURING"
                 prepare_start = time.monotonic()
                 for t in members:
-                    if self.mode == "required":
-                        t.update = self.adapter.prepare(t.payload)
+                    if self.mode == "required" and not self.feature_mode:
+                        if getattr(t, "profile_trace", None) is not None:
+                            from cosmos_framework.inference.robocasa_feature_trace import use_trace
+
+                            with use_trace(t.profile_trace):
+                                t.update = self.adapter.prepare(t.payload)
+                        else:
+                            t.update = self.adapter.prepare(t.payload)
                     t.state = "PREPARED"
                 with self._lock:
                     for t in members:
                         self._fence(t)
                         t.state = "GENERATING"
                 prepared = time.monotonic()
-                output = self.generate_many([t.payload for t in members], [t.update for t in members])
+                from contextlib import nullcontext
+
+                from cosmos_framework.inference.robocasa_feature_trace import use_trace
+
+                trace = getattr(members[0], "profile_trace", None) if len(members) == 1 else None
+                with (
+                    use_trace(trace),
+                    trace.span("native_policy_transaction", producer="policy") if trace else nullcontext(),
+                ):
+                    output = self.generate_many([t.payload for t in members], [t.update for t in members])
                 generated = time.monotonic()
                 if not isinstance(output, BatchOutput) or len(output.actions) != len(members):
                     raise ValueError("native batch output cardinality mismatch")
@@ -440,6 +543,12 @@ class BatchedSessionTransactions(SessionTransactions):
                             **self._response_local(t.update),
                             "native_batch": {"id": batch_id, "size": len(members), "index": i},
                             "timing": {
+                                **({"feature_prepare_ms": t.feature_prepare_ms} if self.feature_mode else {}),
+                                **(
+                                    {"raw_trace": self._profile_snapshot(t)}
+                                    if getattr(t, "profile_trace", None)
+                                    else {}
+                                ),
                                 "queue_ms": max(0, prepare_start - t.queued_at) * 1000,
                                 "batch_prepare_ms": (prepared - prepare_start) * 1000,
                                 "native_generation_ms": (generated - prepared) * 1000,
@@ -463,7 +572,16 @@ class BatchedSessionTransactions(SessionTransactions):
                     for t in members:
                         if t.payload.get("media", {}).get("required") and t.key not in new_jobs:
                             jobs.pop(t.key, None)
+                    commit_started_ns = time.monotonic_ns()
                     self._commit_responses(members, caches, batch=True)
+                    for ticket in members:
+                        if getattr(ticket, "profile_trace", None):
+                            ticket.profile_trace.record(
+                                "response_faststate_boundary_commit",
+                                commit_started_ns,
+                                time.monotonic_ns(),
+                                producer="policy",
+                            )
                     committed = True
                     self._media = jobs
                     self._batches = batches
@@ -517,6 +635,35 @@ class BatchedSessionTransactions(SessionTransactions):
                 if not committed:
                     self._release(t)
             self._changed.notify_all()
+
+    def _profile_snapshot(self, ticket):
+        ticket.profile_trace.resolve_cuda()
+        snapshot = ticket.profile_trace.snapshot()
+        frontier = ticket.profile_frontier
+        for row in snapshot["events"]:
+            row["stratum"] = "first_no_history" if frontier == 0 else "steady_full16"
+            row["fields"].update(
+                arm=self.profiling_arm,
+                session_id=ticket.lease.session_id,
+                request_key=ticket.key,
+                consumer_frontier=frontier,
+            )
+        return snapshot
+
+    def acknowledge(self, proof, key, payload_sha):
+        # Post-publication spans cannot be inserted into an already immutable
+        # Response. Preserve that cache and emit their bounded raw snapshot in
+        # the existing owned Policy process log instead.
+        with self._lock:
+            ticket = self._tickets.get(key)
+            started = time.monotonic_ns()
+            reply = super().acknowledge(proof, key, payload_sha)
+            if ticket is not None and getattr(ticket, "profile_trace", None):
+                ticket.profile_trace.record("response_ack", started, time.monotonic_ns(), producer="policy")
+                logging.getLogger(__name__).info(
+                    "PSM24_POLICY_TRACE %s", json_bytes(self._profile_snapshot(ticket)).decode()
+                )
+            return reply
 
     def _decode(self, job):
         drained = False

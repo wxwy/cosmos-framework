@@ -537,6 +537,9 @@ class ActionServerArgs(pydantic.BaseModel):
     transaction_profile: Literal["legacy", "b1", "batch"] = "legacy"
     """Opt-in Phase B transaction/B1 API. Does not enable multi-Sim or B>1."""
     transaction_owner_token_file: Path | None = None
+    history_source: Literal["server_vae", "sim_shared_vae"] = "server_vae"
+    single_latency_arm: Literal["A", "B", "C"] | None = None
+    """Stage3A explicit B1 signed-history path; defaults preserve native A/B."""
     transaction_run_lease: str | None = None
     transaction_manifest_digest: str | None = None
     transaction_slot_id: str | None = None
@@ -627,6 +630,23 @@ class ActionServerConfig:
 
 def _transaction_options(args):
     batch = args.transaction_profile == "batch"
+    feature_mode = getattr(args, "history_source", "server_vae") == "sim_shared_vae"
+    arm = getattr(args, "single_latency_arm", None)
+    if arm is not None and (
+        arm not in ("A", "B", "C")
+        or not batch
+        or getattr(args, "transaction_max_batch_size", 1) != 1
+        or args.local_memory_mode != ("off" if arm == "A" else "required")
+        or feature_mode != (arm == "C")
+    ):
+        raise ValueError("explicit single A/B/C arm differs from native mode/history/B1")
+    if feature_mode and (
+        not batch
+        or args.local_memory_mode != "required"
+        or getattr(args, "transaction_max_batch_size", 1) != 1
+        or getattr(args, "transaction_batch_wait_ms", 20) != 0
+    ):
+        raise ValueError("Stage3A C requires required Local-TTT, native Policy B1/wait0")
     capacity_profile = getattr(args, "transaction_capacity_profile", "legacy8")
     capacity = transaction_capacity(capacity_profile)
     if not batch and capacity_profile != "legacy8":
@@ -694,7 +714,12 @@ def _transaction_options(args):
     if batch:
         cap = getattr(args, "transaction_max_batch_size", 1)
         wait = getattr(args, "transaction_batch_wait_ms", 20.0)
-        if type(cap) is not int or not 1 <= cap <= capacity or type(wait) not in (int, float) or not 1 <= wait <= 1000:
+        if (
+            type(cap) is not int
+            or not 1 <= cap <= capacity
+            or type(wait) not in (int, float)
+            or not (0 <= wait <= 1000 if feature_mode else 1 <= wait <= 1000)
+        ):
             raise ValueError("bounded native batch/wait required")
         jobs, size, drain = (
             getattr(args, "media_spool_max_jobs", 4),
@@ -716,8 +741,94 @@ def _transaction_options(args):
             media_spool_max_jobs=jobs,
             media_spool_max_bytes=size,
             media_drain_timeout_s=drain,
+            **({"single_latency_arm": arm} if arm is not None else {}),
         )
     return options
+
+
+def feature_owner_dispatch(service, path, record, headers):
+    """Root-only controls; no Sim credential can enroll, issue or complete work."""
+    import base64
+    import struct
+
+    owner = getattr(service, "feature_evidence_owner", None)
+    actor = service.transactions
+    if owner is None:
+        return Reply(404, json_bytes({"error": "signed feature path is not enabled"}))
+    token = headers.get("X-Cosmos-Owner", "")
+    owner._auth(token)
+    fields = {
+        "enroll": {"worker_id", "worker_epoch", "key_id", "key_hex", "identity", "clock_domain", "bmax", "wait_ms"},
+        "register": {"lease", "worker_id", "actor_id", "actor_epoch", "episode_deadline_ns"},
+        "issue": {"lease", "request_key", "payload_sha256"},
+        "complete": {
+            "lease",
+            "chunk_id",
+            "request_key",
+            "source_step",
+            "source_rgb_sha256",
+            "raw15_f32le_b64",
+            "step_completed_ns",
+            "actor_id",
+            "actor_epoch",
+        },
+        "boundary": {"lease", "source_step"},
+        "end": {"lease"},
+        "revoke": {"worker_id", "worker_epoch"},
+    }
+    op = path.removeprefix("/v2/feature/")
+    if op not in fields or not isinstance(record, dict) or set(record) != fields[op]:
+        raise ValueError("exact Owner feature operation required")
+    if op == "enroll":
+        encoded = record["key_hex"]
+        if type(encoded) is not str or len(encoded) != 64 or any(c not in "0123456789abcdef" for c in encoded):
+            raise ValueError("private enrolled key requires exact 32 bytes")
+        args = {k: v for k, v in record.items() if k != "key_hex"}
+        result = owner.enroll_worker(token, key=bytes.fromhex(encoded), **args)
+    elif op == "revoke":
+        result = owner.revoke_worker(token, **record)
+    else:
+        with actor._lock:
+            lease = actor._lease(record["lease"], closed=op == "end")
+            public = lease.identity()
+            if op == "register":
+                args = {k: v for k, v in record.items() if k not in ("lease", "episode_deadline_ns")}
+                result = owner.register_session(
+                    token, public, episode_deadline_ns=int(record["episode_deadline_ns"]), **args
+                )
+            elif op == "boundary":
+                result = owner.boundary_record(token, public, record["source_step"])
+            elif op == "issue":
+                response = actor._result(lease, record["request_key"], record["payload_sha256"])
+                if response.status != 200:
+                    raise ValueError("only an already committed native Action response can issue a chunk")
+                body = response.json()
+                boundary = owner.boundary_record(token, public, body["frontier"])["header"]
+                from cosmos_framework.simulation.robocasa.eval_utils import canonicalize_raw15_for_env
+
+                actions = b"".join(
+                    struct.pack("<15f", *canonicalize_raw15_for_env(row, False)[1]) for row in body["action"]
+                )
+                result = owner.commit_action_chunk(
+                    token,
+                    public,
+                    chunk_id=body["request_key"],
+                    request_key=body["request_key"],
+                    source_start=body["frontier"],
+                    actions_f32le=actions,
+                    deadline_ns=int(boundary["deadline_ns"]),
+                )
+            elif op == "complete":
+                raw = base64.b64decode(record["raw15_f32le_b64"], validate=True)
+                if len(raw) != 60 or base64.b64encode(raw).decode("ascii") != record["raw15_f32le_b64"]:
+                    raise ValueError("canonical raw15 little-endian bytes required")
+                args = {k: v for k, v in record.items() if k not in ("lease", "raw15_f32le_b64", "step_completed_ns")}
+                result = owner.complete_post_step(
+                    token, public, raw15=raw, step_completed_ns=int(record["step_completed_ns"]), **args
+                )
+            else:
+                result = owner.end_session(token, public)
+    return Reply(200, json_bytes({} if result is None else result))
 
 
 def transaction_dispatch(service, method, path, record=None, headers=None) -> Reply:
@@ -725,6 +836,8 @@ def transaction_dispatch(service, method, path, record=None, headers=None) -> Re
     if actor is None:
         return Reply(404, json_bytes({"error": "transaction profile not enabled"}))
     record, headers = ({} if record is None else record), ({} if headers is None else headers)
+    if method == "POST" and path.startswith("/v2/feature/"):
+        return feature_owner_dispatch(service, path, record, headers)
     if method == "POST" and path == "/v2/session/register":
         return actor.register(record, headers.get("X-Cosmos-Owner", ""))
     if method == "POST" and path == "/v2/inference" and set(record) == {"lease", "payload", "budget"}:
@@ -948,11 +1061,39 @@ class ActionModelService:
                 raise ValueError("required V3 RoboCasa Local-TTT needs raw_action_dim=15")
             if not self.requires_state:
                 raise ValueError("required V3 RoboCasa Local-TTT formal checkpoint must use_state=True")
+        self.feature_evidence_owner = None
+        self.local_feature_info = None
+        if getattr(args, "history_source", "server_vae") == "sim_shared_vae":
+            from cosmos_framework.inference.robocasa_feature_evidence import FeatureEvidenceOwner
+            from cosmos_framework.inference.robocasa_session_transactions import monotonic_clock_domain
+            from cosmos_framework.inference.robocasa_vae_daemon import loaded_vae_identity, worker_constructor_config
+
+            tokenizer_config = self.model.config.tokenizer
+            if tokenizer_config.get("bucket_name", "") or not tokenizer_config.get("vae_path"):
+                raise ValueError("C requires an explicitly frozen local VAE weights file")
+            constructor = worker_constructor_config(
+                self.model.tokenizer_vision_gen, vae_path=str(tokenizer_config["vae_path"])
+            )
+            identity = loaded_vae_identity(self.model.tokenizer_vision_gen, constructor)
+            self.feature_evidence_owner = FeatureEvidenceOwner(
+                transaction_options["owner_token"],
+                max_sessions=int(args.local_memory_max_sessions),
+                policy_identity=identity,
+            )
+            self.local_feature_info = {
+                "identity": identity,
+                "worker_constructor_config": worker_constructor_config(self.model.tokenizer_vision_gen),
+                "clock_domain": monotonic_clock_domain(),
+                "history_source": "sim_shared_vae",
+                "policy_bmax": 1,
+                "policy_wait_ms": 0,
+            }
         self.local_memory_adapter = RoboCasaLocalMemoryPolicyAdapter(
             self,
             mode=args.local_memory_mode,
             decode_image=lambda value: _decode_base64_png_to_rgb_uint8(value),
             max_sessions=int(args.local_memory_max_sessions),
+            feature_evidence_owner=self.feature_evidence_owner,
         )
         log.info(f"[action-server] local_memory={self.local_memory_adapter.info()}")
         if transaction_options is not None:
@@ -1115,6 +1256,11 @@ class ActionModelService:
         params.json without needing to know CLI flags.
         """
         return {
+            **(
+                {"local_feature": self.local_feature_info}
+                if getattr(self, "local_feature_info", None) is not None
+                else {}
+            ),
             "session_transactions": (
                 self.transactions.info()
                 if getattr(self, "transactions", None) is not None
@@ -1305,7 +1451,31 @@ class ActionModelService:
             "domain_id": [torch.tensor(get_domain_id(p["domain_name"]), dtype=torch.long) for p in preps],
             "sequence_plan": [p["sequence_plan"] for p in preps],
         }
-        with torch.inference_mode():
+        from contextlib import nullcontext
+
+        capture = nullcontext()
+        feature_mode = getattr(self, "feature_evidence_owner", None) is not None
+        if feature_mode:
+            if n != 1:
+                raise ValueError("Stage3A Action feature admission is B1 only")
+            from cosmos_framework.inference.robocasa_boundary_capture import capture_policy_boundary
+
+            context = self.local_memory_adapter.boundary_context(updates[0])
+            capture = capture_policy_boundary(
+                self.model,
+                source_rgb=preps[0]["img_chw_uint8"].permute(1, 2, 0).contiguous().cpu().numpy().tobytes(),
+                image_size=reqs[0]["image_size"],
+                **context,
+            )
+        from cosmos_framework.inference.robocasa_feature_trace import get_trace, span
+
+        trace = get_trace()
+        with (
+            capture,
+            torch.inference_mode(),
+            span("policy_native_generate", producer="policy"),
+            trace.cuda_span("policy_native_generate", producer="policy") if trace else nullcontext(),
+        ):
             samples = self.model.generate_samples_from_batch(
                 batch,
                 guidance=self.cfg.guidance,
@@ -1314,6 +1484,8 @@ class ActionModelService:
                 has_negative_prompt=False,
                 **self._transaction_prefixes(updates, batch=True),
             )
+        if feature_mode:
+            self.local_memory_adapter.stage_boundary(updates[0], capture.boundary)
         if len(samples["action"]) != n:
             raise ValueError("native batch action cardinality mismatch")
         actions = []
@@ -1352,7 +1524,10 @@ class ActionModelService:
             if any(update is not None for update in updates):
                 raise ValueError("No-TTT cannot carry Local updates")
             return {}  # Do not call prefixes or inject even an empty Local kwarg.
-        prefixes = tuple(self.local_memory_adapter.prefixes(u)[0] for u in updates)
+        from cosmos_framework.inference.robocasa_feature_trace import span
+
+        with span("prefix_prepare_inject", producer="policy"):
+            prefixes = tuple(self.local_memory_adapter.prefixes(u)[0] for u in updates)
         return {"_local_memory_prefixes": prefixes}
 
     def _transaction_decode_media(self, value):
@@ -1743,6 +1918,9 @@ class _ActionHandler(BaseHTTPRequestHandler):
             return
         except TimeoutError as error:
             self._send_json(408, {"error": str(error)})
+            return
+        except PermissionError:
+            self._send_json(403, {"error": "Owner authorization required"})
             return
         except RuntimeError as error:
             self._send_json(409, {"error": str(error)})

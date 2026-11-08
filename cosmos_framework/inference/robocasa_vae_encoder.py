@@ -17,7 +17,9 @@ import hashlib
 import json
 import math
 import struct
+import time
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -225,8 +227,10 @@ class LoadedWanEncode1:
         import numpy as np
         import torch
 
+        from cosmos_framework.inference.robocasa_feature_trace import get_trace
         from cosmos_framework.inference.robocasa_vae_protocol import Frame, source_digest, validate_frame
 
+        trace, prepare_started = get_trace(), time.monotonic_ns()
         self._validate_tokenizer()
         if not isinstance(frames, Sequence) or not 1 <= len(frames) <= 8:
             raise ValueError("independent Encode1 microbatch must contain 1..8 frames")
@@ -267,7 +271,13 @@ class LoadedWanEncode1:
         pixels = torch.stack([item.padded_single_frame for item in prepared])
         normalized = pixels.to(device=self._device, dtype=torch.float32)
         normalized.div_(127.5).sub_(1.0)
-        with torch.no_grad():
+        if trace:
+            trace.record("history_vae_preprocess_copy", prepare_started, time.monotonic_ns(), producer="worker")
+        with (
+            torch.no_grad(),
+            trace.span("history_vae", producer="worker") if trace else nullcontext(),
+            trace.cuda_span("history_vae", device=self._device, producer="worker") if trace else nullcontext(),
+        ):
             latent = self.tokenizer.encode(normalized)
         expected = (len(frames), 48, 1, shape[-2] // 16, shape[-1] // 16)
         if (

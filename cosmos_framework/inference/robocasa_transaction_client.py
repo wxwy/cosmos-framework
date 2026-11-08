@@ -14,6 +14,7 @@ from cosmos_framework.inference.robocasa_session_transactions import (
     digest,
     json_bytes,
     monotonic_clock_domain,
+    original_deadline,
     protocol_for_mode,
     request_frontier,
     transaction_capacity,
@@ -45,6 +46,7 @@ class TransactionPolicyClient:
         self.mode = local_memory_mode
         self.protocol = protocol_for_mode(self.mode)
         self.base_url, self.timeout_s = base_url.rstrip("/"), timeout_s
+        self._original_timeout_cap_s = timeout_s
         self.transport = transport if transport is not None else requests.Session()
         self.clock, self.pause = clock, pause
         self.clock_domain = monotonic_clock_domain()
@@ -59,7 +61,10 @@ class TransactionPolicyClient:
             if remaining <= 0:
                 raise TimeoutError("original transaction deadline exhausted")
             try:
-                response = self.transport.request(method, self.base_url + path, timeout=remaining, **kwargs)
+                from cosmos_framework.inference.robocasa_feature_trace import span
+
+                with span("policy_http", producer="sim", method=method, path=path):
+                    response = self.transport.request(method, self.base_url + path, timeout=remaining, **kwargs)
                 if response.status_code in (429, 503):
                     self.pause(min(0.02, max(0, deadline - self.clock())))
                     continue
@@ -71,7 +76,8 @@ class TransactionPolicyClient:
         if response.status_code not in (200, 202):
             self.last_error = response.json()
             raise RuntimeError(f"transaction API rejected request: HTTP {response.status_code}: {self.last_error}")
-        value = response.json()
+        with span("policy_http_decode", producer="sim", path=path):
+            value = response.json()
         if self.clock() >= deadline:
             raise TimeoutError("original transaction deadline exhausted during response decoding")
         if not isinstance(value, dict):
@@ -142,11 +148,18 @@ class TransactionPolicyClient:
             and 0 <= batch["index"] < batch["size"]
         )
 
-    def predict(self, payload: dict):
+    def predict(self, payload: dict, *, budget: dict | None = None):
         # Freeze before encoding/upload; retries reuse these exact absolute values.
-        started_at = self.clock()
-        deadline = started_at + self.timeout_s
-        budget = {"clock_domain": self.clock_domain, "started_at": started_at, "deadline": deadline}
+        if budget is None:
+            started_at = self.clock()
+            deadline = started_at + self.timeout_s
+            budget = {"clock_domain": self.clock_domain, "started_at": started_at, "deadline": deadline}
+        else:
+            # C freezes this at the successful action boundary, before history
+            # flush/IPC. Validate against the configured cap, not a later
+            # remaining-Episode timeout, and never start another budget here.
+            budget = json.loads(json_bytes(budget))
+            deadline = original_deadline(budget, self.clock_domain, self.clock(), self._original_timeout_cap_s)
         if self.lease is None:
             raise RuntimeError("register a fresh admitted Episode first")
         raw = json_bytes(payload)

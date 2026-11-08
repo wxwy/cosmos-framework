@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -32,6 +33,7 @@ from cosmos_framework.inference.robocasa_vae_protocol import (
     RGB_BYTES,
     Frame,
     ProtocolError,
+    source_digest,
     verify_feature,
 )
 
@@ -92,6 +94,17 @@ class _Worker:
     def owner_complete(self, *args):
         self.calls.append(args)
         return {"completed": True}
+
+    def owner_boundary_skip(self, *args):
+        self.calls.append(args)
+        return {
+            "boundary_skipped": True,
+            "duplicate": False,
+            "source_step": args[3],
+            "frontier": args[3] + 1,
+            "worker_feature": False,
+            "encoded": False,
+        }
 
     def close(self, deadline_ns):
         self.closed = True
@@ -638,3 +651,131 @@ def test_real_subprocess_crash_restart_rejects_old_epoch_and_preserves_external(
             replacement.cleanup()
         external.terminate()
         external.wait(timeout=3)
+
+
+def _boundary_skip_fields(episode_deadline, step=0):
+    """Synthetic trusted post-step input; IPC tests do not attest a real env.step."""
+    rgb_sha = source_digest(bytes([step % 256]) * RGB_BYTES)
+    raw_sha = hashlib.sha256(struct.pack("<15f", *([0.1] * 15))).hexdigest()
+    chunk, request = ("chunk", "request") if step == 0 else (f"chunk-{step}", f"request-{step}")
+    return {
+        "lease": _lease(),
+        "chunk_id": chunk,
+        "request_key": request,
+        "source_step": step,
+        "source_rgb_sha256": rgb_sha,
+        "raw15_sha256": raw_sha,
+        "policy_boundary_sha256": hashlib.sha256(b"synthetic-policy-boundary" + bytes([step])).hexdigest(),
+        "post_step_receipt": {
+            "version": "PSM24-POSTSTEP-v1",
+            "lease": _lease(),
+            "issued_chunk_id": chunk,
+            "policy_request_key": request,
+            "source_step": step,
+            "source_rgb_sha256": rgb_sha,
+            "raw15_sha256": raw_sha,
+            "success": True,
+            "clock_domain": "test-clock",
+            "episode_deadline_ns": str(episode_deadline),
+            "step_completed_ns": str(time.monotonic_ns()),
+            "actor_id": "synthetic-owned-actor",
+            "actor_epoch": "synthetic-actor-epoch",
+            "trust_model": "registry_same_trust_domain",
+        },
+    }
+
+
+def test_owner_boundary_skip_client_roundtrips_exact_metadata_only(server):
+    service, worker, secret = server
+    fields = _boundary_skip_fields(_deadline())
+    result = OwnerVAEClient(service.path, secret).boundary_skip(**fields, deadline_ns=_deadline())
+    assert result == {
+        "boundary_skipped": True,
+        "duplicate": False,
+        "source_step": 0,
+        "frontier": 1,
+        "worker_feature": False,
+        "encoded": False,
+    }
+    assert worker.calls == [
+        tuple(
+            fields[key]
+            for key in (
+                "lease",
+                "chunk_id",
+                "request_key",
+                "source_step",
+                "source_rgb_sha256",
+                "raw15_sha256",
+                "policy_boundary_sha256",
+                "post_step_receipt",
+            )
+        )
+    ]
+    sim = LocalVAEClient(service.path, "session", "sim-only-capability")
+    assert not hasattr(sim, "boundary_skip")
+
+
+@pytest.mark.parametrize("attempt", ["session_capability", "wrong_owner", "data_lane", "missing_receipt"])
+def test_boundary_skip_cannot_be_called_with_normal_capability_or_data_lane(server, attempt):
+    service, worker, secret = server
+    fields = _boundary_skip_fields(_deadline())
+    request = {
+        "op": "owner_boundary_skip",
+        "deadline_ns": str(_deadline()),
+        "control_capability": secret.hex(),
+        **fields,
+    }
+    path = Path(str(service.path) + ".ctl")
+    if attempt == "session_capability":
+        del request["control_capability"]
+        request["capability"] = "sim-only-capability"
+    elif attempt == "wrong_owner":
+        request["control_capability"] = (b"x" * 32).hex()
+    elif attempt == "data_lane":
+        path = service.path
+    else:
+        del request["post_step_receipt"]
+    reply = _raw(path, _json(request))
+    assert reply["ok"] is False and reply["error"]["code"] == "FORBIDDEN"
+    assert worker.calls == [] and secret.hex() not in json.dumps(reply)
+
+
+def test_real_subprocess_boundary_skip_encodes_only_true_history_steps_one_through_fifteen(socket_root):
+    child = _Process(socket_root)
+    try:
+        deadline = _deadline(15)
+        child.owner.register(_lease(), "sim-capability-test-only-32bytes", deadline, deadline)
+        fields = _boundary_skip_fields(deadline)
+        skipped = child.owner.boundary_skip(**fields, deadline_ns=deadline)
+        assert skipped["worker_feature"] is False and skipped["encoded"] is False
+        assert child.sim.info(deadline)["batch_histogram"] == {}
+        assert child.owner.boundary_skip(**fields, deadline_ns=deadline)["duplicate"] is True
+        child.owner.issue("session", "chunk", "request", 1, 15, deadline)
+        child.owner.complete("session", "chunk", 16, deadline)
+        for step in range(1, 16):
+            frame = _frame(deadline, step=step, value=step)
+            key = child.sim.submit(frame, deadline)
+            assert _event(child.events) == {"event": "encoder_entered", "size": 1}
+            result = child.ready_result(key, deadline)
+            assert result["status"] == "ready"
+            feature = verify_feature(
+                result["feature"],
+                child.signing_key,
+                expected_lease=_lease(),
+                expected_identity=_identity(),
+                expected_worker_epoch=child.ready["info"]["worker_epoch"],
+                expected_clock_domain="test-clock",
+                now_ns=time.monotonic_ns(),
+            )
+            assert feature["header"]["source_step"] == step
+            assert feature["header"]["source_rgb_sha256"] == frame.header["source_rgb_sha256"]
+            assert child.sim.ack(key, deadline)["acknowledged"] is True
+        next_boundary = child.owner.boundary_skip(**_boundary_skip_fields(deadline, 16), deadline_ns=deadline)
+        assert next_boundary["frontier"] == 17 and next_boundary["encoded"] is False
+        info = child.sim.info(deadline)
+        assert {int(size): count for size, count in info["batch_histogram"].items()} == {1: 15}
+        assert info["boundary_tombstones"] == 2 and info["items"] == info["bytes"] == 0
+        assert child.sim.end(deadline)["quiescent"] is True
+    finally:
+        child.cleanup()

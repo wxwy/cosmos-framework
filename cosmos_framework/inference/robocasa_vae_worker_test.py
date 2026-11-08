@@ -8,6 +8,8 @@ finite float32 bytes; these tests make no Wan numerical or GPU drain claim.
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import struct
 import threading
 import time
@@ -20,6 +22,7 @@ from cosmos_framework.inference.robocasa_vae_protocol import (
     EncoderDrainUnproven,
     Frame,
     ProtocolError,
+    source_digest,
     verify_feature,
 )
 from cosmos_framework.inference.robocasa_vae_worker import SharedVAEWorker, WorkerConfig
@@ -937,3 +940,395 @@ def test_raw_trace_preserves_monotonic_job_and_end_lifecycle(make_worker):
     dispatch = next(row for row in trace if row["event"] == "DISPATCH")
     assert dispatch["reason"] == "B1" and dispatch["size"] == 1
     assert len({row["job"] for row in trace if "job" in row}) == 1
+
+
+def _boundary_session(fixture, index=0):
+    """Register without issuing a Worker Frame for the Policy-owned boundary."""
+    session = SimpleNamespace(
+        lease=_lease(index),
+        capability=f"synthetic-boundary-capability-{index}-00000000",
+        deadline=fixture.clock() + 30_000_000_000,
+        chunk="chunk-0",
+        start=0,
+    )
+    fixture.worker.owner_register(session.lease, session.capability, session.deadline)
+    return session
+
+
+def _boundary_fields(fixture, session, step=0):
+    """Synthetic trusted-success metadata; not real Sim execution attestation."""
+    rgb_sha = source_digest(bytes([step % 256]) * RGB_BYTES)
+    raw_sha = hashlib.sha256(struct.pack("<15f", *([step / 100] * 15))).hexdigest()
+    return {
+        "lease": dict(session.lease),
+        "chunk_id": f"chunk-{step}",
+        "request_key": f"request-{step}",
+        "source_step": step,
+        "source_rgb_sha256": rgb_sha,
+        "raw15_sha256": raw_sha,
+        "policy_boundary_sha256": hashlib.sha256(struct.pack("<96f", *([step / 100] * 96))).hexdigest(),
+        "post_step_receipt": {
+            "version": "PSM24-POSTSTEP-v1",
+            "lease": dict(session.lease),
+            "issued_chunk_id": f"chunk-{step}",
+            "policy_request_key": f"request-{step}",
+            "source_step": step,
+            "source_rgb_sha256": rgb_sha,
+            "raw15_sha256": raw_sha,
+            "success": True,
+            "clock_domain": CLOCK_DOMAIN,
+            "episode_deadline_ns": str(session.deadline),
+            "step_completed_ns": str(fixture.clock()),
+            "actor_id": "synthetic-owned-actor",
+            "actor_epoch": "synthetic-actor-epoch",
+            "trust_model": "registry_same_trust_domain",
+        },
+    }
+
+
+def _frontiers(fixture, session):
+    with fixture.worker._changed:
+        state = fixture.worker._sessions[session.lease["session_id"]]
+        return state.issued, state.completed, state.submitted, state.consumed
+
+
+def _skip(fixture, fields):
+    return fixture.worker.owner_boundary_skip(**fields)
+
+
+def _encode_sparse_tail(fixture, session, boundary):
+    session.chunk, session.start = f"chunk-{boundary}", boundary
+    sid = session.lease["session_id"]
+    fixture.worker.owner_issue(sid, session.chunk, f"request-{boundary}", boundary + 1, 15)
+    fixture.worker.owner_complete(sid, session.chunk, boundary + 16)
+    for step in range(boundary + 1, boundary + 16):
+        frame = _frame(fixture, session, step)
+        key = fixture.worker.submit(frame, session.capability)
+        _verify(fixture, session, frame, _result(fixture, session, key))
+        fixture.worker.ack(sid, key, session.capability)
+    assert _frontiers(fixture, session) == (boundary + 16,) * 4
+
+
+def test_sparse_boundary_preserves_real_steps_zero_through_thirty_one(make_worker):
+    fixture = make_worker()
+    session = _boundary_session(fixture)
+    zero = _boundary_fields(fixture, session)
+    assert _skip(fixture, zero) == {
+        "boundary_skipped": True,
+        "duplicate": False,
+        "source_step": 0,
+        "frontier": 1,
+        "worker_feature": False,
+        "encoded": False,
+    }
+    assert _frontiers(fixture, session) == (1,) * 4
+    assert fixture.worker.info()["items"] == fixture.worker.info()["bytes"] == 0
+    assert fixture.encoder.calls == []
+    assert _skip(fixture, copy.deepcopy(zero))["duplicate"] is True
+    assert _frontiers(fixture, session) == (1,) * 4
+    with pytest.raises(ValueError):
+        fixture.worker.submit(_frame(fixture, session, 0), session.capability)
+    _encode_sparse_tail(fixture, session, 0)
+    assert _skip(fixture, zero)["duplicate"] is True
+    assert _frontiers(fixture, session) == (16,) * 4
+    sixteen = _boundary_fields(fixture, session, 16)
+    assert _skip(fixture, sixteen)["frontier"] == 17
+    assert _frontiers(fixture, session) == (17,) * 4
+    _encode_sparse_tail(fixture, session, 16)
+    encoded = [frame.header["source_step"] for batch in fixture.encoder.calls for frame in batch]
+    assert encoded == list(range(1, 16)) + list(range(17, 32))
+    assert fixture.worker.info()["items"] == fixture.worker.info()["bytes"] == 0
+    assert fixture.worker.info()["boundary_tombstones"] == 2
+    assert fixture.worker.take_ready(session.lease["session_id"], session.capability) == {
+        "status": "pending",
+        "source_step": 32,
+    }
+
+
+@pytest.mark.parametrize("bmax", [4, 8])
+def test_sparse_boundary_is_disabled_for_experimental_b4_b8(make_worker, bmax):
+    fixture = make_worker(config=WorkerConfig(bmax=bmax), autostart=False)
+    session = _boundary_session(fixture)
+    with pytest.raises(ValueError, match="B1|zero wait"):
+        _skip(fixture, _boundary_fields(fixture, session))
+    assert _frontiers(fixture, session) == (0,) * 4 and fixture.encoder.calls == []
+
+
+def test_sparse_boundary_metadata_creates_no_frame_feature_or_hmac(make_worker, monkeypatch):
+    from cosmos_framework.inference import robocasa_vae_worker as worker_module
+
+    def forbidden_sign(*args, **kwargs):
+        raise AssertionError("Policy-owned boundary must not produce a Worker HMAC")
+
+    monkeypatch.setattr(worker_module, "sign_feature", forbidden_sign)
+    fixture = make_worker(autostart=False)
+    session = _boundary_session(fixture)
+    fields = _boundary_fields(fixture, session)
+    result = _skip(fixture, fields)
+    assert result["worker_feature"] is False and result["encoded"] is False
+    assert not {"feature", "mac_hex", "visual96_f32le_b64", "job_key"} & result.keys()
+    assert fixture.worker.info()["items"] == fixture.worker.info()["bytes"] == 0
+    assert fixture.worker.info()["batch_histogram"] == {} and fixture.encoder.calls == []
+    with pytest.raises(ValueError, match="unknown|evicted"):
+        fixture.worker.poll(session.lease["session_id"], fields["policy_boundary_sha256"], session.capability)
+
+
+def test_sparse_boundary_concurrent_exact_retry_advances_frontiers_once(make_worker):
+    fixture = make_worker(autostart=False)
+    session = _boundary_session(fixture)
+    fields = _boundary_fields(fixture, session)
+    start = threading.Barrier(3)
+    replies, errors = [], []
+
+    def skip_once():
+        try:
+            start.wait(timeout=3)
+            replies.append(_skip(fixture, copy.deepcopy(fields)))
+        except BaseException as error:
+            errors.append(error)
+
+    callers = [threading.Thread(target=skip_once) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    try:
+        start.wait(timeout=3)
+    finally:
+        for caller in callers:
+            caller.join(5)
+        start.abort()
+    assert all(not caller.is_alive() for caller in callers)
+    assert errors == [] and len(replies) == 2
+    assert sorted(reply["duplicate"] for reply in replies) == [False, True]
+    assert all(reply["frontier"] == 1 and reply["encoded"] is False for reply in replies)
+    assert _frontiers(fixture, session) == (1,) * 4
+    info = fixture.worker.info()
+    assert info["boundary_tombstones"] == 1 and info["queued"] == info["items"] == info["bytes"] == 0
+    assert fixture.encoder.calls == []
+
+
+@pytest.mark.parametrize("step", [True, 1, 15, 32])
+def test_sparse_boundary_rejects_arbitrary_or_future_source_step(make_worker, step):
+    fixture = make_worker(autostart=False)
+    session = _boundary_session(fixture)
+    with pytest.raises(REJECTED):
+        _skip(fixture, _boundary_fields(fixture, session, step))
+    assert _frontiers(fixture, session) == (0,) * 4
+    assert fixture.worker.info()["boundary_tombstones"] == 0 and fixture.encoder.calls == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "chunk_id",
+        "request_key",
+        "source_rgb_sha256",
+        "raw15_sha256",
+        "policy_boundary_sha256",
+        "post_step_receipt",
+        "post_step_time",
+    ],
+)
+def test_sparse_boundary_exact_retry_rejects_changed_metadata(make_worker, field):
+    fixture = make_worker(autostart=False)
+    session = _boundary_session(fixture)
+    original = _boundary_fields(fixture, session)
+    _skip(fixture, original)
+    changed = copy.deepcopy(original)
+    if field == "post_step_receipt":
+        changed[field]["actor_epoch"] = "different-valid-actor-epoch"
+    elif field == "post_step_time":
+        changed["post_step_receipt"]["step_completed_ns"] = str(
+            int(original["post_step_receipt"]["step_completed_ns"]) - 1
+        )
+    else:
+        changed[field] = "f" * 64
+        receipt_field = {"chunk_id": "issued_chunk_id", "request_key": "policy_request_key"}.get(field, field)
+        if receipt_field in changed["post_step_receipt"]:
+            changed["post_step_receipt"][receipt_field] = changed[field]
+    with pytest.raises(REJECTED):
+        _skip(fixture, changed)
+    assert _frontiers(fixture, session) == (1,) * 4
+    assert fixture.worker.info()["boundary_tombstones"] == 1 and fixture.encoder.calls == []
+
+
+def test_sparse_boundary_exact_retry_during_later_active_frame_does_not_rewind(make_worker):
+    fixture = make_worker(encoder=_Encoder(blocked=True))
+    session = _boundary_session(fixture)
+    fields = _boundary_fields(fixture, session)
+    _skip(fixture, fields)
+    fixture.worker.owner_issue(session.lease["session_id"], "chunk-0", "request-0", 1, 15)
+    fixture.worker.owner_complete(session.lease["session_id"], "chunk-0", 2)
+    frame = _frame(fixture, session, 1)
+    key = fixture.worker.submit(frame, session.capability)
+    assert fixture.encoder.entered.wait(3)
+    before = _frontiers(fixture, session)
+    charged = fixture.worker.info()["bytes"]
+    assert _skip(fixture, copy.deepcopy(fields))["duplicate"] is True
+    assert _frontiers(fixture, session) == before == (16, 2, 2, 1)
+    assert fixture.worker.info()["active"] == 1 and fixture.worker.info()["bytes"] == charged
+    assert sum(map(len, fixture.encoder.calls)) == 1
+    fixture.encoder.release.set()
+    _verify(fixture, session, frame, _result(fixture, session, key))
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "missing",
+        "empty",
+        "failed",
+        "missing_success",
+        "wrong_step",
+        "foreign_session",
+        "wrong_clock",
+        "changed_deadline",
+        "future_time",
+        "extra",
+        "wrong_trust",
+        "bool_step",
+    ],
+)
+def test_sparse_boundary_requires_exact_successful_post_step_receipt(make_worker, invalid):
+    fixture = make_worker(autostart=False, clock=_Clock())
+    session = _boundary_session(fixture)
+    fields = _boundary_fields(fixture, session)
+    receipt = fields["post_step_receipt"]
+    if invalid == "missing":
+        fields["post_step_receipt"] = None
+    elif invalid == "empty":
+        fields["post_step_receipt"] = {}
+    elif invalid == "failed":
+        receipt["success"] = False
+    elif invalid == "missing_success":
+        del receipt["success"]
+    elif invalid == "wrong_step":
+        receipt["source_step"] = 1
+    elif invalid == "foreign_session":
+        receipt["lease"]["session_id"] = "foreign-session"
+    elif invalid == "wrong_clock":
+        receipt["clock_domain"] = "foreign-clock"
+    elif invalid == "changed_deadline":
+        receipt["episode_deadline_ns"] = str(session.deadline + 1)
+    elif invalid == "future_time":
+        receipt["step_completed_ns"] = str(fixture.clock() + 1)
+    elif invalid == "extra":
+        receipt["unexpected"] = True
+    elif invalid == "wrong_trust":
+        receipt["trust_model"] = "unattested-public-client"
+    else:
+        receipt["source_step"] = True
+    with pytest.raises(REJECTED):
+        _skip(fixture, fields)
+    assert _frontiers(fixture, session) == (0,) * 4
+    assert fixture.worker.info()["boundary_tombstones"] == fixture.worker.info()["items"] == 0
+    assert fixture.encoder.calls == []
+
+
+@pytest.mark.parametrize("field", ["source_rgb_sha256", "raw15_sha256", "policy_boundary_sha256"])
+def test_sparse_boundary_rejects_malformed_digest_before_frontier_update(make_worker, field):
+    fixture = make_worker(autostart=False)
+    session = _boundary_session(fixture)
+    fields = _boundary_fields(fixture, session)
+    fields[field] = "G" * 64
+    with pytest.raises(REJECTED):
+        _skip(fixture, fields)
+    assert _frontiers(fixture, session) == (0,) * 4 and fixture.encoder.calls == []
+
+
+@pytest.mark.parametrize("field", ["server_epoch", "generation", "session_id", "episode_id"])
+def test_sparse_boundary_rejects_foreign_lease_and_epoch(make_worker, field):
+    fixture = make_worker(autostart=False)
+    session = _boundary_session(fixture)
+    fields = _boundary_fields(fixture, session)
+    fields["lease"][field] = 2 if field == "generation" else "foreign-identity"
+    fields["post_step_receipt"]["lease"] = dict(fields["lease"])
+    with pytest.raises(REJECTED):
+        _skip(fixture, fields)
+    assert _frontiers(fixture, session) == (0,) * 4 and fixture.encoder.calls == []
+
+
+@pytest.mark.parametrize("state", ["issued", "completed", "queued", "active", "ready_unacked"])
+def test_sparse_boundary_cannot_bypass_frontiers_or_owned_jobs(make_worker, state):
+    fixture = make_worker(encoder=_Encoder(blocked=state == "active"), autostart=state in ("active", "ready_unacked"))
+    session = _register(fixture, count=1, completed=None if state == "issued" else 1)
+    if state in ("queued", "active", "ready_unacked"):
+        key = fixture.worker.submit(_frame(fixture, session, 0), session.capability)
+        if state == "active":
+            assert fixture.encoder.entered.wait(3)
+        elif state == "ready_unacked":
+            assert _result(fixture, session, key)["status"] == "ready"
+    before, calls = _frontiers(fixture, session), len(fixture.encoder.calls)
+    with pytest.raises(REJECTED):
+        _skip(fixture, _boundary_fields(fixture, session))
+    assert _frontiers(fixture, session) == before and len(fixture.encoder.calls) == calls
+    assert fixture.worker.info()["boundary_tombstones"] == 0
+
+
+def test_sparse_boundary_does_not_mask_missing_last_completed_action(make_worker):
+    fixture = make_worker()
+    session = _boundary_session(fixture)
+    _skip(fixture, _boundary_fields(fixture, session))
+    fixture.worker.owner_issue(session.lease["session_id"], "chunk-0", "request-0", 1, 15)
+    fixture.worker.owner_complete(session.lease["session_id"], "chunk-0", 15)
+    for step in range(1, 15):
+        frame = _frame(fixture, session, step)
+        key = fixture.worker.submit(frame, session.capability)
+        assert _result(fixture, session, key)["status"] == "ready"
+        fixture.worker.ack(session.lease["session_id"], key, session.capability)
+    assert _frontiers(fixture, session) == (16, 15, 15, 15)
+    with pytest.raises(REJECTED):
+        _skip(fixture, _boundary_fields(fixture, session, 16))
+    assert _frontiers(fixture, session) == (16, 15, 15, 15)
+    assert sum(map(len, fixture.encoder.calls)) == 14
+
+
+@pytest.mark.parametrize("change", ["chunk", "request", "count16"])
+def test_sparse_boundary_next_issue_keeps_same_chunk_request_and_h15(make_worker, change):
+    fixture = make_worker(autostart=False)
+    session = _boundary_session(fixture)
+    _skip(fixture, _boundary_fields(fixture, session))
+    with pytest.raises(REJECTED):
+        fixture.worker.owner_issue(
+            session.lease["session_id"],
+            "wrong" if change == "chunk" else "chunk-0",
+            "wrong" if change == "request" else "request-0",
+            1,
+            16 if change == "count16" else 15,
+        )
+    assert _frontiers(fixture, session) == (1,) * 4
+    fixture.worker.owner_issue(session.lease["session_id"], "chunk-0", "request-0", 1, 15)
+    assert _frontiers(fixture, session) == (16, 1, 1, 1)
+
+
+def test_sparse_boundary_tombstone_bound_cannot_revive_evicted_source(make_worker):
+    fixture = make_worker(config=WorkerConfig(max_tombstones=1))
+    session = _boundary_session(fixture)
+    first = _boundary_fields(fixture, session)
+    _skip(fixture, first)
+    _encode_sparse_tail(fixture, session, 0)
+    current = _boundary_fields(fixture, session, 16)
+    _skip(fixture, current)
+    assert fixture.worker.info()["boundary_tombstones"] == 1
+    with pytest.raises(REJECTED):
+        _skip(fixture, first)
+    assert _skip(fixture, current)["duplicate"] is True
+    assert _frontiers(fixture, session) == (17,) * 4
+    assert sum(map(len, fixture.encoder.calls)) == 15
+
+
+def test_sparse_boundary_end_revokes_retry_without_affecting_peer(make_worker):
+    fixture = make_worker()
+    session = _boundary_session(fixture)
+    peer = _register(fixture, 1, count=1, completed=1)
+    fields = _boundary_fields(fixture, session)
+    _skip(fixture, fields)
+    assert _frontiers(fixture, peer) == (1, 1, 0, 0)
+    fixture.worker.end(session.lease["session_id"], session.capability, fixture.clock() + 1_000_000_000)
+    with pytest.raises(REJECTED):
+        _skip(fixture, fields)
+    frame = _frame(fixture, peer, 0)
+    key = fixture.worker.submit(frame, peer.capability)
+    _verify(fixture, peer, frame, _result(fixture, peer, key))
+    assert [frame.header["lease"]["session_id"] for batch in fixture.encoder.calls for frame in batch] == [
+        peer.lease["session_id"]
+    ]

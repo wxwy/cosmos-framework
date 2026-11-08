@@ -20,20 +20,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.nn.modules.module import _IncompatibleKeys
 
-from cosmos_framework.utils.flags import DEVICE, Device
-from cosmos_framework.utils.lazy_config import LazyDict
-from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
-from cosmos_framework.utils.lazy_config.registry import locate
-from cosmos_framework.model._base import ImaginaireModel
-from cosmos_framework.utils import log, misc
-from cosmos_framework.utils.count_params import count_params
-from cosmos_framework.model.generator.algorithm.loss.flow_matching import (
-    ACTION_SLOT_SAMPLE_COUNT_KEY,
-    ACTION_SLOT_SAMPLE_LOSS_KEY,
-    ActionSlotLossStats,
-    compute_flow_matching_loss,
-)
-from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.configs.base.defaults.joint_attention import JointAttnImplementation
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
 from cosmos_framework.configs.base.defaults.parallelism import PRECISION_TO_TORCH_DTYPE
@@ -42,7 +28,27 @@ from cosmos_framework.data.generator.action.utils.action_processing import (
     get_action_processing_records,
 )
 from cosmos_framework.data.generator.action.utils.unified_action_schema import UNIFIED_ACTION_SLOT_GROUPS
+from cosmos_framework.data.generator.sequence_packing import (
+    PackedSequence,
+    SequencePlan,
+    build_sequence_plans_from_data_batch,
+    pack_input_sequence,
+)
+from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
+from cosmos_framework.data.generator.sequence_packing.packers import is_item_generated, uses_single_timestep
 from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
+from cosmos_framework.inference.robocasa_boundary_capture import (
+    observe_policy_current_encoding,
+    policy_current_encode_span,
+)
+from cosmos_framework.model._base import ImaginaireModel
+from cosmos_framework.model.generator.algorithm.loss.flow_matching import (
+    ACTION_SLOT_SAMPLE_COUNT_KEY,
+    ACTION_SLOT_SAMPLE_LOSS_KEY,
+    ActionSlotLossStats,
+    compute_flow_matching_loss,
+)
+from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.model.generator.diffusion.rectified_flow import RectifiedFlow
 from cosmos_framework.model.generator.diffusion.samplers.edm import EDMSampler
 from cosmos_framework.model.generator.diffusion.samplers.fixed_step import FixedStepSampler
@@ -64,6 +70,8 @@ from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.generator.mot.parallelize_unified_mot import materialize_non_offloaded_state
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
+from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
+from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
     GenerationDataNoised,
@@ -95,21 +103,17 @@ from cosmos_framework.model.generator.vision_encoder import (
     get_vae_pixel_shapes,
     normalize_uint8_item,
 )
-from cosmos_framework.data.generator.sequence_packing import (
-    PackedSequence,
-    SequencePlan,
-    build_sequence_plans_from_data_batch,
-    pack_input_sequence,
-)
-from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
-from cosmos_framework.data.generator.sequence_packing.packers import is_item_generated, uses_single_timestep
-from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
-from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
+from cosmos_framework.utils import log, misc
+from cosmos_framework.utils.count_params import count_params
+from cosmos_framework.utils.flags import DEVICE, Device
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution, read_positive_int_metadata
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
 from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_linears_on_meta
+from cosmos_framework.utils.lazy_config import LazyDict
+from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
+from cosmos_framework.utils.lazy_config.registry import locate
 
 # "LIDA" in ASCII: fixed domain tag separating joint LiDAR noise from RGB.
 # Changing this value changes all joint LiDAR inference noise.
@@ -456,7 +460,6 @@ class OmniMoTModel(ImaginaireModel):
             log.info(f"Sound tokenizer initialized: {type(self.tokenizer_sound_gen).__name__}")
         else:
             self.tokenizer_sound_gen = None
-
 
     def build_net(
         self,
@@ -3986,9 +3989,7 @@ class OmniMoTModel(ImaginaireModel):
         )
 
         reuse_pack_templates = (
-            False
-            if has_local_prefixes
-            else self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
+            False if has_local_prefixes else self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
         )
         cond_packed_sequence_template: PackedSequence | None = None
         uncond_packed_sequence_template: PackedSequence | None = None
@@ -4061,11 +4062,15 @@ class OmniMoTModel(ImaginaireModel):
         # process group whose model-forward sequence is at risk). Text-KV
         # eligibility must additionally agree across CFG-parallel peers before
         # either peer installs the request-local attention dispatch.
-        reuse_text_kv = False if has_local_prefixes else self._can_reuse_inference_text_kv(
-            sequence_plans,
-            gen_data_clean,
-            reuse_pack_templates=reuse_pack_templates,
-            has_velocity_postprocess=velocity_postprocess is not None,
+        reuse_text_kv = (
+            False
+            if has_local_prefixes
+            else self._can_reuse_inference_text_kv(
+                sequence_plans,
+                gen_data_clean,
+                reuse_pack_templates=reuse_pack_templates,
+                has_velocity_postprocess=velocity_postprocess is not None,
+            )
         )
         reuse_text_kv = _all_group_ranks_allow(
             reuse_text_kv,
@@ -4909,7 +4914,10 @@ class OmniMoTModel(ImaginaireModel):
             encode_input = (  # [...,C,T,H,W]
                 state if torch.is_floating_point(state) else self._normalize_uint8_vision_item(state)
             )
-            return self.encode(encode_input).contiguous().float()  # [...,C_latent,T_latent,H_latent,W_latent]
+            with policy_current_encode_span(self):
+                encoded = self.encode(encode_input).contiguous().float()  # [...,C_latent,T_latent,H_latent,W_latent]
+            observe_policy_current_encoding(self, encode_input, encoded)
+            return encoded
 
         temporal_dim = state.ndim - 3
         num_frames = int(state.shape[temporal_dim])
