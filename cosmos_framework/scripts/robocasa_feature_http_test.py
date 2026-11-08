@@ -393,6 +393,31 @@ def test_c_constructor_attests_actual_model_object_and_info_exposes_only_public_
     assert replies == [(200, info)]
 
 
+def test_c_policy_initialization_accepts_real_omegaconf_loaded_constructor(wire_rig):
+    from omegaconf import OmegaConf
+
+    from cosmos_framework.inference.robocasa_vae_daemon import loaded_vae_identity, worker_constructor_config
+    from cosmos_framework.inference.robocasa_vae_daemon_test import _tokenizer
+
+    rig = wire_rig
+    tokenizer = _tokenizer(omega=True)
+    rig.service.model.config = SimpleNamespace(
+        tokenizer=OmegaConf.create({"bucket_name": "", "vae_path": "/cpu/synthetic-vae.bin"})
+    )
+    rig.service.model.tokenizer_vision_gen = tokenizer
+    args = SimpleNamespace(history_source="sim_shared_vae", local_memory_max_sessions=2)
+    exec(
+        _constructor_feature_block(), {"self": rig.service, "args": args, "transaction_options": {"owner_token": TOKEN}}
+    )
+    info = rig.service.get_info()["local_feature"]
+    assert info["identity"] == loaded_vae_identity(tokenizer)
+    assert info["worker_constructor_config"] == worker_constructor_config(tokenizer)
+    assert type(info["worker_constructor_config"]["encode_exact_durations"]) is list
+    assert type(info["worker_constructor_config"]["encode_chunk_frames"]) is dict
+    assert info["history_source"] == "sim_shared_vae"
+    assert info["policy_bmax"] == 1 and info["policy_wait_ms"] == 0
+
+
 def test_real_service_c_batch_uses_one_existing_precrop_hook_then_stages_private_boundary(
     wire_rig, capture_methods, monkeypatch
 ):

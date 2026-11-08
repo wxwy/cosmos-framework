@@ -44,22 +44,58 @@ def _tensor_hash(values):
     return result.hexdigest()
 
 
+def _plain_config_container(value):
+    # Resolve in the original OmegaConf tree, before copying away its parent.
+    from omegaconf import DictConfig, ListConfig, OmegaConf
+    from omegaconf.errors import OmegaConfBaseException
+
+    if isinstance(value, (DictConfig, ListConfig)):
+        try:
+            return OmegaConf.to_container(value, resolve=True, throw_on_missing=True, enum_to_str=False)
+        except OmegaConfBaseException as error:
+            raise ValueError("unresolved loaded Wan configuration") from error
+    return value
+
+
 def worker_constructor_config(tokenizer, *, vae_path=None):
     """Effective nonsecret Wan constructor settings, with a local weights path.
 
     Location/credentials are not encoder semantics. Actual loaded tensors and
     scale are independently hashed; the daemon additionally hashes its input file.
     """
+    frames = _plain_config_container(tokenizer.encode_chunk_frames)
+    durations = _plain_config_container(tokenizer.encode_exact_durations)
+    if (
+        not isinstance(frames, Mapping)
+        or not frames
+        or any(
+            type(key) is not str or not key or type(value) is not int or value <= 0 or value % 4
+            for key, value in frames.items()
+        )
+    ):
+        raise ValueError("loaded Wan chunk frames require string keys and positive integer multiples of four")
+    if durations is not None and (
+        type(durations) not in (list, tuple) or any(type(value) is not int or value <= 0 for value in durations)
+    ):
+        raise ValueError("loaded Wan exact durations require a list of positive integers or None")
     config = {
         "chunk_duration": tokenizer.chunk_duration,
         "keep_decoder_cache": False,
         "use_streaming_encode": False,
-        "encode_chunk_frames": dict(tokenizer.encode_chunk_frames),
-        "encode_exact_durations": tokenizer.encode_exact_durations,
+        "encode_chunk_frames": dict(frames),
+        "encode_exact_durations": None if durations is None else list(durations),
         "spatial_compression_factor": tokenizer.spatial_compression_factor,
         "temporal_compression_factor": tokenizer.temporal_compression_factor,
         "causal": tokenizer.is_causal,
     }
+    if (
+        any(
+            type(config[name]) is not int or config[name] <= 0
+            for name in ("chunk_duration", "spatial_compression_factor", "temporal_compression_factor")
+        )
+        or type(config["causal"]) is not bool
+    ):
+        raise ValueError("loaded Wan constructor requires integer dimensions and a boolean causal flag")
     if vae_path is not None:
         config.update(bucket_name="", object_store_credential_path_pretrained="", vae_path=str(vae_path))
     # Freeze mutable lists/mappings rather than return tokenizer-owned objects.
@@ -102,12 +138,12 @@ def loaded_vae_identity(tokenizer, tokenizer_config=None):
         for name in ("bucket_name", "vae_path", "object_store_credential_path_pretrained", "_target_"):
             supplied.pop(name, None)
         for name, value in supplied.items():
-            if name in effective and value != effective[name]:
+            if name in effective and _plain_config_container(value) != effective[name]:
                 raise ValueError("resolved tokenizer config differs from actual loaded configuration")
     scale = getattr(loaded, "scale", None)
     if not isinstance(scale, (tuple, list)) or len(scale) != 2:
         raise ValueError("actual loaded Wan normalization scale is missing")
-    window = getattr(module, "temporal_window", effective["encode_chunk_frames"])
+    window = _plain_config_container(getattr(module, "temporal_window", effective["encode_chunk_frames"]))
     if isinstance(window, Mapping):
         window = dict(window)
     configuration = {
