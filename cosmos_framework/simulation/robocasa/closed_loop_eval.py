@@ -278,7 +278,8 @@ def run_policy(
     http_client=None,
     trace=None,
 ) -> tuple[bool, int, str]:
-    if getattr(local_memory_client, "uses_shared_vae", False) and (
+    shared_vae = getattr(local_memory_client, "uses_shared_vae", False) is True
+    if shared_vae and (
         action_horizon != 16 or not use_state or not USE_BASE_ACTION or BASE_ENCODING != "raw"
     ):
         raise ValueError("shared VAE C requires H16/state15/mobile canonical raw15")
@@ -286,7 +287,7 @@ def run_policy(
     trace = trace if trace is not None else get_trace()
     if trace is not None:
         trace.event("measurement_coverage", egl_separate="unavailable", env_step_includes_render=True)
-        if hasattr(local_memory_client, "attach_trace"):
+        if shared_vae:
             local_memory_client.attach_trace(trace)
 
     def measured(name, **fields):
@@ -349,7 +350,7 @@ def run_policy(
             if not queue:
                 replan_started_ns = observation_ready_ns if replans == 0 else last_step_end_ns
                 stratum = "first_no_history" if replans == 0 else "steady_full16"
-                if local_memory_client is not None and hasattr(local_memory_client, "start_replan"):
+                if shared_vae:
                     local_memory_client.start_replan(0, time.monotonic_ns())
                 with measured("observation_preprocess", source_step=step, stratum=stratum):
                     comp = compose(obs)
@@ -455,7 +456,7 @@ def run_policy(
                 env_action = decode_10d_to_env12(a, False)
 
             prepared_step = None
-            if local_memory_client is not None and hasattr(local_memory_client, "prepare_step"):
+            if shared_vae:
                 prepared_step = local_memory_client.prepare_step(0, step, pre_composite, canonical_raw15)
             if trace is not None:
                 trace.record(

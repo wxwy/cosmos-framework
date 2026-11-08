@@ -163,7 +163,7 @@ class PolicyTransport:
                 raise TimeoutError("original Episode deadline exhausted")
             self.client.timeout_s = min(timeout, self.settings["predict_timeout_s"], remaining)
         try:
-            if getattr(self.local, "uses_shared_vae", False):
+            if getattr(self.local, "uses_shared_vae", False) is True:
                 result = self.client.predict(record, budget=self.local.prediction_budget)
                 self.local.accept_policy_result(result)
             else:
@@ -405,7 +405,7 @@ class PolicyTransport:
             return
         local_error = None
         try:
-            if getattr(self.local, "uses_shared_vae", False):
+            if getattr(self.local, "uses_shared_vae", False) is True:
                 self.local.end(0)
         except BaseException as error:
             local_error = error
