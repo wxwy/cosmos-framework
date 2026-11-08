@@ -1,5 +1,6 @@
 """H1 actual OmegaConf containers at the loaded Wan identity boundary (CPU only)."""
 
+import subprocess
 import sys
 from copy import deepcopy
 from types import SimpleNamespace
@@ -171,3 +172,123 @@ def test_worker_loader_matches_real_policy_constructor_and_rejects_changed_ident
     config["constructor_config"]["encode_exact_durations"][0] = 21
     with pytest.raises(ValueError, match="does not match"):
         daemon.load_real_encoder(config)
+
+
+_GPU_UUID = "GPU-545d3c6f-e60e-dad5-cb58-b0fd6aceb33b"
+
+
+@pytest.fixture
+def cuda_identity_rig(monkeypatch):
+    # Device descriptors and patched CUDA/NVML calls only: no CUDA initialization.
+    device = torch.device("cuda", 0)
+    parameters = [SimpleNamespace(device=device)]
+    rig = SimpleNamespace(
+        expected={"gpu_id": 4, "uuid": _GPU_UUID, "pci_bus_id": "0000:98:00.0"},
+        actual_uuid=_GPU_UUID,
+        visible=1,
+        parameters=parameters,
+        queried=[],
+        nvml_output=f"4, {_GPU_UUID}, 00000000:98:00.0\n",
+    )
+    rig.encoder = SimpleNamespace(
+        tokenizer=SimpleNamespace(model=SimpleNamespace(model=SimpleNamespace(parameters=lambda: iter(rig.parameters))))
+    )
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: rig.visible)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda actual: SimpleNamespace(uuid=rig.actual_uuid))
+
+    def query(argv, *, text, timeout):
+        rig.queried.append(argv)
+        assert text is True and timeout == 10
+        assert argv == [
+            "nvidia-smi",
+            "-i",
+            _GPU_UUID,
+            "--query-gpu=index,uuid,pci.bus_id",
+            "--format=csv,noheader,nounits",
+        ]
+        if isinstance(rig.nvml_output, BaseException):
+            raise rig.nvml_output
+        return rig.nvml_output
+
+    monkeypatch.setattr(daemon.subprocess, "check_output", query)
+    return rig
+
+
+@pytest.mark.parametrize("prefixed", [False, True], ids=["bare", "prefixed"])
+def test_cuda_uuid_full_identity_accepts_only_equivalent_prefix(cuda_identity_rig, prefixed):
+    rig = cuda_identity_rig
+    rig.actual_uuid = _GPU_UUID if prefixed else _GPU_UUID.removeprefix("GPU-")
+    assert daemon._physical_device(rig.expected, rig.encoder) == rig.expected
+    assert len(rig.queried) == 1  # Actual NVML lookup is mandatory for both forms.
+
+
+@pytest.mark.parametrize(
+    "actual",
+    [
+        None,
+        "",
+        "GPU-wrong",
+        "545d3c6f",
+        "GPU-GPU-" + _GPU_UUID[4:],
+        " " + _GPU_UUID,
+        _GPU_UUID + "\n",
+        _GPU_UUID + "extra",
+        "MIG-" + _GPU_UUID[4:],
+        "gpu-" + _GPU_UUID[4:],
+        _GPU_UUID.replace("e60e", "z60e"),
+        "GPU-645d3c6f-e60e-dad5-cb58-b0fd6aceb33b",
+    ],
+)
+def test_cuda_uuid_invalid_missing_or_other_gpu_never_reaches_nvml(cuda_identity_rig, actual):
+    rig = cuda_identity_rig
+    rig.actual_uuid = actual
+    with pytest.raises(ValueError, match="UUID"):
+        daemon._physical_device(rig.expected, rig.encoder)
+    assert not rig.queried
+
+
+def test_malformed_cuda_uuid_cannot_pass_even_with_matching_claimed_identity(cuda_identity_rig):
+    rig = cuda_identity_rig
+    rig.actual_uuid = rig.expected["uuid"] = "GPU-not-a-128-bit-uuid"
+    with pytest.raises(ValueError, match="UUID"):
+        daemon._physical_device(rig.expected, rig.encoder)
+    assert not rig.queried
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        f"5, {_GPU_UUID}, 0000:98:00.0\n",
+        "4, GPU-645d3c6f-e60e-dad5-cb58-b0fd6aceb33b, 0000:98:00.0\n",
+        f"4, {_GPU_UUID}, 0000:99:00.0\n",
+        "",
+        f"4, {_GPU_UUID}, 0000:98:00.0\n4, {_GPU_UUID}, 0000:98:00.0\n",
+        f"4, {_GPU_UUID}, not-a-pci\n",
+        OSError("synthetic NVML unavailable"),
+        subprocess.TimeoutExpired("nvidia-smi", 10),
+    ],
+)
+def test_actual_nvml_index_uuid_pci_and_query_failures_remain_fail_closed(cuda_identity_rig, output):
+    rig = cuda_identity_rig
+    rig.nvml_output = output
+    with pytest.raises((ValueError, OSError, subprocess.TimeoutExpired)):
+        daemon._physical_device(rig.expected, rig.encoder)
+    assert len(rig.queried) == 1
+
+
+@pytest.mark.parametrize("visible", [0, 2])
+def test_actual_cuda_must_be_uniquely_visible_before_nvml(cuda_identity_rig, visible):
+    rig = cuda_identity_rig
+    rig.visible = visible
+    with pytest.raises(ValueError, match="exactly one"):
+        daemon._physical_device(rig.expected, rig.encoder)
+    assert not rig.queried
+
+
+@pytest.mark.parametrize("devices", [[], ["cpu"], ["cuda:0", "cuda:1"], ["cuda:0", "cpu"]])
+def test_actual_weights_must_all_be_on_one_cuda_device(cuda_identity_rig, devices):
+    rig = cuda_identity_rig
+    rig.parameters = [SimpleNamespace(device=torch.device(value)) for value in devices]
+    with pytest.raises(ValueError, match="exactly one"):
+        daemon._physical_device(rig.expected, rig.encoder)
+    assert not rig.queried

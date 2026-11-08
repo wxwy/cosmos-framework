@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import stat
 import struct
 import subprocess
@@ -240,6 +241,10 @@ def _physical_device(expected, encoder):
     ):
         raise ValueError("Worker requires exactly one visible CUDA device")
     uid = str(torch.cuda.get_device_properties(device).uuid)
+    if re.fullmatch(r"(?:GPU-)?[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", uid) is None:
+        raise ValueError("actual Worker CUDA UUID has invalid full 128-bit format")
+    if not uid.startswith("GPU-"):
+        uid = "GPU-" + uid
     if uid != expected["uuid"]:
         raise ValueError("actual Worker CUDA UUID differs from assigned physical GPU")
     output = (
