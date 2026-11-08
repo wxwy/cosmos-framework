@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import ast
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
+
+from cosmos_framework.inference.robocasa_feature_trace import get_trace
 
 
 def runner(*, failure=None, reset_failure=None, media_failure=None, env_failure=None):
@@ -31,6 +34,8 @@ def runner(*, failure=None, reset_failure=None, media_failure=None, env_failure=
     scope = {
         "np": np,
         "time": time,
+        "get_trace": get_trace,
+        "nullcontext": nullcontext,
         "compose": lambda _: np.zeros((2, 4, 3), np.uint8),
         "build_state_token": lambda _: [0] * 15,
         "predict": predict,
