@@ -348,6 +348,8 @@ class BatchedSessionTransactions(SessionTransactions):
                 self._busy = False
                 if not ready:
                     ticket.quiescent, ticket.update = True, None
+                    if ticket.lease.slot_id in self._failed:
+                        self._failed[ticket.lease.slot_id]["quiescent"] = True
                     self._release(ticket)
             self._changed.notify_all()
 
