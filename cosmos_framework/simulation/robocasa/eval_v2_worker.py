@@ -50,6 +50,31 @@ def serve(channel, cfg, *, factory=None):
                 from cosmos_framework.simulation.robocasa import eval_v2_transactions
 
                 modules["transactions"] = Path(eval_v2_transactions.__file__)
+            evidence_profile = cfg["settings"].get("local_evidence_profile", "server_vae")
+            if evidence_profile not in ("server_vae", "sim_shared_vae"):
+                raise ValueError("unknown Actor source profile")
+            if evidence_profile == "sim_shared_vae":
+                if (
+                    cfg["settings"].get("execution_profile") != "phase_b"
+                    or cfg["settings"].get("local_memory_mode") != "required"
+                ):
+                    raise ValueError("C Actor source profile requires phase_b and required Local-TTT")
+                from importlib import import_module
+
+                # The allowlist is source-owned, never inferred from supplied labels.
+                for name, module in {
+                    "shared_client": "cosmos_framework.simulation.robocasa.sim_shared_vae_client",
+                    "local_client": "cosmos_framework.simulation.robocasa.local_memory_client",
+                    "transaction_client": "cosmos_framework.inference.robocasa_transaction_client",
+                    "feature_trace": "cosmos_framework.inference.robocasa_feature_trace",
+                    "feature_evidence": "cosmos_framework.inference.robocasa_feature_evidence",
+                    "session_transactions": "cosmos_framework.inference.robocasa_session_transactions",
+                    "batch_transactions": "cosmos_framework.inference.robocasa_batch_transactions",
+                    "vae_protocol": "cosmos_framework.inference.robocasa_vae_protocol",
+                    "vae_worker": "cosmos_framework.inference.robocasa_vae_worker",
+                    "vae_client": "cosmos_framework.inference.robocasa_vae_client",
+                }.items():
+                    modules[name] = Path(import_module(module).__file__)
             if set(cfg["source_files"]) != set(modules):
                 raise ValueError("incomplete native source witnesses")
             for name, file in modules.items():
