@@ -279,9 +279,7 @@ def run_policy(
     trace=None,
 ) -> tuple[bool, int, str]:
     shared_vae = getattr(local_memory_client, "uses_shared_vae", False) is True
-    if shared_vae and (
-        action_horizon != 16 or not use_state or not USE_BASE_ACTION or BASE_ENCODING != "raw"
-    ):
+    if shared_vae and (action_horizon != 16 or not use_state or not USE_BASE_ACTION or BASE_ENCODING != "raw"):
         raise ValueError("shared VAE C requires H16/state15/mobile canonical raw15")
     rollout_error: BaseException | None = None
     trace = trace if trace is not None else get_trace()
