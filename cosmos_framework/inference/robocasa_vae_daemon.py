@@ -309,6 +309,7 @@ def run_daemon(
                 wait_ms=0,
                 max_sessions=config.get("max_sessions", 16),
                 max_policy_epochs=config.get("max_policy_epochs", 1),
+                history_k=config.get("local_ttt_history_k", 16),
             ),
         )
         server = UnixVAEServer(
@@ -341,6 +342,7 @@ def run_daemon(
                     "max_sessions": worker.config.max_sessions,
                     "max_policy_epochs": worker.config.max_policy_epochs,
                 },
+                **({"local_ttt_history_k": worker.config.history_k} if worker.config.history_k != 16 else {}),
             },
         )
         server.wait_closed()

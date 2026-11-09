@@ -28,6 +28,28 @@ VISUAL96_BYTES = 96 * 4
 MAX_FRAME_WIRE_BYTES = 1 << 20
 MAX_FEATURE_WIRE_BYTES = 16384
 MAX_HEADER_BYTES = 8192
+
+
+def validate_history_k(value):
+    if type(value) is not int or value not in (1, 2, 4, 8, 16):
+        raise ValueError("local_ttt_history_k must be one of1/2/4/8/16")
+    return value
+
+
+def selected_history_step(source_step, chunk_start, history_k):
+    """Selection is relative to the actual completed H16 Action chunk."""
+    stride = 16 // validate_history_k(history_k)
+    if (
+        type(source_step) is not int
+        or type(chunk_start) is not int
+        or chunk_start < 0
+        or chunk_start % 16
+        or not 0 <= source_step - chunk_start < 16
+    ):
+        raise ValueError("source step must belong to its real H16 Action chunk")
+    return (source_step - chunk_start) % stride == 0
+
+
 LEASE_FIELDS = (
     "server_epoch",
     "run_lease",

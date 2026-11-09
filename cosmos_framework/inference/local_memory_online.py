@@ -33,6 +33,7 @@ class OnlineMemoryRequest:
     executed_action: torch.Tensor
     reset: bool = False
     stream_t1: bool = False
+    history_k: int = 16
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class _Record:
     state: ContinualTTTFastState | None
     token: torch.Tensor | None
     fingerprint: str
+    history_k: int = 16
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,10 @@ class OnlineLocalMemory:
             raise ValueError("invalid consumer_step/reset")
         if request.stream_t1 and self.scan_local_memory is None:
             raise ValueError("T1 feature profile requires the existing model-owned Local scan")
+        if type(request.history_k) is not int or request.history_k not in (1, 2, 4, 8, 16):
+            raise ValueError("invalid frozen Local history K")
+        if request.history_k != 16 and not request.stream_t1:
+            raise ValueError("sparse history requires the attested T1 feature path")
         n = len(request.source_steps)
         if n > self.max_evidence_steps or any(type(step) is not int or step < 0 for step in request.source_steps):
             raise ValueError("invalid completed-evidence chronology")
@@ -142,6 +148,8 @@ class OnlineLocalMemory:
         )
         if request.stream_t1:
             identity += ("stream_t1",)
+        if request.history_k != 16:
+            identity += ("history_k", request.history_k)
         digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode())
         digest.update(visual.contiguous().numpy().tobytes())
         digest.update(action.contiguous().numpy().tobytes())
@@ -154,6 +162,8 @@ class OnlineLocalMemory:
             if request.session_id in self._pending:
                 raise RuntimeError("session already has a pending Local-TTT prediction")
             previous = self._records.get(request.session_id)
+            if previous is not None and previous.history_k != request.history_k:
+                raise ValueError("Local history K cannot change within a Session")
             if previous is not None and previous.fingerprint == fingerprint:
                 telemetry = {
                     "adapted_steps": 0.0,
@@ -189,6 +199,10 @@ class OnlineLocalMemory:
                 if request.consumer_step <= previous.consumer_step:
                     raise ValueError("stale or changed-bytes Local-TTT request")
                 expected = tuple(range(previous.consumer_step, request.consumer_step))
+                if request.history_k != 16:
+                    if previous.consumer_step % 16 or len(expected) > 16:
+                        raise ValueError("sparse history must consume its actual H16 chunk")
+                    expected = expected[:: 16 // request.history_k]
                 if request.source_steps != expected:
                     raise ValueError("completed Local-TTT evidence must be contiguous and exactly-once")
                 visual = visual.to(device)
@@ -251,7 +265,9 @@ class OnlineLocalMemory:
                 if not torch.isfinite(token).all() or any(not torch.isfinite(value).all() for value in state):
                     raise FloatingPointError("online Local-TTT produced non-finite fast state/prefix")
 
-            replacement = _Record(request.episode_id, request.consumer_step, state, token, fingerprint)
+            replacement = _Record(
+                request.episode_id, request.consumer_step, state, token, fingerprint, request.history_k
+            )
             update = OnlineMemoryUpdate(
                 self,
                 request.session_id,

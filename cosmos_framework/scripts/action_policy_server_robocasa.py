@@ -538,6 +538,7 @@ class ActionServerArgs(pydantic.BaseModel):
     """Opt-in Phase B transaction/B1 API. Does not enable multi-Sim or B>1."""
     transaction_owner_token_file: Path | None = None
     history_source: Literal["server_vae", "sim_shared_vae"] = "server_vae"
+    local_ttt_history_k: pydantic.StrictInt = 16
     single_latency_arm: Literal["A", "B", "C"] | None = None
     """Stage3A explicit B1 signed-history path; defaults preserve native A/B."""
     transaction_run_lease: str | None = None
@@ -629,8 +630,13 @@ class ActionServerConfig:
 
 
 def _transaction_options(args):
+    from cosmos_framework.inference.robocasa_vae_protocol import validate_history_k
+
+    history_k = validate_history_k(getattr(args, "local_ttt_history_k", 16))
     batch = args.transaction_profile == "batch"
     feature_mode = getattr(args, "history_source", "server_vae") == "sim_shared_vae"
+    if history_k != 16 and not feature_mode:
+        raise ValueError("sparse history requires the shared VAE feature path")
     arm = getattr(args, "single_latency_arm", None)
     if arm is not None and (
         arm not in ("A", "B", "C")
@@ -1080,6 +1086,7 @@ class ActionModelService:
                 transaction_options["owner_token"],
                 max_sessions=int(args.local_memory_max_sessions),
                 policy_identity=identity,
+                history_k=getattr(args, "local_ttt_history_k", 16),
             )
             self.local_feature_info = {
                 "identity": identity,
@@ -1088,6 +1095,11 @@ class ActionModelService:
                 "history_source": "sim_shared_vae",
                 "policy_bmax": transaction_options.get("max_batch_size", 1),
                 "policy_wait_ms": transaction_options.get("batch_wait_ms", 0),
+                **(
+                    {"local_ttt_history_k": args.local_ttt_history_k}
+                    if getattr(args, "local_ttt_history_k", 16) != 16
+                    else {}
+                ),
             }
         self.local_memory_adapter = RoboCasaLocalMemoryPolicyAdapter(
             self,

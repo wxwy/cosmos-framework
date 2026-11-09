@@ -23,7 +23,9 @@ from cosmos_framework.inference.robocasa_vae_protocol import (
     IDENTITY_FIELDS,
     ProtocolError,
     canonical_json,
+    selected_history_step,
     strict_json,
+    validate_history_k,
     validate_identity,
     validate_lease,
     validate_raw15,
@@ -34,6 +36,9 @@ from cosmos_framework.inference.robocasa_vae_protocol import (
 FEATURE_EVIDENCE_VERSION = "PSM24-FEATURES-v1"
 FEATURE_EVIDENCE_FORMAT = "sim_shared_vae_b1_t1"
 POST_STEP_VERSION = "PSM24-POSTSTEP-v1"
+SPARSE_EVIDENCE_VERSION = "PSM28-FEATURES-v2"
+SPARSE_EVIDENCE_FORMAT = "sim_shared_vae_sparse_b1_t1"
+SPARSE_POST_STEP_VERSION = "PSM28-POSTSTEP-v2"
 BOUNDARY_VERSION = "PSM24-BOUNDARY-v1"
 TRUST_MODEL = "registry_same_trust_domain"
 _POST_FIELDS = {
@@ -109,16 +114,30 @@ def _secret(value):
 
 def validate_post_step_receipt(value):
     """Validate public metadata only; authority additionally requires the Owner ledger."""
-    value = _exact(value, _POST_FIELDS, "post-step receipt")
-    if value["version"] != POST_STEP_VERSION or value["success"] is not True or value["trust_model"] != TRUST_MODEL:
+    sparse = type(value) is dict and value.get("version") == SPARSE_POST_STEP_VERSION
+    value = _exact(value, _POST_FIELDS | ({"history_k", "selected"} if sparse else set()), "post-step receipt")
+    if (
+        value["version"] not in (POST_STEP_VERSION, SPARSE_POST_STEP_VERSION)
+        or value["success"] is not True
+        or value["trust_model"] != TRUST_MODEL
+    ):
         raise ProtocolError("unsupported post-step provenance")
+    selected = True
+    if sparse:
+        k = validate_history_k(value["history_k"])
+        step = _step(value["source_step"])
+        selected = selected_history_step(step, step // 16 * 16, k)
+        if k == 16 or type(value["selected"]) is not bool or value["selected"] != selected:
+            raise ProtocolError("post-step selection differs from frozen sparse K")
+        if not selected and value["source_rgb_sha256"] is not None:
+            raise ProtocolError("skipped history must not carry an RGB payload digest")
     result = {
-        "version": POST_STEP_VERSION,
+        "version": value["version"],
         "lease": validate_lease(value["lease"]),
         "issued_chunk_id": _id(value["issued_chunk_id"], "issued_chunk_id"),
         "policy_request_key": _id(value["policy_request_key"], "policy_request_key"),
         "source_step": _step(value["source_step"]),
-        "source_rgb_sha256": _sha(value["source_rgb_sha256"], "source_rgb_sha256"),
+        "source_rgb_sha256": _sha(value["source_rgb_sha256"], "source_rgb_sha256") if selected else None,
         "raw15_sha256": _sha(value["raw15_sha256"], "raw15_sha256"),
         "success": True,
         "clock_domain": _id(value["clock_domain"], "clock_domain"),
@@ -126,6 +145,8 @@ def validate_post_step_receipt(value):
         "actor_epoch": _id(value["actor_epoch"], "actor_epoch"),
         "trust_model": TRUST_MODEL,
     }
+    if sparse:
+        result.update(history_k=k, selected=selected)
     for name in ("episode_deadline_ns", "step_completed_ns"):
         if type(value[name]) is not str:
             raise ProtocolError("receipt deadlines require decimal strings")
@@ -282,13 +303,21 @@ class FeatureEvidenceOwner:
     """Bounded completion authority; FastState/cache publication remains in the adapter."""
 
     def __init__(
-        self, owner_token, *, clock_ns=time.monotonic_ns, max_sessions=1, trust_model=TRUST_MODEL, policy_identity=None
+        self,
+        owner_token,
+        *,
+        clock_ns=time.monotonic_ns,
+        max_sessions=1,
+        trust_model=TRUST_MODEL,
+        policy_identity=None,
+        history_k=16,
     ):
         if trust_model != TRUST_MODEL or type(max_sessions) is not int or not 1 <= max_sessions <= 64:
             raise ValueError("explicit bounded Registry same-trust-domain owner required")
         self._control = _secret(owner_token)
         self.clock_ns = clock_ns
         self.max_sessions = max_sessions
+        self.history_k = validate_history_k(history_k)
         self._workers = {}
         self._revoked_workers = OrderedDict()
         self._sessions = {}
@@ -523,12 +552,12 @@ class FeatureEvidenceOwner:
                 raise ProtocolError("post-step action differs from canonical committed Action")
             receipt = validate_post_step_receipt(
                 {
-                    "version": POST_STEP_VERSION,
+                    "version": POST_STEP_VERSION if self.history_k == 16 else SPARSE_POST_STEP_VERSION,
                     "lease": session.lease,
                     "issued_chunk_id": chunk_id,
                     "policy_request_key": request_key,
                     "source_step": step,
-                    "source_rgb_sha256": _sha(source_rgb_sha256, "source_rgb_sha256"),
+                    "source_rgb_sha256": source_rgb_sha256,
                     "raw15_sha256": hashlib.sha256(raw).hexdigest(),
                     "success": True,
                     "clock_domain": session.worker.clock_domain,
@@ -537,6 +566,14 @@ class FeatureEvidenceOwner:
                     "actor_id": actor_id,
                     "actor_epoch": actor_epoch,
                     "trust_model": TRUST_MODEL,
+                    **(
+                        {
+                            "history_k": self.history_k,
+                            "selected": selected_history_step(step, chunk.start, self.history_k),
+                        }
+                        if self.history_k != 16
+                        else {}
+                    ),
                 }
             )
             encoded = canonical_json(receipt)
@@ -568,6 +605,16 @@ class FeatureEvidenceOwner:
 
     def admit(self, payload, *, lease, deadline_ns, clock_domain, previous_step):
         """Read-only admission before native READY; no source data can create completion."""
+        if self.history_k != 16:
+            if (
+                payload.get("evidence_version") != SPARSE_EVIDENCE_VERSION
+                or payload.get("evidence_format") != SPARSE_EVIDENCE_FORMAT
+                or type(payload.get("local_ttt_history_k")) is not int
+                or payload["local_ttt_history_k"] != self.history_k
+            ):
+                raise ProtocolError("sparse feature selection differs from frozen Owner K")
+        elif "local_ttt_history_k" in payload or payload.get("evidence_version") == SPARSE_EVIDENCE_VERSION:
+            raise ProtocolError("dense Owner cannot accept sparse selection evidence")
         rows = payload.get("evidence")
         step = payload.get("consumer_step")
         if type(rows) is not list or type(step) is not int or type(previous_step) is not int:
@@ -598,7 +645,7 @@ class FeatureEvidenceOwner:
                 raise ProtocolError("completed feature Session cannot reset its causal frontier")
             if steps and (session.chunk is None or session.chunk.start != previous_step):
                 raise ProtocolError("feature history does not match the active completed Action chunk")
-            visual, actions, owned_rows = [], [], []
+            visual, actions, owned_rows, selected_sources = [], [], [], []
             identity = strict_json(session.worker.identity_json)
             for source, row in zip(steps, rows, strict=True):
                 row = _exact(row, {"source_step", "post_step_receipt", "feature"}, "feature row")
@@ -608,6 +655,17 @@ class FeatureEvidenceOwner:
                 completed = session.completed.get(source)
                 if completed is None or canonical_json(post) != completed.receipt_json or post["source_step"] != source:
                     raise ProtocolError("public post-step receipt lacks matching authoritative Owner completion")
+                selected = selected_history_step(source, session.chunk.start, self.history_k)
+                if self.history_k != 16 and (
+                    post.get("history_k") != self.history_k or post.get("selected") != selected
+                ):
+                    raise ProtocolError("post-step selection differs from authoritative Owner")
+                if not selected:
+                    if row["feature"] is not None:
+                        raise ProtocolError("unselected history must not carry a Worker Feature")
+                    owned_rows.append({"source_step": source, "post_step_receipt": post, "feature": None})
+                    continue
+                selected_sources.append(source)
                 if source % 16 == 0:
                     if row["feature"] is not None:
                         raise ProtocolError("Policy boundary must not impersonate a Worker Feature")
@@ -661,7 +719,7 @@ class FeatureEvidenceOwner:
                 owned_rows.append({"source_step": source, "post_step_receipt": post, "feature": owned_feature})
             digest = feature_evidence_digest(owned_rows)
             self.validate_request(lease, deadline, clock_domain)
-            return FeatureEvidenceBatch(steps, tuple(visual), tuple(actions), digest)
+            return FeatureEvidenceBatch(tuple(selected_sources), tuple(visual), tuple(actions), digest)
 
     def end_session(self, token, lease):
         self._auth(token)

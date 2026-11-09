@@ -225,6 +225,16 @@ def build_manifest(
             validate_single_latency(single, local_memory=local_memory)
             extra |= {"single_latency"}
         shared = execution.get("shared_vae") if isinstance(execution, dict) else None
+        if isinstance(execution, dict) and "local_ttt_history_k" in execution:
+            history_k = execution["local_ttt_history_k"]
+            if (
+                type(history_k) is not int
+                or history_k not in (1, 2, 4, 8)
+                or local_memory != "required"
+                or not (shared or single and single["arm"] == "C")
+            ):
+                raise ValueError("sparse K1/2/4/8 requires frozen shared Local-TTT execution")
+            extra.add("local_ttt_history_k")
         if shared is not None:
             if single is not None:
                 raise ValueError("single measurements retain their original frozen identity")

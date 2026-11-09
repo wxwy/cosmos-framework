@@ -68,12 +68,16 @@ class WorkerConfig:
     max_session_items: int = 16
     max_sessions: int = 16
     max_policy_epochs: int = 1
+    history_k: int = 16
     max_tombstones: int = 32
     max_chunks: int = 4
     max_trace: int = 256
     max_retired_sessions: int = 16
 
     def __post_init__(self):
+        from cosmos_framework.inference.robocasa_vae_protocol import validate_history_k
+
+        validate_history_k(self.history_k)
         if type(self.bmax) is not int or self.bmax not in (1, 4, 8):
             raise ValueError("VAE batch cap must be 1, 4 or 8")
         if type(self.wait_ms) is not int or self.wait_ms not in (0, 2, 5) or (self.bmax == 1 and self.wait_ms):
@@ -121,6 +125,7 @@ class _Session:
     jobs: dict = field(default_factory=dict)
     tombstones: OrderedDict = field(default_factory=OrderedDict)
     boundary_tombstones: OrderedDict = field(default_factory=OrderedDict)
+    skipped: OrderedDict = field(default_factory=OrderedDict)
     sparse_boundary: tuple[int, str, str] | None = None
     issued: int = 0
     completed: int = 0
@@ -343,6 +348,8 @@ class SharedVAEWorker:
         action_digest = _sha256(raw15_sha256, "executed raw15 digest")
         boundary_digest = _sha256(policy_boundary_sha256, "Policy boundary digest")
         receipt = validate_post_step_receipt(post_step_receipt)
+        if receipt.get("history_k", 16) != self.config.history_k or receipt.get("selected", True) is not True:
+            raise ValueError("Policy boundary receipt differs from frozen Worker K")
         if (
             receipt["lease"] != lease
             or receipt["issued_chunk_id"] != chunk_id
@@ -402,7 +409,7 @@ class SharedVAEWorker:
                 "encoded": False,
             }
 
-    def owner_complete(self, session_id, chunk_id, completed_through):
+    def owner_complete(self, session_id, chunk_id, completed_through, *, skipped_receipt=None):
         if type(completed_through) is not int or completed_through < 0:
             raise ValueError("exclusive completed frontier required")
         with self._changed:
@@ -413,11 +420,50 @@ class SharedVAEWorker:
                 raise ValueError("unissued or regressing completed frontier")
             if chunk.start > session.completed:
                 raise ValueError("completed frontier cannot skip an earlier chunk")
+            if skipped_receipt is not None:
+                from cosmos_framework.inference.robocasa_feature_evidence import validate_post_step_receipt
+
+                post = validate_post_step_receipt(skipped_receipt)
+                source = completed_through - 1
+                if (
+                    self.config.history_k == 16
+                    or post.get("history_k") != self.config.history_k
+                    or post.get("selected") is not False
+                    or post["source_rgb_sha256"] is not None
+                    or post["lease"] != session.lease
+                    or post["source_step"] != source
+                    or post["issued_chunk_id"] != chunk_id
+                    or post["policy_request_key"] != chunk.request_key
+                    or post["clock_domain"] != self.clock_domain
+                    or int(post["episode_deadline_ns"]) != session.deadline
+                    or int(post["step_completed_ns"]) > self.clock_ns()
+                    or not chunk.start <= source < chunk.end
+                ):
+                    raise ValueError("skipped completion differs from frozen Worker/Action identity")
+                encoded = canonical_json(post)
+                if source in session.skipped and session.skipped[source] != encoded:
+                    raise ValueError("changed-bytes skipped completion")
+                if source not in session.skipped:
+                    while len(session.skipped) >= self.config.max_chunks * 16:
+                        oldest = next(iter(session.skipped))
+                        if oldest >= session.consumed:
+                            raise RuntimeError("bounded skipped-completion capacity exhausted")
+                        session.skipped.popitem(last=False)
+                    session.skipped[source] = encoded
             chunk.completed = completed_through
             session.completed = max(session.completed, completed_through)
+            self._advance_skips(session)
             self._record("MOCK_COMPLETED", session=session, completed_through=completed_through)
             self._changed.notify_all()
             return {"completed_through": session.completed, "attestation": "owner_mock_control_only"}
+
+    def _advance_skips(self, session):
+        # A completed skip may arrive before an earlier asynchronous Frame.
+        if self.config.history_k != 16:
+            while session.submitted in session.skipped:
+                session.submitted += 1
+            while session.consumed < session.submitted and session.consumed not in session.jobs:
+                session.consumed += 1
 
     def submit(self, frame, capability):
         frame = validate_frame(frame)  # Expensive CPU validation never holds the admission lock.
@@ -440,6 +486,11 @@ class SharedVAEWorker:
                     raise ValueError("source identity reused with changed bytes or deadline")
                 return old.key if old is not None else tombstone["job_key"]
             self._open(session)
+            if self.config.history_k != 16:
+                from cosmos_framework.inference.robocasa_vae_protocol import selected_history_step
+
+                if step % 16 == 0 or not selected_history_step(step, step // 16 * 16, self.config.history_k):
+                    raise ValueError("unselected or Policy-owned boundary cannot enter Worker VAE")
             if step != session.submitted:
                 raise ValueError("stale/evicted or noncontiguous source frontier")
             chunk = session.chunks.get(header["issued_chunk_id"])
@@ -467,6 +518,7 @@ class SharedVAEWorker:
             job = _Job(session, key, fingerprint, step, frame, size, deadline, self.clock_ns(), self._job_serial)
             session.jobs[step] = job
             session.submitted += 1
+            self._advance_skips(session)
             self._queue.append(job)
             self._items += 1
             self._bytes += size
@@ -790,4 +842,5 @@ class SharedVAEWorker:
                 "trace_overflow": self._trace_overflow,
                 "causal_attestation": "owner_mock_control_only",
                 "timing_source": "cpu_monotonic_ns",
+                **({"local_ttt_history_k": self.config.history_k} if self.config.history_k != 16 else {}),
             }

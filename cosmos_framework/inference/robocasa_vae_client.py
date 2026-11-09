@@ -260,6 +260,8 @@ class UnixVAEServer:
             "end": {"session_id", "capability"},
             "info": set(),
         }
+        if op == "owner_complete" and "skipped_receipt" in request:
+            owner_fields[op] = owner_fields[op] | {"skipped_receipt"}
         if op in owner_fields:
             if lane != "control" or set(request) != common | {"control_capability"} | owner_fields[op]:
                 raise PermissionError("owner operation requires control lane")
@@ -309,7 +311,10 @@ class UnixVAEServer:
             ), False
         if op == "owner_complete":
             return self.worker.owner_complete(
-                request["session_id"], request["chunk_id"], request["completed_through"]
+                request["session_id"],
+                request["chunk_id"],
+                request["completed_through"],
+                **({"skipped_receipt": request["skipped_receipt"]} if "skipped_receipt" in request else {}),
             ), False
         result = self.worker.close(_drain_deadline(deadline))
         return {**result, "ipc_quiescent": False}, result.get("closed") is True and result.get("quiescent") is True
@@ -531,10 +536,15 @@ class OwnerVAEClient(_Client):
             deadline_ns,
         )
 
-    def complete(self, session_id, chunk_id, completed_through, deadline_ns):
+    def complete(self, session_id, chunk_id, completed_through, deadline_ns, *, skipped_receipt=None):
         return self._owner(
             "owner_complete",
-            dict(session_id=session_id, chunk_id=chunk_id, completed_through=completed_through),
+            dict(
+                session_id=session_id,
+                chunk_id=chunk_id,
+                completed_through=completed_through,
+                **({"skipped_receipt": skipped_receipt} if skipped_receipt is not None else {}),
+            ),
             deadline_ns,
         )
 

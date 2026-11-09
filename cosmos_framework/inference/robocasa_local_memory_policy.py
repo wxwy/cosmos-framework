@@ -24,6 +24,8 @@ from cosmos_framework.inference.robocasa_composite_visual import (
 from cosmos_framework.inference.robocasa_feature_evidence import (
     FEATURE_EVIDENCE_FORMAT,
     FEATURE_EVIDENCE_VERSION,
+    SPARSE_EVIDENCE_FORMAT,
+    SPARSE_EVIDENCE_VERSION,
     FeatureEvidenceOwner,
     PolicyBoundary,
     feature_evidence_digest,
@@ -243,13 +245,20 @@ class RoboCasaLocalMemoryPolicyAdapter:
             "evidence_format",
             "evidence",
         }
+        if owner.history_k != 16:
+            fields.add("local_ttt_history_k")
         if type(payload) is not dict or payload.keys() != fields:
             raise ValueError("Feature profile requires exact opt-in evidence fields")
-        if (
-            payload["evidence_version"] != FEATURE_EVIDENCE_VERSION
-            or payload["evidence_format"] != FEATURE_EVIDENCE_FORMAT
+        if payload["evidence_version"] != (
+            FEATURE_EVIDENCE_VERSION if owner.history_k == 16 else SPARSE_EVIDENCE_VERSION
+        ) or payload["evidence_format"] != (
+            FEATURE_EVIDENCE_FORMAT if owner.history_k == 16 else SPARSE_EVIDENCE_FORMAT
         ):
             raise ValueError("unsupported Feature evidence version/format")
+        if owner.history_k != 16 and (
+            type(payload["local_ttt_history_k"]) is not int or payload["local_ttt_history_k"] != owner.history_k
+        ):
+            raise ValueError("Feature history K differs from frozen Policy Owner")
         if payload["image_size"] != 256 or type(payload["image_size"]) is not int or req.get("image_size") != 256:
             raise ValueError("Stage3A attested Feature preprocessing requires image_size256")
         if payload["preprocess_profile"] != PREPROCESS_PROFILE or type(payload["reset"]) is not bool:
@@ -273,7 +282,15 @@ class RoboCasaLocalMemoryPolicyAdapter:
                 payload, lease=public, deadline_ns=deadline_ns, clock_domain=clock_domain, previous_step=0
             )
             request = OnlineMemoryRequest(
-                session_id, episode_id, 0, (), torch.empty(0, 96), torch.empty(0, 15), True, True
+                session_id,
+                episode_id,
+                0,
+                (),
+                torch.empty(0, 96),
+                torch.empty(0, 15),
+                True,
+                True,
+                history_k=owner.history_k,
             )
             return request, _VisualRecord(episode_id, 0, 256, PREPROCESS_PROFILE, feature_lease_json=lease_json), 0
         if previous.episode_id != episode_id or previous.image_size != 256:
@@ -284,7 +301,15 @@ class RoboCasaLocalMemoryPolicyAdapter:
             visual = previous.last_visual_summary.detach().clone()
             actions = previous.last_executed_action.detach().clone()
             request = OnlineMemoryRequest(
-                session_id, episode_id, step, previous.last_source_steps, visual, actions, False, True
+                session_id,
+                episode_id,
+                step,
+                previous.last_source_steps,
+                visual,
+                actions,
+                False,
+                True,
+                history_k=owner.history_k,
             )
             return request, previous, 0
         batch = owner.admit(
@@ -298,7 +323,9 @@ class RoboCasaLocalMemoryPolicyAdapter:
             -1, 96
         )
         actions = torch.tensor([struct.unpack("<15f", raw) for raw in batch.raw15], dtype=torch.float32).reshape(-1, 15)
-        request = OnlineMemoryRequest(session_id, episode_id, step, batch.source_steps, visual, actions, False, True)
+        request = OnlineMemoryRequest(
+            session_id, episode_id, step, batch.source_steps, visual, actions, False, True, history_k=owner.history_k
+        )
         replacement = _VisualRecord(
             episode_id,
             step,
@@ -491,6 +518,16 @@ class RoboCasaLocalMemoryPolicyAdapter:
         }
         if update.feature_profile:
             result["evidence_profile"] = FEATURE_EVIDENCE_FORMAT
+            if self.feature_evidence_owner.history_k != 16:
+                selected = update.visual_replacement.last_source_steps
+                start = selected[0] if selected else replacement.consumer_step
+                result.update(
+                    evidence_profile=SPARSE_EVIDENCE_FORMAT,
+                    local_ttt_history_k=self.feature_evidence_owner.history_k,
+                    selected_source_steps=list(selected),
+                    skipped_source_steps=[s for s in range(start, replacement.consumer_step) if s not in selected],
+                    verified_worker_features=sum(s % 16 != 0 for s in selected),
+                )
             # This metadata is serialized into a PRIVATE native Response before
             # commit_many publishes that same Response/FastState/boundary. Owner
             # lookups still read only the immutable published snapshot.
@@ -512,6 +549,13 @@ class RoboCasaLocalMemoryPolicyAdapter:
             "evidence_version": self.EVIDENCE_VERSION,
             "evidence_format": self.EVIDENCE_FORMAT,
             "visual_evidence": "corrected_composite_single_frame_encode1_v1",
-            "feature_evidence_profile": None if self.feature_evidence_owner is None else FEATURE_EVIDENCE_FORMAT,
+            "feature_evidence_profile": None
+            if self.feature_evidence_owner is None
+            else (FEATURE_EVIDENCE_FORMAT if self.feature_evidence_owner.history_k == 16 else SPARSE_EVIDENCE_FORMAT),
+            **(
+                {"local_ttt_history_k": self.feature_evidence_owner.history_k}
+                if self.feature_evidence_owner is not None and self.feature_evidence_owner.history_k != 16
+                else {}
+            ),
             **self.memory.info(),
         }

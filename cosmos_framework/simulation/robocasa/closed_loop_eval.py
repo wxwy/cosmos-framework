@@ -433,7 +433,12 @@ def run_policy(
 
             a = np.asarray(queue.pop(0))
             action_prepare_ns = trace.now_ns() if trace is not None else None
-            pre_composite = compose(obs).astype(np.uint8) if local_memory_client is not None else None
+            history_image = local_memory_client is not None and (
+                not shared_vae
+                or getattr(local_memory_client, "history_k", 16) == 16
+                or local_memory_client.needs_history_image(step)
+            )
+            pre_composite = compose(obs).astype(np.uint8) if history_image else None
             if USE_BASE_ACTION:
                 want = _ACTION_DIM_BY_ENCODING[BASE_ENCODING]
                 if a.shape[-1] != want:
@@ -505,8 +510,8 @@ def run_policy(
                     }
                 )
             if local_memory_client is not None:
-                assert pre_composite is not None
                 if prepared_step is None:
+                    assert pre_composite is not None
                     with measured("history_capture_png", source_step=step, stratum="chunk_middle"):
                         local_memory_client.record_completed(0, pre_composite, canonical_raw15)
             if save_video is not None:
