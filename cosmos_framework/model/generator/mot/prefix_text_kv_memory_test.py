@@ -305,6 +305,85 @@ def test_unexpected_attention_dispatch_is_restored_after_partial_install():
     assert net.layers[1].self_attn.dispatch_attention_fn is sentinel
 
 
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_compiled_cached_prefix_dispatch_keeps_symbolic_guards_and_current_prefix(monkeypatch, dynamic):
+    """Real H100 hit SymBool != bool in the dispatcher under Dynamo.
+
+    CPU eager backend traces the production dispatcher in fullgraph mode. The
+    kernel double is SDPA for this unpadded B1 layout (no varlen loop to trace).
+    """
+
+    def kernel(query, key, value, **kwargs):
+        return F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            enable_gqa=True,
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(cache_module, "attention", kernel)
+    torch.manual_seed(93)
+    caches = make_inference_text_kv_cache(1)
+    und_key, und_value = torch.randn(1, 5, 1, 8), torch.randn(1, 5, 1, 8)
+    caches[0].store(und_key, und_value)
+    state = InferenceTextKVMemoryState(caches, local_prefix_length=4)
+    state.init(
+        {
+            "_num_full_tokens": 6,
+            "_num_causal_tokens": 5,
+            "_causal_seq_offsets": torch.tensor([0, 5]),
+            "_full_only_seq_offsets": torch.tensor([0, 6]),
+        },
+        torch.device("cpu"),
+    )
+    memory = state.read_for_layer(0)
+    q, k, v = torch.randn(6, 2, 8), torch.randn(6, 1, 8), torch.randn(6, 1, 8)
+
+    def pack(tensor):
+        native, _, _ = build_packed_sequence(
+            "two_way",
+            packed_sequence=torch.cat((tensor.new_zeros(5, *tensor.shape[1:]), tensor)),
+            attn_modes=["causal", "full"],
+            split_lens=[5, 6],
+            sample_lens=[11],
+            packed_und_token_indexes=torch.arange(5),
+            packed_gen_token_indexes=torch.arange(5, 11),
+            num_heads=tensor.shape[1],
+            head_dim=8,
+            num_layers=1,
+        )
+        return from_und_gen_splits(tensor.new_empty(0, *tensor.shape[1:]), tensor, native)
+
+    mask = SimpleNamespace(is_three_way=False, control_stream_token_ranges=None)
+    prefix_key, prefix_value = torch.randn(4, 1, 8), torch.randn(4, 1, 8)
+    compiled = torch.compile(
+        cache_module.dispatch_attention_with_text_kv_memory, backend="eager", fullgraph=True, dynamic=dynamic
+    )
+    with torch.inference_mode():
+        results = []
+        for shift in (0, 1, 0):
+            pk, pv = prefix_key + shift, prefix_value + shift
+            result, _ = compiled(
+                pack(q),
+                pack(k),
+                pack(v),
+                mask,
+                memory_value=memory,
+                memory_prefix_key_states=pk,
+                memory_prefix_value_states=pv,
+                memory_prefix_sample_offsets=torch.tensor([0, 4]),
+            )
+            expected = kernel(
+                q.unsqueeze(0),
+                torch.cat((pk, und_key[0], k)).unsqueeze(0),
+                torch.cat((pv, und_value[0], v)).unsqueeze(0),
+            )
+            torch.testing.assert_close(get_gen_seq(result), expected[0].flatten(-2, -1), rtol=0, atol=0)
+            results.append(get_gen_seq(result).clone())
+        assert not torch.equal(results[0], results[1])
+        torch.testing.assert_close(results[0], results[2], rtol=0, atol=0)
+
+
 def _generation_harness():
     """Production generation orchestration, preencoded CPU carriers/tiny MoT.
 

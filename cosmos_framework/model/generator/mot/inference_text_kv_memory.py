@@ -293,7 +293,12 @@ def dispatch_attention_with_text_kv_memory(
     """
     has_prefix = memory_prefix_key_states is not None
     prefix_aware = isinstance(memory_value, InferenceTextKVMemoryValue) and memory_value.local_prefix_length > 0
-    if prefix_aware != has_prefix:
+    # Branch on SymBool directly. SymBool != Python bool can fail in Dynamo's
+    # symbolic comparison (BooleanAtom), even when Prefix length is backed.
+    if prefix_aware:
+        if not has_prefix:
+            raise ValueError("Prefix-aware text K/V requires the current request's Prefix on every step")
+    elif has_prefix:
         raise ValueError("Prefix-aware text K/V requires the current request's Prefix on every step")
     if prefix_aware:
         if (
