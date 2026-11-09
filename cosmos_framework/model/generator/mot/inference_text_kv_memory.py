@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import torch
 
 from cosmos_framework.model.attention import attention
-from cosmos_framework.model.generator.mot.attention import SplitInfo, dispatch_attention
+from cosmos_framework.model.generator.mot.attention import SplitInfo, dispatch_attention, two_way_attention
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryState, MemoryValue
 from cosmos_framework.data.generator.sequence_packing.runtime import (
     SequencePack,
@@ -70,6 +70,7 @@ class InferenceTextKVMemoryValue(MemoryValue):
     max_seqlen_kv: int = 0
     for_cuda_graphs: bool = False
     local_prefix_length: int = 0
+    causal_pad_length: int = 0
 
 
 class InferenceTextKVMemoryState(MemoryState):
@@ -80,6 +81,7 @@ class InferenceTextKVMemoryState(MemoryState):
             raise ValueError("local_prefix_length must be a nonnegative integer")
         self._text_kv_cache = text_kv_cache
         self.local_prefix_length = local_prefix_length
+        self._causal_pad_length = 0
         self._gen_len = 0
         self._kv_reorder_indices: torch.Tensor | None = None
         self._cumulative_seqlen_q: torch.Tensor | None = None
@@ -108,13 +110,8 @@ class InferenceTextKVMemoryState(MemoryState):
         if self.local_prefix_length:
             if und_off is None or gen_off is None or und_off.numel() != 2 or gen_off.numel() != 2:
                 raise ValueError("Prefix-aware text K/V requires a single native sample")
-            # Keep the Prefix path on varlen attention, just like its uncached
-            # reference. Only real query/KV rows participate; padding owns no Prefix.
-            self._cumulative_seqlen_q = torch.tensor([0, self._gen_len], dtype=torch.int32, device=device)
-            kv_len = self.local_prefix_length + int(hidden_states["_num_causal_tokens"]) + self._gen_len
-            self._cumulative_seqlen_kv = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
-            self._max_seqlen_q = self._gen_len
-            self._max_seqlen_kv = kv_len
+            # Preserve the real native tower layout, including its pad segment.
+            self._causal_pad_length = hidden_states["causal_seq"].shape[0] - int(hidden_states["_num_causal_tokens"])
             return
         if isinstance(und_off, torch.Tensor) and isinstance(gen_off, torch.Tensor) and und_off.numel() > 2:
             und_off = und_off.to(dtype=torch.int32)
@@ -162,6 +159,7 @@ class InferenceTextKVMemoryState(MemoryState):
             max_seqlen_kv=self._max_seqlen_kv,
             for_cuda_graphs=False,
             local_prefix_length=self.local_prefix_length,
+            causal_pad_length=self._causal_pad_length,
         )
 
     def write_for_layer(self, layer_idx: int, kv_to_store: KVToStore) -> None:
@@ -327,7 +325,20 @@ def dispatch_attention_with_text_kv_memory(
                 memory_value,
                 memory_prefix_key_states,
                 memory_prefix_value_states,
+                attention_mask,
+                memory_prefix_sample_offsets,
             )
+        return two_way_attention(
+            packed_query_states,
+            packed_key_states,
+            packed_value_states,
+            packed_key_states_normalized=packed_key_states_normalized,
+            memory_prefix_key_states=memory_prefix_key_states,
+            memory_prefix_value_states=memory_prefix_value_states,
+            memory_prefix_sample_offsets=memory_prefix_sample_offsets,
+            memory_prefix_max_len=memory_prefix_max_len,
+            _capture_prefix_text_kv=True,
+        )
     if isinstance(memory_value, InferenceTextKVMemoryValue) and memory_value.frame_idx > 0:
         return _attention_gen_with_cached_text(
             packed_query_states,
@@ -357,8 +368,10 @@ def _attention_gen_with_cached_text_and_prefix(
     memory_value: InferenceTextKVMemoryValue,
     prefix_key: torch.Tensor,
     prefix_value: torch.Tensor,
-) -> tuple[SequencePack, None]:
-    """B1 GEN queries see [current Prefix | cached UND | current GEN].
+    attention_mask: SplitInfo,
+    prefix_offsets: torch.Tensor,
+) -> tuple[SequencePack, KVToStore]:
+    """Reuse native GEN attention with current Prefix, cached UND and current GEN.
 
     UND never attends to Prefix or GEN, so its per-layer K/V is static.
     Prefix K/V is projected by the current decoder layer on EVERY forward,
@@ -367,24 +380,33 @@ def _attention_gen_with_cached_text_and_prefix(
     und_key, und_value = memory_value.und_k_cached, memory_value.und_v_cached
     if und_key is None or und_value is None:
         raise ValueError("Prefix-aware generation requires initialized text K/V")
-    gen_len = memory_value.gen_len
     q_gen = get_gen_seq(query)
-    k_full = torch.cat((prefix_key.unsqueeze(0), und_key, get_gen_seq(key)[:gen_len].unsqueeze(0)), dim=1)
-    v_full = torch.cat((prefix_value.unsqueeze(0), und_value, get_gen_seq(value)[:gen_len].unsqueeze(0)), dim=1)
-    result = attention(
-        query=q_gen[:gen_len].unsqueeze(0),
-        key=k_full,
-        value=v_full,
-        is_causal=False,
-        return_lse=False,
-        cumulative_seqlen_Q=memory_value.cumulative_seqlen_q,
-        cumulative_seqlen_KV=memory_value.cumulative_seqlen_kv,
-        max_seqlen_Q=memory_value.max_seqlen_q,
-        max_seqlen_KV=memory_value.max_seqlen_kv,
+    pad = memory_value.causal_pad_length
+    und_k = torch.nn.functional.pad(und_key[0], (0, 0, 0, 0, 0, pad))
+    und_v = torch.nn.functional.pad(und_value[0], (0, 0, 0, 0, 0, pad))
+    dummy_und_q = q_gen.new_zeros(und_k.shape[0], q_gen.shape[1], q_gen.shape[2])
+    result, _ = dispatch_attention(
+        from_und_gen_splits(dummy_und_q, q_gen, query),
+        from_und_gen_splits(und_k, get_gen_seq(key), key),
+        from_und_gen_splits(und_v, get_gen_seq(value), value),
+        attention_mask,
+        memory_prefix_key_states=prefix_key,
+        memory_prefix_value_states=prefix_value,
+        memory_prefix_sample_offsets=prefix_offsets,
+        memory_prefix_max_len=memory_value.local_prefix_length,
     )
-    gen_out = q_gen.new_zeros(q_gen.shape[0], q_gen.shape[1] * q_gen.shape[2])
-    gen_out[:gen_len] = result.squeeze(0).flatten(-2, -1)
-    return from_und_gen_splits(gen_out.new_empty(0, gen_out.shape[-1]), gen_out, query), None
+    gen_out = get_gen_seq(result)
+    empty_k = und_key[:, :0]
+    empty_v = und_value[:, :0]
+    # The initialized cache ignores writes. A non-None sentinel also prevents
+    # PackedAttentionMoT from exporting unused pre-scatter GEN K/V, which would
+    # change the compiled precision boundary. Dummy UND queries are discarded.
+    return from_und_gen_splits(gen_out.new_empty(0, gen_out.shape[-1]), gen_out, query), (
+        empty_k,
+        empty_v,
+        empty_k,
+        empty_v,
+    )
 
 
 def install_inference_memory_attention_dispatch(

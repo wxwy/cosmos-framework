@@ -225,6 +225,7 @@ def test_prefix_is_required_on_every_cache_hit():
             {
                 "_num_full_tokens": 6,
                 "_num_causal_tokens": 5,
+                "causal_seq": torch.empty(5, 16),
                 "_causal_seq_offsets": torch.tensor([0, 5]),
                 "_full_only_seq_offsets": torch.tensor([0, 6]),
             },
@@ -310,51 +311,55 @@ def test_compiled_cached_prefix_dispatch_keeps_symbolic_guards_and_current_prefi
     """Real H100 hit SymBool != bool in the dispatcher under Dynamo.
 
     CPU eager backend traces the production dispatcher in fullgraph mode. The
-    kernel double is SDPA for this unpadded B1 layout (no varlen loop to trace).
+    kernel double uses a tensorized per-segment SDPA mask (no Python varlen loop).
     """
 
     def kernel(query, key, value, **kwargs):
+        qo, ko = kwargs.get("cumulative_seqlen_Q"), kwargs.get("cumulative_seqlen_KV")
+        mask = None
+        if qo is not None:
+            qsample = torch.bucketize(torch.arange(query.shape[1]), qo[1:], right=True)
+            ksample = torch.bucketize(torch.arange(key.shape[1]), ko[1:], right=True)
+            mask = qsample[:, None] == ksample[None, :]
         return F.scaled_dot_product_attention(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
+            attn_mask=mask,
             enable_gqa=True,
         ).transpose(1, 2)
 
-    monkeypatch.setattr(cache_module, "attention", kernel)
+    monkeypatch.setattr(attention_module, "attention", kernel)
     torch.manual_seed(93)
     caches = make_inference_text_kv_cache(1)
-    und_key, und_value = torch.randn(1, 5, 1, 8), torch.randn(1, 5, 1, 8)
+    und_key, und_value = torch.randn(1, 6, 1, 8), torch.randn(1, 6, 1, 8)
     caches[0].store(und_key, und_value)
     state = InferenceTextKVMemoryState(caches, local_prefix_length=4)
-    state.init(
-        {
-            "_num_full_tokens": 6,
-            "_num_causal_tokens": 5,
-            "_causal_seq_offsets": torch.tensor([0, 5]),
-            "_full_only_seq_offsets": torch.tensor([0, 6]),
-        },
-        torch.device("cpu"),
-    )
-    memory = state.read_for_layer(0)
     q, k, v = torch.randn(6, 2, 8), torch.randn(6, 1, 8), torch.randn(6, 1, 8)
 
     def pack(tensor):
         native, _, _ = build_packed_sequence(
             "two_way",
-            packed_sequence=torch.cat((tensor.new_zeros(5, *tensor.shape[1:]), tensor)),
+            packed_sequence=torch.cat((tensor.new_zeros(6, *tensor.shape[1:]), tensor)),
             attn_modes=["causal", "full"],
-            split_lens=[5, 6],
-            sample_lens=[11],
-            packed_und_token_indexes=torch.arange(5),
-            packed_gen_token_indexes=torch.arange(5, 11),
+            split_lens=[6, 6],
+            sample_lens=[12],
+            packed_und_token_indexes=torch.arange(6),
+            packed_gen_token_indexes=torch.arange(6, 12),
             num_heads=tensor.shape[1],
             head_dim=8,
             num_layers=1,
         )
-        return from_und_gen_splits(tensor.new_empty(0, *tensor.shape[1:]), tensor, native)
+        return native
 
-    mask = SimpleNamespace(is_three_way=False, control_stream_token_ranges=None)
+    native_q, native_k, native_v = pack(q), pack(k), pack(v)
+    state.init(native_q, torch.device("cpu"))
+    memory = state.read_for_layer(0)
+
+    def gen_only(p):
+        return from_und_gen_splits(p["causal_seq"][:0], get_gen_seq(p), p)
+
+    mask = attention_module.SplitInfo([6, 6], ["causal", "full"], [12], actual_len=12)
     prefix_key, prefix_value = torch.randn(4, 1, 8), torch.randn(4, 1, 8)
     compiled = torch.compile(
         cache_module.dispatch_attention_with_text_kv_memory, backend="eager", fullgraph=True, dynamic=dynamic
@@ -364,24 +369,125 @@ def test_compiled_cached_prefix_dispatch_keeps_symbolic_guards_and_current_prefi
         for shift in (0, 1, 0):
             pk, pv = prefix_key + shift, prefix_value + shift
             result, _ = compiled(
-                pack(q),
-                pack(k),
-                pack(v),
+                gen_only(native_q),
+                gen_only(native_k),
+                gen_only(native_v),
                 mask,
                 memory_value=memory,
                 memory_prefix_key_states=pk,
                 memory_prefix_value_states=pv,
                 memory_prefix_sample_offsets=torch.tensor([0, 4]),
             )
-            expected = kernel(
-                q.unsqueeze(0),
-                torch.cat((pk, und_key[0], k)).unsqueeze(0),
-                torch.cat((pv, und_value[0], v)).unsqueeze(0),
+            ref_k = from_und_gen_splits(
+                F.pad(und_key[0], (0, 0, 0, 0, 0, memory.causal_pad_length)),
+                get_gen_seq(native_k),
+                native_k,
             )
-            torch.testing.assert_close(get_gen_seq(result), expected[0].flatten(-2, -1), rtol=0, atol=0)
+            ref_v = from_und_gen_splits(
+                F.pad(und_value[0], (0, 0, 0, 0, 0, memory.causal_pad_length)),
+                get_gen_seq(native_v),
+                native_v,
+            )
+            expected, _ = dispatch_attention(
+                native_q,
+                ref_k,
+                ref_v,
+                mask,
+                memory_prefix_key_states=pk,
+                memory_prefix_value_states=pv,
+                memory_prefix_sample_offsets=torch.tensor([0, 4]),
+            )
+            torch.testing.assert_close(get_gen_seq(result), get_gen_seq(expected), rtol=0, atol=0)
+            assert torch.count_nonzero(get_gen_seq(result)[6:]) == 0
             results.append(get_gen_seq(result).clone())
         assert not torch.equal(results[0], results[1])
         torch.testing.assert_close(results[0], results[2], rtol=0, atol=0)
+
+
+def test_prefix_cache_fill_uses_materialized_native_kv_and_hit_keeps_native_padding(monkeypatch):
+    """Keep the exact native GEN operands/backend contract, including pad ranges."""
+    torch.manual_seed(109)
+
+    def pack(tensor):
+        return build_packed_sequence(
+            "two_way",
+            packed_sequence=tensor,
+            attn_modes=["causal", "full"],
+            split_lens=[5, 6],
+            sample_lens=[11],
+            packed_und_token_indexes=torch.arange(5),
+            packed_gen_token_indexes=torch.arange(5, 11),
+            num_heads=tensor.shape[1],
+            head_dim=8,
+            num_layers=1,
+            full_seq_alignment=8,
+            causal_seq_alignment=8,
+        )[:2]
+
+    query, mask = pack(torch.randn(11, 2, 8))
+    key, _ = pack(torch.randn(11, 1, 8))
+    value, _ = pack(torch.randn(11, 1, 8))
+    norm_key = from_und_gen_splits(key["causal_seq"] * 2, get_gen_seq(key), key)
+    kwargs = dict(
+        memory_prefix_key_states=torch.randn(4, 1, 8),
+        memory_prefix_value_states=torch.randn(4, 1, 8),
+        memory_prefix_sample_offsets=torch.tensor([0, 4]),
+    )
+    calls = []
+
+    def kernel(query, key, value, **kw):
+        calls.append(
+            dict(
+                query=query.clone(),
+                key=key.clone(),
+                value=value.clone(),
+                **{k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in kw.items()},
+            )
+        )
+        return _cpu_attention(query, key, value, **kw)
+
+    monkeypatch.setattr(attention_module, "attention", kernel)
+    monkeypatch.setattr(cache_module, "attention", kernel)
+    caches = make_inference_text_kv_cache(1)
+    state = InferenceTextKVMemoryState(caches, local_prefix_length=4)
+    state.init(query, torch.device("cpu"))
+    with torch.inference_mode():
+        expected, _ = dispatch_attention(query, key, value, mask, packed_key_states_normalized=norm_key, **kwargs)
+        native_gen_call = calls[-1]
+        fill, kv = cache_module.dispatch_attention_with_text_kv_memory(
+            query,
+            key,
+            value,
+            mask,
+            memory_value=state.read_for_layer(0),
+            packed_key_states_normalized=norm_key,
+            **kwargs,
+        )
+        assert kv is not None and kv[0].numel() == kv[1].numel() == 0
+        positions = query["_causal_indices"] + 4
+        torch.testing.assert_close(kv[2][0], native_gen_call["key"][0, positions], rtol=0, atol=0)
+        torch.testing.assert_close(kv[3][0], native_gen_call["value"][0, positions], rtol=0, atol=0)
+        state.write_for_layer(0, kv)
+
+        def gen_only(p):
+            return from_und_gen_splits(p["causal_seq"][:0], get_gen_seq(p), p)
+
+        hit, ignored = cache_module.dispatch_attention_with_text_kv_memory(
+            gen_only(query),
+            gen_only(key),
+            gen_only(value),
+            mask,
+            memory_value=state.read_for_layer(0),
+            **kwargs,
+        )
+        assert ignored is not None and all(t.numel() == 0 for t in ignored)
+        hit_gen_call = calls[-1]
+        for name in ("query", "key", "value", "cumulative_seqlen_Q", "cumulative_seqlen_KV"):
+            torch.testing.assert_close(hit_gen_call[name], native_gen_call[name], rtol=0, atol=0)
+        assert hit_gen_call["max_seqlen_Q"] == native_gen_call["max_seqlen_Q"]
+        assert hit_gen_call["max_seqlen_KV"] == native_gen_call["max_seqlen_KV"]
+        torch.testing.assert_close(get_gen_seq(fill), get_gen_seq(expected), rtol=0, atol=0)
+        torch.testing.assert_close(get_gen_seq(hit), get_gen_seq(expected), rtol=0, atol=0)
 
 
 def _generation_harness():
