@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 import requests
 
+from cosmos_framework.evaluation.robocasa_v2.contract import ACTION_CHUNK_SIZE
 from cosmos_framework.inference.robocasa_session_transactions import digest, json_bytes
 from cosmos_framework.inference.robocasa_transaction_client import TransactionPolicyClient
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
@@ -82,7 +83,8 @@ class PolicyTransport:
                 settings["predict_timeout_s"],
                 self.client.clock_domain,
                 end_timeout_s=settings.get("shared_vae_end_timeout_s", 5.0),
-                local_ttt_history_k=settings.get("local_ttt_history_k", 16),
+                local_ttt_history_k=settings.get("local_ttt_history_k"),
+                action_horizon=settings.get("action_chunk_size", ACTION_CHUNK_SIZE),
             )
         else:
             if "sim_shared_vae" in assignment:

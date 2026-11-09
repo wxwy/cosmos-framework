@@ -64,10 +64,10 @@ def test_sparse_partial_tail_can_End_but_cannot_prepare_a_new_Policy_chunk(k, en
     h.owner.end_session(TOKEN, h.lease)
 
 
-@pytest.mark.parametrize("value", [0, 3, 5, 32, True, 2.0, "2", None])
+@pytest.mark.parametrize("value", [0, 3, 5, 32, True, 2.0, "2"])
 def test_history_k_rejects_coercion_and_unsupported_values(value):
     with pytest.raises(ValueError):
-        validate_history_k(value)
+        validate_history_k(value, 16)
 
 
 @pytest.mark.parametrize("k", KS)
@@ -333,9 +333,9 @@ def test_worker_skip_replay_forgery_and_late_frame_cannot_advance_or_encode():
 @pytest.mark.parametrize("start", [0, 16, 32])
 @pytest.mark.parametrize("k", KS)
 def test_selection_uses_actual_chunk_relative_time_without_renumbering(start, k):
-    assert tuple(s for s in range(start, start + 16) if selected_history_step(s, start, k)) == tuple(
+    assert tuple(s for s in range(start, start + 16) if selected_history_step(s, start, k, 16)) == tuple(
         start + j for j in SELECTED[k]
     )
     for invalid in (start - 1, start + 16):
         with pytest.raises(ValueError):
-            selected_history_step(invalid, start, k)
+            selected_history_step(invalid, start, k, 16)

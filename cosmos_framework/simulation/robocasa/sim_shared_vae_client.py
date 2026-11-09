@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from cosmos_framework.evaluation.robocasa_v2.contract import ACTION_CHUNK_SIZE
 from cosmos_framework.inference.robocasa_feature_evidence import (
     FEATURE_EVIDENCE_FORMAT,
     FEATURE_EVIDENCE_VERSION,
@@ -123,12 +124,19 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
         worker_client=None,
         completion_channel=None,
         end_timeout_s=2.0,
-        local_ttt_history_k=16,
+        local_ttt_history_k=None,
+        action_horizon=ACTION_CHUNK_SIZE,
     ):
         super().__init__(enabled=True, max_evidence_steps=16)
         self.lease = validate_lease({k: v for k, v in lease.items() if k != "capability"})
-        self.history_k = validate_history_k(local_ttt_history_k)
-        if validate_history_k(descriptor.get("local_ttt_history_k", 16)) != self.history_k:
+        self.action_horizon = validate_history_k(None, action_horizon)
+        if (
+            self.action_horizon != ACTION_CHUNK_SIZE
+            or validate_history_k(None, descriptor.get("action_chunk_size", ACTION_CHUNK_SIZE)) != self.action_horizon
+        ):
+            raise ValueError("assigned Action Horizon differs from frozen Native model protocol")
+        self.history_k = validate_history_k(local_ttt_history_k, self.action_horizon)
+        if validate_history_k(descriptor.get("local_ttt_history_k"), self.action_horizon) != self.history_k:
             raise ValueError("history K differs from assigned frozen shared Worker")
         if descriptor.get("trust_model") != "registry_same_trust_domain":
             raise ValueError("explicit controlled Actor trust model required")
@@ -274,7 +282,9 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
         with self._changed:
             if self._boundary is None:
                 raise RuntimeError("history selection requires a committed Policy chunk")
-            return selected_history_step(source_step, self._boundary["header"]["source_step"], self.history_k)
+            return selected_history_step(
+                source_step, self._boundary["header"]["source_step"], self.history_k, self.action_horizon
+            )
 
     def prepare_step(self, slot, source_step, composite_image, executed_raw15):
         with self._changed:
@@ -287,7 +297,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
             header = self._boundary["header"]
             if not header["source_step"] <= source_step < header["source_step"] + 16:
                 raise ValueError("Sim step lies outside committed action chunk")
-            selected = selected_history_step(source_step, header["source_step"], self.history_k)
+            selected = selected_history_step(source_step, header["source_step"], self.history_k, self.action_horizon)
             if not selected and composite_image is not None:
                 raise ValueError("unselected history must not create an RGB payload")
             rgb = self._image(composite_image, "pre-action composite").copy().tobytes() if selected else None
@@ -301,7 +311,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                 source_digest(rgb) if selected else None,
                 hashlib.sha256(raw15).hexdigest(),
             )
-            if source_step % 16 == 0 and snapshot.source_rgb_sha256 != header["source_rgb_sha256"]:
+            if source_step % self.action_horizon == 0 and snapshot.source_rgb_sha256 != header["source_rgb_sha256"]:
                 raise ValueError("pre-action boundary RGB differs from committed current Policy image")
             self._prepared = snapshot
             return snapshot
@@ -321,7 +331,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
             episode = self._get(slot)
             if self._prepared is not snapshot or snapshot.source_step != episode.consumer_step:
                 raise ValueError("exact prepared successful Sim step required")
-            if snapshot.source_step % 16 == 15:
+            if snapshot.source_step % self.action_horizon == self.action_horizon - 1:
                 self.start_replan(slot, step_completed_ns)
             try:
                 with self._profile_span("owner_step_completion", source_step=snapshot.source_step):
@@ -352,7 +362,8 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                     raise ValueError("Owner completion receipt differs from actual successful Sim step")
                 frame = (
                     None
-                    if snapshot.source_step % 16 == 0 or not self.needs_history_image(snapshot.source_step)
+                    if snapshot.source_step % self.action_horizon == 0
+                    or not self.needs_history_image(snapshot.source_step)
                     else Frame.create(
                         self.lease,
                         snapshot.chunk_id,
@@ -368,7 +379,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                     )
                 )
                 row = _Evidence(snapshot.source_step, receipt, frame, ready=frame is None)
-                if receipt.get("history_k", 16) != self.history_k or receipt.get(
+                if receipt.get("history_k", self.action_horizon) != self.history_k or receipt.get(
                     "selected", True
                 ) != self.needs_history_image(snapshot.source_step):
                     raise ValueError("Owner receipt selection differs from frozen Sim K")
@@ -464,7 +475,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                     for step in expected
                 ],
             )
-            if self.history_k != 16:
+            if self.history_k != self.action_horizon:
                 payload.update(
                     evidence_version=SPARSE_EVIDENCE_VERSION,
                     evidence_format=SPARSE_EVIDENCE_FORMAT,
@@ -475,7 +486,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
     def acknowledge(self, slot, status):
         with self._changed:
             episode = self._get(slot)
-            if self.history_k != 16 and (
+            if self.history_k != self.action_horizon and (
                 not isinstance(status, dict)
                 or type(status.get("local_ttt_history_k")) is not int
                 or status["local_ttt_history_k"] != self.history_k
@@ -562,13 +573,21 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                     {
                         "local_ttt_history_k": self.history_k,
                         "selected_source_steps": [
-                            s for s in self._rows if selected_history_step(s, s // 16 * 16, self.history_k)
+                            s
+                            for s in self._rows
+                            if selected_history_step(
+                                s, s // self.action_horizon * self.action_horizon, self.history_k, self.action_horizon
+                            )
                         ],
                         "skipped_source_steps": [
-                            s for s in self._rows if not selected_history_step(s, s // 16 * 16, self.history_k)
+                            s
+                            for s in self._rows
+                            if not selected_history_step(
+                                s, s // self.action_horizon * self.action_horizon, self.history_k, self.action_horizon
+                            )
                         ],
                     }
-                    if self.history_k != 16
+                    if self.history_k != self.action_horizon
                     else {}
                 ),
             }

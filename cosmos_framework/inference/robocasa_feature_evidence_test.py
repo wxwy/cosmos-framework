@@ -50,7 +50,7 @@ LEASE = {
 
 
 class EvidenceHarness:
-    def __init__(self, *, max_sessions=1, bind_lookup=True, history_k=16):
+    def __init__(self, *, max_sessions=1, bind_lookup=True, history_k=None):
         self.clock = [100]
         self.lease = deepcopy(LEASE)
         self.identity = deepcopy(IDENTITY)

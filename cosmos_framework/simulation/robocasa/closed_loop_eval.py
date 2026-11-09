@@ -435,7 +435,7 @@ def run_policy(
             action_prepare_ns = trace.now_ns() if trace is not None else None
             history_image = local_memory_client is not None and (
                 not shared_vae
-                or getattr(local_memory_client, "history_k", 16) == 16
+                or getattr(local_memory_client, "history_k", action_horizon) == action_horizon
                 or local_memory_client.needs_history_image(step)
             )
             pre_composite = compose(obs).astype(np.uint8) if history_image else None

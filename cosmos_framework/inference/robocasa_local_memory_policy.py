@@ -15,6 +15,7 @@ from typing import Any, Callable, Literal
 import torch
 from torch.distributed.tensor import DTensor
 
+from cosmos_framework.evaluation.robocasa_v2.contract import ACTION_CHUNK_SIZE
 from cosmos_framework.inference.local_memory_online import OnlineLocalMemory, OnlineMemoryRequest, OnlineMemoryUpdate
 from cosmos_framework.inference.local_memory_state import CachedMemoryResponse, MemorySnapshot
 from cosmos_framework.inference.robocasa_composite_visual import (
@@ -114,6 +115,9 @@ class RoboCasaLocalMemoryPolicyAdapter:
                 scan_local_memory=scan,
                 max_sessions=max_sessions,
                 max_evidence_steps=max_evidence_steps,
+                action_horizon=feature_evidence_owner.action_horizon
+                if feature_evidence_owner is not None
+                else ACTION_CHUNK_SIZE,
             )
             self.memory.paired = True
             self._lock = self.memory.store.lock
@@ -245,17 +249,17 @@ class RoboCasaLocalMemoryPolicyAdapter:
             "evidence_format",
             "evidence",
         }
-        if owner.history_k != 16:
+        if owner.history_k != owner.action_horizon:
             fields.add("local_ttt_history_k")
         if type(payload) is not dict or payload.keys() != fields:
             raise ValueError("Feature profile requires exact opt-in evidence fields")
         if payload["evidence_version"] != (
-            FEATURE_EVIDENCE_VERSION if owner.history_k == 16 else SPARSE_EVIDENCE_VERSION
+            FEATURE_EVIDENCE_VERSION if owner.history_k == owner.action_horizon else SPARSE_EVIDENCE_VERSION
         ) or payload["evidence_format"] != (
-            FEATURE_EVIDENCE_FORMAT if owner.history_k == 16 else SPARSE_EVIDENCE_FORMAT
+            FEATURE_EVIDENCE_FORMAT if owner.history_k == owner.action_horizon else SPARSE_EVIDENCE_FORMAT
         ):
             raise ValueError("unsupported Feature evidence version/format")
-        if owner.history_k != 16 and (
+        if owner.history_k != owner.action_horizon and (
             type(payload["local_ttt_history_k"]) is not int or payload["local_ttt_history_k"] != owner.history_k
         ):
             raise ValueError("Feature history K differs from frozen Policy Owner")
@@ -518,7 +522,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
         }
         if update.feature_profile:
             result["evidence_profile"] = FEATURE_EVIDENCE_FORMAT
-            if self.feature_evidence_owner.history_k != 16:
+            if self.feature_evidence_owner.history_k != self.feature_evidence_owner.action_horizon:
                 selected = update.visual_replacement.last_source_steps
                 start = selected[0] if selected else replacement.consumer_step
                 result.update(
@@ -526,7 +530,7 @@ class RoboCasaLocalMemoryPolicyAdapter:
                     local_ttt_history_k=self.feature_evidence_owner.history_k,
                     selected_source_steps=list(selected),
                     skipped_source_steps=[s for s in range(start, replacement.consumer_step) if s not in selected],
-                    verified_worker_features=sum(s % 16 != 0 for s in selected),
+                    verified_worker_features=sum(s % self.feature_evidence_owner.action_horizon != 0 for s in selected),
                 )
             # This metadata is serialized into a PRIVATE native Response before
             # commit_many publishes that same Response/FastState/boundary. Owner
@@ -551,10 +555,15 @@ class RoboCasaLocalMemoryPolicyAdapter:
             "visual_evidence": "corrected_composite_single_frame_encode1_v1",
             "feature_evidence_profile": None
             if self.feature_evidence_owner is None
-            else (FEATURE_EVIDENCE_FORMAT if self.feature_evidence_owner.history_k == 16 else SPARSE_EVIDENCE_FORMAT),
+            else (
+                FEATURE_EVIDENCE_FORMAT
+                if self.feature_evidence_owner.history_k == self.feature_evidence_owner.action_horizon
+                else SPARSE_EVIDENCE_FORMAT
+            ),
             **(
                 {"local_ttt_history_k": self.feature_evidence_owner.history_k}
-                if self.feature_evidence_owner is not None and self.feature_evidence_owner.history_k != 16
+                if self.feature_evidence_owner is not None
+                and self.feature_evidence_owner.history_k != self.feature_evidence_owner.action_horizon
                 else {}
             ),
             **self.memory.info(),

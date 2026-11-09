@@ -19,6 +19,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
+from cosmos_framework.evaluation.robocasa_v2.contract import ACTION_CHUNK_SIZE
 from cosmos_framework.inference.robocasa_vae_protocol import (
     IDENTITY_FIELDS,
     ProtocolError,
@@ -112,7 +113,7 @@ def _secret(value):
     return hashlib.sha256(b"PSM24-owner-control\0" + value).digest()
 
 
-def validate_post_step_receipt(value):
+def validate_post_step_receipt(value, *, action_horizon=ACTION_CHUNK_SIZE):
     """Validate public metadata only; authority additionally requires the Owner ledger."""
     sparse = type(value) is dict and value.get("version") == SPARSE_POST_STEP_VERSION
     value = _exact(value, _POST_FIELDS | ({"history_k", "selected"} if sparse else set()), "post-step receipt")
@@ -124,10 +125,10 @@ def validate_post_step_receipt(value):
         raise ProtocolError("unsupported post-step provenance")
     selected = True
     if sparse:
-        k = validate_history_k(value["history_k"])
+        k = validate_history_k(value["history_k"], action_horizon)
         step = _step(value["source_step"])
-        selected = selected_history_step(step, step // 16 * 16, k)
-        if k == 16 or type(value["selected"]) is not bool or value["selected"] != selected:
+        selected = selected_history_step(step, step // action_horizon * action_horizon, k, action_horizon)
+        if k == action_horizon or type(value["selected"]) is not bool or value["selected"] != selected:
             raise ProtocolError("post-step selection differs from frozen sparse K")
         if not selected and value["source_rgb_sha256"] is not None:
             raise ProtocolError("skipped history must not carry an RGB payload digest")
@@ -310,14 +311,18 @@ class FeatureEvidenceOwner:
         max_sessions=1,
         trust_model=TRUST_MODEL,
         policy_identity=None,
-        history_k=16,
+        history_k=None,
+        action_horizon=ACTION_CHUNK_SIZE,
     ):
         if trust_model != TRUST_MODEL or type(max_sessions) is not int or not 1 <= max_sessions <= 64:
             raise ValueError("explicit bounded Registry same-trust-domain owner required")
         self._control = _secret(owner_token)
         self.clock_ns = clock_ns
         self.max_sessions = max_sessions
-        self.history_k = validate_history_k(history_k)
+        self.action_horizon = validate_history_k(None, action_horizon)
+        if self.action_horizon != ACTION_CHUNK_SIZE:
+            raise ValueError("Feature Owner Action Horizon differs from the frozen Native model protocol")
+        self.history_k = validate_history_k(history_k, self.action_horizon)
         self._workers = {}
         self._revoked_workers = OrderedDict()
         self._sessions = {}
@@ -552,7 +557,7 @@ class FeatureEvidenceOwner:
                 raise ProtocolError("post-step action differs from canonical committed Action")
             receipt = validate_post_step_receipt(
                 {
-                    "version": POST_STEP_VERSION if self.history_k == 16 else SPARSE_POST_STEP_VERSION,
+                    "version": POST_STEP_VERSION if self.history_k == self.action_horizon else SPARSE_POST_STEP_VERSION,
                     "lease": session.lease,
                     "issued_chunk_id": chunk_id,
                     "policy_request_key": request_key,
@@ -569,9 +574,9 @@ class FeatureEvidenceOwner:
                     **(
                         {
                             "history_k": self.history_k,
-                            "selected": selected_history_step(step, chunk.start, self.history_k),
+                            "selected": selected_history_step(step, chunk.start, self.history_k, self.action_horizon),
                         }
-                        if self.history_k != 16
+                        if self.history_k != self.action_horizon
                         else {}
                     ),
                 }
@@ -605,7 +610,7 @@ class FeatureEvidenceOwner:
 
     def admit(self, payload, *, lease, deadline_ns, clock_domain, previous_step):
         """Read-only admission before native READY; no source data can create completion."""
-        if self.history_k != 16:
+        if self.history_k != self.action_horizon:
             if (
                 payload.get("evidence_version") != SPARSE_EVIDENCE_VERSION
                 or payload.get("evidence_format") != SPARSE_EVIDENCE_FORMAT
@@ -622,7 +627,11 @@ class FeatureEvidenceOwner:
         if not 0 <= previous_step <= step or step - previous_step > 16:
             raise ProtocolError("feature history must contain exactly the actual contiguous completed steps")
         steps = tuple(range(previous_step, step))
-        if self.history_k != 16 and steps and (previous_step % 16 or len(steps) != 16):
+        if (
+            self.history_k != self.action_horizon
+            and steps
+            and (previous_step % self.action_horizon or len(steps) != self.action_horizon)
+        ):
             raise ProtocolError("sparse Feature prepare requires one complete H16 Action chunk")
         if len(rows) != len(steps):
             raise ProtocolError("feature history must contain exactly the actual contiguous completed steps")
@@ -657,8 +666,8 @@ class FeatureEvidenceOwner:
                 completed = session.completed.get(source)
                 if completed is None or canonical_json(post) != completed.receipt_json or post["source_step"] != source:
                     raise ProtocolError("public post-step receipt lacks matching authoritative Owner completion")
-                selected = selected_history_step(source, session.chunk.start, self.history_k)
-                if self.history_k != 16 and (
+                selected = selected_history_step(source, session.chunk.start, self.history_k, self.action_horizon)
+                if self.history_k != self.action_horizon and (
                     post.get("history_k") != self.history_k or post.get("selected") != selected
                 ):
                     raise ProtocolError("post-step selection differs from authoritative Owner")
@@ -668,7 +677,7 @@ class FeatureEvidenceOwner:
                     owned_rows.append({"source_step": source, "post_step_receipt": post, "feature": None})
                     continue
                 selected_sources.append(source)
-                if source % 16 == 0:
+                if source % self.action_horizon == 0:
                     if row["feature"] is not None:
                         raise ProtocolError("Policy boundary must not impersonate a Worker Feature")
                     boundary = self._boundary(session, source)

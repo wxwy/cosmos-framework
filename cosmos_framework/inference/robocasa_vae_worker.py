@@ -17,6 +17,7 @@ from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
+from cosmos_framework.evaluation.robocasa_v2.contract import ACTION_CHUNK_SIZE
 from cosmos_framework.inference.robocasa_vae_protocol import (
     IDENTITY_FIELDS,
     MAX_FEATURE_WIRE_BYTES,
@@ -72,12 +73,15 @@ class WorkerConfig:
     max_chunks: int = 4
     max_trace: int = 256
     max_retired_sessions: int = 16
-    history_k: int = 16
+    history_k: int | None = None
+    action_horizon: int = ACTION_CHUNK_SIZE
 
     def __post_init__(self):
         from cosmos_framework.inference.robocasa_vae_protocol import validate_history_k
 
-        validate_history_k(self.history_k)
+        object.__setattr__(self, "history_k", validate_history_k(self.history_k, self.action_horizon))
+        if self.action_horizon != ACTION_CHUNK_SIZE:
+            raise ValueError("Worker Action Horizon differs from the frozen Native model protocol")
         if type(self.bmax) is not int or self.bmax not in (1, 4, 8):
             raise ValueError("VAE batch cap must be 1, 4 or 8")
         if type(self.wait_ms) is not int or self.wait_ms not in (0, 2, 5) or (self.bmax == 1 and self.wait_ms):
@@ -347,8 +351,11 @@ class SharedVAEWorker:
         rgb_digest = _sha256(source_rgb_sha256, "source RGB digest")
         action_digest = _sha256(raw15_sha256, "executed raw15 digest")
         boundary_digest = _sha256(policy_boundary_sha256, "Policy boundary digest")
-        receipt = validate_post_step_receipt(post_step_receipt)
-        if receipt.get("history_k", 16) != self.config.history_k or receipt.get("selected", True) is not True:
+        receipt = validate_post_step_receipt(post_step_receipt, action_horizon=self.config.action_horizon)
+        if (
+            receipt.get("history_k", self.config.action_horizon) != self.config.history_k
+            or receipt.get("selected", True) is not True
+        ):
             raise ValueError("Policy boundary receipt differs from frozen Worker K")
         if (
             receipt["lease"] != lease
@@ -423,10 +430,10 @@ class SharedVAEWorker:
             if skipped_receipt is not None:
                 from cosmos_framework.inference.robocasa_feature_evidence import validate_post_step_receipt
 
-                post = validate_post_step_receipt(skipped_receipt)
+                post = validate_post_step_receipt(skipped_receipt, action_horizon=self.config.action_horizon)
                 source = completed_through - 1
                 if (
-                    self.config.history_k == 16
+                    self.config.history_k == self.config.action_horizon
                     or post.get("history_k") != self.config.history_k
                     or post.get("selected") is not False
                     or post["source_rgb_sha256"] is not None
@@ -459,7 +466,7 @@ class SharedVAEWorker:
 
     def _advance_skips(self, session):
         # A completed skip may arrive before an earlier asynchronous Frame.
-        if self.config.history_k != 16:
+        if self.config.history_k != self.config.action_horizon:
             while session.submitted in session.skipped:
                 session.submitted += 1
             while session.consumed < session.submitted and session.consumed not in session.jobs:
@@ -486,10 +493,11 @@ class SharedVAEWorker:
                     raise ValueError("source identity reused with changed bytes or deadline")
                 return old.key if old is not None else tombstone["job_key"]
             self._open(session)
-            if self.config.history_k != 16:
+            if self.config.history_k != self.config.action_horizon:
                 from cosmos_framework.inference.robocasa_vae_protocol import selected_history_step
 
-                if step % 16 == 0 or not selected_history_step(step, step // 16 * 16, self.config.history_k):
+                h = self.config.action_horizon
+                if step % h == 0 or not selected_history_step(step, step // h * h, self.config.history_k, h):
                     raise ValueError("unselected or Policy-owned boundary cannot enter Worker VAE")
             if step != session.submitted:
                 raise ValueError("stale/evicted or noncontiguous source frontier")
@@ -842,5 +850,9 @@ class SharedVAEWorker:
                 "trace_overflow": self._trace_overflow,
                 "causal_attestation": "owner_mock_control_only",
                 "timing_source": "cpu_monotonic_ns",
-                **({"local_ttt_history_k": self.config.history_k} if self.config.history_k != 16 else {}),
+                **(
+                    {"local_ttt_history_k": self.config.history_k, "action_chunk_size": self.config.action_horizon}
+                    if self.config.history_k != self.config.action_horizon
+                    else {}
+                ),
             }
