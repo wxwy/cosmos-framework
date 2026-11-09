@@ -3730,6 +3730,7 @@ class OmniMoTModel(ImaginaireModel):
         upsample_seed: int | None = None,
         _local_memory_prefixes: tuple[torch.Tensor | None, ...] | None = None,
         use_prefix_text_kv_cache: bool = True,
+        use_prefix_pack_templates: bool = True,
         **kwargs,
     ) -> dict[str, list[torch.Tensor]]:
         """
@@ -3774,7 +3775,11 @@ class OmniMoTModel(ImaginaireModel):
             use_prefix_text_kv_cache (bool): Reuse request-local text K/V with a Local
                 Prefix for eligible B1, two_way, guidance=1 inference. False keeps
                 the original Prefix-on path for controlled same-weight comparisons.
-                Does not change No-TTT, pack-template reuse or model-mode validation.
+                Does not change No-TTT or model-mode validation.
+            use_prefix_pack_templates (bool): Reuse request-local packed metadata
+                for eligible Prefix-aware text-KV requests. Prefix stays fixed
+                within this request; noisy tokens and timesteps refresh every step.
+                False retains the approved text-KV-only path for comparisons.
             upsample_task (str | None): Canonical V4.2 task resolved by the
                 inference caller. ``None`` disables native prompt upsampling.
                 Otherwise, the conditional captions in
@@ -3993,8 +3998,28 @@ class OmniMoTModel(ImaginaireModel):
             _align_device,
         )
 
+        reuse_prefix_text_kv = (
+            has_local_prefixes
+            and use_prefix_text_kv_cache
+            and guidance == 1.0
+            and velocity_postprocess_builder is None
+            and _dp_shard_group is None
+            and _cfgp_group is None
+            and (self.parallel_dims is None or not self.parallel_dims.cfgp_enabled)
+            and self._can_reuse_inference_text_kv(
+                sequence_plans,
+                gen_data_clean,
+                reuse_pack_templates=self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean),
+                has_velocity_postprocess=velocity_postprocess is not None,
+            )
+        )
+        # Prefix is attached before packing and immutable for this generation.
+        # Templates live only in this call; the existing update path refreshes
+        # current noise/timesteps while preserving Prefix, masks and positions.
         reuse_pack_templates = (
-            False if has_local_prefixes else self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
+            reuse_prefix_text_kv and use_prefix_pack_templates
+            if has_local_prefixes
+            else self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
         )
         cond_packed_sequence_template: PackedSequence | None = None
         uncond_packed_sequence_template: PackedSequence | None = None
@@ -4067,22 +4092,6 @@ class OmniMoTModel(ImaginaireModel):
         # process group whose model-forward sequence is at risk). Text-KV
         # eligibility must additionally agree across CFG-parallel peers before
         # either peer installs the request-local attention dispatch.
-        reuse_prefix_text_kv = (
-            has_local_prefixes
-            and use_prefix_text_kv_cache
-            and guidance == 1.0
-            and velocity_postprocess_builder is None
-            and _dp_shard_group is None
-            and _cfgp_group is None
-            and (self.parallel_dims is None or not self.parallel_dims.cfgp_enabled)
-            and self._can_reuse_inference_text_kv(
-                sequence_plans,
-                gen_data_clean,
-                # Eligibility only: Prefix packs are still rebuilt on every step.
-                reuse_pack_templates=self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean),
-                has_velocity_postprocess=velocity_postprocess is not None,
-            )
-        )
         reuse_text_kv = (
             reuse_prefix_text_kv
             if has_local_prefixes

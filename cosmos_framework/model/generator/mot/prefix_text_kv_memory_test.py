@@ -592,7 +592,13 @@ def _generation_harness():
 @pytest.mark.parametrize("setting", ["temporal_causal", "three_way", "postprocess_builder"])
 def test_generation_unsupported_prefix_cache_layout_keeps_original_path(setting):
     obj, batch = _generation_harness()
-    kwargs = dict(guidance=1.0, num_steps=3, seed=[31], _local_memory_prefixes=(torch.randn(4, 32),))
+    kwargs = dict(
+        guidance=1.0,
+        num_steps=3,
+        seed=[31],
+        _local_memory_prefixes=(torch.randn(4, 32),),
+        use_prefix_pack_templates=False,
+    )
     if setting == "temporal_causal":
         obj.config.video_temporal_causal = True
     elif setting == "three_way":
@@ -607,7 +613,13 @@ def test_generation_unsupported_prefix_cache_layout_keeps_original_path(setting)
 def test_generation_entrypoint_same_prefix_actions_cache_hits_and_opt_out():
     obj, batch = _generation_harness()
     prefix = (torch.randn(4, 32),)
-    kwargs = dict(guidance=1.0, num_steps=6, seed=[31], _local_memory_prefixes=prefix)
+    kwargs = dict(
+        guidance=1.0,
+        num_steps=6,
+        seed=[31],
+        _local_memory_prefixes=prefix,
+        use_prefix_pack_templates=False,
+    )
     reference = obj.generate_samples_from_batch(batch, use_prefix_text_kv_cache=False, **kwargs)
     assert obj.seen == [(False, False, False)] * 6 and not obj.created
     obj.seen.clear()
@@ -625,7 +637,13 @@ def test_generation_entrypoint_same_prefix_actions_cache_hits_and_opt_out():
 def test_generation_exception_clears_cache_and_retry_starts_with_fill(fail_at):
     obj, batch = _generation_harness()
     prefix = (torch.randn(4, 32),)
-    kwargs = dict(guidance=1.0, num_steps=6, seed=[31], _local_memory_prefixes=prefix)
+    kwargs = dict(
+        guidance=1.0,
+        num_steps=6,
+        seed=[31],
+        _local_memory_prefixes=prefix,
+        use_prefix_pack_templates=False,
+    )
     obj.fail_at = fail_at
     with pytest.raises(RuntimeError, match="injected generation failure"):
         obj.generate_samples_from_batch(batch, **kwargs)
@@ -641,7 +659,7 @@ def test_generation_exception_clears_cache_and_retry_starts_with_fill(fail_at):
 
 def test_generation_no_prefix_native_path_and_option_are_unchanged():
     obj, batch = _generation_harness()
-    kwargs = dict(guidance=1.0, num_steps=6, seed=[31])
+    kwargs = dict(guidance=1.0, num_steps=6, seed=[31], use_prefix_pack_templates=False)
     reference = obj.generate_samples_from_batch(batch, use_prefix_text_kv_cache=False, **kwargs)
     assert obj.seen == [(True, False, True)] + [(True, True, True)] * 5
     obj.seen.clear()
@@ -653,7 +671,7 @@ def test_generation_no_prefix_native_path_and_option_are_unchanged():
 def test_generation_requests_changed_instruction_prefix_and_reset_are_isolated():
     obj, batch = _generation_harness()
     prefix = torch.randn(4, 32)
-    kwargs = dict(guidance=1.0, num_steps=6, seed=[31])
+    kwargs = dict(guidance=1.0, num_steps=6, seed=[31], use_prefix_pack_templates=False)
 
     def request(p):
         obj.seen.clear()
