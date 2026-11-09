@@ -4,11 +4,12 @@
 """Request-local text K/V reuse for diffusion inference (cosmos3-local).
 
 Caches understanding (text) K/V from the first denoising forward and reuses
-them on later steps within the same request. Intentionally self-contained in
-``cosmos3`` — does not import ``cosmos_framework.data.generator.sequence_packing``.
+them on later steps within the same request.
 
 Supports single-sample packs (dense attention) and multi-sample packs such as
 batched CFG (cond+uncond as B=2) via varlen attention with per-sample isolation.
+Prefix-aware B1 keeps native varlen attention; the current request's Local
+Prefix K/V is projected and supplied separately on every decoder forward.
 """
 
 from __future__ import annotations
@@ -47,6 +48,10 @@ class UndKVCache:
             raise AssertionError("UndKVCache not initialized — must call store() first")
         return self.k_und, self.v_und
 
+    def clear(self) -> None:
+        self.k_und = self.v_und = None
+        self.is_initialized = False
+
 
 @dataclass
 class InferenceTextKVMemoryValue(MemoryValue):
@@ -64,13 +69,17 @@ class InferenceTextKVMemoryValue(MemoryValue):
     max_seqlen_q: int = 0
     max_seqlen_kv: int = 0
     for_cuda_graphs: bool = False
+    local_prefix_length: int = 0
 
 
 class InferenceTextKVMemoryState(MemoryState):
     """Request-local memory state that reuses static text K/V during diffusion inference."""
 
-    def __init__(self, text_kv_cache: list[UndKVCache]) -> None:
+    def __init__(self, text_kv_cache: list[UndKVCache], *, local_prefix_length: int = 0) -> None:
+        if type(local_prefix_length) is not int or local_prefix_length < 0:
+            raise ValueError("local_prefix_length must be a nonnegative integer")
         self._text_kv_cache = text_kv_cache
+        self.local_prefix_length = local_prefix_length
         self._gen_len = 0
         self._kv_reorder_indices: torch.Tensor | None = None
         self._cumulative_seqlen_q: torch.Tensor | None = None
@@ -79,7 +88,6 @@ class InferenceTextKVMemoryState(MemoryState):
         self._max_seqlen_kv = 0
 
     def init(self, hidden_states: dict, device: torch.device) -> None:
-        del device
         self._gen_len = int(hidden_states["_num_full_tokens"])
         # Precompute the multi-sample layout outside the compiled decoder layers.
         # Doing this here avoids converting CUDA offsets to Python lists and
@@ -97,6 +105,17 @@ class InferenceTextKVMemoryState(MemoryState):
             gen_off = drop_pad_segment(hidden_states, gen_off)
         if isinstance(und_off, torch.Tensor) and isinstance(gen_off, torch.Tensor) and und_off.shape != gen_off.shape:
             raise RuntimeError(f"und/gen sample counts disagree: und={und_off.numel() - 1} gen={gen_off.numel() - 1}")
+        if self.local_prefix_length:
+            if und_off is None or gen_off is None or und_off.numel() != 2 or gen_off.numel() != 2:
+                raise ValueError("Prefix-aware text K/V requires a single native sample")
+            # Keep the Prefix path on varlen attention, just like its uncached
+            # reference. Only real query/KV rows participate; padding owns no Prefix.
+            self._cumulative_seqlen_q = torch.tensor([0, self._gen_len], dtype=torch.int32, device=device)
+            kv_len = self.local_prefix_length + int(hidden_states["_num_causal_tokens"]) + self._gen_len
+            self._cumulative_seqlen_kv = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
+            self._max_seqlen_q = self._gen_len
+            self._max_seqlen_kv = kv_len
+            return
         if isinstance(und_off, torch.Tensor) and isinstance(gen_off, torch.Tensor) and und_off.numel() > 2:
             und_off = und_off.to(dtype=torch.int32)
             gen_off = gen_off.to(dtype=torch.int32)
@@ -142,6 +161,7 @@ class InferenceTextKVMemoryState(MemoryState):
             max_seqlen_q=self._max_seqlen_q,
             max_seqlen_kv=self._max_seqlen_kv,
             for_cuda_graphs=False,
+            local_prefix_length=self.local_prefix_length,
         )
 
     def write_for_layer(self, layer_idx: int, kv_to_store: KVToStore) -> None:
@@ -261,12 +281,48 @@ def dispatch_attention_with_text_kv_memory(
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
     packed_key_states_normalized: SequencePack | None = None,
+    memory_prefix_key_states: torch.Tensor | None = None,
+    memory_prefix_value_states: torch.Tensor | None = None,
+    memory_prefix_sample_offsets: torch.Tensor | None = None,
+    memory_prefix_max_len: int = 4,
 ) -> tuple[SequencePack, KVToStore | None]:
     """Dispatch attention with optional request-local text K/V reuse.
 
     Falls through to standard ``dispatch_attention`` when ``memory_value`` is
     ``None`` or still on the first (cache-fill) step.
     """
+    has_prefix = memory_prefix_key_states is not None
+    prefix_aware = isinstance(memory_value, InferenceTextKVMemoryValue) and memory_value.local_prefix_length > 0
+    if prefix_aware != has_prefix:
+        raise ValueError("Prefix-aware text K/V requires the current request's Prefix on every step")
+    if prefix_aware:
+        if (
+            torch.is_grad_enabled()
+            or natten_metadata is not None
+            or attention_mask.is_three_way
+            or attention_mask.control_stream_token_ranges is not None
+            or getattr(attention_mask, "flex_block_mask", None) is not None
+            or getattr(attention_mask, "multiview_maskless", None) is not None
+        ):
+            raise ValueError("Prefix-aware text K/V supports only native two_way inference")
+        if (
+            memory_prefix_value_states is None
+            or memory_prefix_sample_offsets is None
+            or memory_prefix_sample_offsets.numel() != 2
+            or memory_prefix_key_states.shape != memory_prefix_value_states.shape
+            or memory_prefix_key_states.shape[0] != memory_value.local_prefix_length
+            or memory_prefix_max_len != memory_value.local_prefix_length
+        ):
+            raise ValueError("Prefix-aware text K/V requires one complete native Prefix")
+        if memory_value.frame_idx > 0:
+            return _attention_gen_with_cached_text_and_prefix(
+                packed_query_states,
+                packed_key_states,
+                packed_value_states,
+                memory_value,
+                memory_prefix_key_states,
+                memory_prefix_value_states,
+            )
     if isinstance(memory_value, InferenceTextKVMemoryValue) and memory_value.frame_idx > 0:
         return _attention_gen_with_cached_text(
             packed_query_states,
@@ -282,7 +338,48 @@ def dispatch_attention_with_text_kv_memory(
         natten_metadata=natten_metadata,
         memory_value=None,
         packed_key_states_normalized=packed_key_states_normalized,
+        memory_prefix_key_states=memory_prefix_key_states,
+        memory_prefix_value_states=memory_prefix_value_states,
+        memory_prefix_sample_offsets=memory_prefix_sample_offsets,
+        memory_prefix_max_len=memory_prefix_max_len,
     )
+
+
+def _attention_gen_with_cached_text_and_prefix(
+    query: SequencePack,
+    key: SequencePack,
+    value: SequencePack,
+    memory_value: InferenceTextKVMemoryValue,
+    prefix_key: torch.Tensor,
+    prefix_value: torch.Tensor,
+) -> tuple[SequencePack, None]:
+    """B1 GEN queries see [current Prefix | cached UND | current GEN].
+
+    UND never attends to Prefix or GEN, so its per-layer K/V is static.
+    Prefix K/V is projected by the current decoder layer on EVERY forward,
+    including gen-only forwards; it is neither cached nor read from a Session.
+    """
+    und_key, und_value = memory_value.und_k_cached, memory_value.und_v_cached
+    if und_key is None or und_value is None:
+        raise ValueError("Prefix-aware generation requires initialized text K/V")
+    gen_len = memory_value.gen_len
+    q_gen = get_gen_seq(query)
+    k_full = torch.cat((prefix_key.unsqueeze(0), und_key, get_gen_seq(key)[:gen_len].unsqueeze(0)), dim=1)
+    v_full = torch.cat((prefix_value.unsqueeze(0), und_value, get_gen_seq(value)[:gen_len].unsqueeze(0)), dim=1)
+    result = attention(
+        query=q_gen[:gen_len].unsqueeze(0),
+        key=k_full,
+        value=v_full,
+        is_causal=False,
+        return_lse=False,
+        cumulative_seqlen_Q=memory_value.cumulative_seqlen_q,
+        cumulative_seqlen_KV=memory_value.cumulative_seqlen_kv,
+        max_seqlen_Q=memory_value.max_seqlen_q,
+        max_seqlen_KV=memory_value.max_seqlen_kv,
+    )
+    gen_out = q_gen.new_zeros(q_gen.shape[0], q_gen.shape[1] * q_gen.shape[2])
+    gen_out[:gen_len] = result.squeeze(0).flatten(-2, -1)
+    return from_und_gen_splits(gen_out.new_empty(0, gen_out.shape[-1]), gen_out, query), None
 
 
 def install_inference_memory_attention_dispatch(

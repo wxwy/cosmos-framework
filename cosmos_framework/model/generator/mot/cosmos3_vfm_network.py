@@ -39,6 +39,7 @@ from cosmos_framework.model.generator.mot.flex_attention import (
     SensorMaskItem,
     build_multiview_block_mask,
 )
+from cosmos_framework.model.generator.mot.inference_text_kv_memory import InferenceTextKVMemoryState
 from cosmos_framework.model.generator.mot.local_evidence import ContinualTTTFastState
 from cosmos_framework.model.generator.mot.memory_prefix import LocalMemoryRuntime, build_memory_prefix_context
 from cosmos_framework.model.generator.mot.modeling_utils import TimestepEmbedder, has_noisy_tokens
@@ -1574,8 +1575,18 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         local_tokens = packed_seq.local_memory_tokens
         has_local_tokens = local_tokens is not None and any(token is not None for token in local_tokens)
         if has_local_tokens:
-            if not self.config.local_memory_enabled or memory is not None:
+            if not self.config.local_memory_enabled:
                 raise ValueError("Local Memory requires enabled model and no inference text-KV memory")
+            if memory is not None and not (
+                isinstance(memory, InferenceTextKVMemoryState)
+                and memory.local_prefix_length == self.config.local_memory_k_local
+                and len(local_tokens) == 1
+                and self.config.joint_attn_implementation == "two_way"
+                and not torch.is_grad_enabled()
+            ):
+                raise ValueError(
+                    "Local Memory requires enabled model and no inference text-KV memory except Prefix-aware B1"
+                )
             if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
                 raise ValueError("Local Memory does not support context parallelism")
             if self.pad_for_cuda_graphs or self.flex_backend is not None or self.multiview_backend is not None:

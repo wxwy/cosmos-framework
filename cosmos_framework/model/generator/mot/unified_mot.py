@@ -1509,6 +1509,7 @@ class MoTDecoderLayer(nn.Module):
                 gen_position_embeddings,
                 natten_metadata=natten_metadata,
                 memory_value=memory_value,
+                **({"memory_prefix_context": normalized_memory_prefix} if normalized_memory_prefix is not None else {}),
             )
             gen_attn_out = get_gen_seq(pack_attn_out)
             # No residual_und here: the gen_only MLP branch below builds its own
