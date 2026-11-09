@@ -39,11 +39,13 @@ import importlib.util
 import json
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
+from cosmos_framework.inference.robocasa_feature_trace import get_trace
 from cosmos_framework.inference.robocasa_local_memory_contract import validate_local_memory_eval_contract
 from cosmos_framework.simulation.robocasa.eval_utils import (
     canonicalize_raw15_for_env,
@@ -274,8 +276,21 @@ def run_policy(
     on_frame: Callable | None = None,
     language_instruction: str | None = None,
     http_client=None,
+    trace=None,
 ) -> tuple[bool, int, str]:
+    shared_vae = getattr(local_memory_client, "uses_shared_vae", False) is True
+    if shared_vae and (action_horizon != 16 or not use_state or not USE_BASE_ACTION or BASE_ENCODING != "raw"):
+        raise ValueError("shared VAE C requires H16/state15/mobile canonical raw15")
     rollout_error: BaseException | None = None
+    trace = trace if trace is not None else get_trace()
+    if trace is not None:
+        trace.event("measurement_coverage", egl_separate="unavailable", env_step_includes_render=True)
+        if shared_vae:
+            local_memory_client.attach_trace(trace)
+
+    def measured(name, **fields):
+        return nullcontext() if trace is None else trace.span(name, **fields)
+
     frames, generated = [], []
     mode = generated_video_mode or ("all" if gen_video_path is not None else "none")
     if mode not in {"none", "first", "all"} or (mode != "none" and gen_video_path is None):
@@ -305,7 +320,10 @@ def run_policy(
 
     try:
         observe("environment_initialization")
-        obs = env.reset() if initial_observation is None else initial_observation
+        with measured("initial_observation", stratum="load"):
+            obs = env.reset() if initial_observation is None else initial_observation
+        observation_ready_ns = trace.now_ns() if trace is not None else None
+        last_step_end_ns = None
         if local_memory_client is not None:
             local_memory_client.begin(0, image_size=image_size)
         if language_instruction is not None:
@@ -328,21 +346,41 @@ def run_policy(
         observe("executing")
         for step in range(max_steps):
             if not queue:
-                comp = compose(obs)
-                state_token = build_state_token(obs) if use_state else None
-                local_payload = local_memory_client.payload(0) if local_memory_client is not None else None
+                replan_started_ns = observation_ready_ns if replans == 0 else last_step_end_ns
+                stratum = "first_no_history" if replans == 0 else "steady_full16"
+                if shared_vae:
+                    local_memory_client.start_replan(0, time.monotonic_ns())
+                with measured("observation_preprocess", source_step=step, stratum=stratum):
+                    comp = compose(obs)
+                    state_token = build_state_token(obs) if use_state else None
+                with measured("boundary_history_drain", source_step=step, stratum=stratum):
+                    local_payload = local_memory_client.payload(0) if local_memory_client is not None else None
                 observe("predicting")
                 prediction_t0 = time.monotonic()
-                result = predict(
-                    server_url,
-                    comp,
-                    prompt,
-                    image_size,
-                    timeout,
-                    state=state_token,
-                    local_memory=local_payload,
-                    **({"http_session": http_client} if http_client is not None else {}),
-                )
+                with measured("policy_http", source_step=step, stratum=stratum):
+                    result = predict(
+                        server_url,
+                        comp,
+                        prompt,
+                        image_size,
+                        timeout,
+                        state=state_token,
+                        local_memory=local_payload,
+                        **({"http_session": http_client} if http_client is not None else {}),
+                    )
+                if trace is not None:
+                    raw_trace = result.get("timing", {}).get("raw_trace")
+                    if raw_trace is None:
+                        trace.mark_incomplete("policy_trace_unavailable")
+                    else:
+                        try:
+                            with measured("policy_trace_ingest", source_step=step, stratum=stratum):
+                                trace.merge(
+                                    "policy", raw_trace, clock_domain=raw_trace.get("clock_domain"), deduplicate=False
+                                )
+                        except Exception as error:
+                            trace.mark_incomplete("policy_trace_ingest_failed")
+                            trace.event("policy_trace_error", error_type=type(error).__name__)
                 prediction_ms = (time.monotonic() - prediction_t0) * 1000.0
                 progress_predictions += 1
                 progress_latency = prediction_ms
@@ -353,7 +391,8 @@ def run_policy(
                     status = result.get("local_memory")
                     if not isinstance(status, dict):
                         raise RuntimeError("required Local-TTT server response is missing local_memory status")
-                    local_memory_client.acknowledge(0, status)
+                    with measured("local_ack", source_step=step, stratum=stratum):
+                        local_memory_client.acknowledge(0, status)
                 if mode == "all" or (mode == "first" and replans == 0):
                     observe("video_saving")
                     if not result.get("video"):
@@ -382,8 +421,18 @@ def run_policy(
                 replans += 1
                 acts = result["action"]
                 queue = acts[:action_horizon] if action_horizon > 0 else list(acts)
+                if trace is not None:
+                    trace.record(
+                        "first_action" if replans == 1 else "replan",
+                        replan_started_ns,
+                        trace.now_ns(),
+                        source_step=step,
+                        stratum=stratum,
+                        definition="boundary_to_executable_action_chunk",
+                    )
 
             a = np.asarray(queue.pop(0))
+            action_prepare_ns = trace.now_ns() if trace is not None else None
             pre_composite = compose(obs).astype(np.uint8) if local_memory_client is not None else None
             if USE_BASE_ACTION:
                 want = _ACTION_DIM_BY_ENCODING[BASE_ENCODING]
@@ -404,7 +453,41 @@ def run_policy(
                     )
                 env_action = decode_10d_to_env12(a, False)
 
-            obs, reward, env_done, info = env.step(env_action)
+            prepared_step = None
+            if shared_vae:
+                prepared_step = local_memory_client.prepare_step(0, step, pre_composite, canonical_raw15)
+            if trace is not None:
+                trace.record(
+                    "action_preprocess_copy",
+                    action_prepare_ns,
+                    trace.now_ns(),
+                    source_step=step,
+                    stratum="chunk_middle",
+                )
+            with measured("sim_step", source_step=step, stratum="chunk_middle", egl_separate="unavailable"):
+                if prepared_step is None:
+                    obs, reward, env_done, info = env.step(env_action)
+                    step_completed_ns = time.monotonic_ns() if trace is not None else None
+                else:
+                    try:
+                        obs, reward, env_done, info = env.step(env_action)
+                        step_completed_ns = time.monotonic_ns()
+                    except BaseException as error:
+                        local_memory_client.abort_step(0, prepared_step, error)
+                        raise
+            if trace is not None:
+                last_step_end_ns = step_completed_ns
+                trace.record(
+                    "step_cycle",
+                    observation_ready_ns,
+                    step_completed_ns,
+                    source_step=step,
+                    stratum="chunk_middle",
+                    definition="observation_ready_to_env_step_return",
+                )
+                observation_ready_ns = step_completed_ns
+            if prepared_step is not None:
+                local_memory_client.complete_step(0, prepared_step, step_completed_ns)
             progress_steps = step + 1
             if on_action is not None:
                 on_action(
@@ -423,7 +506,9 @@ def run_policy(
                 )
             if local_memory_client is not None:
                 assert pre_composite is not None
-                local_memory_client.record_completed(0, pre_composite, canonical_raw15)
+                if prepared_step is None:
+                    with measured("history_capture_png", source_step=step, stratum="chunk_middle"):
+                        local_memory_client.record_completed(0, pre_composite, canonical_raw15)
             if save_video is not None:
                 frames.append(compose(obs).astype(np.uint8))
             if on_frame is not None:
@@ -460,7 +545,8 @@ def run_policy(
             if local_memory_client is not None:
                 observe("local_cleanup")
             if local_memory_client is not None:
-                session_id = local_memory_client.end(0)
+                with measured("end", stratum="cleanup"):
+                    session_id = local_memory_client.end(0)
                 if session_id is not None:
                     reset_local_memory(
                         server_url,

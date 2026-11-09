@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:psm:issue23:stage0:feature-envelope:v1",
+  "title": "PROPOSED Stage0 signed Worker feature envelope; no implemented API",
+  "description": "Semantic validation must additionally verify MAC, digests, float finiteness, issuer/lease/frontier, loaded VAE attestation, absolute deadlines and exact retry identity. Keys are never serialized here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["header", "raw15_f32le_b64", "visual96_f32le_b64", "mac_hex"],
+  "properties": {
+    "header": {"$ref": "#/$defs/header"},
+    "raw15_f32le_b64": {"type": "string", "minLength": 80, "maxLength": 80, "pattern": "^[A-Za-z0-9+/]+$", "description": "Exactly 60 decoded bytes; 15 finite little-endian float32 executed actions."},
+    "visual96_f32le_b64": {"type": "string", "minLength": 512, "maxLength": 512, "pattern": "^[A-Za-z0-9+/]+$", "description": "Exactly 384 decoded bytes; 96 finite little-endian float32 values."},
+    "mac_hex": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "ns": {"type": "string", "pattern": "^[0-9]{1,20}$", "description": "Unsigned monotonic nanoseconds in attested shared host clock domain, decimal string to avoid JSON float loss."},
+    "header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "key_id", "worker_id", "worker_epoch", "policy_epoch", "lease", "issued_chunk_id", "policy_request_key", "source_step", "source_rgb_sha256", "source_rgb_contract", "rgb_shape", "rgb_layout", "raw15_sha256", "visual96_sha256", "vae_weights_sha256", "vae_config_sha256", "preprocess_profile_sha256", "visual96_contract_sha256", "encoder_backend", "encoder_dtype", "clock_domain", "episode_deadline_ns", "job_deadline_ns", "replan_deadline_ns"],
+      "properties": {
+        "version": {"const": "PSM23-VIS96-v1"},
+        "key_id": {"$ref": "#/$defs/id"},
+        "worker_id": {"$ref": "#/$defs/id"},
+        "worker_epoch": {"$ref": "#/$defs/id"},
+        "policy_epoch": {"$ref": "#/$defs/id"},
+        "lease": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["server_epoch", "run_lease", "manifest_digest", "slot_id", "generation", "task", "episode_index", "attempt_id", "episode_id", "session_id"],
+          "properties": {
+            "server_epoch": {"$ref": "#/$defs/id", "description": "Must equal outer header.policy_epoch and the authoritative SessionLease.server_epoch."},
+            "run_lease": {"$ref": "#/$defs/id"},
+            "manifest_digest": {"$ref": "#/$defs/sha256"},
+            "slot_id": {"$ref": "#/$defs/id"},
+            "generation": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+            "task": {"$ref": "#/$defs/id"},
+            "episode_index": {"type": "integer", "minimum": 0},
+            "attempt_id": {"$ref": "#/$defs/id"},
+            "episode_id": {"$ref": "#/$defs/id"},
+            "session_id": {"$ref": "#/$defs/id"}
+          }
+        },
+        "issued_chunk_id": {"$ref": "#/$defs/id"},
+        "policy_request_key": {"$ref": "#/$defs/id"},
+        "source_step": {"type": "integer", "minimum": 0},
+        "source_rgb_sha256": {"$ref": "#/$defs/sha256"},
+        "source_rgb_contract": {"const": "PSM23-RGB-v1_HWC_UINT8_RGB", "description": "SHA256(domain ASCII plus NUL, three u32be H/W/C, immutable C-order HWC RGB bytes); Policy boundary and Worker use this exact domain before resizing, normalization or padding."},
+        "rgb_shape": {"type": "array", "prefixItems": [{"const": 256}, {"const": 512}, {"const": 3}], "minItems": 3, "maxItems": 3},
+        "rgb_layout": {"const": "HWC_UINT8_RGB"},
+        "raw15_sha256": {"$ref": "#/$defs/sha256"},
+        "visual96_sha256": {"$ref": "#/$defs/sha256"},
+        "vae_weights_sha256": {"$ref": "#/$defs/sha256"},
+        "vae_config_sha256": {"$ref": "#/$defs/sha256", "description": "Includes latent normalization/scale and actual loaded encoder configuration."},
+        "preprocess_profile_sha256": {"$ref": "#/$defs/sha256"},
+        "visual96_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "encoder_backend": {"enum": ["eager", "aot_b1"]},
+        "encoder_dtype": {"const": "bfloat16"},
+        "clock_domain": {"$ref": "#/$defs/id"},
+        "episode_deadline_ns": {"$ref": "#/$defs/ns"},
+        "job_deadline_ns": {"$ref": "#/$defs/ns"},
+        "replan_deadline_ns": {"oneOf": [{"$ref": "#/$defs/ns"}, {"type": "null"}], "description": "Null for a background job preceding the next Replan; a later tightened budget is checked without re-signing or extending the original immutable receipt."}
+      }
+    }
+  }
+}

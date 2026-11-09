@@ -1,0 +1,44 @@
+{
+  "spec_version": "issue23.stage0.v1",
+  "profile": "single_latency",
+  "priority": "P0",
+  "execution_ready": false,
+  "runnable_config": false,
+  "result": "NOT_RUN",
+  "topology": {"policy_servers": 1, "sims": 1, "policy_bmax": 1, "policy_intentional_peer_wait_ms": 0, "report_separately": ["same_gpu", "split_gpu"]},
+  "invariants": {"horizon": 16, "raw_action_dim": 15, "state_dim": 15, "data_fps": 20, "wallclock_20hz_claim": false, "resume_mb_strict": true},
+  "pre_run_required_unset": {
+    "no_ttt_checkpoint_N_digest": null,
+    "local_checkpoint_L_digest": null,
+    "actual_vae_weights_and_config_digest": null,
+    "source_formal_pair": null,
+    "gpu_uuid_mapping": null,
+    "task_seed_initial_state_manifest": null,
+    "precision_sampler_num_steps": null,
+    "backend_per_arm": null,
+    "warmup_and_sample_count": null,
+    "numerical_tolerance_review": null,
+    "latency_noninferiority_margin_ms": null,
+    "minimum_meaningful_sr_delta_pp": null,
+    "owner_hardware_gate": null
+  },
+  "arms": [
+    {"id": "A", "checkpoint_ref": "N", "memory": "off", "history_path": "none", "history_workers": 0, "history_encodes_per_full_chunk": 0, "fast_weight": "none", "prefix": false},
+    {"id": "B", "checkpoint_ref": "L", "memory": "required", "history_path": "server_vae_official_baseline", "history_workers": 0, "history_encodes_per_full_chunk": 16, "fast_weight": "T16_original", "prefix": true, "pr4_baseline": false},
+    {"id": "C", "checkpoint_ref": "L", "same_inference_config_as": "B", "memory": "required", "history_path": "sim_shared_vae", "history_workers": 1, "vae_bmax": 1, "vae_wait_ms": 0, "history_encodes_per_full_chunk": 15, "policy_owned_boundary_features": 1, "fast_weight": "16xT1_causal", "prefix": true, "same_gpu_additional_vae_copy": true}
+  ],
+  "optional_D": {"status": "UNSUPPORTED_NOT_RUN", "checkpoint_ref": "L", "label": "mechanism_ablation_not_native_no_ttt", "independent_legal_mode_review_required": true},
+  "execution_design": {"sequential_exclusive_arms": true, "balanced_randomized_arm_order": true, "fixed_input_and_real_closed_loop_separate": true, "reuse_same_reset_initial_state": true, "strata": ["cold_process", "first_no_history", "steady_full16", "partial_terminal"], "no_multi_scheduler_requirement": true},
+  "timing": {
+    "trace_schema": "../trace.schema.json",
+    "raw_ns_required": true,
+    "statistics": ["count", "p50", "p95", "p99", "mean", "95pct_ci"],
+    "phases": ["sim_step", "egl_render", "observation_preprocess", "history_capture_png", "enqueue_copy", "vae_ready_queue", "history_vae", "feature_ipc_verify", "executor_wait", "ttt_queue", "fast_weight_update", "prefix_prepare", "prefix_inject", "current_frame_vae", "policy_ready_queue", "policy_prepare", "policy_generation", "response_decode", "ack_commit", "end", "boundary_history_drain", "first_action", "replan", "step_cycle"],
+    "foreground_vs_background_separate": true,
+    "overlapping_durations_not_additive": true,
+    "gpu_events_resolved_without_per_op_global_sync": true,
+    "budget_frozen_before_payload_wait": true
+  },
+  "sr": {"underlying_tasks": 18, "smoke_episodes_per_task": 2, "smoke_proves_sr_gain": false, "larger_example_episodes_per_task": 50, "larger_requires_separate_owner_gate": true, "matched": ["task", "seed", "initial_state_digest", "instruction", "max_steps"], "outcomes": ["00", "01", "10", "11"], "ci": "task_stratified_paired_episode_cluster_bootstrap", "invalid_blocks_clean_gate": true},
+  "report": ["B-A_and_C-A_system_costs_checkpoint_confounding", "C-B_same_weight_engineering_delta", "delta_first_action", "delta_replan_quantiles_and_paired_deltas", "delta_critical_path", "incremental_latency_per_executed_step", "delta_peak_memory_utilization", "per_task_overall_sr_delta_pp_ci", "joint_cost_benefit_uncertainty", "no_ratio_if_latency_near_zero", "no_hardware_extrapolation"]
+}

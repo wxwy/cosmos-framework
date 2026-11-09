@@ -25,6 +25,7 @@ STREAMING_RESOURCE_FIELDS = frozenset(
         "initialization_concurrency",
     )
 )
+VAE_RESOURCE_FIELDS = STREAMING_RESOURCE_FIELDS | {"vae_startup_rss_bytes", "vae_startup_gpu_bytes"}
 RESUME = "retry_missing_episode_no_scene_reproduction_v2"
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -59,6 +60,66 @@ def validate_streaming_resources(value):
         )
     if any(value[k] > value["max_owned_gpu_bytes"] for k in ("server_startup_gpu_bytes", "sim_startup_gpu_bytes")):
         raise ValueError("startup GPU reservation exceeds owned GPU budget")
+    return value
+
+
+def validate_single_latency(value, *, local_memory):
+    """New opt-in identity only; historical execution dictionaries stay exact."""
+    if type(value) is not dict or set(value) != {"version", "arm", "history_source", "worker"}:
+        raise ValueError("exact single-latency experiment identity required")
+    if value["version"] != "stage3a_single_v1" or value["arm"] not in ("A", "B", "C"):
+        raise ValueError("explicit Stage3A A/B/C arm required")
+    if local_memory != ("off" if value["arm"] == "A" else "required"):
+        raise ValueError("single-latency arm differs from Local-TTT mode")
+    if value["arm"] != "C":
+        if value["history_source"] != "server_vae" or value["worker"] is not None:
+            raise ValueError("A/B must not create a historical VAE Worker")
+        return value
+    worker = value["worker"]
+    fields = {
+        "vae_weights",
+        "vae_weights_sha256",
+        "vae_config",
+        "vae_config_sha256",
+        "egl_vendor_json",
+        "egl_vendor_sha256",
+        "bmax",
+        "wait_ms",
+        "trust_model",
+        "resources",
+        "max_rss_bytes",
+    }
+    if value["history_source"] != "sim_shared_vae" or type(worker) is not dict or set(worker) != fields:
+        raise ValueError("complete Stage3A Worker identity required")
+    if (
+        worker["bmax"] != 1
+        or type(worker["bmax"]) is not int
+        or worker["wait_ms"] != 0
+        or type(worker["wait_ms"]) is not int
+    ):
+        raise ValueError("B4/B8 feature Action Path is disabled; require B1/wait0")
+    if worker["trust_model"] != "registry_same_trust_domain":
+        raise ValueError("explicit controlled Actor/Owner trust domain required")
+    for name in ("vae_weights", "vae_config", "egl_vendor_json"):
+        if type(worker[name]) is not str or not worker[name].startswith("/") or "\0" in worker[name]:
+            raise ValueError("absolute frozen Worker input paths required")
+    for name in ("vae_weights_sha256", "vae_config_sha256", "egl_vendor_sha256"):
+        if type(worker[name]) is not str or not _SHA.fullmatch(worker[name]):
+            raise ValueError("frozen Worker input SHA256 required")
+    budget = worker["resources"]
+    if type(budget) is not dict or set(budget) != VAE_RESOURCE_FIELDS:
+        raise ValueError("complete Worker/Server/Sim startup resources required")
+    validate_streaming_resources({key: budget[key] for key in STREAMING_RESOURCE_FIELDS})
+    for name in ("vae_startup_rss_bytes", "vae_startup_gpu_bytes"):
+        integer(budget[name], 1, 2**63 - 1, name)
+    if budget["vae_startup_gpu_bytes"] > budget["max_owned_gpu_bytes"]:
+        raise ValueError("Worker GPU reservation exceeds owned GPU budget")
+    integer(worker["max_rss_bytes"], 1, 2**63 - 1, "Worker owned RSS budget")
+    if any(
+        budget[name] > worker["max_rss_bytes"]
+        for name in ("sim_startup_rss_bytes", "server_startup_rss_bytes", "vae_startup_rss_bytes")
+    ):
+        raise ValueError("startup RSS reservation exceeds owned RSS budget")
     return value
 
 
@@ -139,6 +200,10 @@ def build_manifest(
     if execution is not None:
         is_streaming = isinstance(execution, dict) and execution.get("scheduling") == STREAMING_SCHEDULE
         extra = {"scheduling", "resources", "max_rss_bytes"} if is_streaming else set()
+        single = execution.get("single_latency") if isinstance(execution, dict) else None
+        if single is not None:
+            validate_single_latency(single, local_memory=local_memory)
+            extra |= {"single_latency"}
         if (
             not isinstance(execution, dict)
             or set(execution)
@@ -149,7 +214,16 @@ def build_manifest(
             raise ValueError("exact native batch execution identity required")
         integer(execution["sims_per_gpu"], 1, 32 if is_streaming else 8, "M")
         integer(execution["max_infer_batch_size"], 1, 32 if is_streaming else 8, "B")
-        integer(execution["batch_wait_ms"], 1, 1000, "batch_wait_ms")
+        integer(execution["batch_wait_ms"], 0 if single and single["arm"] == "C" else 1, 1000, "batch_wait_ms")
+        if single and (
+            execution["sims_per_gpu"] != 1
+            or execution["max_infer_batch_size"] != 1
+            or type(execution["gpu_ids"]) is not list
+            or len(execution["gpu_ids"]) != 1
+        ):
+            raise ValueError("single-latency experiment requires exactly one Server and one Sim")
+        if single and single["arm"] == "C" and execution["batch_wait_ms"] != 0:
+            raise ValueError("Stage3A C requires zero Policy peer wait")
         gpus = execution["gpu_ids"]
         if (
             not isinstance(gpus, list)

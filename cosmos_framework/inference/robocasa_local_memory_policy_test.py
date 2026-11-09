@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -213,3 +214,199 @@ def test_corrected_active_modules_do_not_import_historical_b1() -> None:
         imports = [node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
         imports += [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names]
         assert not any(any(name in imported for name in forbidden) for imported in imports if imported), module
+
+
+def _feature_adapter(*, max_sessions=1):
+    from cosmos_framework.inference.robocasa_feature_evidence_test import EvidenceHarness
+
+    harness = EvidenceHarness(bind_lookup=False, max_sessions=max_sessions)
+    model = _Model()
+
+    def no_history_decode(_):
+        raise AssertionError("C history must use verified feature bytes without PNG decode or Encode1")
+
+    adapter = policy.RoboCasaLocalMemoryPolicyAdapter(
+        SimpleNamespace(model=model),
+        mode="required",
+        decode_image=no_history_decode,
+        feature_evidence_owner=harness.owner,
+        max_sessions=max_sessions,
+    )
+    return harness, adapter, model
+
+
+def _feature_request(harness, step, rows):
+    payload = harness.payload(rows, consumer_step=step)
+    payload["preprocess_profile"] = PREPROCESS_PROFILE
+    return {"image_size": 256, "local_memory": payload}
+
+
+def _prepare_feature(adapter, harness, step, rows):
+    from cosmos_framework.inference.robocasa_feature_evidence_test import CLOCK
+
+    return adapter.prepare(
+        _feature_request(harness, step, rows),
+        lease=harness.lease,
+        deadline_ns=9000,
+        clock_domain=CLOCK,
+        request_key=f"request-{step}",
+    )
+
+
+def _commit_feature_cold(adapter, harness):
+    from cosmos_framework.inference.local_memory_state import CachedMemoryResponse
+    from cosmos_framework.inference.robocasa_vae_protocol import canonical_json
+
+    update = _prepare_feature(adapter, harness, 0, [])
+    assert adapter.committed_boundary(harness.lease["session_id"], 0) is None
+    adapter.stage_boundary(update, harness.boundary())
+    private_status = adapter.status(update)
+    assert private_status["committed_boundary"] == harness.boundary().record()
+    assert adapter.committed_boundary(harness.lease["session_id"], 0) is None
+    response = CachedMemoryResponse("request-0", "f" * 64, canonical_json({"local_memory": private_status}))
+    adapter.commit(update, response)
+    harness.commit_chunk()
+    return response
+
+
+def test_feature_boundary_response_fast_state_publish_once_and_exact_replay():
+    from cosmos_framework.inference.local_memory_state import CachedMemoryResponse
+    from cosmos_framework.inference.robocasa_vae_protocol import canonical_json
+
+    harness, adapter, model = _feature_adapter()
+    _commit_feature_cold(adapter, harness)
+    rows = harness.rows()
+    before = adapter.snapshot
+    update = _prepare_feature(adapter, harness, 16, rows)
+    assert adapter.snapshot is before
+    assert model.scan_calls == [(1, False)] + [(1, True)] * 15
+    assert adapter.status(update)["encoded_steps"] == 0
+    context = adapter.boundary_context(update)
+    assert context["lease"] == harness.lease and context["source_step"] == 16
+    assert context["chunk_id"] == context["request_key"] == "request-16"
+    context["lease"]["session_id"] = "caller-mutated"
+    assert adapter.boundary_context(update)["lease"] == harness.lease
+    adapter.stage_boundary(update, harness.boundary(16))
+    assert adapter.committed_boundary(harness.lease["session_id"], 16) is None
+    body = canonical_json({"local_memory": adapter.status(update)})
+    cached = CachedMemoryResponse("request-16", "e" * 64, body)
+    adapter.commit(update, cached)
+    snapshot = adapter.snapshot
+    session = harness.lease["session_id"]
+    assert snapshot.fast[session].consumer_step == snapshot.visual[session].consumer_step == 16
+    assert snapshot.visual[session].boundary == harness.boundary(16)
+    assert (
+        json.loads(snapshot.responses[session].body)["local_memory"]["committed_boundary"]
+        == harness.boundary(16).record()
+    )
+    assert not adapter._visual_pending and not adapter._boundary_pending and not adapter.memory._pending
+    replay = _prepare_feature(adapter, harness, 16, deepcopy(rows))
+    assert replay.memory.replay and len(model.scan_calls) == 16
+    adapter.commit(replay, cached)
+    assert adapter.snapshot.fast[session] is snapshot.fast[session]
+    assert adapter.snapshot.visual[session].boundary == snapshot.visual[session].boundary
+    changed = deepcopy(rows)
+    changed[1]["post_step_receipt"]["source_rgb_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="replay"):
+        _prepare_feature(adapter, harness, 16, changed)
+
+
+def test_feature_abort_and_end_discard_private_response_and_boundary():
+    from cosmos_framework.inference.robocasa_feature_evidence_test import TOKEN
+
+    harness, adapter, _ = _feature_adapter()
+    cold_response = _commit_feature_cold(adapter, harness)
+    rows = harness.rows()
+    before = adapter.snapshot
+    update = _prepare_feature(adapter, harness, 16, rows)
+    adapter.stage_boundary(update, harness.boundary(16))
+    assert adapter.status(update)["committed_boundary"] == harness.boundary(16).record()
+    assert harness.owner.boundary_record(TOKEN, harness.lease, 0) == harness.boundary().record()
+    with pytest.raises(ValueError):
+        harness.owner.boundary_record(TOKEN, harness.lease, 16)
+    adapter.abort(update)
+    assert adapter.snapshot is before
+    assert adapter.snapshot.responses[harness.lease["session_id"]] is cold_response
+    assert adapter.committed_boundary(harness.lease["session_id"], 16) is None
+    assert not adapter._visual_pending and not adapter._boundary_pending and not adapter.memory._pending
+    adapter.reset(harness.lease["session_id"])
+    harness.owner.end_session(TOKEN, harness.lease)
+    assert not adapter.snapshot.fast and not adapter.snapshot.visual and not adapter.snapshot.responses
+
+
+def test_feature_missing_step_or_boundary_cannot_publish_or_scan():
+    harness, adapter, model = _feature_adapter()
+    initial = adapter.snapshot
+    cold = _prepare_feature(adapter, harness, 0, [])
+    with pytest.raises(RuntimeError, match="boundary"):
+        adapter.commit(cold)
+    assert adapter.snapshot is initial
+    adapter.abort(cold)
+    _commit_feature_cold(adapter, harness)
+    rows = harness.rows()
+    before = adapter.snapshot
+    with pytest.raises(ValueError, match="contiguous"):
+        _prepare_feature(adapter, harness, 16, rows[:-1])
+    assert adapter.snapshot is before and not model.scan_calls and not adapter.memory._pending
+    with pytest.raises(ValueError):
+        adapter.prepare(_feature_request(harness, 16, rows))
+
+
+def test_feature_revoke_between_prepare_and_commit_cannot_publish():
+    from cosmos_framework.inference.robocasa_feature_evidence_test import TOKEN
+
+    harness, adapter, _ = _feature_adapter()
+    _commit_feature_cold(adapter, harness)
+    rows = harness.rows()
+    before = adapter.snapshot
+    update = _prepare_feature(adapter, harness, 16, rows)
+    adapter.stage_boundary(update, harness.boundary(16))
+    harness.owner.revoke_worker(TOKEN, "worker", "worker-epoch")
+    with pytest.raises(ValueError, match="inactive|revoked"):
+        adapter.commit(update)
+    assert adapter.snapshot is before
+    adapter.abort(update)
+    assert not adapter._visual_pending and not adapter._boundary_pending and not adapter.memory._pending
+
+
+def test_feature_profile_cannot_fallback_to_legacy_or_reset_completed_frontier():
+    from cosmos_framework.inference.robocasa_feature_evidence_test import CLOCK
+
+    harness, adapter, model = _feature_adapter()
+    with pytest.raises(ValueError, match="unsupported"):
+        adapter.prepare(
+            _request(0, 0, reset=True),
+            lease=harness.lease,
+            deadline_ns=9000,
+            clock_domain=CLOCK,
+            request_key="request-0",
+        )
+    _commit_feature_cold(adapter, harness)
+    harness.rows()
+    before = adapter.snapshot
+    with pytest.raises(ValueError, match="reset"):
+        _prepare_feature(adapter, harness, 0, [])
+    assert adapter.snapshot is before and not model.scan_calls and not adapter.memory._pending
+
+
+def test_feature_batch_missing_second_boundary_never_partially_publishes():
+    from cosmos_framework.inference.robocasa_feature_evidence_test import CLOCK, TOKEN
+
+    harness, adapter, _ = _feature_adapter(max_sessions=2)
+    other = {**harness.lease, "session_id": "session-2", "episode_id": "episode-2", "slot_id": "slot-1"}
+    harness.owner.register_session(
+        TOKEN, other, worker_id="worker", actor_id="actor-2", actor_epoch="actor-epoch-2", episode_deadline_ns=10000
+    )
+    before = adapter.snapshot
+    first = _prepare_feature(adapter, harness, 0, [])
+    request = _feature_request(harness, 0, [])
+    request["local_memory"].update(session_id=other["session_id"], episode_id=other["episode_id"])
+    second = adapter.prepare(request, lease=other, deadline_ns=9000, clock_domain=CLOCK, request_key="request-other-0")
+    adapter.stage_boundary(first, harness.boundary())
+    with pytest.raises(RuntimeError, match="boundary"):
+        adapter.commit_many(((first, None), (second, None)))
+    assert adapter.snapshot is before and not adapter.snapshot.fast and not adapter.snapshot.visual
+    assert len(adapter._visual_pending) == len(adapter.memory._pending) == 2
+    adapter.abort(first)
+    adapter.abort(second)
+    assert not adapter._boundary_pending and not adapter._visual_pending and not adapter.memory._pending

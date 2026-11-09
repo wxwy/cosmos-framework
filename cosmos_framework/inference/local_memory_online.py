@@ -32,6 +32,7 @@ class OnlineMemoryRequest:
     visual_summary: torch.Tensor
     executed_action: torch.Tensor
     reset: bool = False
+    stream_t1: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,8 +112,15 @@ class OnlineLocalMemory:
         for value in (request.session_id, request.episode_id):
             if not isinstance(value, str) or not value.strip() or len(value) > 256:
                 raise ValueError("session_id/episode_id must be non-empty bounded strings")
-        if type(request.consumer_step) is not int or request.consumer_step < 0 or type(request.reset) is not bool:
+        if (
+            type(request.consumer_step) is not int
+            or request.consumer_step < 0
+            or type(request.reset) is not bool
+            or type(request.stream_t1) is not bool
+        ):
             raise ValueError("invalid consumer_step/reset")
+        if request.stream_t1 and self.scan_local_memory is None:
+            raise ValueError("T1 feature profile requires the existing model-owned Local scan")
         n = len(request.source_steps)
         if n > self.max_evidence_steps or any(type(step) is not int or step < 0 for step in request.source_steps):
             raise ValueError("invalid completed-evidence chronology")
@@ -132,6 +140,8 @@ class OnlineLocalMemory:
             request.source_steps,
             request.reset,
         )
+        if request.stream_t1:
+            identity += ("stream_t1",)
         digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode())
         digest.update(visual.contiguous().numpy().tobytes())
         digest.update(action.contiguous().numpy().tobytes())
@@ -187,8 +197,9 @@ class OnlineLocalMemory:
                 token = None if previous.token is None else previous.token.detach().clone()
                 self.core.reset_telemetry()
                 if self.scan_local_memory is not None:
-                    for start in range(0, len(expected), self.core.ttt_tbptt_steps):
-                        end = min(start + self.core.ttt_tbptt_steps, len(expected))
+                    scan_steps = 1 if request.stream_t1 else self.core.ttt_tbptt_steps
+                    for start in range(0, len(expected), scan_steps):
+                        end = min(start + scan_steps, len(expected))
                         valid = torch.ones(1, end - start, dtype=torch.bool, device=device)
                         with torch.enable_grad():
                             tokens, candidate, present = self.scan_local_memory(

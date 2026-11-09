@@ -67,7 +67,26 @@ class PolicyTransport:
             capacity_profile=settings.get("capacity_profile", "legacy8"),
         )
         self.lease = self.client.bind_assignment(assignment)
-        self.local = AssignedLocalMemoryClient(self.lease) if self.client.mode == "required" else None
+        profile = settings.get("local_evidence_profile", "server_vae")
+        if profile not in ("server_vae", "sim_shared_vae"):
+            raise ValueError("explicit server_vae/sim_shared_vae evidence profile required")
+        if profile == "sim_shared_vae":
+            if self.client.mode != "required" or settings["max_infer_batch_size"] != 1:
+                raise ValueError("Stage3A shared VAE requires Local mode required and Policy B1")
+            from cosmos_framework.simulation.robocasa.sim_shared_vae_client import SimSharedVAEClient
+
+            self.local = SimSharedVAEClient(
+                self.lease,
+                assignment["sim_shared_vae"],
+                int(episode_deadline * 1e9),
+                settings["predict_timeout_s"],
+                self.client.clock_domain,
+                end_timeout_s=settings.get("shared_vae_end_timeout_s", 5.0),
+            )
+        else:
+            if "sim_shared_vae" in assignment:
+                raise ValueError("shared VAE credentials require explicit C profile")
+            self.local = AssignedLocalMemoryClient(self.lease) if self.client.mode == "required" else None
         self._failed, self._ended, self.replan = False, False, 0
         self._last_delivered = -1
         self._stop = threading.Event()
@@ -144,7 +163,11 @@ class PolicyTransport:
                 raise TimeoutError("original Episode deadline exhausted")
             self.client.timeout_s = min(timeout, self.settings["predict_timeout_s"], remaining)
         try:
-            result = self.client.predict(record)
+            if getattr(self.local, "uses_shared_vae", False) is True:
+                result = self.client.predict(record, budget=self.local.prediction_budget)
+                self.local.accept_policy_result(result)
+            else:
+                result = self.client.predict(record)
             self._last_delivered = frontier
             self.replan += 1
             return _Response(result)
@@ -380,11 +403,28 @@ class PolicyTransport:
     def end(self):
         if self._ended:
             return
-        self.close_media()
+        local_error = None
+        try:
+            if getattr(self.local, "uses_shared_vae", False) is True:
+                self.local.end(0)
+        except BaseException as error:
+            local_error = error
+        finally:
+            self.close_media()
+        if local_error is not None and not self.local._session_end_done:
+            raise local_error
         # Cleanup has its own bounded budget; never revives inference work.
         self.client.timeout_s = self.settings["predict_timeout_s"]
-        self.client.end()
+        try:
+            self.client.end()
+        except BaseException as error:
+            if local_error is not None:
+                local_error.cleanup_error = repr(error)
+                raise local_error from error
+            raise
         self._ended = True
+        if local_error is not None:
+            raise local_error
 
     def close_media(self):
         if self.strict_media:
