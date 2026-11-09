@@ -18,9 +18,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from cosmos_framework.evaluation.robocasa_v2.contract import ACTION_CHUNK_SIZE
 from cosmos_framework.inference.robocasa_feature_evidence import (
     FEATURE_EVIDENCE_FORMAT,
     FEATURE_EVIDENCE_VERSION,
+    SPARSE_EVIDENCE_FORMAT,
+    SPARSE_EVIDENCE_VERSION,
     validate_boundary_record,
     validate_post_step_receipt,
 )
@@ -28,7 +31,9 @@ from cosmos_framework.inference.robocasa_vae_client import LocalVAEClient, _Clie
 from cosmos_framework.inference.robocasa_vae_protocol import (
     Frame,
     canonical_json,
+    selected_history_step,
     source_digest,
+    validate_history_k,
     validate_identity,
     validate_lease,
     validate_raw15,
@@ -87,9 +92,9 @@ class PreparedStep:
     source_step: int
     chunk_id: str
     request_key: str
-    rgb: bytes
+    rgb: bytes | None
     raw15: bytes
-    source_rgb_sha256: str
+    source_rgb_sha256: str | None
     raw15_sha256: str
 
 
@@ -119,9 +124,20 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
         worker_client=None,
         completion_channel=None,
         end_timeout_s=2.0,
+        local_ttt_history_k=None,
+        action_horizon=ACTION_CHUNK_SIZE,
     ):
         super().__init__(enabled=True, max_evidence_steps=16)
         self.lease = validate_lease({k: v for k, v in lease.items() if k != "capability"})
+        self.action_horizon = validate_history_k(None, action_horizon)
+        if (
+            self.action_horizon != ACTION_CHUNK_SIZE
+            or validate_history_k(None, descriptor.get("action_chunk_size", ACTION_CHUNK_SIZE)) != self.action_horizon
+        ):
+            raise ValueError("assigned Action Horizon differs from frozen Native model protocol")
+        self.history_k = validate_history_k(local_ttt_history_k, self.action_horizon)
+        if validate_history_k(descriptor.get("local_ttt_history_k"), self.action_horizon) != self.history_k:
+            raise ValueError("history K differs from assigned frozen shared Worker")
         if descriptor.get("trust_model") != "registry_same_trust_domain":
             raise ValueError("explicit controlled Actor trust model required")
         if type(episode_deadline_ns) is not int or episode_deadline_ns <= 0 or not 0 < predict_timeout_s <= 6000:
@@ -262,6 +278,14 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
             )
             self._pending_boundary = boundary
 
+    def needs_history_image(self, source_step):
+        with self._changed:
+            if self._boundary is None:
+                raise RuntimeError("history selection requires a committed Policy chunk")
+            return selected_history_step(
+                source_step, self._boundary["header"]["source_step"], self.history_k, self.action_horizon
+            )
+
     def prepare_step(self, slot, source_step, composite_image, executed_raw15):
         with self._changed:
             self._check()
@@ -273,7 +297,10 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
             header = self._boundary["header"]
             if not header["source_step"] <= source_step < header["source_step"] + 16:
                 raise ValueError("Sim step lies outside committed action chunk")
-            rgb = self._image(composite_image, "pre-action composite").copy().tobytes()
+            selected = selected_history_step(source_step, header["source_step"], self.history_k, self.action_horizon)
+            if not selected and composite_image is not None:
+                raise ValueError("unselected history must not create an RGB payload")
+            rgb = self._image(composite_image, "pre-action composite").copy().tobytes() if selected else None
             raw15 = validate_raw15(np.asarray(executed_raw15, dtype="<f4").reshape(-1).tobytes())
             snapshot = PreparedStep(
                 source_step,
@@ -281,10 +308,10 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                 header["policy_request_key"],
                 rgb,
                 raw15,
-                source_digest(rgb),
+                source_digest(rgb) if selected else None,
                 hashlib.sha256(raw15).hexdigest(),
             )
-            if source_step % 16 == 0 and snapshot.source_rgb_sha256 != header["source_rgb_sha256"]:
+            if source_step % self.action_horizon == 0 and snapshot.source_rgb_sha256 != header["source_rgb_sha256"]:
                 raise ValueError("pre-action boundary RGB differs from committed current Policy image")
             self._prepared = snapshot
             return snapshot
@@ -304,7 +331,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
             episode = self._get(slot)
             if self._prepared is not snapshot or snapshot.source_step != episode.consumer_step:
                 raise ValueError("exact prepared successful Sim step required")
-            if snapshot.source_step % 16 == 15:
+            if snapshot.source_step % self.action_horizon == self.action_horizon - 1:
                 self.start_replan(slot, step_completed_ns)
             try:
                 with self._profile_span("owner_step_completion", source_step=snapshot.source_step):
@@ -335,7 +362,8 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                     raise ValueError("Owner completion receipt differs from actual successful Sim step")
                 frame = (
                     None
-                    if snapshot.source_step % 16 == 0
+                    if snapshot.source_step % self.action_horizon == 0
+                    or not self.needs_history_image(snapshot.source_step)
                     else Frame.create(
                         self.lease,
                         snapshot.chunk_id,
@@ -351,6 +379,10 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                     )
                 )
                 row = _Evidence(snapshot.source_step, receipt, frame, ready=frame is None)
+                if receipt.get("history_k", self.action_horizon) != self.history_k or receipt.get(
+                    "selected", True
+                ) != self.needs_history_image(snapshot.source_step):
+                    raise ValueError("Owner receipt selection differs from frozen Sim K")
                 self._rows[snapshot.source_step] = row
                 if frame is not None:
                     self._queue.append(row)
@@ -443,11 +475,23 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                     for step in expected
                 ],
             )
+            if self.history_k != self.action_horizon:
+                payload.update(
+                    evidence_version=SPARSE_EVIDENCE_VERSION,
+                    evidence_format=SPARSE_EVIDENCE_FORMAT,
+                    local_ttt_history_k=self.history_k,
+                )
             return payload
 
     def acknowledge(self, slot, status):
         with self._changed:
             episode = self._get(slot)
+            if self.history_k != self.action_horizon and (
+                not isinstance(status, dict)
+                or type(status.get("local_ttt_history_k")) is not int
+                or status["local_ttt_history_k"] != self.history_k
+            ):
+                raise ValueError("policy ACK history K differs from frozen Session")
             if (
                 not isinstance(status, dict)
                 or status.get("session_id") != episode.session_id
@@ -525,4 +569,25 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                 "queued": len(self._queue),
                 "worker_alive": self._thread is not None and self._thread.is_alive(),
                 "trace": list(self._trace),
+                **(
+                    {
+                        "local_ttt_history_k": self.history_k,
+                        "selected_source_steps": [
+                            s
+                            for s in self._rows
+                            if selected_history_step(
+                                s, s // self.action_horizon * self.action_horizon, self.history_k, self.action_horizon
+                            )
+                        ],
+                        "skipped_source_steps": [
+                            s
+                            for s in self._rows
+                            if not selected_history_step(
+                                s, s // self.action_horizon * self.action_horizon, self.history_k, self.action_horizon
+                            )
+                        ],
+                    }
+                    if self.history_k != self.action_horizon
+                    else {}
+                ),
             }

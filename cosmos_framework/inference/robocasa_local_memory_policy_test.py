@@ -216,10 +216,10 @@ def test_corrected_active_modules_do_not_import_historical_b1() -> None:
         assert not any(any(name in imported for name in forbidden) for imported in imports if imported), module
 
 
-def _feature_adapter(*, max_sessions=1):
+def _feature_adapter(*, max_sessions=1, history_k=None):
     from cosmos_framework.inference.robocasa_feature_evidence_test import EvidenceHarness
 
-    harness = EvidenceHarness(bind_lookup=False, max_sessions=max_sessions)
+    harness = EvidenceHarness(bind_lookup=False, max_sessions=max_sessions, history_k=history_k)
     model = _Model()
 
     def no_history_decode(_):

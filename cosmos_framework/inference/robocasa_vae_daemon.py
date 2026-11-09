@@ -18,6 +18,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+from cosmos_framework.evaluation.robocasa_v2.contract import ACTION_CHUNK_SIZE
 from cosmos_framework.inference.robocasa_vae_protocol import canonical_json, strict_json
 
 
@@ -309,6 +310,8 @@ def run_daemon(
                 wait_ms=0,
                 max_sessions=config.get("max_sessions", 16),
                 max_policy_epochs=config.get("max_policy_epochs", 1),
+                history_k=config.get("local_ttt_history_k"),
+                action_horizon=config.get("action_chunk_size", ACTION_CHUNK_SIZE),
             ),
         )
         server = UnixVAEServer(
@@ -341,6 +344,11 @@ def run_daemon(
                     "max_sessions": worker.config.max_sessions,
                     "max_policy_epochs": worker.config.max_policy_epochs,
                 },
+                **(
+                    {"local_ttt_history_k": worker.config.history_k, "action_chunk_size": worker.config.action_horizon}
+                    if worker.config.history_k != worker.config.action_horizon
+                    else {}
+                ),
             },
         )
         server.wait_closed()

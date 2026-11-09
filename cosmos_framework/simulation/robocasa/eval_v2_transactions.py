@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 import requests
 
+from cosmos_framework.evaluation.robocasa_v2.contract import ACTION_CHUNK_SIZE
 from cosmos_framework.inference.robocasa_session_transactions import digest, json_bytes
 from cosmos_framework.inference.robocasa_transaction_client import TransactionPolicyClient
 from cosmos_framework.simulation.robocasa.local_memory_client import RoboCasaLocalMemoryClient
@@ -71,8 +72,8 @@ class PolicyTransport:
         if profile not in ("server_vae", "sim_shared_vae"):
             raise ValueError("explicit server_vae/sim_shared_vae evidence profile required")
         if profile == "sim_shared_vae":
-            if self.client.mode != "required" or settings["max_infer_batch_size"] != 1:
-                raise ValueError("Stage3A shared VAE requires Local mode required and Policy B1")
+            if self.client.mode != "required" or not 1 <= settings["max_infer_batch_size"] <= 8:
+                raise ValueError("shared VAE requires Local mode required and native Policy batch1..8")
             from cosmos_framework.simulation.robocasa.sim_shared_vae_client import SimSharedVAEClient
 
             self.local = SimSharedVAEClient(
@@ -82,6 +83,8 @@ class PolicyTransport:
                 settings["predict_timeout_s"],
                 self.client.clock_domain,
                 end_timeout_s=settings.get("shared_vae_end_timeout_s", 5.0),
+                local_ttt_history_k=settings.get("local_ttt_history_k"),
+                action_horizon=settings.get("action_chunk_size", ACTION_CHUNK_SIZE),
             )
         else:
             if "sim_shared_vae" in assignment:

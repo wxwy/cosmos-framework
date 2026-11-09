@@ -50,12 +50,16 @@ LEASE = {
 
 
 class EvidenceHarness:
-    def __init__(self, *, max_sessions=1, bind_lookup=True):
+    def __init__(self, *, max_sessions=1, bind_lookup=True, history_k=None):
         self.clock = [100]
         self.lease = deepcopy(LEASE)
         self.identity = deepcopy(IDENTITY)
         self.owner = FeatureEvidenceOwner(
-            TOKEN, clock_ns=lambda: self.clock[0], max_sessions=max_sessions, policy_identity=self.identity
+            TOKEN,
+            clock_ns=lambda: self.clock[0],
+            max_sessions=max_sessions,
+            policy_identity=self.identity,
+            history_k=history_k,
         )
         self.owner.enroll_worker(
             TOKEN,
@@ -125,7 +129,7 @@ class EvidenceHarness:
             "chunk_id": f"request-{step // 16 * 16}",
             "request_key": f"request-{step // 16 * 16}",
             "source_step": step,
-            "source_rgb_sha256": source_digest(self.rgb(step)),
+            "source_rgb_sha256": source_digest(self.rgb(step)) if step % (16 // self.owner.history_k) == 0 else None,
             "raw15": self.action(step),
             "step_completed_ns": self.clock[0] - 1,
             "actor_id": "actor",
@@ -162,13 +166,13 @@ class EvidenceHarness:
             {
                 "source_step": step,
                 "post_step_receipt": self.complete(step),
-                "feature": None if step % 16 == 0 else self.feature(step),
+                "feature": None if step % 16 == 0 or step % (16 // self.owner.history_k) else self.feature(step),
             }
             for step in range(start, start + count)
         ]
 
     def payload(self, rows, *, consumer_step=16):
-        return {
+        payload = {
             "session_id": self.lease["session_id"],
             "episode_id": self.lease["episode_id"],
             "consumer_step": consumer_step,
@@ -178,6 +182,18 @@ class EvidenceHarness:
             "evidence_format": FEATURE_EVIDENCE_FORMAT,
             "evidence": rows,
         }
+        if self.owner.history_k != 16:
+            from cosmos_framework.inference.robocasa_feature_evidence import (
+                SPARSE_EVIDENCE_FORMAT,
+                SPARSE_EVIDENCE_VERSION,
+            )
+
+            payload.update(
+                evidence_version=SPARSE_EVIDENCE_VERSION,
+                evidence_format=SPARSE_EVIDENCE_FORMAT,
+                local_ttt_history_k=self.owner.history_k,
+            )
+        return payload
 
     def admit(self, rows, *, consumer_step=16, previous_step=0, **changes):
         arguments = {"lease": self.lease, "deadline_ns": 8000, "clock_domain": CLOCK, "previous_step": previous_step}

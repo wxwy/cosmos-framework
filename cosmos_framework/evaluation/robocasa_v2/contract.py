@@ -11,6 +11,8 @@ import sys
 from dataclasses import dataclass, field
 
 SCHEMA = "psm_robocasa_eval_v2"
+# Existing frozen Native model/protocol contract; not a configurable history default.
+ACTION_CHUNK_SIZE = 16
 SAMPLING = "dynamic_slot_environment_seed_then_continuous_reset_v3"
 ROUND_SCHEDULE = "episode_major_frozen_order_round_barrier_v1"
 STREAMING_SCHEDULE = "streaming_task_affinity_v2"
@@ -208,7 +210,7 @@ def build_manifest(
             "skipped_retry": "explicit_owner_authorization_only",
             "raw_action_dim": 15,
             "state_dim": 15,
-            "action_chunk_size": 16,
+            "action_chunk_size": ACTION_CHUNK_SIZE,
             "observation_frames": 17,
             "fps": 20,
             "camera": "left_wrist",
@@ -225,6 +227,19 @@ def build_manifest(
             validate_single_latency(single, local_memory=local_memory)
             extra |= {"single_latency"}
         shared = execution.get("shared_vae") if isinstance(execution, dict) else None
+        if isinstance(execution, dict) and "local_ttt_history_k" in execution:
+            from cosmos_framework.inference.robocasa_vae_protocol import validate_history_k
+
+            horizon = body["protocol"]["action_chunk_size"]
+            history_k = validate_history_k(execution["local_ttt_history_k"], horizon)
+            if (
+                execution["local_ttt_history_k"] is None
+                or history_k == horizon
+                or local_memory != "required"
+                or not (shared or single and single["arm"] == "C")
+            ):
+                raise ValueError("sparse divisor K requires frozen shared Local-TTT execution; dense K must be omitted")
+            extra.add("local_ttt_history_k")
         if shared is not None:
             if single is not None:
                 raise ValueError("single measurements retain their original frozen identity")

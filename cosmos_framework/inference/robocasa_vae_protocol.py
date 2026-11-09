@@ -28,6 +28,32 @@ VISUAL96_BYTES = 96 * 4
 MAX_FRAME_WIRE_BYTES = 1 << 20
 MAX_FEATURE_WIRE_BYTES = 16384
 MAX_HEADER_BYTES = 8192
+
+
+def validate_history_k(value, action_horizon):
+    """Resolve omitted K to the actual Action Chunk H; reject coercion/non-divisors."""
+    if type(action_horizon) is not int or action_horizon <= 0:
+        raise ValueError("action_horizon must be a positive integer Action Chunk length")
+    if value is None:
+        return action_horizon
+    if type(value) is not int or value <= 0 or action_horizon % value:
+        raise ValueError("local_ttt_history_k must be a positive integer divisor of action_horizon")
+    return value
+
+
+def selected_history_step(source_step, chunk_start, history_k, action_horizon):
+    """Select original source IDs relative to their authoritative Action Chunk."""
+    stride = action_horizon // validate_history_k(history_k, action_horizon)
+    if (
+        type(source_step) is not int
+        or type(chunk_start) is not int
+        or chunk_start < 0
+        or not 0 <= source_step - chunk_start < action_horizon
+    ):
+        raise ValueError("source step must belong to its real Action Chunk")
+    return (source_step - chunk_start) % stride == 0
+
+
 LEASE_FIELDS = (
     "server_epoch",
     "run_lease",
