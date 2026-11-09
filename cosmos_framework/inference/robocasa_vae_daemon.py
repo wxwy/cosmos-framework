@@ -304,7 +304,12 @@ def run_daemon(
             config["worker_id"],
             worker_epoch=config["worker_epoch"],
             clock_domain=config["clock_domain"],
-            config=WorkerConfig(bmax=1, wait_ms=0),
+            config=WorkerConfig(
+                bmax=1,
+                wait_ms=0,
+                max_sessions=config.get("max_sessions", 16),
+                max_policy_epochs=config.get("max_policy_epochs", 1),
+            ),
         )
         server = UnixVAEServer(
             worker,
@@ -332,6 +337,10 @@ def run_daemon(
                 "attestation": attestation,
                 "sockets": socket_proof,
                 "physical_device": physical,
+                "limits": {
+                    "max_sessions": worker.config.max_sessions,
+                    "max_policy_epochs": worker.config.max_policy_epochs,
+                },
             },
         )
         server.wait_closed()

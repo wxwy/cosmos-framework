@@ -188,16 +188,17 @@ def test_end_during_feature_prepare_cancels_without_generation_or_pending_state_
 
 
 @pytest.mark.parametrize("cap,wait", [(8, 0), (4, 0), (1, 1)])
-def test_c_rejects_b4_b8_or_intentional_peer_wait_before_allocating_executor(cap, wait):
+def test_explicit_single_c_rejects_b4_b8_or_intentional_peer_wait_before_allocating_executor(cap, wait):
     base, _model = sessions.make_adapter(1)
     adapter = _ControlledFeatureAdapter(base)
-    with pytest.raises(ValueError, match="B1/wait0"):
+    with pytest.raises(ValueError, match="single|one native Policy member"):
         BatchedSessionTransactions(
             adapter,
             lambda *_args: None,
             lambda: None,
             max_batch_size=cap,
             batch_wait_ms=wait,
+            single_latency_arm="C",
             owner_token="cpu-owner",
             run_lease="run",
             manifest_digest="a" * 64,

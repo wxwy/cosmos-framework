@@ -58,6 +58,7 @@ class _BoundaryCapture:
         deadline_ns: int,
         clock_domain: str,
         clock_ns: Callable[[], int],
+        _bind_context: bool = True,
     ) -> None:
         from cosmos_framework.inference.robocasa_vae_protocol import (
             RGB_BYTES,
@@ -88,6 +89,7 @@ class _BoundaryCapture:
         self._request_key, self._chunk_id, self._step = request_key, chunk_id, source_step
         self._image_size, self._deadline, self._clock_domain = image_size, deadline_ns, clock_domain
         self._clock = clock_ns
+        self._bind_context, self._token = _bind_context, None
         self._entered = self._active = self._complete = False
         self._failure: BaseException | None = None
         self._events = 0
@@ -164,7 +166,8 @@ class _BoundaryCapture:
         parameters = getattr(self._module, "parameters", None)
         self._parameter_ids = tuple(id(parameter) for parameter in parameters()) if callable(parameters) else ()
         self._check_tokenizer()
-        self._token = _CURRENT_CAPTURE.set(self)
+        if self._bind_context:
+            self._token = _CURRENT_CAPTURE.set(self)
         self._active = True
         return self
 
@@ -210,7 +213,8 @@ class _BoundaryCapture:
 
     def __exit__(self, exception_type, exception, traceback):
         self._active = False
-        _CURRENT_CAPTURE.reset(self._token)
+        if self._token is not None:
+            _CURRENT_CAPTURE.reset(self._token)
         if exception_type is not None:
             self._visual = None
             return False
@@ -272,3 +276,75 @@ def capture_policy_boundary(
         clock_domain=clock_domain,
         clock_ns=clock_ns,
     )
+
+
+class _BoundaryBatchCapture:
+    """Observe the existing ordered B1 Encode1 calls of one native Policy batch."""
+
+    def __init__(self, model, contexts):
+        if type(contexts) not in (list, tuple) or not 1 <= len(contexts) <= 8:
+            raise ValueError("Policy boundary batch must contain1..8 independent members")
+        self._captures = [
+            _BoundaryCapture(
+                model, **{"image_size": 256, "clock_ns": time.monotonic_ns, **context}, _bind_context=False
+            )
+            for context in contexts
+        ]
+        if len({c._lease["session_id"] for c in self._captures}) != len(self._captures):
+            raise ValueError("duplicate Session in Policy boundary batch")
+        self._entered = self._complete = False
+        self._index = 0
+        self._failure = None
+
+    def __enter__(self):
+        if self._entered or _CURRENT_CAPTURE.get() is not None:
+            raise RuntimeError("nested/reentered Policy boundary batch is forbidden")
+        self._entered = True
+        entered = []
+        try:
+            for capture in self._captures:
+                capture.__enter__()
+                entered.append(capture)
+        except BaseException as error:
+            for capture in entered:
+                capture.__exit__(type(error), error, error.__traceback__)
+            raise
+        self._token = _CURRENT_CAPTURE.set(self)
+        return self
+
+    def observe(self, model, pixels, latent):
+        try:
+            if self._failure is not None or self._index >= len(self._captures):
+                raise RuntimeError("unexpected extra/current Policy boundary encoding")
+            self._captures[self._index].observe(model, pixels, latent)
+            self._index += 1
+        except BaseException as error:
+            self._failure = error
+            raise
+
+    def __exit__(self, exception_type, exception, traceback):
+        _CURRENT_CAPTURE.reset(self._token)
+        failure = exception or self._failure
+        for capture in self._captures:
+            try:
+                capture.__exit__(type(failure) if failure else None, failure, traceback)
+            except BaseException as error:
+                failure = failure or error
+        if failure is not None:
+            for capture in self._captures:
+                capture._boundary, capture._complete, capture._visual = None, False, None
+            if exception is None:
+                raise failure
+        else:
+            self._complete = True
+        return False
+
+    @property
+    def boundaries(self):
+        if not self._complete:
+            raise RuntimeError("batch boundaries remain private until every member succeeds")
+        return tuple(capture.boundary for capture in self._captures)
+
+
+def capture_policy_boundaries(model, contexts):
+    return _BoundaryBatchCapture(model, contexts)

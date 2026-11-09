@@ -79,8 +79,13 @@ class BatchedSessionTransactions(SessionTransactions):
         if single_latency_arm not in (None, "A", "B", "C") or (single_latency_arm is not None and max_batch_size != 1):
             raise ValueError("P0 latency profiling requires one native Policy member")
         self.profiling_arm = single_latency_arm or ("C" if self.feature_mode else None)
-        if self.feature_mode and (adapter.mode != "required" or max_batch_size != 1 or batch_wait_ms != 0):
-            raise ValueError("Stage3A signed features require Policy B1/wait0; B4/B8 Action admission is disabled")
+        if self.feature_mode and (
+            adapter.mode != "required"
+            or type(max_batch_size) is not int
+            or not 1 <= max_batch_size <= 8
+            or (single_latency_arm == "C" and batch_wait_ms != 0)
+        ):
+            raise ValueError("signed features require Local-TTT and Policy batch1..8; single C retains wait0")
         capacity = transaction_capacity(kwargs.get("capacity_profile", "legacy8"))
         if type(max_batch_size) is not int or not 1 <= max_batch_size <= capacity:
             raise ValueError(f"native batch cap must be1..{capacity}")
@@ -106,6 +111,7 @@ class BatchedSessionTransactions(SessionTransactions):
         self.media_drain_timeout_s = media_drain_timeout_s
         self._acked_media = {}
         self._queue, self._enqueued, self._media = [], {}, {}
+        self._feature_pending = set()
         self._pumping = False
         self._batch_histogram = Counter()
         self._batches = 0
@@ -281,7 +287,12 @@ class BatchedSessionTransactions(SessionTransactions):
             ticket.profile_trace.event("policy_admission", producer="policy", arm=self.profiling_arm)
         if self.feature_mode:
             ticket.state = "FEATURE_PREPARING"
-            self._executor.submit(self._prepare_feature, ticket)
+            self._feature_pending.add(ticket.key)
+            try:
+                self._executor.submit(self._prepare_feature, ticket)
+            except BaseException:
+                self._feature_pending.discard(ticket.key)
+                raise
             return
         self._queue_native(ticket)
 
@@ -340,6 +351,7 @@ class BatchedSessionTransactions(SessionTransactions):
                     except BaseException:
                         pass
         with self._lock:
+            self._feature_pending.discard(ticket.key)
             if not drained or abort_failed:
                 self._quarantined = True
                 if ticket.lease.slot_id in self._failed:
@@ -384,11 +396,25 @@ class BatchedSessionTransactions(SessionTransactions):
                     self._busy = True
                 elif self._queue:
                     oldest = self._queue[0]
+                    if (
+                        self.feature_mode
+                        and self._feature_pending
+                        and len(self._queue) < min(self.max_batch_size, len(self.slot_ids))
+                        and not self._stopping
+                        and not oldest.cancelled
+                        and oldest.lease.slot_id not in self._closing
+                        and self.clock() < oldest.deadline
+                    ):
+                        # Preparation shares this executor. Yield to already-admitted
+                        # feature tasks; never block it waiting for peers to become READY.
+                        self._executor.submit(self._pump)
+                        return
                     remaining = min(
                         self.wait_s - (time.monotonic() - self._enqueued[oldest.key]), oldest.deadline - self.clock()
                     )
                     if (
                         not oldest.cancelled
+                        and not self.feature_mode
                         and len(self._queue) < min(self.max_batch_size, len(self.slot_ids))
                         and remaining > 0
                         and not self._stopping

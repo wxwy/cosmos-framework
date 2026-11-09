@@ -123,6 +123,26 @@ def validate_single_latency(value, *, local_memory):
     return value
 
 
+def validate_shared_vae(value, *, local_memory):
+    """History-source identity independent of optional single-instance measurements."""
+    if (
+        type(value) is not dict
+        or set(value) != {"version", "history_source", "worker"}
+        or value["version"] != "sim_shared_vae_b1_v1"
+    ):
+        raise ValueError("exact shared VAE history-source identity required")
+    validate_single_latency(
+        {
+            "version": "stage3a_single_v1",
+            "arm": "C",
+            "history_source": value["history_source"],
+            "worker": value["worker"],
+        },
+        local_memory=local_memory,
+    )
+    return value
+
+
 def build_manifest(
     *,
     tasks,
@@ -204,6 +224,12 @@ def build_manifest(
         if single is not None:
             validate_single_latency(single, local_memory=local_memory)
             extra |= {"single_latency"}
+        shared = execution.get("shared_vae") if isinstance(execution, dict) else None
+        if shared is not None:
+            if single is not None:
+                raise ValueError("single measurements retain their original frozen identity")
+            validate_shared_vae(shared, local_memory=local_memory)
+            extra |= {"shared_vae"}
         if (
             not isinstance(execution, dict)
             or set(execution)
@@ -214,7 +240,11 @@ def build_manifest(
             raise ValueError("exact native batch execution identity required")
         integer(execution["sims_per_gpu"], 1, 32 if is_streaming else 8, "M")
         integer(execution["max_infer_batch_size"], 1, 32 if is_streaming else 8, "B")
-        integer(execution["batch_wait_ms"], 0 if single and single["arm"] == "C" else 1, 1000, "batch_wait_ms")
+        integer(
+            execution["batch_wait_ms"], 0 if shared or (single and single["arm"] == "C") else 1, 1000, "batch_wait_ms"
+        )
+        if shared and execution["max_infer_batch_size"] > 8:
+            raise ValueError("shared VAE uses Policy batch1..8 independently of Worker B1")
         if single and (
             execution["sims_per_gpu"] != 1
             or execution["max_infer_batch_size"] != 1

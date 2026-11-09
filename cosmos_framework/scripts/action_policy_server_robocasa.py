@@ -643,10 +643,11 @@ def _transaction_options(args):
     if feature_mode and (
         not batch
         or args.local_memory_mode != "required"
-        or getattr(args, "transaction_max_batch_size", 1) != 1
-        or getattr(args, "transaction_batch_wait_ms", 20) != 0
+        or type(getattr(args, "transaction_max_batch_size", 1)) is not int
+        or not 1 <= getattr(args, "transaction_max_batch_size", 1) <= 8
+        or (arm == "C" and getattr(args, "transaction_batch_wait_ms", 20) != 0)
     ):
-        raise ValueError("Stage3A C requires required Local-TTT, native Policy B1/wait0")
+        raise ValueError("shared VAE requires Local-TTT and native Policy batch1..8; single C keeps wait0")
     capacity_profile = getattr(args, "transaction_capacity_profile", "legacy8")
     capacity = transaction_capacity(capacity_profile)
     if not batch and capacity_profile != "legacy8":
@@ -1085,8 +1086,8 @@ class ActionModelService:
                 "worker_constructor_config": worker_constructor_config(self.model.tokenizer_vision_gen),
                 "clock_domain": monotonic_clock_domain(),
                 "history_source": "sim_shared_vae",
-                "policy_bmax": 1,
-                "policy_wait_ms": 0,
+                "policy_bmax": transaction_options.get("max_batch_size", 1),
+                "policy_wait_ms": transaction_options.get("batch_wait_ms", 0),
             }
         self.local_memory_adapter = RoboCasaLocalMemoryPolicyAdapter(
             self,
@@ -1456,16 +1457,23 @@ class ActionModelService:
         capture = nullcontext()
         feature_mode = getattr(self, "feature_evidence_owner", None) is not None
         if feature_mode:
-            if n != 1:
-                raise ValueError("Stage3A Action feature admission is B1 only")
-            from cosmos_framework.inference.robocasa_boundary_capture import capture_policy_boundary
+            from cosmos_framework.inference.robocasa_boundary_capture import (
+                capture_policy_boundaries,
+                capture_policy_boundary,
+            )
 
-            context = self.local_memory_adapter.boundary_context(updates[0])
-            capture = capture_policy_boundary(
-                self.model,
-                source_rgb=preps[0]["img_chw_uint8"].permute(1, 2, 0).contiguous().cpu().numpy().tobytes(),
-                image_size=reqs[0]["image_size"],
-                **context,
+            contexts = [
+                dict(
+                    self.local_memory_adapter.boundary_context(update),
+                    source_rgb=prep["img_chw_uint8"].permute(1, 2, 0).contiguous().cpu().numpy().tobytes(),
+                    image_size=req["image_size"],
+                )
+                for update, prep, req in zip(updates, preps, reqs, strict=True)
+            ]
+            capture = (
+                capture_policy_boundary(self.model, **contexts[0])
+                if n == 1
+                else capture_policy_boundaries(self.model, contexts)
             )
         from cosmos_framework.inference.robocasa_feature_trace import get_trace, span
 
@@ -1485,7 +1493,9 @@ class ActionModelService:
                 **self._transaction_prefixes(updates, batch=True),
             )
         if feature_mode:
-            self.local_memory_adapter.stage_boundary(updates[0], capture.boundary)
+            boundaries = (capture.boundary,) if n == 1 else capture.boundaries
+            for update, boundary in zip(updates, boundaries, strict=True):
+                self.local_memory_adapter.stage_boundary(update, boundary)
         if len(samples["action"]) != n:
             raise ValueError("native batch action cardinality mismatch")
         actions = []

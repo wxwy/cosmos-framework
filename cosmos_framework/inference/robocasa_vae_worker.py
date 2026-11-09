@@ -67,6 +67,7 @@ class WorkerConfig:
     max_bytes: int = 128 * 1024**2
     max_session_items: int = 16
     max_sessions: int = 16
+    max_policy_epochs: int = 1
     max_tombstones: int = 32
     max_chunks: int = 4
     max_trace: int = 256
@@ -82,6 +83,7 @@ class WorkerConfig:
             "max_bytes",
             "max_session_items",
             "max_sessions",
+            "max_policy_epochs",
             "max_tombstones",
             "max_chunks",
             "max_trace",
@@ -91,6 +93,8 @@ class WorkerConfig:
                 raise ValueError("positive bounded Worker capacity required")
         if self.max_session_items > 16:
             raise ValueError("completed evidence per Session is bounded by H16")
+        if self.max_policy_epochs > self.max_sessions:
+            raise ValueError("Policy epoch capacity cannot exceed physical Session capacity")
 
 
 @dataclass
@@ -182,6 +186,7 @@ class SharedVAEWorker:
         self._last_served = 0
         self._stopping = self._quarantined = False
         self._run = None
+        self._policy_epochs = set()
         self._thread = None
         if autostart:
             self.start()
@@ -242,9 +247,14 @@ class SharedVAEWorker:
                 raise TimeoutError("original Episode deadline exhausted")
             if len(self._sessions) >= self.config.max_sessions:
                 raise RuntimeError("bounded live Session capacity exhausted")
-            run = (lease["run_lease"], lease["manifest_digest"], lease["server_epoch"])
+            run = (lease["run_lease"], lease["manifest_digest"])
             if self._run is not None and self._run != run:
                 raise ValueError("foreign Worker run/manifest/Policy epoch")
+            if (
+                lease["server_epoch"] not in self._policy_epochs
+                and len(self._policy_epochs) >= self.config.max_policy_epochs
+            ):
+                raise ValueError("foreign Worker Policy epoch or bounded Policy capacity exhausted")
             slot = self._slots.get(lease["slot_id"])
             if slot is not None:
                 epoch, generation, old_sid = slot
@@ -261,6 +271,7 @@ class SharedVAEWorker:
             self._sessions[sid] = session
             self._slots[lease["slot_id"]] = (lease["server_epoch"], lease["generation"], sid)
             self._run = run
+            self._policy_epochs.add(lease["server_epoch"])
             self._record("REGISTER", session=session)
             self._changed.notify_all()
             return {"registered": True, "duplicate": False, "worker_epoch": self.worker_epoch}
