@@ -200,7 +200,7 @@ class OnlineLocalMemory:
                     raise ValueError("stale or changed-bytes Local-TTT request")
                 expected = tuple(range(previous.consumer_step, request.consumer_step))
                 if request.history_k != 16:
-                    if previous.consumer_step % 16 or len(expected) > 16:
+                    if previous.consumer_step % 16 or len(expected) != 16:
                         raise ValueError("sparse history must consume its actual H16 chunk")
                     expected = expected[:: 16 // request.history_k]
                 if request.source_steps != expected:

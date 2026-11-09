@@ -13,6 +13,7 @@ from copy import deepcopy
 import pytest
 import torch
 
+from cosmos_framework.inference.local_memory_online import OnlineMemoryRequest
 from cosmos_framework.inference.local_memory_state import CachedMemoryResponse
 from cosmos_framework.inference.robocasa_feature_evidence import validate_post_step_receipt
 from cosmos_framework.inference.robocasa_feature_evidence_test import CLOCK, KEY, TOKEN
@@ -31,6 +32,36 @@ from cosmos_framework.inference.robocasa_vae_worker import SharedVAEWorker, Work
 
 KS = (1, 2, 4, 8, 16)
 SELECTED = {1: (0,), 2: (0, 8), 4: (0, 4, 8, 12), 8: tuple(range(0, 16, 2)), 16: tuple(range(16))}
+
+
+@pytest.mark.parametrize("k", [1, 2, 4, 8])
+@pytest.mark.parametrize("entry", ["owner", "memory"])
+def test_sparse_partial_tail_can_End_but_cannot_prepare_a_new_Policy_chunk(k, entry):
+    h, adapter, model = _feature_adapter(history_k=k)
+    _commit_feature_cold(adapter, h)
+    rows = h.rows(count=8)
+    original = adapter.snapshot
+    with pytest.raises(ValueError, match="H16"):
+        if entry == "owner":
+            _prepare_feature(adapter, h, 8, rows)
+        else:
+            sources = tuple(range(0, 8, 16 // k))
+            adapter.memory.prepare(
+                OnlineMemoryRequest(
+                    h.lease["session_id"],
+                    h.lease["episode_id"],
+                    8,
+                    sources,
+                    torch.zeros(len(sources), 96),
+                    torch.zeros(len(sources), 15),
+                    stream_t1=True,
+                    history_k=k,
+                )
+            )
+    assert adapter.snapshot is original and not model.scan_calls
+    assert not adapter.memory._pending and not adapter._visual_pending
+    adapter.reset(h.lease["session_id"])
+    h.owner.end_session(TOKEN, h.lease)
 
 
 @pytest.mark.parametrize("value", [0, 3, 5, 32, True, 2.0, "2", None])

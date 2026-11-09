@@ -622,6 +622,8 @@ class FeatureEvidenceOwner:
         if not 0 <= previous_step <= step or step - previous_step > 16:
             raise ProtocolError("feature history must contain exactly the actual contiguous completed steps")
         steps = tuple(range(previous_step, step))
+        if self.history_k != 16 and steps and (previous_step % 16 or len(steps) != 16):
+            raise ProtocolError("sparse Feature prepare requires one complete H16 Action chunk")
         if len(rows) != len(steps):
             raise ProtocolError("feature history must contain exactly the actual contiguous completed steps")
         deadline = _ns(deadline_ns)

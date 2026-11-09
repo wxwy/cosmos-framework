@@ -68,11 +68,11 @@ class WorkerConfig:
     max_session_items: int = 16
     max_sessions: int = 16
     max_policy_epochs: int = 1
-    history_k: int = 16
     max_tombstones: int = 32
     max_chunks: int = 4
     max_trace: int = 256
     max_retired_sessions: int = 16
+    history_k: int = 16
 
     def __post_init__(self):
         from cosmos_framework.inference.robocasa_vae_protocol import validate_history_k
