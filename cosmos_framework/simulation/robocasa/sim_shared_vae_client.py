@@ -128,7 +128,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
         super().__init__(enabled=True, max_evidence_steps=16)
         self.lease = validate_lease({k: v for k, v in lease.items() if k != "capability"})
         self.history_k = validate_history_k(local_ttt_history_k)
-        if descriptor.get("local_ttt_history_k", 16) != self.history_k:
+        if validate_history_k(descriptor.get("local_ttt_history_k", 16)) != self.history_k:
             raise ValueError("history K differs from assigned frozen shared Worker")
         if descriptor.get("trust_model") != "registry_same_trust_domain":
             raise ValueError("explicit controlled Actor trust model required")
@@ -476,7 +476,9 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
         with self._changed:
             episode = self._get(slot)
             if self.history_k != 16 and (
-                not isinstance(status, dict) or status.get("local_ttt_history_k") != self.history_k
+                not isinstance(status, dict)
+                or type(status.get("local_ttt_history_k")) is not int
+                or status["local_ttt_history_k"] != self.history_k
             ):
                 raise ValueError("policy ACK history K differs from frozen Session")
             if (

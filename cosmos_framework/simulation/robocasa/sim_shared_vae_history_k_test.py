@@ -131,7 +131,8 @@ def test_native_loop_skips_composition_before_unselected_steps_and_handles_parti
     assert channel.ends == 1 and not client.diagnostics()["worker_alive"]
 
 
-def test_unselected_RGB_and_changed_ACK_K_are_rejected_without_losing_retained_rows():
+@pytest.mark.parametrize("bad_ack_k", [2, True, 1.0])
+def test_unselected_RGB_and_changed_ACK_K_are_rejected_without_losing_retained_rows(bad_ack_k):
     client, worker, channel = client_for(1)
     client.begin()
     try:
@@ -148,7 +149,7 @@ def test_unselected_RGB_and_changed_ACK_K_are_rejected_without_losing_retained_r
         client.payload()
         result = result_for(client, 16)
         client.accept_policy_result(result)
-        result["local_memory"]["local_ttt_history_k"] = 2
+        result["local_memory"]["local_ttt_history_k"] = bad_ack_k
         with pytest.raises(ValueError, match="history K"):
             client.acknowledge(0, result["local_memory"])
         assert client.diagnostics()["pending"] == 16 and not worker.frames
