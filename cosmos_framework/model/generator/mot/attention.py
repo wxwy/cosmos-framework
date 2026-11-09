@@ -208,6 +208,7 @@ def two_way_attention(
     memory_prefix_value_states: torch.Tensor | None = None,
     memory_prefix_sample_offsets: torch.Tensor | None = None,
     memory_prefix_max_len: int = 4,
+    _capture_prefix_text_kv: bool = False,
 ):
     """
     Performs two-way attention with causal and full attention.
@@ -223,6 +224,10 @@ def two_way_attention(
     packed_key_normalized = (
         packed_key_states_normalized if packed_key_states_normalized is not None else packed_key_states
     )
+    if _capture_prefix_text_kv and (
+        torch.is_grad_enabled() or memory_prefix_key_states is None or get_num_real_samples(packed_query_states) != 1
+    ):
+        raise ValueError("Prefix text K/V capture requires native B1 inference with Prefix")
 
     # The tower offsets carry the pad segment folded in when the pack has one, so these cover it.
     # it carries one. Every pass that may see padding needs those: trailing padding rows belong to
@@ -258,9 +263,10 @@ def two_way_attention(
     # sample offsets. The dense single-sample shortcut has no offset fence, so it
     # cannot safely inject those rows. Keep the native dense fast path when no
     # prefix is present, but force varlen whenever Local K/V is supplied.
-    use_varlen = _use_varlen(
-        get_num_real_samples(packed_query_states), has_caption_offsets=False
-    ) or memory_prefix_key_states is not None
+    use_varlen = (
+        _use_varlen(get_num_real_samples(packed_query_states), has_caption_offsets=False)
+        or memory_prefix_key_states is not None
+    )
 
     if use_varlen:
         # The attention stack re-derives these quantities from the tensors it is handed and guards
@@ -418,6 +424,16 @@ def two_way_attention(
     full_out = full_res.squeeze(0).flatten(-2, -1)  # type: ignore  # [N_full,heads*head_dim]
 
     out_all = from_mode_splits(causal_out, full_out, packed_query_states)
+    if _capture_prefix_text_kv:
+        # Capture AFTER the actual GEN K/V buffer's BF16 materialization. Returning
+        # pre-scatter RoPE outputs changes Inductor fusion/rounding, including the
+        # otherwise identical cache-fill forward. GEN K/V is not part of this cache.
+        und_indices = packed_query_states["_causal_indices"] + memory_prefix_max_len
+        und_k = sample_k.index_select(0, und_indices).unsqueeze(0)
+        und_v = sample_v.index_select(0, und_indices).unsqueeze(0)
+        empty_k = sample_k.new_empty(1, 0, *sample_k.shape[1:])
+        empty_v = sample_v.new_empty(1, 0, *sample_v.shape[1:])
+        return out_all, (empty_k, empty_v, und_k, und_v)
     return out_all
 
 

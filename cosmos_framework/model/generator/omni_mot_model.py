@@ -3729,6 +3729,7 @@ class OmniMoTModel(ImaginaireModel):
         upsample_presence_penalty: float = 0.0,
         upsample_seed: int | None = None,
         _local_memory_prefixes: tuple[torch.Tensor | None, ...] | None = None,
+        use_prefix_text_kv_cache: bool = True,
         **kwargs,
     ) -> dict[str, list[torch.Tensor]]:
         """
@@ -3770,6 +3771,10 @@ class OmniMoTModel(ImaginaireModel):
                 ``OmniInference`` explicitly passes the configured
                 ``SetupOverrides.use_batched_cfg`` policy.
                 Reuses a doubled pack template and a shared text K/V cache when eligible.
+            use_prefix_text_kv_cache (bool): Reuse request-local text K/V with a Local
+                Prefix for eligible B1, two_way, guidance=1 inference. False keeps
+                the original Prefix-on path for controlled same-weight comparisons.
+                Does not change No-TTT, pack-template reuse or model-mode validation.
             upsample_task (str | None): Canonical V4.2 task resolved by the
                 inference caller. ``None`` disables native prompt upsampling.
                 Otherwise, the conditional captions in
@@ -4062,8 +4067,24 @@ class OmniMoTModel(ImaginaireModel):
         # process group whose model-forward sequence is at risk). Text-KV
         # eligibility must additionally agree across CFG-parallel peers before
         # either peer installs the request-local attention dispatch.
+        reuse_prefix_text_kv = (
+            has_local_prefixes
+            and use_prefix_text_kv_cache
+            and guidance == 1.0
+            and velocity_postprocess_builder is None
+            and _dp_shard_group is None
+            and _cfgp_group is None
+            and (self.parallel_dims is None or not self.parallel_dims.cfgp_enabled)
+            and self._can_reuse_inference_text_kv(
+                sequence_plans,
+                gen_data_clean,
+                # Eligibility only: Prefix packs are still rebuilt on every step.
+                reuse_pack_templates=self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean),
+                has_velocity_postprocess=velocity_postprocess is not None,
+            )
+        )
         reuse_text_kv = (
-            False
+            reuse_prefix_text_kv
             if has_local_prefixes
             else self._can_reuse_inference_text_kv(
                 sequence_plans,
@@ -4129,14 +4150,22 @@ class OmniMoTModel(ImaginaireModel):
                     if reuse_pack_templates:
                         if tokens is cond_tokens and not skip_text_tokens:
                             packed_sequence_template = cond_packed_sequence_template
-                            text_kv_cache = cond_text_kv_cache
                         elif tokens is uncond_tokens and skip_text_tokens == skip_text_tokens_for_cfg:
                             packed_sequence_template = uncond_packed_sequence_template
+                    if reuse_text_kv:
+                        if tokens is cond_tokens and not skip_text_tokens:
+                            text_kv_cache = cond_text_kv_cache
+                        elif tokens is uncond_tokens and skip_text_tokens == skip_text_tokens_for_cfg:
                             if reuse_text_kv and uncond_text_kv_cache is None:
                                 uncond_text_kv_cache = self._make_inference_text_kv_cache(net)
                             text_kv_cache = uncond_text_kv_cache
                     memory: MemoryState | None = (
-                        InferenceTextKVMemoryState(text_kv_cache) if text_kv_cache is not None else None
+                        InferenceTextKVMemoryState(
+                            text_kv_cache,
+                            local_prefix_length=self.config.local_memory_k_local if has_local_prefixes else 0,
+                        )
+                        if text_kv_cache is not None
+                        else None
                     )
                     return self._get_velocity(
                         net=net,
@@ -4543,6 +4572,12 @@ class OmniMoTModel(ImaginaireModel):
         finally:
             if previous_attention_dispatch is not None:
                 restore_inference_attention_dispatch(previous_attention_dispatch)
+            if has_local_prefixes:
+                # Release even a partially filled stack on failure. No cache is
+                # attached to the model or a Session, including for retries.
+                for branch_cache in (cond_text_kv_cache, uncond_text_kv_cache, batched_text_kv_cache):
+                    for layer_cache in branch_cache or ():
+                        layer_cache.clear()
 
     def _extract_condition_images_for_visualization(
         self,
