@@ -138,6 +138,30 @@ def prepend_memory_kv(
     """Interleave [Local, native] per sample while preserving native query offsets."""
     if memory_k.shape != memory_v.shape or native_k.shape != native_v.shape:
         raise ValueError("Memory Prefix K/V shapes must match")
+    if (
+        not torch.is_grad_enabled()
+        and memory_offsets.ndim == native_offsets.ndim == 1
+        and memory_offsets.numel() == 2
+        and native_offsets.numel() in (2, 3)
+        and memory_offsets.dtype in (torch.int32, torch.int64)
+        and native_offsets.dtype in (torch.int32, torch.int64)
+        and memory_k.shape[0] == k_local
+        and k_local > 0
+        and memory_k.dtype == native_k.dtype
+        and memory_v.dtype == native_v.dtype
+        and memory_k.device == native_k.device
+        and memory_offsets.device == native_offsets.device == native_k.device
+    ):
+        # Native offsets are zero-based. With one real sample, all Local rows
+        # precede all native rows, including any trailing pad segment. Preserve
+        # that segment's boundary without expanding sample IDs or scattering.
+        # Grad-enabled training and other layouts keep the original routine.
+        return (
+            torch.cat((memory_k, native_k)),
+            torch.cat((memory_v, native_v)),
+            torch.cat((native_offsets[:1], native_offsets[1:] + k_local)),
+            max_native_len + k_local,
+        )
     if native_offsets.numel() == memory_offsets.numel() + 1:
         # Native packing may add one trailing pad segment; it owns no Local rows.
         memory_offsets = torch.cat((memory_offsets, memory_offsets[-1:]))
