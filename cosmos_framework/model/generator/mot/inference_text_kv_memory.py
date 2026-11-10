@@ -9,7 +9,8 @@ them on later steps within the same request.
 Supports single-sample packs (dense attention) and multi-sample packs such as
 batched CFG (cond+uncond as B=2) via varlen attention with per-sample isolation.
 Prefix-aware B1 keeps native varlen attention; the current request's Local
-Prefix K/V is projected and supplied separately on every decoder forward.
+Prefix K/V is supplied separately on every decoder forward. Explicitly bound
+frozen requests may reuse native first-fill projections within that request.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import torch
 
 from cosmos_framework.model.attention import attention
 from cosmos_framework.model.generator.mot.attention import (
+    _FrozenPrefixTextKVToStore,
     _PrefixTextKVToStore,
     SplitInfo,
     dispatch_attention,
@@ -34,6 +36,30 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
 )
 
 
+def prefix_projection_binding(prefixes) -> tuple | None:
+    """Host-only identity/version proof; retain the source to prevent ID reuse.
+
+    Unversioned inference tensors and tensor subclasses conservatively retain
+    the original path. No tensor values or device synchronization are needed.
+    This runs outside compiled decoders, once per sampling step.
+    """
+    if torch.compiler.is_compiling() or torch.is_grad_enabled() or prefixes is None or len(prefixes) != 1:
+        return None
+    token = prefixes[0]
+    if type(token) is not torch.Tensor or token.requires_grad or token.is_inference():
+        return None
+    return (
+        token,
+        token._version,
+        token.data_ptr(),
+        tuple(token.shape),
+        token.stride(),
+        token.storage_offset(),
+        token.dtype,
+        token.device,
+    )
+
+
 class UndKVCache:
     """Fixed per-layer cache for understanding (text) tokens."""
 
@@ -42,6 +68,7 @@ class UndKVCache:
         self.v_und: torch.Tensor | None = None
         self.prefix_key_input: torch.Tensor | None = None
         self.prefix_key_output: torch.Tensor | None = None
+        self.prefix_value_output: torch.Tensor | None = None
         self.is_initialized = False
 
     def store(
@@ -51,6 +78,7 @@ class UndKVCache:
         *,
         prefix_key_input: torch.Tensor | None = None,
         prefix_key_output: torch.Tensor | None = None,
+        prefix_value_output: torch.Tensor | None = None,
     ) -> None:
         """Store und K/V. ``k``/``v``: [B,S_und,H,D]."""
         if (prefix_key_input is None) != (prefix_key_output is None):
@@ -59,10 +87,18 @@ class UndKVCache:
             prefix_key_input.shape != prefix_key_output.shape or prefix_key_input.device != prefix_key_output.device
         ):
             raise ValueError("Prefix normalization reference shape/device mismatch")
+        if prefix_value_output is not None and (
+            prefix_key_output is None
+            or prefix_value_output.shape != prefix_key_output.shape
+            or prefix_value_output.dtype != prefix_key_output.dtype
+            or prefix_value_output.device != prefix_key_output.device
+        ):
+            raise ValueError("Frozen Prefix value reference shape/dtype/device mismatch")
         self.k_und = k.detach().clone()
         self.v_und = v.detach().clone()
         self.prefix_key_input = None if prefix_key_input is None else prefix_key_input.detach().clone()
         self.prefix_key_output = None if prefix_key_output is None else prefix_key_output.detach().clone()
+        self.prefix_value_output = None if prefix_value_output is None else prefix_value_output.detach().clone()
         self.is_initialized = True
 
     def get(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -73,6 +109,7 @@ class UndKVCache:
     def clear(self) -> None:
         self.k_und = self.v_und = None
         self.prefix_key_input = self.prefix_key_output = None
+        self.prefix_value_output = None
         self.is_initialized = False
 
 
@@ -96,16 +133,32 @@ class InferenceTextKVMemoryValue(MemoryValue):
     causal_pad_length: int = 0
     prefix_key_input_cached: torch.Tensor | None = None
     prefix_key_output_cached: torch.Tensor | None = None
+    prefix_value_output_cached: torch.Tensor | None = None
+    reuse_prefix_projections: bool = False
 
 
 class InferenceTextKVMemoryState(MemoryState):
     """Request-local memory state that reuses static text K/V during diffusion inference."""
 
-    def __init__(self, text_kv_cache: list[UndKVCache], *, local_prefix_length: int = 0) -> None:
+    def __init__(
+        self,
+        text_kv_cache: list[UndKVCache],
+        *,
+        local_prefix_length: int = 0,
+        frozen_prefix_binding: tuple | None = None,
+        current_prefixes=None,
+    ) -> None:
         if type(local_prefix_length) is not int or local_prefix_length < 0:
             raise ValueError("local_prefix_length must be a nonnegative integer")
         self._text_kv_cache = text_kv_cache
         self.local_prefix_length = local_prefix_length
+        current = prefix_projection_binding(current_prefixes) if frozen_prefix_binding is not None else None
+        self.reuse_prefix_projections = (
+            local_prefix_length > 0
+            and current is not None
+            and frozen_prefix_binding[0] is current[0]
+            and frozen_prefix_binding[1:] == current[1:]
+        )
         self._causal_pad_length = 0
         self._gen_len = 0
         self._kv_reorder_indices: torch.Tensor | None = None
@@ -167,6 +220,8 @@ class InferenceTextKVMemoryState(MemoryState):
 
     def read_for_layer(self, layer_idx: int) -> InferenceTextKVMemoryValue:
         cache = self._text_kv_cache[layer_idx]
+        if self.reuse_prefix_projections and cache.is_initialized and cache.prefix_value_output is None:
+            raise ValueError("Frozen Prefix projection cache is incomplete")
         if cache.is_initialized:
             und_k_cached, und_v_cached = cache.get()  # und_k/v: [1,N_und,H_kv,D]
         else:
@@ -187,6 +242,8 @@ class InferenceTextKVMemoryState(MemoryState):
             causal_pad_length=self._causal_pad_length,
             prefix_key_input_cached=cache.prefix_key_input,
             prefix_key_output_cached=cache.prefix_key_output,
+            prefix_value_output_cached=cache.prefix_value_output,
+            reuse_prefix_projections=self.reuse_prefix_projections,
         )
 
     def write_for_layer(self, layer_idx: int, kv_to_store: KVToStore) -> None:
@@ -195,6 +252,25 @@ class InferenceTextKVMemoryState(MemoryState):
             return
         # Prefix-aware fill tags the otherwise unused GEN slots explicitly;
         # ordinary text-cache captures retain the original GEN/UND tuple.
+        prefix_value = None
+        if isinstance(kv_to_store, _FrozenPrefixTextKVToStore):
+            if (
+                not self.reuse_prefix_projections
+                or kv_to_store.native_key_output.ndim != 4
+                or kv_to_store.native_key_output.shape[0] != 1
+                or kv_to_store.native_key_output.shape != kv_to_store.native_value_output.shape
+                or kv_to_store.native_key_output.shape[1] < self.local_prefix_length
+                or kv_to_store.und_indices.ndim != 1
+            ):
+                raise ValueError("Frozen Prefix projection capture requires a bound native K/V pair")
+            prefix_key = kv_to_store.native_key_output[:, : self.local_prefix_length]
+            prefix_value = kv_to_store.native_value_output[:, : self.local_prefix_length]
+            kv_to_store = _PrefixTextKVToStore(
+                kv_to_store.prefix_key_input,
+                prefix_key,
+                kv_to_store.native_key_output.index_select(1, kv_to_store.und_indices),
+                kv_to_store.native_value_output.index_select(1, kv_to_store.und_indices),
+            )
         _gen_k, _gen_v, und_k, und_v = kv_to_store
         if isinstance(kv_to_store, _PrefixTextKVToStore):
             if (
@@ -209,6 +285,7 @@ class InferenceTextKVMemoryState(MemoryState):
                 und_v,
                 prefix_key_input=kv_to_store.prefix_key_input,
                 prefix_key_output=kv_to_store.prefix_key_output,
+                prefix_value_output=prefix_value,
             )
         else:
             cache.store(und_k, und_v)
@@ -392,6 +469,7 @@ def dispatch_attention_with_text_kv_memory(
             memory_prefix_max_len=memory_prefix_max_len,
             _capture_prefix_text_kv=True,
             memory_prefix_key_source_states=memory_prefix_key_source_states,
+            _capture_prefix_projections=memory_value.reuse_prefix_projections,
         )
     if isinstance(memory_value, InferenceTextKVMemoryValue) and memory_value.frame_idx > 0:
         return _attention_gen_with_cached_text(
@@ -429,7 +507,8 @@ def _attention_gen_with_cached_text_and_prefix(
     """Reuse native GEN attention with current Prefix, cached UND and current GEN.
 
     UND never attends to Prefix or GEN, so its per-layer K/V is static.
-    Prefix K/V is projected by the current decoder layer on EVERY forward.
+    Prefix K/V comes from current projections or the same request's explicitly
+    bound native projection capture. The normalization reference is unchanged.
     Reuse native fill's normalization rounding only for an identical projected
     key input. Changed input uses current normalization; V is always current.
     The reference is request-local and never stored in a Session.

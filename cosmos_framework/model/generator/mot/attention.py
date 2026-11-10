@@ -35,6 +35,20 @@ class _PrefixTextKVToStore(NamedTuple):
     und_value: torch.Tensor
 
 
+class _FrozenPrefixTextKVToStore(NamedTuple):
+    """Four-tensor capture of the actual native GEN attention buffers.
+
+    Only an explicitly bound request-local inference cache consumes this tag.
+    Extraction/cloning happens outside the compiled decoder, retaining the
+    buffer identity consumed by Attention rather than returning a recompute.
+    """
+
+    prefix_key_input: torch.Tensor
+    native_key_output: torch.Tensor
+    native_value_output: torch.Tensor
+    und_indices: torch.Tensor
+
+
 class SplitInfo:
     def __init__(
         self,
@@ -223,6 +237,7 @@ def two_way_attention(
     memory_prefix_max_len: int = 4,
     _capture_prefix_text_kv: bool = False,
     memory_prefix_key_source_states: torch.Tensor | None = None,
+    _capture_prefix_projections: bool = False,
 ):
     """
     Performs two-way attention with causal and full attention.
@@ -443,17 +458,27 @@ def two_way_attention(
         # pre-scatter RoPE outputs changes Inductor fusion/rounding, including the
         # otherwise identical cache-fill forward. GEN K/V is not part of this cache.
         und_indices = packed_query_states["_causal_indices"] + memory_prefix_max_len
+        if _capture_prefix_projections:
+            if memory_prefix_key_source_states is None:
+                raise ValueError("Frozen Prefix projection capture requires the native normalization input")
+            return out_all, _FrozenPrefixTextKVToStore(
+                memory_prefix_key_source_states.unsqueeze(0),
+                sample_k.unsqueeze(0),
+                sample_v.unsqueeze(0),
+                und_indices,
+            )
         und_k = sample_k.index_select(0, und_indices).unsqueeze(0)
         und_v = sample_v.index_select(0, und_indices).unsqueeze(0)
         if memory_prefix_key_source_states is not None:
             if memory_prefix_key_source_states.shape != memory_prefix_key_states.shape:
                 raise ValueError("Prefix normalization input must preserve the key shape")
-            return out_all, _PrefixTextKVToStore(
+            captured = _PrefixTextKVToStore(
                 memory_prefix_key_source_states.unsqueeze(0),
                 sample_k[:memory_prefix_max_len].unsqueeze(0),
                 und_k,
                 und_v,
             )
+            return out_all, captured
         empty_k = sample_k.new_empty(1, 0, *sample_k.shape[1:])
         empty_v = sample_v.new_empty(1, 0, *sample_v.shape[1:])
         return out_all, (empty_k, empty_v, und_k, und_v)

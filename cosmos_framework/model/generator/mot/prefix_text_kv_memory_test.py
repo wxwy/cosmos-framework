@@ -80,7 +80,7 @@ class _TinyMoT(nn.Module):
         # Match the install/restore entry point of the full VFM network.
         self.language_model = SimpleNamespace(model=SimpleNamespace(layers=self.layers))
 
-    def step(self, und, gen, prefix, caches=None, alignment=1):
+    def step(self, und, gen, prefix, caches=None, alignment=1, memory_owner=None):
         nu, ng = und.shape[0], gen.shape[0]
         pack, mask, _ = build_packed_sequence(
             "two_way",
@@ -118,7 +118,7 @@ class _TinyMoT(nn.Module):
             if prefix is not None
             else None
         )
-        memory = (
+        memory = memory_owner or (
             InferenceTextKVMemoryState(caches, local_prefix_length=4 if prefix is not None else 0) if caches else None
         )
         if memory:
@@ -518,7 +518,8 @@ def test_compiled_cached_prefix_dispatch_keeps_symbolic_guards_and_current_prefi
         torch.testing.assert_close(results[0], results[2], rtol=0, atol=0)
 
 
-def test_prefix_cache_fill_uses_materialized_native_kv_and_hit_keeps_native_padding(monkeypatch):
+@pytest.mark.parametrize("frozen_projection", [False, True])
+def test_prefix_cache_fill_uses_materialized_native_kv_and_hit_keeps_native_padding(monkeypatch, frozen_projection):
     """Keep the exact native GEN operands/backend contract, including pad ranges."""
     torch.manual_seed(109)
 
@@ -555,6 +556,8 @@ def test_prefix_cache_fill_uses_materialized_native_kv_and_hit_keeps_native_padd
                 query=query.clone(),
                 key=key.clone(),
                 value=value.clone(),
+                key_ptr=key.data_ptr(),
+                value_ptr=value.data_ptr(),
                 **{k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in kw.items()},
             )
         )
@@ -563,7 +566,15 @@ def test_prefix_cache_fill_uses_materialized_native_kv_and_hit_keeps_native_padd
     monkeypatch.setattr(attention_module, "attention", kernel)
     monkeypatch.setattr(cache_module, "attention", kernel)
     caches = make_inference_text_kv_cache(1)
-    state = InferenceTextKVMemoryState(caches, local_prefix_length=4)
+    token = torch.randn(4, 32)
+    with torch.no_grad():
+        binding = cache_module.prefix_projection_binding((token,)) if frozen_projection else None
+        state = InferenceTextKVMemoryState(
+            caches, local_prefix_length=4, frozen_prefix_binding=binding, current_prefixes=(token,)
+        )
+    cache_kwargs = dict(kwargs)
+    if frozen_projection:
+        cache_kwargs["memory_prefix_key_source_states"] = kwargs["memory_prefix_key_states"]
     state.init(query, torch.device("cpu"))
     with torch.inference_mode():
         expected, _ = dispatch_attention(query, key, value, mask, packed_key_states_normalized=norm_key, **kwargs)
@@ -575,13 +586,28 @@ def test_prefix_cache_fill_uses_materialized_native_kv_and_hit_keeps_native_padd
             mask,
             memory_value=state.read_for_layer(0),
             packed_key_states_normalized=norm_key,
-            **kwargs,
+            **cache_kwargs,
         )
-        assert kv is not None and kv[0].numel() == kv[1].numel() == 0
+        assert kv is not None
+        if frozen_projection:
+            assert isinstance(kv, cache_module._FrozenPrefixTextKVToStore)
+            assert kv.native_key_output.data_ptr() == calls[-1]["key_ptr"]
+            assert kv.native_value_output.data_ptr() == calls[-1]["value_ptr"]
+            torch.testing.assert_close(kv.native_key_output[0, :4], native_gen_call["key"][0, :4], rtol=0, atol=0)
+            torch.testing.assert_close(kv.native_value_output[0, :4], native_gen_call["value"][0, :4], rtol=0, atol=0)
+        else:
+            assert kv[0].numel() == kv[1].numel() == 0
         positions = query["_causal_indices"] + 4
-        torch.testing.assert_close(kv[2][0], native_gen_call["key"][0, positions], rtol=0, atol=0)
-        torch.testing.assert_close(kv[3][0], native_gen_call["value"][0, positions], rtol=0, atol=0)
+        if not frozen_projection:
+            torch.testing.assert_close(kv[2][0], native_gen_call["key"][0, positions], rtol=0, atol=0)
+            torch.testing.assert_close(kv[3][0], native_gen_call["value"][0, positions], rtol=0, atol=0)
         state.write_for_layer(0, kv)
+        torch.testing.assert_close(caches[0].k_und[0], native_gen_call["key"][0, positions], rtol=0, atol=0)
+        torch.testing.assert_close(caches[0].v_und[0], native_gen_call["value"][0, positions], rtol=0, atol=0)
+        if frozen_projection:
+            torch.testing.assert_close(
+                caches[0].prefix_value_output[0], native_gen_call["value"][0, :4], rtol=0, atol=0
+            )
 
         def gen_only(p):
             return from_und_gen_splits(p["causal_seq"][:0], get_gen_seq(p), p)
@@ -592,7 +618,7 @@ def test_prefix_cache_fill_uses_materialized_native_kv_and_hit_keeps_native_padd
             gen_only(value),
             mask,
             memory_value=state.read_for_layer(0),
-            **kwargs,
+            **cache_kwargs,
         )
         assert ignored is not None and all(t.numel() == 0 for t in ignored)
         hit_gen_call = calls[-1]
@@ -690,7 +716,13 @@ def _generation_harness():
             raise RuntimeError("injected generation failure")
         gen = kwargs["noise_x"][0][:96].reshape(6, 16)
         prefix = kwargs["gen_data_clean"].x0_tokens_local_memory
-        out = obj.net.step(obj.text, gen, prefix[0] if prefix else None, memory._text_kv_cache if memory else None)
+        out = obj.net.step(
+            obj.text,
+            gen,
+            prefix[0] if prefix else None,
+            memory._text_kv_cache if memory else None,
+            memory_owner=memory,
+        )
         flat = out.flatten().repeat(4)[:352]
         return [flat]
 
@@ -745,6 +777,295 @@ def test_generation_entrypoint_same_prefix_actions_cache_hits_and_opt_out():
         torch.testing.assert_close(actual[modality][0], reference[modality][0], rtol=0, atol=0)
     assert all(not c.is_initialized and c.k_und is c.v_und is None for c in obj.created[-1])
     assert all(layer.self_attn.dispatch_attention_fn is dispatch_attention for layer in obj.net.layers)
+
+
+def test_frozen_request_projects_prefix_kv_once_per_layer_over_thirty_steps():
+    obj, batch = _generation_harness()
+    obj.training = False
+    counts = {name: [0] * 3 for name in ("key", "value", "norm")}
+    handles = []
+    for index, layer in enumerate(obj.net.layers):
+        for name, module in (
+            ("key", layer.self_attn.k_proj_moe_gen),
+            ("value", layer.self_attn.v_proj_moe_gen),
+            ("norm", layer.self_attn.k_norm_moe_gen),
+        ):
+
+            def counted(_module, args, _output, index=index, name=name):
+                if args[0].shape[0] == 4:
+                    counts[name][index] += 1
+
+            handles.append(module.register_forward_hook(counted))
+    prefix = torch.randn(4, 32)
+    try:
+        obj.generate_samples_from_batch(
+            batch,
+            guidance=1.0,
+            num_steps=30,
+            seed=[31],
+            _local_memory_prefixes=(prefix,),
+            use_prefix_pack_templates=False,
+            use_prefix_projection_cache=True,
+        )
+        assert counts == {name: [1] * 3 for name in counts}, counts
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("alignment", [1, 8])
+def test_frozen_prefix_projection_matches_all_thirty_native_steps(dtype, alignment):
+    torch.manual_seed(135)
+    net = _TinyMoT(dtype)
+    und, gen, prefix = (torch.randn(*s, dtype=dtype) for s in ((5, 16), (6, 16), (4, 32)))
+    with torch.inference_mode():
+        reference = [net.step(und, gen + i * 0.01, prefix, alignment=alignment) for i in range(30)]
+    with torch.no_grad():
+        binding = cache_module.prefix_projection_binding((prefix,))
+    caches = make_inference_text_kv_cache(3)
+    previous = install_inference_memory_attention_dispatch(net)
+    try:
+        with torch.inference_mode():
+            for i, expected in enumerate(reference):
+                owner = InferenceTextKVMemoryState(
+                    caches, local_prefix_length=4, frozen_prefix_binding=binding, current_prefixes=(prefix,)
+                )
+                assert owner.reuse_prefix_projections
+                result = net.step(und, gen + i * 0.01, prefix, caches, alignment, memory_owner=owner)
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    finally:
+        restore_inference_attention_dispatch(previous)
+        for cache in caches:
+            cache.clear()
+            assert cache.prefix_value_output is None
+
+
+def test_prefix_projection_binding_is_identity_version_and_grad_guarded():
+    token = torch.randn(4, 32)
+    caches = make_inference_text_kv_cache(1)
+    with torch.no_grad():
+        binding = cache_module.prefix_projection_binding((token,))
+
+        def bound(current):
+            return InferenceTextKVMemoryState(
+                caches, local_prefix_length=4, frozen_prefix_binding=binding, current_prefixes=current
+            ).reuse_prefix_projections
+
+        assert binding[0] is token and bound((token,))
+        assert not bound((token.clone(),)) and not bound((None,)) and not bound((token, token))
+        token.add_(1)
+        assert not bound((token,))
+        token.sub_(1)
+        assert not bound((token,))  # Version changed even after value restoration.
+        assert cache_module.prefix_projection_binding((token.requires_grad_(),)) is None
+    with torch.enable_grad():
+        assert cache_module.prefix_projection_binding((token.detach(),)) is None
+    with torch.inference_mode():
+        assert cache_module.prefix_projection_binding((torch.randn(4, 32),)) is None
+
+
+@pytest.mark.parametrize("mutation", ["inplace", "replace"])
+def test_generation_changed_prefix_uses_current_path_and_restores(mutation):
+    def run(enabled):
+        obj, batch = _generation_harness()
+        obj.training = False
+        prefix = torch.randn(4, 32)
+        native_sampler, native_velocity = obj.sampler, obj._get_velocity
+        seen, current, calls = [], {}, 0
+
+        def velocity(**kwargs):
+            current["clean"] = kwargs["gen_data_clean"]
+            seen.append(kwargs["memory"].reuse_prefix_projections)
+            return native_velocity(**kwargs)
+
+        def sampler(velocity_fn, *args, **kwargs):
+            def step(*a, **kw):
+                nonlocal calls
+                if calls in (2, 4):
+                    if mutation == "inplace":
+                        prefix.add_(1 if calls == 2 else -1)
+                    else:
+                        current["clean"].x0_tokens_local_memory[0] = prefix + 1 if calls == 2 else prefix
+                calls += 1
+                return velocity_fn(*a, **kw)
+
+            return native_sampler(step, *args, **kwargs)
+
+        obj._get_velocity, obj.sampler = velocity, sampler
+        output = obj.generate_samples_from_batch(
+            batch,
+            guidance=1.0,
+            num_steps=6,
+            seed=[31],
+            _local_memory_prefixes=(prefix,),
+            use_prefix_pack_templates=False,
+            use_prefix_projection_cache=enabled,
+        )
+        return output, seen
+
+    expected, _ = run(False)
+    actual, seen = run(True)
+    assert seen == (
+        [True, True, False, False, False, False] if mutation == "inplace" else [True, True, False, False, True, True]
+    )
+    for modality in expected:
+        torch.testing.assert_close(actual[modality][0], expected[modality][0], rtol=0, atol=0)
+
+
+def test_prefix_projection_binding_detects_storage_replacement():
+    token = torch.randn(4, 32)
+    with torch.no_grad():
+        binding = cache_module.prefix_projection_binding((token,))
+        replacement = token.clone() + 1
+        token.data = replacement
+        state = InferenceTextKVMemoryState(
+            make_inference_text_kv_cache(1),
+            local_prefix_length=4,
+            frozen_prefix_binding=binding,
+            current_prefixes=(token,),
+        )
+        assert not state.reuse_prefix_projections
+
+
+@pytest.mark.parametrize("reason", ["training", "net_training", "opt_out", "inference_tensor"])
+def test_projection_reuse_declines_unproven_or_training_requests(reason):
+    obj, batch = _generation_harness()
+    obj.training = reason == "training"
+    if reason == "net_training":
+        obj.net.train()
+    prefix = torch.randn(4, 32)
+    if reason == "inference_tensor":
+        with torch.inference_mode():
+            prefix = prefix.clone()
+    seen, native = [], obj._get_velocity
+
+    def velocity(**kwargs):
+        seen.append(kwargs["memory"].reuse_prefix_projections)
+        return native(**kwargs)
+
+    obj._get_velocity = velocity
+    obj.generate_samples_from_batch(
+        batch,
+        guidance=1.0,
+        num_steps=3,
+        seed=[31],
+        _local_memory_prefixes=(prefix,),
+        use_prefix_pack_templates=False,
+        use_prefix_projection_cache=reason != "opt_out",
+    )
+    assert seen == [False] * 3
+
+
+@pytest.mark.parametrize("fail_at", [1, 3])
+def test_frozen_projection_failure_retry_and_requests_clear_all_references(fail_at):
+    obj, batch = _generation_harness()
+    obj.training = False
+    prefix = torch.randn(4, 32)
+    kwargs = dict(
+        guidance=1.0, num_steps=6, seed=[31], _local_memory_prefixes=(prefix,), use_prefix_pack_templates=False
+    )
+    obj.fail_at = fail_at
+    with pytest.raises(RuntimeError, match="injected"):
+        obj.generate_samples_from_batch(batch, **kwargs)
+    failed = obj.created[-1]
+    assert all(
+        c.prefix_value_output is c.prefix_key_input is c.prefix_key_output is c.k_und is c.v_und is None for c in failed
+    )
+    obj.fail_at = None
+    obj.seen.clear()
+    actual = obj.generate_samples_from_batch(batch, **kwargs)
+    fresh = obj.created[-1]
+    assert not ({id(c) for c in failed} & {id(c) for c in fresh})
+    expected = obj.generate_samples_from_batch(batch, use_prefix_projection_cache=False, **kwargs)
+    for modality in expected:
+        torch.testing.assert_close(actual[modality][0], expected[modality][0], rtol=0, atol=0)
+    assert all(c.prefix_value_output is None for c in fresh)
+    assert all(layer.self_attn.dispatch_attention_fn is dispatch_attention for layer in obj.net.layers)
+
+
+def test_frozen_projection_value_is_cloned_detached_and_cleared():
+    cache = make_inference_text_kv_cache(1)[0]
+    text, source = torch.randn(1, 5, 1, 8), torch.randn(1, 4, 1, 8)
+    value = torch.randn_like(source, requires_grad=True)
+    expected = value.detach().clone()
+    cache.store(text, text, prefix_key_input=source, prefix_key_output=source, prefix_value_output=value)
+    with torch.no_grad():
+        value.add_(10)
+    torch.testing.assert_close(cache.prefix_value_output, expected, rtol=0, atol=0)
+    assert not cache.prefix_value_output.requires_grad
+    cache.clear()
+    assert cache.prefix_value_output is cache.prefix_key_input is cache.prefix_key_output is None
+
+
+@pytest.mark.parametrize("corruption", ["missing", "dtype", "shape"])
+def test_frozen_projection_corrupt_value_fails_closed(corruption):
+    net = _TinyMoT()
+    und, gen, prefix = torch.randn(5, 16), torch.randn(6, 16), torch.randn(4, 32)
+    with torch.no_grad():
+        binding = cache_module.prefix_projection_binding((prefix,))
+    caches = make_inference_text_kv_cache(3)
+    previous = install_inference_memory_attention_dispatch(net)
+    try:
+        with torch.inference_mode():
+
+            def owner():
+                return InferenceTextKVMemoryState(
+                    caches, local_prefix_length=4, frozen_prefix_binding=binding, current_prefixes=(prefix,)
+                )
+
+            net.step(und, gen, prefix, caches, memory_owner=owner())
+            cached = caches[0].prefix_value_output
+            caches[0].prefix_value_output = (
+                None if corruption == "missing" else (cached.double() if corruption == "dtype" else cached[:, :3])
+            )
+            with pytest.raises(ValueError, match="Frozen Prefix projection cache"):
+                net.step(und, gen, prefix, caches, memory_owner=owner())
+    finally:
+        restore_inference_attention_dispatch(previous)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_compiled_frozen_projection_fill_and_hits_keep_strict_outputs(monkeypatch, dynamic):
+    def kernel(query, key, value, **kwargs):
+        qo, ko = kwargs.get("cumulative_seqlen_Q"), kwargs.get("cumulative_seqlen_KV")
+        if qo is None:
+            qo = torch.tensor([0, query.shape[1]], device=query.device)
+            ko = torch.tensor([0, key.shape[1]], device=key.device)
+        qi, ki = torch.arange(query.shape[1], device=query.device), torch.arange(key.shape[1], device=key.device)
+        qs, ks = torch.bucketize(qi, qo[1:], right=True), torch.bucketize(ki, ko[1:], right=True)
+        mask = qs[:, None] == ks[None, :]
+        if kwargs.get("is_causal", False):
+            mask = mask & ((ki - ko[ks])[None, :] <= (qi - qo[qs])[:, None])
+        return F.scaled_dot_product_attention(
+            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), attn_mask=mask, enable_gqa=True
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(attention_module, "attention", kernel)
+    monkeypatch.setattr(cache_module, "attention", kernel)
+    torch.manual_seed(136)
+    net = _TinyMoT(torch.bfloat16)
+    und, gen, prefix = (torch.randn(*shape, dtype=torch.bfloat16) for shape in ((5, 16), (6, 16), (4, 32)))
+    with torch.inference_mode():
+        expected = [net.step(und, gen + i * 0.01, prefix) for i in range(3)]
+    with torch.no_grad():
+        binding = cache_module.prefix_projection_binding((prefix,))
+    previous = install_inference_memory_attention_dispatch(net)
+    caches = make_inference_text_kv_cache(3)
+    torch._dynamo.reset()
+    try:
+        for index, layer in enumerate(net.layers):
+            net.layers[index] = torch.compile(layer, backend="eager", fullgraph=True, dynamic=dynamic)
+        with torch.inference_mode():
+            for i, reference in enumerate(expected):
+                owner = InferenceTextKVMemoryState(
+                    caches, local_prefix_length=4, frozen_prefix_binding=binding, current_prefixes=(prefix,)
+                )
+                actual = net.step(und, gen + i * 0.01, prefix, caches, memory_owner=owner)
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    finally:
+        restore_inference_attention_dispatch(previous)
+        torch._dynamo.reset()
 
 
 @pytest.mark.parametrize("fail_at", [1, 3])

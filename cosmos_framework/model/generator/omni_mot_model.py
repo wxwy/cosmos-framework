@@ -64,6 +64,7 @@ from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
     UndKVCache,
     install_inference_memory_attention_dispatch,
     make_inference_text_kv_cache,
+    prefix_projection_binding,
     restore_inference_attention_dispatch,
 )
 from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
@@ -3731,6 +3732,7 @@ class OmniMoTModel(ImaginaireModel):
         _local_memory_prefixes: tuple[torch.Tensor | None, ...] | None = None,
         use_prefix_text_kv_cache: bool = True,
         use_prefix_pack_templates: bool = True,
+        use_prefix_projection_cache: bool = True,
         **kwargs,
     ) -> dict[str, list[torch.Tensor]]:
         """
@@ -3780,6 +3782,10 @@ class OmniMoTModel(ImaginaireModel):
                 for eligible Prefix-aware text-KV requests. Prefix stays fixed
                 within this request; noisy tokens and timesteps refresh every step.
                 False retains the approved text-KV-only path for comparisons.
+            use_prefix_projection_cache (bool): Capture per-layer Prefix K/V
+                from the first native compiled forward for eligible eval B1
+                requests. Reuse only while the versioned Prefix source remains
+                identical; replacements/mutations retain the original path.
             upsample_task (str | None): Canonical V4.2 task resolved by the
                 inference caller. ``None`` disables native prompt upsampling.
                 Otherwise, the conditional captions in
@@ -4118,6 +4124,14 @@ class OmniMoTModel(ImaginaireModel):
         # Request-scoped: install only for this generate call and restore afterward so we
         # never permanently shadow another dispatch_attention_fn on the model.
         previous_attention_dispatch = None
+        frozen_prefix_binding = (
+            prefix_projection_binding(gen_data_clean.x0_tokens_local_memory)
+            if reuse_prefix_text_kv
+            and use_prefix_projection_cache
+            and not getattr(self, "training", True)
+            and not getattr(net or self.net, "training", True)
+            else None
+        )
         diffusion_cache = None if has_local_prefixes else getattr(self, "_diffusion_cache", None)
         cache_step_index: int | None = None
         try:
@@ -4172,6 +4186,10 @@ class OmniMoTModel(ImaginaireModel):
                         InferenceTextKVMemoryState(
                             text_kv_cache,
                             local_prefix_length=self.config.local_memory_k_local if has_local_prefixes else 0,
+                            frozen_prefix_binding=frozen_prefix_binding,
+                            current_prefixes=gen_data_clean.x0_tokens_local_memory
+                            if frozen_prefix_binding is not None
+                            else None,
                         )
                         if text_kv_cache is not None
                         else None

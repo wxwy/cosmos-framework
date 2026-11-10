@@ -810,14 +810,31 @@ class PackedAttentionMoT(nn.Module):
 
         memory_prefix_kwargs = {}
         if memory_prefix_context is not None:
-            prefix_k = self.k_proj_moe_gen(memory_prefix_context.hidden).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
-            prefix_v = self.v_proj_moe_gen(memory_prefix_context.hidden).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
+            if getattr(memory_value, "reuse_prefix_projections", False) and memory_value.frame_idx > 0:
+                source = memory_value.prefix_key_input_cached
+                key = memory_value.prefix_key_output_cached
+                value = memory_value.prefix_value_output_cached
+                if source is None or key is None or value is None:
+                    raise ValueError("Frozen Prefix projection cache is incomplete")
+                expected = (1, memory_prefix_context.k_local, self.num_key_value_heads, self.head_dim)
+                if any(
+                    t.shape != expected
+                    or t.dtype != memory_prefix_context.hidden.dtype
+                    or t.device != memory_prefix_context.hidden.device
+                    for t in (source, key, value)
+                ):
+                    raise ValueError("Frozen Prefix projection cache identity mismatch")
+                prefix_k, prefix_v, normalized_prefix_k = source[0], value[0], key[0]
+            else:
+                prefix_k = self.k_proj_moe_gen(memory_prefix_context.hidden).view(
+                    -1, self.num_key_value_heads, self.head_dim
+                )
+                prefix_v = self.v_proj_moe_gen(memory_prefix_context.hidden).view(
+                    -1, self.num_key_value_heads, self.head_dim
+                )
+                normalized_prefix_k = self.k_norm_moe_gen(prefix_k)
             memory_prefix_kwargs = dict(
-                memory_prefix_key_states=self.k_norm_moe_gen(prefix_k),
+                memory_prefix_key_states=normalized_prefix_k,
                 memory_prefix_value_states=prefix_v,
                 memory_prefix_sample_offsets=memory_prefix_context.sample_offsets,
                 memory_prefix_max_len=memory_prefix_context.k_local,
