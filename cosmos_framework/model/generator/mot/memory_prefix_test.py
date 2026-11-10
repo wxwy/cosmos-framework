@@ -12,6 +12,7 @@ import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils._python_dispatch import TorchDispatchMode
 
 import cosmos_framework.model.generator.mot.attention as attention_module
 from cosmos_framework.data.generator.sequence_packing.packers import pack_input_sequence
@@ -447,3 +448,183 @@ def test_three_way_dispatch_rejected_before_attention() -> None:
     mask = SimpleNamespace(is_three_way=True, control_stream_token_ranges=None)
     with pytest.raises(ValueError, match="two_way"):
         dispatch_attention(None, None, None, mask, memory_prefix_key_states=torch.zeros(4, 1, 8))
+
+
+class _AssemblyOps(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.counts = {}
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        name = func._schema.name
+        self.counts[name] = self.counts.get(name, 0) + 1
+        return func(*args, **(kwargs or {}))
+
+
+def _b1_assembly_inputs(native_len=13, pad=0, *, dtype=torch.float32, offset_dtype=torch.int32, prefix_len=4):
+    generator = torch.Generator().manual_seed(35)
+
+    def values(rows):
+        # Noncontiguous source views must retain their native values and order.
+        return torch.randn(rows, 8, 2, generator=generator, dtype=dtype).transpose(1, 2)
+
+    ends = [0, native_len] + ([native_len + pad] if pad else [])
+    return dict(
+        memory_k=values(prefix_len),
+        memory_v=values(prefix_len),
+        memory_offsets=torch.tensor([0, prefix_len]),
+        native_k=values(native_len + pad),
+        native_v=values(native_len + pad),
+        native_offsets=torch.tensor(ends, dtype=offset_dtype),
+        max_native_len=max(native_len, pad),
+        k_local=prefix_len or 4,
+    )
+
+
+def _legacy_assembly(inputs):
+    # Grad-enabled execution deliberately retains the original generic routine.
+    # Its baseline body is also bound byte-for-byte in the author evidence.
+    with torch.enable_grad():
+        return prepend_memory_kv(**inputs)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("native_len", [1, 32, 132, 267, 400])
+@pytest.mark.parametrize("pad", [0, 2, 8])
+def test_b1_inference_layout_matches_generic_with_native_padding(dtype, offset_dtype, native_len, pad):
+    inputs = _b1_assembly_inputs(native_len, pad, dtype=dtype, offset_dtype=offset_dtype)
+    snapshots = {name: value.clone() for name, value in inputs.items() if isinstance(value, torch.Tensor)}
+    reference = _legacy_assembly(inputs)
+    with torch.inference_mode():
+        actual = prepend_memory_kv(**inputs)
+    for left, right in zip(actual[:3], reference[:3], strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+        assert left.dtype == right.dtype and left.stride() == right.stride()
+    assert actual[3] == reference[3]
+    assert actual[2].tolist() == [0, native_len + 4] + ([native_len + pad + 4] if pad else [])
+    for name, value in snapshots.items():
+        torch.testing.assert_close(inputs[name], value, rtol=0, atol=0)
+
+
+def test_b1_inference_assembly_has_no_sample_expansion_scan_or_index_copy():
+    for pad in (0, 2):
+        inputs = _b1_assembly_inputs(pad=pad)
+        with torch.inference_mode(), _AssemblyOps() as ops:
+            actual = prepend_memory_kv(**inputs)
+        forbidden = {
+            name: count
+            for name, count in ops.counts.items()
+            if name
+            in {
+                "aten::repeat_interleave",
+                "aten::cumsum",
+                "aten::index_copy",
+            }
+        }
+        assert not forbidden, f"B1 assembly still runs generic sample metadata/scatter: {forbidden}"
+        torch.testing.assert_close(actual[0][:4], inputs["memory_k"], rtol=0, atol=0)
+        torch.testing.assert_close(actual[1][4:], inputs["native_v"], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("prefix_len", [1, 4, 8])
+def test_b1_assembly_current_prefix_changes_and_restores(prefix_len):
+    inputs = _b1_assembly_inputs(32, 2, dtype=torch.bfloat16, prefix_len=prefix_len)
+    with torch.inference_mode():
+        original = prepend_memory_kv(**inputs)
+        changed_inputs = dict(inputs, memory_k=inputs["memory_k"] + 1, memory_v=inputs["memory_v"] - 1)
+        changed = prepend_memory_kv(**changed_inputs)
+        restored = prepend_memory_kv(**inputs)
+    torch.testing.assert_close(changed[0][:prefix_len], changed_inputs["memory_k"], rtol=0, atol=0)
+    torch.testing.assert_close(changed[1][:prefix_len], changed_inputs["memory_v"], rtol=0, atol=0)
+    assert not torch.equal(changed[0], original[0]) and not torch.equal(changed[1], original[1])
+    for index in range(3):
+        torch.testing.assert_close(original[index], restored[index], rtol=0, atol=0)
+    torch.testing.assert_close(changed[0][prefix_len:], original[0][prefix_len:], rtol=0, atol=0)
+    torch.testing.assert_close(changed[1][prefix_len:], original[1][prefix_len:], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sample_count", [2, 3])
+@pytest.mark.parametrize("pad", [0, 2])
+def test_multi_sample_inference_keeps_generic_interleaving_and_scans(sample_count, pad):
+    inputs = _b1_assembly_inputs(2 * sample_count, pad)
+    # Exactly one sample owns a Prefix; others retain their original boundaries.
+    inputs["memory_offsets"] = torch.tensor([0] + [4] * sample_count)
+    inputs["native_offsets"] = torch.tensor(
+        list(range(0, 2 * sample_count + 1, 2)) + ([2 * sample_count + pad] if pad else []), dtype=torch.int32
+    )
+    reference = _legacy_assembly(inputs)
+    with torch.inference_mode(), _AssemblyOps() as ops:
+        actual = prepend_memory_kv(**inputs)
+    assert ops.counts["aten::repeat_interleave"] == 2 and ops.counts["aten::cumsum"] == 1
+    for index in range(3):
+        torch.testing.assert_close(actual[index], reference[index], rtol=0, atol=0)
+    assert actual[3] == reference[3]
+
+
+def test_b1_grad_enabled_assembly_preserves_generic_path_and_gradients():
+    inputs = _b1_assembly_inputs(13, 2)
+    for name in ("memory_k", "memory_v", "native_k", "native_v"):
+        inputs[name].requires_grad_()
+    with torch.enable_grad(), _AssemblyOps() as ops:
+        key, value, _, _ = prepend_memory_kv(**inputs)
+    assert ops.counts["aten::repeat_interleave"] == 2 and ops.counts["aten::cumsum"] == 1
+    (2 * key.sum() + 3 * value.sum()).backward()
+    for name, scale in (("memory_k", 2), ("native_k", 2), ("memory_v", 3), ("native_v", 3)):
+        torch.testing.assert_close(inputs[name].grad, torch.full_like(inputs[name], scale), rtol=0, atol=0)
+
+
+def test_b1_empty_prefix_retains_generic_path():
+    inputs = _b1_assembly_inputs(13, 2, prefix_len=0)
+    with torch.inference_mode(), _AssemblyOps() as ops:
+        actual = prepend_memory_kv(**inputs)
+    assert ops.counts["aten::repeat_interleave"] == 2
+    torch.testing.assert_close(actual[0], inputs["native_k"], rtol=0, atol=0)
+    torch.testing.assert_close(actual[2], inputs["native_offsets"], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bad", ["key_dtype", "value_dtype", "sample_count", "device", "kv_shape"])
+def test_b1_invalid_assembly_still_rejected(bad):
+    inputs = _b1_assembly_inputs()
+    if bad in ("key_dtype", "value_dtype"):
+        key = "memory_k" if bad == "key_dtype" else "memory_v"
+        inputs[key] = inputs[key].to(torch.bfloat16)
+    elif bad == "sample_count":
+        inputs["native_offsets"] = torch.tensor([0, 1, 2, 13], dtype=torch.int32)
+    elif bad == "device":
+        inputs["memory_k"] = inputs["memory_k"].to("meta")
+    else:
+        inputs["memory_v"] = inputs["memory_v"][:3]
+    for context in (torch.enable_grad, torch.inference_mode):
+        with context(), pytest.raises((ValueError, RuntimeError)):
+            prepend_memory_kv(**inputs)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
+def test_b1_assembly_fullgraph_keeps_exact_layout_without_scans(dynamic, offset_dtype):
+    graphs = []
+
+    def backend(graph, _inputs):
+        graphs.append([str(node.target) for node in graph.graph.nodes if node.op == "call_function"])
+        return graph.forward
+
+    torch._dynamo.reset()
+    compiled = torch.compile(prepend_memory_kv, backend=backend, fullgraph=True, dynamic=dynamic)
+    try:
+        for native_len, pad in ((13, 0), (132, 2), (32, 8)):
+            inputs = _b1_assembly_inputs(native_len, pad, dtype=torch.bfloat16, offset_dtype=offset_dtype)
+            reference = _legacy_assembly(inputs)
+            with torch.inference_mode():
+                actual = compiled(**inputs)
+            for index in range(3):
+                torch.testing.assert_close(actual[index], reference[index], rtol=0, atol=0)
+            assert actual[3] == reference[3]
+        assert graphs
+        assert not any(
+            "repeat_interleave" in name or "cumsum" in name or "index_copy" in name
+            for graph in graphs
+            for name in graph
+        )
+    finally:
+        torch._dynamo.reset()
