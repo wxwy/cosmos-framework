@@ -19,7 +19,12 @@ from dataclasses import dataclass
 import torch
 
 from cosmos_framework.model.attention import attention
-from cosmos_framework.model.generator.mot.attention import SplitInfo, dispatch_attention, two_way_attention
+from cosmos_framework.model.generator.mot.attention import (
+    _PrefixTextKVToStore,
+    SplitInfo,
+    dispatch_attention,
+    two_way_attention,
+)
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryState, MemoryValue
 from cosmos_framework.data.generator.sequence_packing.runtime import (
     SequencePack,
@@ -35,12 +40,29 @@ class UndKVCache:
     def __init__(self) -> None:
         self.k_und: torch.Tensor | None = None
         self.v_und: torch.Tensor | None = None
+        self.prefix_key_input: torch.Tensor | None = None
+        self.prefix_key_output: torch.Tensor | None = None
         self.is_initialized = False
 
-    def store(self, k: torch.Tensor, v: torch.Tensor) -> None:
+    def store(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        prefix_key_input: torch.Tensor | None = None,
+        prefix_key_output: torch.Tensor | None = None,
+    ) -> None:
         """Store und K/V. ``k``/``v``: [B,S_und,H,D]."""
+        if (prefix_key_input is None) != (prefix_key_output is None):
+            raise ValueError("Prefix normalization reference requires input and output")
+        if prefix_key_input is not None and (
+            prefix_key_input.shape != prefix_key_output.shape or prefix_key_input.device != prefix_key_output.device
+        ):
+            raise ValueError("Prefix normalization reference shape/device mismatch")
         self.k_und = k.detach().clone()
         self.v_und = v.detach().clone()
+        self.prefix_key_input = None if prefix_key_input is None else prefix_key_input.detach().clone()
+        self.prefix_key_output = None if prefix_key_output is None else prefix_key_output.detach().clone()
         self.is_initialized = True
 
     def get(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -50,6 +72,7 @@ class UndKVCache:
 
     def clear(self) -> None:
         self.k_und = self.v_und = None
+        self.prefix_key_input = self.prefix_key_output = None
         self.is_initialized = False
 
 
@@ -71,6 +94,8 @@ class InferenceTextKVMemoryValue(MemoryValue):
     for_cuda_graphs: bool = False
     local_prefix_length: int = 0
     causal_pad_length: int = 0
+    prefix_key_input_cached: torch.Tensor | None = None
+    prefix_key_output_cached: torch.Tensor | None = None
 
 
 class InferenceTextKVMemoryState(MemoryState):
@@ -160,14 +185,33 @@ class InferenceTextKVMemoryState(MemoryState):
             for_cuda_graphs=False,
             local_prefix_length=self.local_prefix_length,
             causal_pad_length=self._causal_pad_length,
+            prefix_key_input_cached=cache.prefix_key_input,
+            prefix_key_output_cached=cache.prefix_key_output,
         )
 
     def write_for_layer(self, layer_idx: int, kv_to_store: KVToStore) -> None:
         cache = self._text_kv_cache[layer_idx]
         if cache.is_initialized:
             return
-        _gen_k, _gen_v, und_k, und_v = kv_to_store  # gen [1,N_gen,H_kv,D], und [1,N_und,H_kv,D]
-        cache.store(und_k, und_v)
+        # Prefix-aware fill tags the otherwise unused GEN slots explicitly;
+        # ordinary text-cache captures retain the original GEN/UND tuple.
+        _gen_k, _gen_v, und_k, und_v = kv_to_store
+        if isinstance(kv_to_store, _PrefixTextKVToStore):
+            if (
+                self.local_prefix_length <= 0
+                or kv_to_store.prefix_key_input.ndim != 4
+                or kv_to_store.prefix_key_input.shape[0] != 1
+                or kv_to_store.prefix_key_input.shape[1] != self.local_prefix_length
+            ):
+                raise ValueError("Prefix normalization reference requires the current B1 Prefix")
+            cache.store(
+                und_k,
+                und_v,
+                prefix_key_input=kv_to_store.prefix_key_input,
+                prefix_key_output=kv_to_store.prefix_key_output,
+            )
+        else:
+            cache.store(und_k, und_v)
 
     def is_gen_only(self) -> bool:
         # Require every layer: layer-0 alone can be True after a partial first forward (e.g. OOM mid-stack).
@@ -283,6 +327,7 @@ def dispatch_attention_with_text_kv_memory(
     memory_prefix_value_states: torch.Tensor | None = None,
     memory_prefix_sample_offsets: torch.Tensor | None = None,
     memory_prefix_max_len: int = 4,
+    memory_prefix_key_source_states: torch.Tensor | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
     """Dispatch attention with optional request-local text K/V reuse.
 
@@ -291,6 +336,8 @@ def dispatch_attention_with_text_kv_memory(
     """
     has_prefix = memory_prefix_key_states is not None
     prefix_aware = isinstance(memory_value, InferenceTextKVMemoryValue) and memory_value.local_prefix_length > 0
+    if memory_prefix_key_source_states is not None and not prefix_aware:
+        raise ValueError("Prefix normalization input requires Prefix-aware text K/V")
     # Branch on SymBool directly. SymBool != Python bool can fail in Dynamo's
     # symbolic comparison (BooleanAtom), even when Prefix length is backed.
     if prefix_aware:
@@ -317,6 +364,11 @@ def dispatch_attention_with_text_kv_memory(
             or memory_prefix_max_len != memory_value.local_prefix_length
         ):
             raise ValueError("Prefix-aware text K/V requires one complete native Prefix")
+        if memory_prefix_key_source_states is not None and (
+            memory_prefix_key_source_states.shape != memory_prefix_key_states.shape
+            or memory_prefix_key_source_states.device != memory_prefix_key_states.device
+        ):
+            raise ValueError("Prefix normalization input must preserve key shape/device")
         if memory_value.frame_idx > 0:
             return _attention_gen_with_cached_text_and_prefix(
                 packed_query_states,
@@ -327,6 +379,7 @@ def dispatch_attention_with_text_kv_memory(
                 memory_prefix_value_states,
                 attention_mask,
                 memory_prefix_sample_offsets,
+                memory_prefix_key_source_states,
             )
         return two_way_attention(
             packed_query_states,
@@ -338,6 +391,7 @@ def dispatch_attention_with_text_kv_memory(
             memory_prefix_sample_offsets=memory_prefix_sample_offsets,
             memory_prefix_max_len=memory_prefix_max_len,
             _capture_prefix_text_kv=True,
+            memory_prefix_key_source_states=memory_prefix_key_source_states,
         )
     if isinstance(memory_value, InferenceTextKVMemoryValue) and memory_value.frame_idx > 0:
         return _attention_gen_with_cached_text(
@@ -370,16 +424,42 @@ def _attention_gen_with_cached_text_and_prefix(
     prefix_value: torch.Tensor,
     attention_mask: SplitInfo,
     prefix_offsets: torch.Tensor,
+    prefix_key_source: torch.Tensor | None = None,
 ) -> tuple[SequencePack, KVToStore]:
     """Reuse native GEN attention with current Prefix, cached UND and current GEN.
 
     UND never attends to Prefix or GEN, so its per-layer K/V is static.
-    Prefix K/V is projected by the current decoder layer on EVERY forward,
-    including gen-only forwards; it is neither cached nor read from a Session.
+    Prefix K/V is projected by the current decoder layer on EVERY forward.
+    Reuse native fill's normalization rounding only for an identical projected
+    key input. Changed input uses current normalization; V is always current.
+    The reference is request-local and never stored in a Session.
     """
     und_key, und_value = memory_value.und_k_cached, memory_value.und_v_cached
     if und_key is None or und_value is None:
         raise ValueError("Prefix-aware generation requires initialized text K/V")
+    source = memory_value.prefix_key_input_cached
+    reference = memory_value.prefix_key_output_cached
+    if (source is None) != (reference is None):
+        raise ValueError("Incomplete Prefix normalization reference")
+    if source is not None:
+        if (
+            prefix_key_source is None
+            or source.ndim != 4
+            or reference.ndim != 4
+            or source.shape[0] != 1
+            or reference.shape[0] != 1
+            or source.shape[1:] != prefix_key_source.shape
+            or reference.shape[1:] != prefix_key.shape
+            or source.dtype != prefix_key_source.dtype
+            or reference.dtype != prefix_key.dtype
+            or source.device != prefix_key_source.device
+            or reference.device != prefix_key.device
+        ):
+            raise ValueError("Prefix normalization input/reference identity mismatch")
+        # No tolerance, host synchronization or ignored current Prefix. This
+        # data-dependent choice also keeps the changed-input calculation live.
+        same_input = torch.all(prefix_key_source == source[0])
+        prefix_key = torch.where(same_input, reference[0], prefix_key)
     q_gen = get_gen_seq(query)
     pad = memory_value.causal_pad_length
     und_k = torch.nn.functional.pad(und_key[0], (0, 0, 0, 0, 0, pad))

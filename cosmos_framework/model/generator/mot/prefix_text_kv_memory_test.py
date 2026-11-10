@@ -238,6 +238,49 @@ def test_prefix_is_required_on_every_cache_hit():
     restore_inference_attention_dispatch(previous)
 
 
+def test_identical_prefix_norm_input_keeps_fill_rounding_and_changed_prefix_is_live(monkeypatch):
+    """Model a one-ULP backend drift after the unchanged K projection.
+
+    Real Nemotron compiled fill/hit produced different Prefix K normalization
+    with identical inputs. The CPU double controls only that normalization
+    rounding; current Prefix changes must still affect the hit.
+    """
+    torch.manual_seed(31)
+    net = _TinyMoT(torch.bfloat16)
+    und, gen, prefix = (torch.randn(*shape, dtype=torch.bfloat16) for shape in ((5, 16), (6, 16), (4, 32)))
+    drift = False
+    for layer in net.layers:
+        original = layer.self_attn.k_norm_moe_gen.forward
+
+        def normalization(value, original=original):
+            result = original(value)
+            if drift and value.shape[0] == 4:
+                return torch.nextafter(result, torch.full_like(result, float("inf")))
+            return result
+
+        monkeypatch.setattr(layer.self_attn.k_norm_moe_gen, "forward", normalization)
+    with torch.inference_mode():
+        reference = net.step(und, gen, prefix)
+        previous = install_inference_memory_attention_dispatch(net)
+        try:
+            caches = make_inference_text_kv_cache(3)
+            fill = net.step(und, gen, prefix, caches)
+            torch.testing.assert_close(fill, reference, rtol=0, atol=0)
+            drift = True
+            hit = net.step(und, gen, prefix, caches)
+            torch.testing.assert_close(hit, reference, rtol=0, atol=0)
+
+            restore_inference_attention_dispatch(previous)
+            changed_reference = net.step(und, gen, prefix + 3)
+            install_inference_memory_attention_dispatch(net)
+            changed = net.step(und, gen, prefix + 3, caches)
+            torch.testing.assert_close(changed, changed_reference, rtol=0, atol=0)
+            assert not torch.equal(changed, reference)
+            torch.testing.assert_close(net.step(und, gen, prefix, caches), reference, rtol=0, atol=0)
+        finally:
+            restore_inference_attention_dispatch(previous)
+
+
 def test_partial_fill_is_not_gen_only_and_cleanup_allows_retry():
     caches = make_inference_text_kv_cache(3)
     state = InferenceTextKVMemoryState(caches, local_prefix_length=4)
@@ -248,6 +291,69 @@ def test_partial_fill_is_not_gen_only_and_cleanup_allows_retry():
         cache.clear()
         assert not cache.is_initialized and cache.k_und is cache.v_und is None
     assert not state.is_gen_only()
+
+
+def test_prefix_normalization_reference_is_owned_and_clear_removes_it():
+    cache = make_inference_text_kv_cache(1)[0]
+    text = torch.randn(1, 5, 1, 8)
+    source = torch.randn(1, 4, 1, 8, requires_grad=True)
+    reference = torch.randn_like(source)
+    expected_source, expected_reference = source.detach().clone(), reference.clone()
+    cache.store(text, text, prefix_key_input=source, prefix_key_output=reference)
+    with torch.no_grad():
+        source.add_(1)
+        reference.add_(2)
+    torch.testing.assert_close(cache.prefix_key_input, expected_source, rtol=0, atol=0)
+    torch.testing.assert_close(cache.prefix_key_output, expected_reference, rtol=0, atol=0)
+    assert not cache.prefix_key_input.requires_grad
+    cache.clear()
+    assert cache.prefix_key_input is cache.prefix_key_output is None
+    assert not cache.is_initialized and cache.k_und is cache.v_und is None
+
+
+@pytest.mark.parametrize("missing", ["prefix_key_input", "prefix_key_output"])
+def test_incomplete_prefix_normalization_reference_is_rejected(missing):
+    cache = make_inference_text_kv_cache(1)[0]
+    text, prefix = torch.randn(1, 5, 1, 8), torch.randn(1, 4, 1, 8)
+    kwargs = dict(prefix_key_input=prefix, prefix_key_output=prefix)
+    kwargs[missing] = None
+    with pytest.raises(ValueError, match="input and output"):
+        cache.store(text, text, **kwargs)
+    assert not cache.is_initialized
+
+
+@pytest.mark.parametrize("mismatch", ["shape", "device"])
+def test_incompatible_prefix_normalization_reference_is_rejected(mismatch):
+    cache = make_inference_text_kv_cache(1)[0]
+    text, source = torch.randn(1, 5, 1, 8), torch.randn(1, 4, 1, 8)
+    reference = source[:, :3] if mismatch == "shape" else torch.empty_like(source, device="meta")
+    with pytest.raises(ValueError, match="shape/device"):
+        cache.store(text, text, prefix_key_input=source, prefix_key_output=reference)
+    assert not cache.is_initialized
+
+
+@pytest.mark.parametrize("corruption", ["missing", "dtype", "batch", "shape"])
+def test_prefix_cache_hit_rejects_corrupt_normalization_reference(corruption):
+    torch.manual_seed(75)
+    net = _TinyMoT()
+    und, gen, prefix = torch.randn(5, 16), torch.randn(6, 16), torch.randn(4, 32)
+    caches = make_inference_text_kv_cache(3)
+    previous = install_inference_memory_attention_dispatch(net)
+    with torch.inference_mode():
+        try:
+            net.step(und, gen, prefix, caches)
+            if corruption == "missing":
+                caches[0].prefix_key_input = None
+            elif corruption == "dtype":
+                caches[0].prefix_key_input = caches[0].prefix_key_input.double()
+            elif corruption == "batch":
+                caches[0].prefix_key_input = caches[0].prefix_key_input.repeat(2, 1, 1, 1)
+            else:
+                caches[0].prefix_key_output = caches[0].prefix_key_output[:, :3]
+            with pytest.raises(ValueError, match="Prefix normalization"):
+                net.step(und, gen, prefix, caches)
+        finally:
+            restore_inference_attention_dispatch(previous)
 
 
 def test_prefix_cache_rejects_multiple_native_samples():
@@ -307,7 +413,10 @@ def test_unexpected_attention_dispatch_is_restored_after_partial_install():
 
 
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_compiled_cached_prefix_dispatch_keeps_symbolic_guards_and_current_prefix(monkeypatch, dynamic):
+@pytest.mark.parametrize("normalization_memo", [False, True])
+def test_compiled_cached_prefix_dispatch_keeps_symbolic_guards_and_current_prefix(
+    monkeypatch, dynamic, normalization_memo
+):
     """Real H100 hit SymBool != bool in the dispatcher under Dynamo.
 
     CPU eager backend traces the production dispatcher in fullgraph mode. The
@@ -361,6 +470,10 @@ def test_compiled_cached_prefix_dispatch_keeps_symbolic_guards_and_current_prefi
 
     mask = attention_module.SplitInfo([6, 6], ["causal", "full"], [12], actual_len=12)
     prefix_key, prefix_value = torch.randn(4, 1, 8), torch.randn(4, 1, 8)
+    if normalization_memo:
+        caches[0].prefix_key_input = prefix_key.unsqueeze(0).clone()
+        caches[0].prefix_key_output = prefix_key.unsqueeze(0).clone()
+        memory = state.read_for_layer(0)
     compiled = torch.compile(
         cache_module.dispatch_attention_with_text_kv_memory, backend="eager", fullgraph=True, dynamic=dynamic
     )
@@ -377,6 +490,7 @@ def test_compiled_cached_prefix_dispatch_keeps_symbolic_guards_and_current_prefi
                 memory_prefix_key_states=pk,
                 memory_prefix_value_states=pv,
                 memory_prefix_sample_offsets=torch.tensor([0, 4]),
+                **({"memory_prefix_key_source_states": pk} if normalization_memo else {}),
             )
             ref_k = from_und_gen_splits(
                 F.pad(und_key[0], (0, 0, 0, 0, 0, memory.causal_pad_length)),

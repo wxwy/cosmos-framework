@@ -822,6 +822,8 @@ class PackedAttentionMoT(nn.Module):
                 memory_prefix_sample_offsets=memory_prefix_context.sample_offsets,
                 memory_prefix_max_len=memory_prefix_context.k_local,
             )
+            if getattr(memory_value, "local_prefix_length", 0) > 0:
+                memory_prefix_kwargs["memory_prefix_key_source_states"] = prefix_k
         packed_attn_output, kv_to_store = self.dispatch_attention_fn(
             packed_query_states_,
             packed_key_states_,

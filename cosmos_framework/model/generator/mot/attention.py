@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch.fx.experimental.symbolic_shapes import guard_or_true
@@ -20,6 +20,19 @@ from cosmos_framework.model.generator.mot.memory_prefix import prepend_memory_kv
 from cosmos_framework.model.generator.mot.multiview_attention import multiview_attention
 from cosmos_framework.model.generator.mot.multiview_maskless_attention import MultiviewMasklessPlan
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryValue
+
+
+class _PrefixTextKVToStore(NamedTuple):
+    """B1 inference-only normalization reference plus static text K/V.
+
+    This tagged four-tensor tuple is consumed only by the request-local text
+    cache. Other MemoryState implementations retain their GEN/UND tuple.
+    """
+
+    prefix_key_input: torch.Tensor
+    prefix_key_output: torch.Tensor
+    und_key: torch.Tensor
+    und_value: torch.Tensor
 
 
 class SplitInfo:
@@ -209,6 +222,7 @@ def two_way_attention(
     memory_prefix_sample_offsets: torch.Tensor | None = None,
     memory_prefix_max_len: int = 4,
     _capture_prefix_text_kv: bool = False,
+    memory_prefix_key_source_states: torch.Tensor | None = None,
 ):
     """
     Performs two-way attention with causal and full attention.
@@ -431,6 +445,15 @@ def two_way_attention(
         und_indices = packed_query_states["_causal_indices"] + memory_prefix_max_len
         und_k = sample_k.index_select(0, und_indices).unsqueeze(0)
         und_v = sample_v.index_select(0, und_indices).unsqueeze(0)
+        if memory_prefix_key_source_states is not None:
+            if memory_prefix_key_source_states.shape != memory_prefix_key_states.shape:
+                raise ValueError("Prefix normalization input must preserve the key shape")
+            return out_all, _PrefixTextKVToStore(
+                memory_prefix_key_source_states.unsqueeze(0),
+                sample_k[:memory_prefix_max_len].unsqueeze(0),
+                und_k,
+                und_v,
+            )
         empty_k = sample_k.new_empty(1, 0, *sample_k.shape[1:])
         empty_v = sample_v.new_empty(1, 0, *sample_v.shape[1:])
         return out_all, (empty_k, empty_v, und_k, und_v)
