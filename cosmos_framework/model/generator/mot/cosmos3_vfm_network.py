@@ -23,6 +23,8 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
     get_caption_seq_offsets,
     get_causal_seq,
     get_full_only_seq,
+    get_gen_seq,
+    set_gen_seq,
 )
 from cosmos_framework.model.generator.mot.action_io_projector import (
     ACTION_IO_PROJECTOR_DOMAIN_AWARE,
@@ -1989,6 +1991,21 @@ class Cosmos3VFMNetwork(PreTrainedModel):
                     force_varlen=torch.is_grad_enabled() or has_local_tokens or any(condition.global_present),
                 )
             memory_prefix_context = self._g2_condition_prefix(condition, features, memory_prefix_context, target_dtype)
+            if torch.is_grad_enabled() and self.config.global_memory_enabled:
+                # FSDP2 needs the same backward units/gradient inventory on ranks
+                # with no Global samples, or with an empty-language CA branch.
+                # A scalar zero dependency allocates NO prefix/query rows and
+                # does not run Reader for absent samples. Frozen GEN still has
+                # an input graph, so its backward unshards stay rank-consistent.
+                leaves = [
+                    p.reshape(-1)[0]
+                    for module in (self.global_memory_reader, self.global_memory_projector)
+                    for p in module.parameters()
+                    if p.requires_grad
+                ]
+                if leaves:
+                    anchor = torch.stack(leaves).sum().to(target_dtype) * 0
+                    set_gen_seq(input_pack, get_gen_seq(input_pack) + anchor)
             g2_kwargs = dict(prepared_text=features, prepared_gen_text_kv=condition.gen_text_kv)
         packed_outputs, lbl_metadata = self.language_model(
             input_pack,
