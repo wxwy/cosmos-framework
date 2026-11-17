@@ -13,12 +13,14 @@ request snapshot; training tensors retain their autograd graph.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 import torch
+from torch.nn import functional as F
 
 G2_ABI_VERSION = "psm_g2_c0_v1"
+G2_MODEL_ABI_VERSION = "psm_g2_b1_v1"
 
 
 class TrainingStage(StrEnum):
@@ -289,6 +291,170 @@ class UNDTextFeatures:
                 raise ValueError("UND layer K/V must contain only effective packed text rows")
             if layer.cos.shape != layer.sin.shape or layer.cos.shape != (layer.key.shape[0], layer.key.shape[2]):
                 raise ValueError("UND layer RoPE shape mismatch")
+
+
+@dataclass(frozen=True, kw_only=True)
+class GENLayerKV:
+    """Current-weight inference K/V, already normalized/rotated for GEN.
+
+    Text rows follow text.lengths; Global rows follow present samples (64 each).
+    These are inference snapshots, never substitutes for a trainable projection.
+    """
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+    def __post_init__(self):
+        if self.key.ndim != 3 or self.key.shape != self.value.shape:
+            raise ValueError("GEN K/V must share [N,H_kv,D_head] shape")
+        if self.key.device != self.value.device or self.key.dtype != self.value.dtype:
+            raise ValueError("GEN K/V device/dtype mismatch")
+
+
+@dataclass(frozen=True, kw_only=True)
+class G2ConditionBatch:
+    """One condition authority for native training and generation.
+
+    C supplies the actual post-dropout native text. D may additionally supply
+    prepared snapshots under its checkpoint/session signature. A cached projected
+    row establishes Global presence without reloading views. With no projected
+    row, None views means absent; it never reserves zero-valued prefix tokens.
+    """
+
+    text: EffectiveTextBatch
+    views: tuple[tuple[SpatialView, ...] | None, ...]
+    text_features: UNDTextFeatures | None = None
+    global_tokens: tuple[torch.Tensor | None, ...] | None = None
+    gen_text_kv: tuple[GENLayerKV, ...] | None = None
+    global_kv: tuple[GENLayerKV, ...] | None = None
+
+    def __post_init__(self):
+        if len(self.views) != len(self.text.lengths):
+            raise ValueError("G2 views require one entry per text sample")
+        if any(v is not None and not v for v in self.views):
+            raise ValueError("absent Global uses None, not an empty view collection")
+        if self.text_features is not None and self.text_features.text != self.text:
+            raise ValueError("prepared UND text identity mismatch")
+        if self.global_tokens is not None:
+            if len(self.global_tokens) != len(self.views):
+                raise ValueError("projected Global sample count mismatch")
+            for views, tokens in zip(self.views, self.global_tokens, strict=True):
+                if views is not None and tokens is None:
+                    raise ValueError("prepared Global tokens omitted a present view sample")
+                if tokens is not None and (tokens.ndim != 2 or tokens.shape[0] != 64):
+                    raise ValueError("projected Global must be [64,D_model]")
+        for layers, rows in (
+            (self.gen_text_kv, sum(self.text.lengths)),
+            (self.global_kv, 64 * sum(self.global_present)),
+        ):
+            if layers is not None and any(layer.key.shape[0] != rows for layer in layers):
+                raise ValueError("prepared GEN K/V row count mismatch")
+        if self.global_kv is not None and self.global_tokens is None:
+            raise ValueError("prepared Global K/V requires its projected tokens")
+
+    @property
+    def global_present(self) -> tuple[bool, ...]:
+        source = self.views if self.global_tokens is None else self.global_tokens
+        return tuple(value is not None for value in source)
+
+
+def move_g2_condition(condition: G2ConditionBatch, device) -> G2ConditionBatch:
+    """Move only tensor carriers; preserve text, geometry and autograd identity."""
+
+    def layer_to(layer):
+        fields = {"key": layer.key.to(device), "value": layer.value.to(device)}
+        if isinstance(layer, UNDLayerKV):
+            fields.update(cos=layer.cos.to(device), sin=layer.sin.to(device))
+        return replace(layer, **fields)
+
+    features = condition.text_features
+    if features is not None:
+        features = replace(
+            features,
+            hidden=features.hidden.to(device),
+            valid_mask=features.valid_mask.to(device),
+            layers=tuple(layer_to(l) for l in features.layers),
+        )
+    return replace(
+        condition,
+        text_features=features,
+        views=tuple(
+            None
+            if views is None
+            else tuple(replace(v, latent=v.latent.to(device), valid_mask=v.valid_mask.to(device)) for v in views)
+            for views in condition.views
+        ),
+        global_tokens=None
+        if condition.global_tokens is None
+        else tuple(None if t is None else t.to(device) for t in condition.global_tokens),
+        gen_text_kv=None if condition.gen_text_kv is None else tuple(layer_to(l) for l in condition.gen_text_kv),
+        global_kv=None if condition.global_kv is None else tuple(layer_to(l) for l in condition.global_kv),
+    )
+
+
+def stack_g2_prepared(*, text_features, text_kv, global_tokens, global_kv, device=None) -> G2ConditionBatch:
+    """Combine D's ordered B1 snapshots into one native mixed batch.
+
+    Missing converted KV falls back to current model projection for the batch.
+    Projected Global presence survives a view-payload cache hit. No service or
+    cache implementation is imported into the model ABI.
+    """
+    count = len(text_features)
+    if not count or not count == len(text_kv) == len(global_tokens) == len(global_kv):
+        raise ValueError("one ordered prepared condition per native sample is required")
+    first = text_features[0]
+    texts = [f.text for f in text_features]
+    identity = (first.text.formatter_id, first.text.tokenizer_id, first.text.dropout_id)
+    if any(len(t.lengths) != 1 or (t.formatter_id, t.tokenizer_id, t.dropout_id) != identity for t in texts):
+        raise ValueError("prepared samples need B1 text and a common formatter/tokenizer/dropout protocol")
+    text = replace(
+        first.text,
+        token_ids=tuple(t.token_ids[0] for t in texts),
+        position_ids=tuple(t.position_ids[0] for t in texts),
+        dropped=tuple(t.dropped[0] for t in texts),
+    )
+    device = first.hidden.device if device is None else device
+    layer_count = len(first.layers)
+    if any(len(f.layers) != layer_count for f in text_features):
+        raise ValueError("prepared UND layer counts differ")
+    layers = tuple(
+        UNDLayerKV(
+            **{
+                field: torch.cat([getattr(f.layers[i], field).to(device) for f in text_features])
+                for field in ("key", "value", "cos", "sin")
+            }
+        )
+        for i in range(layer_count)
+    )
+    longest = max(text.lengths)
+    hidden = torch.cat([F.pad(f.hidden.to(device), (0, 0, 0, longest - f.hidden.shape[1])) for f in text_features])
+    mask = torch.arange(longest, device=device)[None] < torch.tensor(text.lengths, device=device)[:, None]
+    features = UNDTextFeatures(text=text, hidden=hidden, valid_mask=mask, layers=layers)
+    projected = tuple(
+        None if t is None else (t[0] if t.ndim == 3 and t.shape[0] == 1 else t).to(device) for t in global_tokens
+    )
+
+    def combine(values):
+        if not values or any(v is None for v in values):
+            return None
+        if any(len(v) != layer_count for v in values):
+            raise ValueError("prepared GEN K/V layer counts differ")
+        return tuple(
+            GENLayerKV(
+                key=torch.cat([v[i].key.to(device) for v in values]),
+                value=torch.cat([v[i].value.to(device) for v in values]),
+            )
+            for i in range(layer_count)
+        )
+
+    return G2ConditionBatch(
+        text=text,
+        views=(None,) * count,
+        text_features=features,
+        global_tokens=projected,
+        gen_text_kv=combine(text_kv),
+        global_kv=combine(tuple(v for t, v in zip(projected, global_kv, strict=True) if t is not None)),
+    )
 
 
 @dataclass(frozen=True, kw_only=True)

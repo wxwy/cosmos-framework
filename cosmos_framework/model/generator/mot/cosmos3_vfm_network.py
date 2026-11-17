@@ -3,6 +3,7 @@
 
 import math
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import List, Tuple
 
 import torch
@@ -39,9 +40,19 @@ from cosmos_framework.model.generator.mot.flex_attention import (
     SensorMaskItem,
     build_multiview_block_mask,
 )
+from cosmos_framework.model.generator.mot.g2_contracts import (
+    EffectiveTextBatch,
+    G2ConditionBatch,
+    GlobalMemoryConfig,
+    UNDTextFeatures,
+)
 from cosmos_framework.model.generator.mot.inference_text_kv_memory import InferenceTextKVMemoryState
 from cosmos_framework.model.generator.mot.local_evidence import ContinualTTTFastState
-from cosmos_framework.model.generator.mot.memory_prefix import LocalMemoryRuntime, build_memory_prefix_context
+from cosmos_framework.model.generator.mot.memory_prefix import (
+    LocalMemoryRuntime,
+    build_joint_memory_prefix_context,
+    build_memory_prefix_context,
+)
 from cosmos_framework.model.generator.mot.modeling_utils import TimestepEmbedder, has_noisy_tokens
 from cosmos_framework.model.generator.mot.multiview_attention import (
     reject_mixed_caption_layouts,
@@ -52,6 +63,7 @@ from cosmos_framework.model.generator.mot.multiview_maskless_attention import (
     MultiviewMasklessPlan,
     build_multiview_maskless_plan,
 )
+from cosmos_framework.model.generator.mot.unified_mot import prepare_und_text_features
 from cosmos_framework.model.generator.utils.memory import MemoryState
 from cosmos_framework.model.generator.utils.rig_view_embedding import add_view_embeddings
 from cosmos_framework.utils import log
@@ -91,6 +103,11 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         multiview_attention_config: MultiviewAttentionConfig | None = None,
         action_dim=32,
         local_memory_enabled: bool = False,
+        g2_text_enabled: bool = False,
+        global_memory_enabled: bool = False,
+        global_memory_config: dict | GlobalMemoryConfig | None = None,
+        global_memory_latent_channels: int = 48,
+        global_memory_top_variant: str = "with_robot",
         local_memory_dim: int = 32,
         local_memory_evidence_dim: int = 256,
         local_memory_action_dim: int = 15,
@@ -115,6 +132,21 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         **kwargs,
     ):
         self.vision_gen = vision_gen
+        self.g2_text_enabled = g2_text_enabled or global_memory_enabled
+        self.global_memory_enabled = global_memory_enabled
+        memory_options = (
+            dict(global_memory_config)
+            if isinstance(global_memory_config, dict)
+            else vars(global_memory_config)
+            if global_memory_config is not None
+            else {"top_view_variant": global_memory_top_variant}
+        )
+        if "enabled" in memory_options and memory_options["enabled"] != global_memory_enabled:
+            raise ValueError("Global flag and GlobalMemoryConfig.enabled disagree")
+        memory_options["enabled"] = global_memory_enabled
+        self.global_memory_config = vars(GlobalMemoryConfig(**memory_options))
+        self.global_memory_latent_channels = global_memory_latent_channels
+        self.global_memory_top_variant = global_memory_top_variant
         self.sound_gen = sound_gen
         self.vlm_config = vlm_config
         self.latent_patch_size = latent_patch_size
@@ -214,6 +246,18 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         self.num_hidden_layers = text_config.num_hidden_layers
         self.attention_io_layout = "sequence_sharded"
         self.predict_text_tokens = config.predict_text_tokens
+        if config.g2_text_enabled and config.joint_attn_implementation != "two_way":
+            raise ValueError("G2 text preparation requires native two_way attention")
+        if config.global_memory_enabled:
+            from cosmos_framework.model.generator.mot.global_memory import GlobalMemoryProjector, GlobalMemoryReader
+
+            gcfg = GlobalMemoryConfig(**config.global_memory_config)
+            self.global_memory_reader = GlobalMemoryReader(
+                text_dim=self.hidden_size,
+                config=gcfg,
+                latent_channels=config.global_memory_latent_channels,
+            )
+            self.global_memory_projector = GlobalMemoryProjector(model_dim=self.hidden_size, config=gcfg)
         if config.local_memory_enabled:
             if config.joint_attn_implementation != "two_way":
                 raise ValueError("Local Memory requires two_way attention")
@@ -415,6 +459,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         )
 
     def init_weights(self, buffer_device: torch.device | None):
+        if getattr(self.config, "global_memory_enabled", False):
+            self.global_memory_reader.reset_parameters()
+            self.global_memory_projector.reset_parameters()
         if self.config.local_memory_enabled:
             self.local_memory_runtime.encoder.visual_proj.reset_parameters()
             self.local_memory_runtime.encoder.action_proj.reset_parameters()
@@ -860,6 +907,142 @@ class Cosmos3VFMNetwork(PreTrainedModel):
 
             unpacked.append(output)
         return unpacked
+
+    def _g2_check_mode(self):
+        if not getattr(self.config, "g2_text_enabled", False):
+            raise ValueError("G2 conditions require g2_text_enabled")
+        if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
+            raise ValueError("G2 does not support context parallelism")
+        if self.pad_for_cuda_graphs or self.flex_backend is not None or self.multiview_backend is not None:
+            raise ValueError("G2 does not support CUDA graphs or multiview")
+
+    @torch.no_grad()
+    def prepare_und_text(self, text: EffectiveTextBatch) -> UNDTextFeatures:
+        """Public frozen UND prefill using native packing, embedding and RoPE."""
+        self._g2_check_mode()
+        device = self.language_model.model.embed_tokens.weight.device
+        ids, pos, text_idx, gen_idx, sample_lens, splits = [], [], [], [], [], []
+        cursor = 0
+        for tokens, positions in zip(text.token_ids, text.position_ids, strict=True):
+            n = len(tokens)
+            ids.extend(tokens)
+            pos.append(torch.cat((torch.tensor(positions, device=device), torch.zeros(3, 2, device=device)), dim=1))
+            text_idx.extend(range(cursor, cursor + n))
+            gen_idx.extend(range(cursor + n, cursor + n + 2))
+            sample_lens.append(n + 2)
+            splits.extend((n, 2))
+            cursor += n + 2
+        embeddings = self.language_model.model.embed_tokens(torch.tensor(ids, device=device, dtype=torch.long))
+        full = embeddings.new_zeros((cursor, self.hidden_size))
+        full[torch.tensor(text_idx, device=device, dtype=torch.long)] = embeddings
+        pack, _, _ = build_packed_sequence(
+            "two_way",
+            packed_sequence=full,
+            attn_modes=["causal", "full"] * len(sample_lens),
+            split_lens=splits,
+            sample_lens=sample_lens,
+            packed_und_token_indexes=torch.tensor(text_idx, device=device, dtype=torch.long),
+            packed_gen_token_indexes=torch.tensor(gen_idx, device=device, dtype=torch.long),
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            num_layers=self.num_hidden_layers,
+        )
+        return prepare_und_text_features(
+            self.language_model.model,
+            pack,
+            torch.cat(pos, dim=1),
+            text,
+            force_varlen=self.config.global_memory_enabled or self.config.local_memory_enabled,
+        )
+
+    @torch.no_grad()
+    def prepare_gen_text_kv(self, features: UNDTextFeatures):
+        self._g2_check_mode()
+        if len(features.layers) != len(self.language_model.model.layers):
+            raise ValueError("UND features require all native layers")
+        return tuple(
+            block.prepare_gen_text_kv(kv)
+            for block, kv in zip(
+                self.language_model.model.layers,
+                features.layers,
+                strict=True,
+            )
+        )
+
+    def prepare_task_queries(self, features: UNDTextFeatures):
+        return self.global_memory_reader.prepare_task_queries(features)
+
+    def read_global(self, task_queries, views):
+        return self.global_memory_reader.read_visual(task_queries, views)
+
+    def project_global(self, reader):
+        return self.global_memory_projector(reader.tokens)
+
+    @torch.no_grad()
+    def prepare_global_kv(self, projected):
+        self._g2_check_mode()
+        if not getattr(self.config, "global_memory_enabled", False):
+            raise ValueError("Global K/V requires an enabled Global model")
+        # Tensor[B,64,D] from project_global or ordered per-sample optional rows.
+        tokens = (
+            projected.flatten(0, 1)
+            if isinstance(projected, torch.Tensor)
+            else torch.cat([t for t in projected if t is not None])
+        )
+        return tuple(block.prepare_global_kv(tokens) for block in self.language_model.model.layers)
+
+    def prepare_global_tokens(self, features, views, *, prepared=None):
+        """Public per-request Reader/projector boundary, with absent rows omitted."""
+        self._g2_check_mode()
+        return prepared if prepared is not None else self._g2_projected_global(features, views)
+
+    def _g2_projected_global(self, features, views):
+        present = [i for i, v in enumerate(views) if v is not None]
+        if not present:
+            return tuple(None for _ in views)
+        if not getattr(self.config, "global_memory_enabled", False):
+            raise ValueError("Global conditions supplied to a Global-off model")
+        text = replace(
+            features.text,
+            token_ids=tuple(features.text.token_ids[i] for i in present),
+            position_ids=tuple(features.text.position_ids[i] for i in present),
+            dropped=tuple(features.text.dropped[i] for i in present),
+        )
+        max_len = max(text.lengths)
+        selected = UNDTextFeatures(
+            text=text,
+            hidden=features.hidden[present, :max_len],
+            valid_mask=features.valid_mask[present, :max_len],
+            layers=(),
+        )
+        reader = self.global_memory_reader(selected, tuple(views[i] for i in present))
+        projected = self.global_memory_projector(reader.tokens).to(features.hidden.dtype)
+        by_sample = dict(zip(present, projected.unbind(0), strict=True))
+        return tuple(by_sample.get(i) for i in range(len(views)))
+
+    def _g2_condition_prefix(self, condition: G2ConditionBatch, features, local_context, target_dtype):
+        if condition.gen_text_kv is not None or condition.global_kv is not None:
+            if torch.is_grad_enabled():
+                raise ValueError("prepared GEN K/V snapshots are inference-only")
+        present = [i for i, enabled in enumerate(condition.global_present) if enabled]
+        if present and not getattr(self.config, "global_memory_enabled", False):
+            raise ValueError("Global conditions supplied to a Global-off model")
+        if condition.global_kv is not None and len(condition.global_kv) != self.num_hidden_layers:
+            raise ValueError("prepared Global K/V requires all native layers")
+        tokens = condition.global_tokens
+        if present and tokens is not None and torch.is_grad_enabled():
+            raise ValueError("training Global tokens must be computed through the registered Reader/projector")
+        if present and tokens is None:
+            tokens = self._g2_projected_global(features, condition.views)
+        if tokens is not None:
+            tokens = tuple(t.to(target_dtype) if t is not None else None for t in tokens)
+        return build_joint_memory_prefix_context(
+            tokens,
+            local_context,
+            target_dtype=target_dtype,
+            k_local=self.config.local_memory_k_local,
+            global_kv=condition.global_kv,
+        )
 
     def _encode_text(
         self,
@@ -1573,6 +1756,14 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         # assert self.training, "Cosmos3VFMNetwork only supports training mode"
 
         local_tokens = packed_seq.local_memory_tokens
+        condition = getattr(packed_seq, "g2_condition", None)
+        if getattr(self.config, "g2_text_enabled", False) or condition is not None:
+            self._g2_check_mode()
+            if condition is None:
+                raise ValueError("G2 requires one explicit effective text/dropout condition")
+            if memory is not None or packed_seq.control_weights is not None:
+                raise ValueError("G2 prepared conditions do not support legacy MemoryState or multi-control")
+            packed_seq.validate_g2_text()
         has_local_tokens = local_tokens is not None and any(token is not None for token in local_tokens)
         if has_local_tokens:
             if not self.config.local_memory_enabled:
@@ -1780,6 +1971,25 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             parallel_dims=sequence_shard_parallel_dims,
         )
 
+        g2_kwargs = {}
+        if condition is not None:
+            features = condition.text_features
+            # Every DP rank must enter the same extra per-block FSDP forwards.
+            cached = features is not None
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                flag = torch.tensor(int(cached), device=get_causal_seq(input_pack)[0].device)
+                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+                cached = bool(flag.item())
+            if not cached:
+                features = prepare_und_text_features(
+                    self.language_model.model,
+                    input_pack,
+                    packed_position_ids,
+                    condition.text,
+                    force_varlen=torch.is_grad_enabled() or has_local_tokens or any(condition.global_present),
+                )
+            memory_prefix_context = self._g2_condition_prefix(condition, features, memory_prefix_context, target_dtype)
+            g2_kwargs = dict(prepared_text=features, prepared_gen_text_kv=condition.gen_text_kv)
         packed_outputs, lbl_metadata = self.language_model(
             input_pack,
             attention_mask=attention_meta,
@@ -1787,6 +1997,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             natten_metadata_list=natten_metadata_list,
             memory=memory,
             memory_prefix_context=memory_prefix_context,
+            **g2_kwargs,
         )
         last_hidden_state = get_context_parallel_last_hidden_state(
             packed_outputs=packed_outputs,

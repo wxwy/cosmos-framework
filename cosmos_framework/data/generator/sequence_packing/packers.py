@@ -875,4 +875,6 @@ def pack_input_sequence(
         gen_data_clean=gen_data_clean,
     )
     packed.local_memory_tokens = tuple(local_memory_tokens)
+    packed.g2_condition = gen_data_clean.g2_condition
+    packed.validate_g2_text()
     return packed
