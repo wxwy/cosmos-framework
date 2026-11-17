@@ -14,6 +14,8 @@ from cosmos_framework.data.generator.action.utils.json_formatter import ActionPr
 from cosmos_framework.data.generator.action.utils.static_task_text import (
     StaticTaskText,
     StaticTaskTextRecipe,
+    effective_text_batch,
+    effective_text_mask,
     prepare_static_task_text,
     resolve_consumer_text_dropout,
     serialize_static_task_prompt,
@@ -197,3 +199,19 @@ def test_recipe_and_asset_fail_closed():
         replace(recipe_fixture(), planned_video_frames=0)
     with pytest.raises(TypeError, match="bool"):
         resolve_consumer_text_dropout({"text_dropout_applied": 0}, 0.1)
+
+
+def test_c0_final_tokens_include_actual_native_specials_and_mrope():
+    samples = [
+        prepare_static_task_text(task_fixture(), recipe_fixture(), ProcessorFixture(), dropout_applied=drop)
+        for drop in (False, True)
+    ]
+    specials = {"bos_token_id": 101, "eos_token_id": 102, "start_of_generation": 103}
+    train = effective_text_batch(samples, recipe_fixture(), special_tokens=specials)
+    service = effective_text_batch(samples, recipe_fixture(), special_tokens=specials)
+    assert train == service
+    assert train.token_ids[1] == (101, 7, 9, 102, 103)
+    assert train.position_ids[1] == ((0, 1, 2, 3, 4),) * 3
+    assert train.dropped == (False, True)
+    mask = effective_text_mask(train)
+    assert tuple(mask.sum(dim=1).tolist()) == train.lengths
