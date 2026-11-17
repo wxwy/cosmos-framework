@@ -20,7 +20,7 @@ from cosmos_framework.data.generator.sequence_packing.sequence import SequencePl
 from cosmos_framework.model.generator.mot import attention, global_memory
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
 from cosmos_framework.model.generator.mot.g2_contract_fixtures import synthetic_view
-from cosmos_framework.model.generator.mot.g2_contracts import EffectiveTextBatch, G2ConditionBatch
+from cosmos_framework.model.generator.mot.g2_contracts import EffectiveTextBatch, G2ConditionBatch, GlobalMemoryConfig
 from cosmos_framework.model.generator.mot.g2_core_test import TinyLM, cpu_attention, native_pack, tiny_model
 from cosmos_framework.model.generator.mot.g2_parameters import parameter_inventory, set_trainable_names
 from cosmos_framework.model.generator.mot.unified_mot import Nemotron3DenseVLTextModel, prepare_und_text_features
@@ -38,7 +38,7 @@ def cpu_dispatch(monkeypatch):
     monkeypatch.setattr(global_memory, "_dispatch_attention", cpu_attention)
 
 
-def network():
+def network(*, global_enabled=True):
     lm = TinyLM(tiny_model())
     # The fixture UND has already been initialized by its native constructor.
     lm.init_weights = lambda buffer_device: None
@@ -51,9 +51,9 @@ def network():
         action_dim=15,
         action_io_projector_type="shared_weight_bias",
         local_memory_enabled=True,
-        global_memory_enabled=True,
+        global_memory_enabled=global_enabled,
         global_memory_latent_channels=4,
-        global_memory_config={"enabled": True, "top_view_variant": "with_robot"},
+        global_memory_config={"enabled": global_enabled, "top_view_variant": "with_robot"},
     )
     net = Cosmos3VFMNetwork(lm, config)
     net.init_weights(buffer_device=torch.device("cpu"))
@@ -273,3 +273,84 @@ def test_d_actual_cache_sessions_to_native_action_head(empty_second, monkeypatch
                 torch.testing.assert_close(lhs, rhs, atol=3e-6, rtol=3e-5)
     assert counts["prepare_g2_text"] == counts["read_g2_global"] == 8  # 2 cached + 6 reference
     assert on.cache.info()["stages"]["global"]["hit"] == 4
+
+
+def test_c_warm_start_stage_switch_and_resume_with_actual_native_action_heads():
+    """Direct C controller/native-head composition; grouped Local/DCP tested separately."""
+    import copy
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from cosmos_framework.checkpoint.g2_warm_start import load_g1_model_only
+    from cosmos_framework.trainer.g2_training import G2_OPTIMIZER_SELECTION, build_g2_optimizer
+    from cosmos_framework.trainer.g2_training_test import equal_tree, plan_fixture
+    from examples.psm_wma_robocasa_g2_recipe import install_g2_training
+
+    text_recipe = StaticTaskTextRecipe(17, 24.0, 16, 16, "synthetic-tokenizer")
+    plan = replace(plan_fixture(a=1, b=1, target=2), text_recipe_identity=text_recipe.identity)
+    recipe = SimpleNamespace(training=plan, text=text_recipe, global_memory=GlobalMemoryConfig(enabled=True))
+
+    def owner():
+        model = nn.Module()
+        model.net = network()
+        model.g2_parameter_inventory = lambda: parameter_inventory(model, net_prefix="net.")
+        model.set_trainable_names = lambda names: set_trainable_names(model, names)
+
+        def factory(_optimizer_config, _scheduler_config):
+            return build_g2_optimizer(
+                model,
+                optimizer_type="adamw",
+                lr=1e-5,
+                fused=True,
+                keys_to_select=[G2_OPTIMIZER_SELECTION],
+                weight_decay=0.03,
+            ), None
+
+        model.init_optimizer_scheduler = factory
+        trainer = SimpleNamespace()
+        install_g2_training(model, trainer, recipe, {})
+        optimizer, controller = model.init_optimizer_scheduler(None, None)
+        return model, optimizer, controller
+
+    torch.manual_seed(613)
+    g1 = nn.Module()
+    g1.net = network(global_enabled=False)
+    model, optimizer, controller = owner()
+    report = load_g1_model_only(
+        model, g1.state_dict(), new_global_names=frozenset(model.g2_parameter_inventory()["new_state_keys"])
+    )
+    assert report["local_loaded_names"] and controller.stage.value == "TRAIN_A"
+    local_weights = copy.deepcopy(model.net.local_memory_runtime.state_dict())
+
+    def step(model, optimizer, controller, iteration):
+        packed, _, _ = packed_batch(model.net, [[1, 2]], ((synthetic_view(),),), (None,))
+        output = model.net(packed)
+        (output["preds_action"][0] - 0.25).square().mean().backward()
+        controller.prepare_commit(actual_consumers=1, iteration=iteration)
+        optimizer.step()
+        controller.step()
+        optimizer.zero_grad(set_to_none=True)
+        # This fixture has no open grouped Local transaction. The actual grouped
+        # transaction + sidecar/GA path is exercised by C's integration tests.
+        controller.commit_boundary(iteration=iteration + 1, ga_complete=True, local_transaction_complete=True)
+
+    step(model, optimizer, controller, 0)
+    assert controller.stage.value == "TRAIN_B"
+    assert all(p.requires_grad == (n in controller.roles) for n, p in model.named_parameters())
+    saved = copy.deepcopy((model.state_dict(), optimizer.state_dict(), controller.state_dict(), torch.get_rng_state()))
+    step(model, optimizer, controller, 1)
+    expected = copy.deepcopy(
+        (model.state_dict(), optimizer.state_dict(), controller.state_dict(), torch.get_rng_state())
+    )
+    resumed, other_optimizer, other_controller = owner()
+    resumed.load_state_dict(saved[0], strict=True)
+    other_optimizer.load_state_dict(saved[1])
+    other_controller.load_state_dict(saved[2])
+    torch.set_rng_state(saved[3])
+    step(resumed, other_optimizer, other_controller, 1)
+    equal_tree(
+        expected,
+        (resumed.state_dict(), other_optimizer.state_dict(), other_controller.state_dict(), torch.get_rng_state()),
+    )
+    equal_tree(local_weights, resumed.net.local_memory_runtime.state_dict())
