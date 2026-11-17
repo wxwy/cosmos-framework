@@ -216,15 +216,28 @@ class GroupedLocalMemoryStateCallback(Callback):
         window = getattr(self.trainer, "_grouped_window", None)
         if window is None:
             raise RuntimeError("Local window 尚未建立；禁止零步 checkpoint")
-        return snapshot_grouped_local_state(
+        local = snapshot_grouped_local_state(
             window,
             iteration=self.trainer._grouped_completed_iteration,
             config_digest=self.trainer._grouped_config_digest,
         )
+        controller = getattr(self.trainer, "_g2_stage_controller", None)
+        if controller is None:
+            return local
+        return {"format": "psm_g2_grouped_stage_v1", "local": local, "training_stage": controller.state_dict()}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         if not self.has_checkpoint_state() or getattr(self.trainer, "_grouped_window", None) is not None:
             raise RuntimeError("Local checkpoint 必须在创建 grouped window 前加载")
+        if hasattr(self.trainer, "_g2_stage_controller"):
+            if (
+                not isinstance(state_dict, dict)
+                or set(state_dict) != {"format", "local", "training_stage"}
+                or (state_dict["format"] != "psm_g2_grouped_stage_v1")
+            ):
+                raise ValueError("G2 same-job resume requires explicit stage/Local sidecar")
+            self.trainer._pending_g2_resume_stage = deepcopy(state_dict["training_stage"])
+            state_dict = state_dict["local"]
         self.trainer._pending_grouped_resume = deepcopy(state_dict)
 
 

@@ -109,8 +109,7 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         if type(num_workers) is not int or not 0 <= num_workers <= 16:
             raise ValueError("num_workers must be an integer in [0,16]")
         if type(full_segment_prefetch) is not bool or (
-            full_segment_prefetch
-            and (num_workers != 1 or producer.transform_rng_mode != "consumer_keyed_v1")
+            full_segment_prefetch and (num_workers != 1 or producer.transform_rng_mode != "consumer_keyed_v1")
         ):
             raise ValueError("full segment prefetch requires num_workers=1 and consumer_keyed_v1 RNG")
         if (
@@ -244,6 +243,9 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 raise RuntimeError("同 job DCP 未向 grouped callback 恢复 Local 状态")
             if pending is not None:
                 try:
+                    if hasattr(self, "_g2_stage_controller"):
+                        if self._pending_g2_resume_stage != self._g2_stage_controller.state_dict():
+                            raise ValueError("G2 scheduler and Local sidecar stage identities disagree")
                     restore_grouped_local_state(
                         self._grouped_window,
                         pending,
@@ -260,6 +262,10 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         window._telemetry_stage = self._telemetry_stage
         prefetcher = getattr(self, "_grouped_prefetcher", None)
         if grad_accum_iter == 0:
+            if hasattr(self, "_g2_stage_controller"):
+                if self._g2_stage_controller.completed_steps != iteration:
+                    raise ValueError("G2 stage counter and grouped optimizer iteration disagree")
+                self._g2_actual_consumers = 0
             if prefetcher is not None:
                 prefetcher.reset_iteration()
             window.begin()
@@ -285,6 +291,30 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                     batch = collate_grouped_native_batch(payloads)
             with self._telemetry_stage("batch_transfer"):
                 batch = move_cached_native_batch(batch, device=next(model.parameters()).device, move=misc.to)
+                if "g2_views" in batch:
+                    from cosmos_framework.data.generator.action.datasets.g2_training_adapter import move_g2_views
+
+                    batch = move_g2_views(batch, next(model.parameters()).device)
+            g2_controller = getattr(self, "_g2_stage_controller", None)
+            if g2_controller is not None:
+                self._g2_actual_consumers += len(payloads)
+                if hasattr(self, "_g2_text_recipe"):
+                    from cosmos_framework.data.generator.action.utils.static_task_text import effective_text_batch
+                    from cosmos_framework.model.generator.mot.g2_contracts import G2ConditionBatch
+
+                    batch["g2_condition"] = G2ConditionBatch(
+                        text=effective_text_batch(
+                            payloads,
+                            self._g2_text_recipe,
+                            special_tokens=model.llm_special_tokens,
+                            use_float_positions=getattr(
+                                getattr(model.config, "diffusion_expert_config", model.config),
+                                "enable_fps_modulation",
+                                False,
+                            ),
+                        ),
+                        views=tuple(views if views else None for views in batch["g2_views"]),
+                    )
             self.callbacks.on_before_forward(iteration=iteration)
             with self._telemetry_stage("forward"):
                 with self.training_timer("forward"):
@@ -366,6 +396,11 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             self.callbacks.on_before_optimizer_step(model, optimizer, scheduler, grad_scaler, iteration=iteration)
             model.on_before_optimizer_step(optimizer, scheduler, iteration=iteration)
             self._require_finite_gradients(optimizer)
+            g2_controller = getattr(self, "_g2_stage_controller", None)
+            if g2_controller is not None:
+                if scheduler is not g2_controller:
+                    raise RuntimeError("G2 requires its per-group scheduler state")
+                g2_controller.prepare_commit(actual_consumers=self._g2_actual_consumers, iteration=iteration)
             self._observe_grouped(
                 "pre_optimizer",
                 iteration=iteration,
@@ -384,6 +419,12 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             self.callbacks.on_before_zero_grad(model, optimizer, scheduler, iteration=iteration)
             model.on_before_zero_grad(optimizer, scheduler, iteration=iteration)
             self._zero_grad(model, optimizer, iteration)
+            if g2_controller is not None:
+                g2_controller.commit_boundary(
+                    iteration=iteration + 1,
+                    ga_complete=True,
+                    local_transaction_complete=window.plan is None and window._candidate is None,
+                )
             return output, member_loss, 0
         except Exception:
             if prefetcher is not None:

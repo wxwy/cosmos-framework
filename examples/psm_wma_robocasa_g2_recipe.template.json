@@ -1,0 +1,35 @@
+{
+  "training": {
+    "profile": "R2",
+    "init_checkpoint_identity": null,
+    "data_identity": null,
+    "split_identity": null,
+    "text_recipe_identity": null,
+    "state15_recipe_identity": null,
+    "stage_a_steps": null,
+    "stage_b_steps": null,
+    "target_effective_consumers": null,
+    "b_stream": null,
+    "grad_accum_steps": null,
+    "world_size": null,
+    "global_schedule": {"warmup_steps": null, "decay": null, "min_factor": null},
+    "gen_schedule": {"warmup_steps": null, "decay": null, "min_factor": null},
+    "action_schedule": {"warmup_steps": null, "decay": null, "min_factor": null}
+  },
+  "text": {
+    "planned_video_frames": null,
+    "fps": null,
+    "height": null,
+    "width": null,
+    "tokenizer_identity": null,
+    "cfg_dropout_rate": 0.1
+  },
+  "global_memory": {"enabled": true, "top_view_variant": "with_robot"},
+  "alignment_version": null,
+  "view_recipe_id": null,
+  "provider_factory": null,
+  "provider_kwargs": {},
+  "g1_config_path": null,
+  "g1_config_sha256": null,
+  "save_iter": null
+}

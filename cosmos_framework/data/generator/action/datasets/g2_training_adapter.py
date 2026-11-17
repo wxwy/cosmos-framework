@@ -24,6 +24,7 @@ from cosmos_framework.model.generator.mot.g2_contracts import G2SampleIdentity, 
 class AlignedG2Provider(Protocol):
     identity: str
     evidence_scope: str  # "fixture" or provider-owned verified DATA_C receipt
+    latent_channels: int  # small recipe metadata; only queried when Global is enabled
 
     def read_common(self, *, task_class: str, episode_index: int, decision_frame: int) -> Mapping[str, Any]: ...
 
@@ -59,7 +60,7 @@ class G2TrainingDataAdapter:
         if provider.identity != recipe.data_identity or not provider.evidence_scope:
             raise ValueError("offline provider/data identity mismatch")
         self.provider, self.recipe = provider, recipe
-        self._static_ids: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._static_ids: OrderedDict[str, str] = OrderedDict()
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         task, episode, frame = (sample[key] for key in ("task_class", "episode_index", "start_frame"))
@@ -73,6 +74,8 @@ class G2TrainingDataAdapter:
             or common["task_class"] != task
             or common["episode_index"] != episode
             or identity.decision_frame != frame
+            or type(identity.decision_frame) is not int
+            or type(identity.logical_state_frame) is not int
             or identity.data_version != self.recipe.data_identity
             or identity.alignment_version != self.recipe.alignment_version
             or identity.state15_recipe_id != self.recipe.state15_recipe_id
@@ -93,7 +96,7 @@ class G2TrainingDataAdapter:
         original_action = sample["action"]
         if original_action.shape != (17, 15) or not torch.equal(state15[5:], original_action[0, 5:]):
             raise ValueError("DATA_B must preserve the existing EEF10 handling")
-        asset_key = (identity.episode_id, identity.subtask_id)
+        asset_key = identity.episode_id  # Atomic training episode is one subtask.
         previous = self._static_ids.get(asset_key)
         if previous is not None and previous != text.identity:
             raise ValueError("static initial instruction changed within one subtask")

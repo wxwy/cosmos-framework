@@ -84,7 +84,7 @@ def test_r1_does_not_even_resolve_global_method_or_payload():
         read_common = provider.read_common
 
         def __getattribute__(self, name):
-            if name in {"read_selected_views", "views"}:
+            if name in {"read_selected_views", "views", "latent_channels"}:
                 raise AssertionError("R1 touched Global provider")
             return object.__getattribute__(self, name)
 
@@ -148,3 +148,11 @@ def test_common_inputs_r1_r2_are_identical():
     assert torch.equal(left["action"], right["action"])
     assert left["static_task_text"] == right["static_task_text"]
     assert left["g2_sample_identity"] == right["g2_sample_identity"]
+
+
+def test_atomic_episode_cannot_switch_subtask_to_hide_static_text_drift():
+    provider, adapter, sample = setup_fixture(False)
+    adapter(sample)
+    provider.task = replace(provider.task, subtask_id="new-subtask", enhanced_instruction="Changed current facts.")
+    with pytest.raises(ValueError, match="static initial instruction changed"):
+        adapter(sample)

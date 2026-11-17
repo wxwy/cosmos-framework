@@ -3,6 +3,7 @@
 
 """Synthetic CPU contract tests; no real tokenizer/UND/data alignment claim."""
 
+import json
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 
@@ -134,6 +135,7 @@ def test_static_tokens_ignore_future_action_window_current_state_and_clean_row_c
         assert torch.equal(left[key], right[key])
     assert left["text_condition_identity"] == right["text_condition_identity"]
     assert "idle_frame" not in left["ai_caption"] and "initial" in left["ai_caption"].lower()
+    assert json.loads(left["ai_caption"])["actions"][0]["spatial_context_scope"] == "initial_spatial_context"
     assert "0:00-0:01" in left["ai_caption"]  # Fixed 17/20, not action rows.
 
 
@@ -215,3 +217,24 @@ def test_c0_final_tokens_include_actual_native_specials_and_mrope():
     assert train.dropped == (False, True)
     mask = effective_text_mask(train)
     assert tuple(mask.sum(dim=1).tolist()) == train.lengths
+
+
+def test_final_text_protocol_stacks_mixed_full_empty_b1_service_conditions():
+    from cosmos_framework.model.generator.mot.g2_contracts import UNDTextFeatures, stack_g2_prepared
+
+    samples = [
+        prepare_static_task_text(task_fixture(), recipe_fixture(), ProcessorFixture(), dropout_applied=drop)
+        for drop in (False, True)
+    ]
+    specials = {"bos_token_id": 101, "eos_token_id": 102, "start_of_generation": 103}
+    texts = [effective_text_batch([sample], recipe_fixture(), special_tokens=specials) for sample in samples]
+    features = tuple(
+        UNDTextFeatures(
+            text=text, hidden=torch.zeros(1, text.lengths[0], 8), valid_mask=effective_text_mask(text), layers=()
+        )
+        for text in texts
+    )
+    carrier = stack_g2_prepared(
+        text_features=features, text_kv=(None, None), global_tokens=(None, None), global_kv=(None, None)
+    )
+    assert carrier.text == effective_text_batch(samples, recipe_fixture(), special_tokens=specials)

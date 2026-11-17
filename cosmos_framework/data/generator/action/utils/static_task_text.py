@@ -27,7 +27,7 @@ from cosmos_framework.data.generator.sequence_packing.mrope import get_3d_mrope_
 from cosmos_framework.data.generator.sequence_packing.sequence import PackedSequenceBuilder
 from cosmos_framework.model.generator.mot.g2_contracts import EffectiveTextBatch
 
-TEXT_PROTOCOL = "psm_g2_static_initial_text_v1"
+TEXT_PROTOCOL = "psm_g2_static_initial_text_v2"
 
 
 def _digest(value: Any) -> str:
@@ -102,6 +102,9 @@ def build_static_task_prompt(task: StaticTaskText, recipe: StaticTaskTextRecipe)
     """Use the one action JSON formatter on a whitelist of static fields only."""
     sample = {
         "ai_caption": task.enhanced_instruction,
+        # Explicit semantic label survives serialization even when the provider
+        # uses a different natural-language template for its initial facts.
+        "relabel_prompt": {"spatial_context_scope": task.context_scope},
         "viewpoint": recipe.viewpoint,
         "additional_view_description": recipe.additional_view_description,
         "conditioning_fps": recipe.fps,
@@ -227,7 +230,7 @@ def effective_text_batch(
         dropped=tuple(decisions),
         formatter_id=recipe.identity,
         tokenizer_id=recipe.tokenizer_identity,
-        dropout_id=_digest({"policy": "consumer_once_v1", "decisions": decisions}),
+        dropout_id=_digest({"policy": "consumer_once_v1", "rate": recipe.cfg_dropout_rate}),
     )
 
 
