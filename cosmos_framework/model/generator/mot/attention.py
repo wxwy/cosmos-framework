@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from typing import Any, NamedTuple
 
 import torch
-from torch.fx.experimental.symbolic_shapes import guard_or_true
+from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 from torch.nn.attention.flex_attention import BlockMask
 
 from cosmos_framework.model.attention import (
@@ -226,38 +226,11 @@ def _use_varlen(num_samples: int, *, has_caption_offsets: bool) -> bool:
     return has_caption_offsets or torch.is_grad_enabled() or guard_or_true(num_samples > 1)
 
 
-def two_way_attention(
-    packed_query_states: SequencePack,
-    packed_key_states: SequencePack,
-    packed_value_states: SequencePack,
-    packed_key_states_normalized: SequencePack | None = None,
-    memory_prefix_key_states: torch.Tensor | None = None,
-    memory_prefix_value_states: torch.Tensor | None = None,
-    memory_prefix_sample_offsets: torch.Tensor | None = None,
-    memory_prefix_max_len: int = 4,
-    _capture_prefix_text_kv: bool = False,
-    memory_prefix_key_source_states: torch.Tensor | None = None,
-    _capture_prefix_projections: bool = False,
-):
-    """
-    Performs two-way attention with causal and full attention.
-
-    ``packed_key_states_normalized``: optional alternative K pack for the generator's full
-    attention (gen→all). When provided, the generator attends to these keys instead of
-    ``packed_key_states``, so the und K tokens can be normalised for the gen cross-attention path
-    while the reasoner's own causal self-attention keeps raw K tokens. ``None`` uses
-    ``packed_key_states`` for both paths.
-
-    """
-    # Gen full-attention takes the normed keys when provided, else the standard packed keys.
-    packed_key_normalized = (
-        packed_key_states_normalized if packed_key_states_normalized is not None else packed_key_states
-    )
-    if _capture_prefix_text_kv and (
-        torch.is_grad_enabled() or memory_prefix_key_states is None or get_num_real_samples(packed_query_states) != 1
-    ):
-        raise ValueError("Prefix text K/V capture requires native B1 inference with Prefix")
-
+def causal_text_attention(packed_query_states, packed_key_states, packed_value_states, *, force_varlen=False):
+    """Native UND attention, shared by two_way and frozen G2 text preparation."""
+    if guard_or_false(packed_query_states["_num_causal_tokens"] == 0):
+        empty = get_causal_seq(packed_query_states)[0]
+        return empty.flatten(-2, -1) * 0
     # The tower offsets carry the pad segment folded in when the pack has one, so these cover it.
     # it carries one. Every pass that may see padding needs those: trailing padding rows belong to
     # no sample, and varlen attention leaves rows outside its cumulative ranges unwritten in both
@@ -294,7 +267,7 @@ def two_way_attention(
     # prefix is present, but force varlen whenever Local K/V is supplied.
     use_varlen = (
         _use_varlen(get_num_real_samples(packed_query_states), has_caption_offsets=False)
-        or memory_prefix_key_states is not None
+        or force_varlen
     )
 
     if use_varlen:
@@ -363,6 +336,55 @@ def two_way_attention(
 
     # [1,N_und,heads,head_dim] -> [N_und,heads,head_dim] -> [N_und,heads*head_dim]
     causal_out = causal_res.squeeze(0).flatten(-2, -1)  # type: ignore  # [N_und,heads*head_dim]
+
+    return causal_out
+
+
+def two_way_attention(
+    packed_query_states: SequencePack,
+    packed_key_states: SequencePack,
+    packed_value_states: SequencePack,
+    packed_key_states_normalized: SequencePack | None = None,
+    memory_prefix_key_states: torch.Tensor | None = None,
+    memory_prefix_value_states: torch.Tensor | None = None,
+    memory_prefix_sample_offsets: torch.Tensor | None = None,
+    memory_prefix_max_len: int = 4,
+    _capture_prefix_text_kv: bool = False,
+    memory_prefix_key_source_states: torch.Tensor | None = None,
+    _capture_prefix_projections: bool = False,
+    skip_und_attention: bool = False,
+):
+    """
+    Performs two-way attention with causal and full attention.
+
+    ``packed_key_states_normalized``: optional alternative K pack for the generator's full
+    attention (gen→all). When provided, the generator attends to these keys instead of
+    ``packed_key_states``, so the und K tokens can be normalised for the gen cross-attention path
+    while the reasoner's own causal self-attention keeps raw K tokens. ``None`` uses
+    ``packed_key_states`` for both paths.
+
+    """
+    # Gen full-attention takes the normed keys when provided, else the standard packed keys.
+    packed_key_normalized = (
+        packed_key_states_normalized if packed_key_states_normalized is not None else packed_key_states
+    )
+    if _capture_prefix_text_kv and (
+        torch.is_grad_enabled() or memory_prefix_key_states is None or get_num_real_samples(packed_query_states) != 1
+    ):
+        raise ValueError("Prefix text K/V capture requires native B1 inference with Prefix")
+
+    use_varlen = (
+        _use_varlen(get_num_real_samples(packed_query_states), has_caption_offsets=False)
+        or memory_prefix_key_states is not None
+    )
+    if skip_und_attention:
+        causal_q, _ = get_causal_seq(packed_query_states)
+        causal_out = causal_q.new_zeros((causal_q.shape[0], causal_q.shape[1] * causal_q.shape[2]))
+    else:
+        causal_out = causal_text_attention(
+            packed_query_states, packed_key_states, packed_value_states,
+            force_varlen=memory_prefix_key_states is not None,
+        )
 
     full_q, full_q_offsets = get_full_only_seq(packed_query_states)
     max_full_len = packed_query_states["max_full_len"]
@@ -863,8 +885,9 @@ def dispatch_attention(
     memory_prefix_value_states: torch.Tensor | None = None,
     memory_prefix_sample_offsets: torch.Tensor | None = None,
     memory_prefix_max_len: int = 4,
+    skip_und_attention: bool = False,
 ) -> tuple[SequencePack, KVToStore | None]:
-    if memory_prefix_key_states is not None and (
+    if (memory_prefix_key_states is not None or skip_und_attention) and (
         memory_value is not None
         or attention_mask.is_three_way
         or attention_mask.control_stream_token_ranges is not None
@@ -925,6 +948,7 @@ def dispatch_attention(
             memory_prefix_value_states=memory_prefix_value_states,
             memory_prefix_sample_offsets=memory_prefix_sample_offsets,
             memory_prefix_max_len=memory_prefix_max_len,
+            skip_und_attention=skip_und_attention,
         )
     return output, None
 

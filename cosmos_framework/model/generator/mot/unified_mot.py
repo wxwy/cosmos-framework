@@ -13,13 +13,26 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed import ProcessGroup
 
+from cosmos_framework.data.generator.sequence_packing.runtime import (
+    SequencePack,
+    from_all_seq,
+    from_und_gen_splits,
+    get_gen_seq,
+    get_num_real_tokens,
+    get_und_seq,
+    has_pad_segment,
+    set_gen_seq,
+    set_und_seq,
+    zeros_like,
+)
 from cosmos_framework.model.attention import attention as imaginaire_attention
 from cosmos_framework.model.attention.masks import CausalType
-from cosmos_framework.utils import log
 from cosmos_framework.model.generator.mot.attention import (
     AttentionMaskType,
+    causal_text_attention,
     dispatch_attention,
 )
+from cosmos_framework.model.generator.mot.g2_contracts import GENLayerKV, UNDLayerKV, UNDTextFeatures
 from cosmos_framework.model.generator.mot.memory_prefix import MemoryPrefixContext
 
 # Nemotron 3 Dense VL imports
@@ -78,18 +91,7 @@ from cosmos_framework.model.generator.utils.load_balancing_stats import (
     LBLMetadata,
 )
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryState, MemoryValue
-from cosmos_framework.data.generator.sequence_packing.runtime import (
-    SequencePack,
-    from_all_seq,
-    from_und_gen_splits,
-    get_gen_seq,
-    get_num_real_tokens,
-    get_und_seq,
-    has_pad_segment,
-    set_gen_seq,
-    set_und_seq,
-    zeros_like,
-)
+from cosmos_framework.utils import log
 
 # Torch optimization settings
 torch._dynamo.config.cache_size_limit = 512
@@ -695,6 +697,33 @@ class PackedAttentionMoT(nn.Module):
         empty_und = gen_seq.new_empty((0, self.hidden_size))  # [0,hidden_size]
         return from_und_gen_splits(empty_und, gen_seq, pack), None
 
+    def _project_und(self, hidden):
+        q = self.q_proj(hidden).view(-1, self.num_attention_heads, self.head_dim)
+        k = self.k_proj(hidden).view(-1, self.num_key_value_heads, self.head_dim)
+        v = self.v_proj(hidden).view(-1, self.num_key_value_heads, self.head_dim)
+        return self.q_norm(q), self.k_norm(k), v
+
+    def _gen_text_key(self, q_rope, key, cos, sin):
+        # This executes under the CURRENT GEN norm, outside the frozen UND graph.
+        if self.k_norm_und_for_gen is not None:
+            key = self.k_norm_und_for_gen(key)
+        return self._apply_rotary_pos_emb(q_rope, key, cos, sin, unsqueeze_dim=1)[1]
+
+    def prepare_und(self, pack, packed_position_embeddings, *, force_varlen=False):
+        q, k, v = self._project_und(get_und_seq(pack))
+        cos, sin = (get_und_seq(p) for p in packed_position_embeddings)
+        qr, kr = self._apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+        empty_q = qr.new_empty((0, self.num_attention_heads, self.head_dim))
+        empty_kv = kr.new_empty((0, self.num_key_value_heads, self.head_dim))
+        out = causal_text_attention(
+            from_und_gen_splits(qr, empty_q, pack),
+            from_und_gen_splits(kr, empty_kv, pack),
+            from_und_gen_splits(v, empty_kv, pack),
+            force_varlen=force_varlen,
+        )
+        count = pack["_num_causal_tokens"]
+        return self.o_proj(out), UNDLayerKV(key=k[:count], value=v[:count], cos=cos[:count], sin=sin[:count])
+
     def forward(
         self,
         pack: SequencePack,
@@ -703,6 +732,7 @@ class PackedAttentionMoT(nn.Module):
         natten_metadata: dict | None = None,
         memory_value: MemoryValue | None = None,
         memory_prefix_context: MemoryPrefixContext | None = None,
+        prepared_text_kv: UNDLayerKV | None = None,
     ) -> tuple[SequencePack, KVToStore | None]:
         """Forward pass with optional memory-augmented attention.
 
@@ -734,18 +764,19 @@ class PackedAttentionMoT(nn.Module):
                 memory_value,
             )
 
-        q_und_in = self.q_proj(get_und_seq(pack))  # [N_und,num_heads*head_dim]
-        q_gen_in = self.q_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_heads*head_dim]
-
-        k_und_in = self.k_proj(get_und_seq(pack))  # [N_und,num_kv_heads*head_dim]
-        k_gen_in = self.k_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_kv_heads*head_dim]
-
-        v_und_in = self.v_proj(get_und_seq(pack))  # [N_und,num_kv_heads*head_dim]
-        v_gen_in = self.v_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_kv_heads*head_dim]
-
-        q_und = q_und_in.view(-1, self.num_attention_heads, self.head_dim)  # [N_und,num_heads,head_dim]
-        k_und = k_und_in.view(-1, self.num_key_value_heads, self.head_dim)  # [N_und,num_kv_heads,head_dim]
-        v_und = v_und_in.view(-1, self.num_key_value_heads, self.head_dim)  # [N_und,num_kv_heads,head_dim]
+        if prepared_text_kv is None:
+            q_und, k_und, v_und = self._project_und(get_und_seq(pack))
+        else:
+            count = get_und_seq(pack).shape[0]
+            pad = count - prepared_text_kv.key.shape[0]
+            if pad < 0:
+                raise ValueError("Prepared UND contains extra text rows")
+            k_und = F.pad(prepared_text_kv.key, (0, 0, 0, 0, 0, pad))
+            v_und = F.pad(prepared_text_kv.value, (0, 0, 0, 0, 0, pad))
+            q_und = k_und.new_zeros((count, self.num_attention_heads, self.head_dim))
+        q_gen_in = self.q_proj_moe_gen(get_gen_seq(pack))
+        k_gen_in = self.k_proj_moe_gen(get_gen_seq(pack))
+        v_gen_in = self.v_proj_moe_gen(get_gen_seq(pack))
 
         q_gen = q_gen_in.view(-1, self.num_attention_heads, self.head_dim)  # [N_gen,num_heads,head_dim]
         k_gen = k_gen_in.view(-1, self.num_key_value_heads, self.head_dim)  # [N_gen,num_kv_heads,head_dim]
@@ -762,9 +793,6 @@ class PackedAttentionMoT(nn.Module):
         if torch.compiler.is_compiling():
             for head_split in (q_und, k_und, v_und, q_gen, k_gen, v_gen):
                 torch._dynamo.mark_static(head_split, 1)
-
-        q_und = self.q_norm(q_und)  # [N_und,num_heads,head_dim]
-        k_und = self.k_norm(k_und)  # [N_und,num_kv_heads,head_dim]
 
         q_gen = self.q_norm_moe_gen(q_gen)  # [N_gen,num_heads,head_dim]
         k_gen = self.k_norm_moe_gen(k_gen)  # [N_gen,num_kv_heads,head_dim]
@@ -795,15 +823,10 @@ class PackedAttentionMoT(nn.Module):
         # cross-attention (fixes scale mismatch when qk_norm_for_diffusion=True but
         # qk_norm_for_text=False, i.e. the Nemotron-3 config).  The raw k_und_ is kept
         # in packed_key_states_ for the reasoner's own causal self-attention.
-        if self.k_norm_und_for_gen is not None:
-            k_und_normalized = self.k_norm_und_for_gen(k_und)  # RMSNorm before RoPE
-            _, k_und_for_gen_ = self._apply_rotary_pos_emb(
-                q_und_,  # dummy q — already RoPE-applied, output discarded; only k is used
-                k_und_normalized,
-                get_und_seq(packed_cos),
-                get_und_seq(packed_sin),
-                unsqueeze_dim=1,
-            )  # k_und_for_gen_: [N_und,num_kv_heads,head_dim]
+        if isinstance(prepared_text_kv, GENLayerKV):
+            packed_key_states_normalized_ = from_und_gen_splits(k_und, k_gen_, pack)
+        elif self.k_norm_und_for_gen is not None:
+            k_und_for_gen_ = self._gen_text_key(q_und_, k_und, get_und_seq(packed_cos), get_und_seq(packed_sin))
             packed_key_states_normalized_: SequencePack | None = from_und_gen_splits(k_und_for_gen_, k_gen_, pack)
         else:
             packed_key_states_normalized_ = None
@@ -816,7 +839,7 @@ class PackedAttentionMoT(nn.Module):
                 value = memory_value.prefix_value_output_cached
                 if source is None or key is None or value is None:
                     raise ValueError("Frozen Prefix projection cache is incomplete")
-                expected = (1, memory_prefix_context.k_local, self.num_key_value_heads, self.head_dim)
+                expected = (1, memory_prefix_context.max_length, self.num_key_value_heads, self.head_dim)
                 if any(
                     t.shape != expected
                     or t.dtype != memory_prefix_context.hidden.dtype
@@ -825,6 +848,27 @@ class PackedAttentionMoT(nn.Module):
                 ):
                     raise ValueError("Frozen Prefix projection cache identity mismatch")
                 prefix_k, prefix_v, normalized_prefix_k = source[0], value[0], key[0]
+            elif memory_prefix_context.global_kv is not None:
+                cached = memory_prefix_context.global_kv[0]
+                if torch.is_grad_enabled():
+                    raise ValueError("cached Global K/V is inference-only")
+                gs, ls = memory_prefix_context.global_lengths, memory_prefix_context.local_lengths
+                local_rows, start = [], 0
+                for g, loc in zip(gs, ls, strict=True):
+                    local_rows.append(memory_prefix_context.hidden[start + g : start + g + loc])
+                    start += g + loc
+                local_hidden = torch.cat(local_rows)
+                lk = self.k_norm_moe_gen(
+                    self.k_proj_moe_gen(local_hidden).view(-1, self.num_key_value_heads, self.head_dim)
+                )
+                lv = self.v_proj_moe_gen(local_hidden).view(-1, self.num_key_value_heads, self.head_dim)
+                keys, values, gi, li = [], [], 0, 0
+                for g, loc in zip(gs, ls, strict=True):
+                    keys.extend((cached.key[gi : gi + g], lk[li : li + loc]))
+                    values.extend((cached.value[gi : gi + g], lv[li : li + loc]))
+                    gi, li = gi + g, li + loc
+                normalized_prefix_k, prefix_v = torch.cat(keys), torch.cat(values)
+                prefix_k = normalized_prefix_k  # legacy prefix capture is disallowed with G2 snapshots
             else:
                 prefix_k = self.k_proj_moe_gen(memory_prefix_context.hidden).view(
                     -1, self.num_key_value_heads, self.head_dim
@@ -837,7 +881,7 @@ class PackedAttentionMoT(nn.Module):
                 memory_prefix_key_states=normalized_prefix_k,
                 memory_prefix_value_states=prefix_v,
                 memory_prefix_sample_offsets=memory_prefix_context.sample_offsets,
-                memory_prefix_max_len=memory_prefix_context.k_local,
+                memory_prefix_max_len=memory_prefix_context.max_length,
             )
             if getattr(memory_value, "local_prefix_length", 0) > 0:
                 memory_prefix_kwargs["memory_prefix_key_source_states"] = prefix_k
@@ -850,6 +894,7 @@ class PackedAttentionMoT(nn.Module):
             memory_value=memory_value,
             packed_key_states_normalized=packed_key_states_normalized_,
             **memory_prefix_kwargs,
+            **({"skip_und_attention": True} if prepared_text_kv is not None else {}),
         )
 
         # Produce kv_to_store for MemoryState.write_for_layer() when the
@@ -926,7 +971,11 @@ class PackedAttentionMoT(nn.Module):
                 cp_group,
             )  # [N_gen,hidden_size]
         else:
-            und_seq = self.o_proj(get_und_seq(packed_attn_output))  # [N_und,hidden_size]
+            und_seq = (
+                get_und_seq(pack).new_zeros(get_und_seq(pack).shape)
+                if prepared_text_kv is not None
+                else self.o_proj(get_und_seq(packed_attn_output))
+            )  # [N_und,hidden_size]
             gen_seq = self.o_proj_moe_gen(get_gen_seq(packed_attn_output))  # [N_gen,hidden_size]
         return from_und_gen_splits(und_seq, gen_seq, pack), kv_to_store  # [N_und+N_gen,hidden_size]
 
@@ -1116,6 +1165,26 @@ def _stack_lbl_metadata(
     return final_lbl_metadata
 
 
+def _packed_position_embeddings(self, pack, position_ids):
+    # Create position embeddings (Qwen3 style) - squeeze once at model level
+    # tensor below is only used for its dtype and device
+    _meta_tensor = get_gen_seq(pack)  # [S_gen,D]
+    cos, sin = self.rotary_emb(
+        _meta_tensor,
+        position_ids=position_ids.unsqueeze(0) if position_ids.ndim == 1 else position_ids.unsqueeze(1),
+    )  # if ndim == 2, the mrope position_ids is (3, seq_len); inject the batch dim in the
+    # middle to get (3, 1, seq_len) so the rotary_emb's mrope branch broadcasts correctly.
+    # In both branches Qwen3VLTextRotaryEmbedding.apply_interleaved_mrope collapses the
+    # T/H/W axis, so cos / sin always come back as [1, N, head_dim].
+    cos = cos.squeeze(0)  # [N,head_dim]
+    sin = sin.squeeze(0)  # [N,head_dim]
+    position_embeddings = (
+        from_all_seq(cos, pack),
+        from_all_seq(sin, pack),
+    )
+    return position_embeddings
+
+
 def _impl_forward(
     self,
     pack: SequencePack,
@@ -1124,6 +1193,8 @@ def _impl_forward(
     natten_metadata_list: list | None = None,
     memory: MemoryState | None = None,
     memory_prefix_context: MemoryPrefixContext | None = None,
+    prepared_text: UNDTextFeatures | None = None,
+    prepared_gen_text_kv: tuple[GENLayerKV, ...] | None = None,
 ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
     """Shared training forward pass for the three MoT text models.
 
@@ -1149,23 +1220,8 @@ def _impl_forward(
         "model.config.vlm_config.model_instance.config.include_gen_pathway=false override."
     )
 
-    # Create position embeddings (Qwen3 style) - squeeze once at model level
-    # tensor below is only used for its dtype and device
-    _meta_tensor = get_gen_seq(pack)  # [S_gen,D]
-    device = _meta_tensor.device
-    cos, sin = self.rotary_emb(
-        _meta_tensor,
-        position_ids=position_ids.unsqueeze(0) if position_ids.ndim == 1 else position_ids.unsqueeze(1),
-    )  # if ndim == 2, the mrope position_ids is (3, seq_len); inject the batch dim in the
-    # middle to get (3, 1, seq_len) so the rotary_emb's mrope branch broadcasts correctly.
-    # In both branches Qwen3VLTextRotaryEmbedding.apply_interleaved_mrope collapses the
-    # T/H/W axis, so cos / sin always come back as [1, N, head_dim].
-    cos = cos.squeeze(0)  # [N,head_dim]
-    sin = sin.squeeze(0)  # [N,head_dim]
-    position_embeddings = (
-        from_all_seq(cos, pack),
-        from_all_seq(sin, pack),
-    )
+    device = get_gen_seq(pack).device
+    position_embeddings = _packed_position_embeddings(self, pack, position_ids)
     # Tracking the load balancing loss across all layers. For dense models, lbl_metadata_all
     # will be a dictionary with empty lists for each pathway. For MoE models, the lists
     # for each pathway will be populated with the load balancing loss metadata for each layer.
@@ -1179,6 +1235,13 @@ def _impl_forward(
 
     # Derive gen_only once (outside compile) if using MemoryState
     memory_gen_only = memory.is_gen_only() if memory is not None else False
+    if prepared_text is not None:
+        if memory is not None or len(prepared_text.layers) != len(self.layers):
+            raise ValueError("Prepared UND requires all layers and no legacy MemoryState")
+        memory_gen_only = True
+    if prepared_gen_text_kv is not None:
+        if torch.is_grad_enabled() or prepared_text is None or len(prepared_gen_text_kv) != len(self.layers):
+            raise ValueError("prepared GEN text K/V requires no_grad and complete UND features")
 
     for i, decoder_layer in enumerate(self.layers):
         # MemoryState: produce read-only MemoryValue for this layer (outside compile)
@@ -1190,8 +1253,13 @@ def _impl_forward(
             position_embeddings,
             natten_metadata=None if natten_metadata_list is None else natten_metadata_list[i],
             memory_value=memory_value,
-            memory_prefix_context=memory_prefix_context,
+            memory_prefix_context=memory_prefix_context.for_layer(i) if memory_prefix_context is not None else None,
             gen_only=memory_gen_only,
+            **(
+                {"prepared_text_kv": (prepared_gen_text_kv or prepared_text.layers)[i]}
+                if prepared_text is not None
+                else {}
+            ),
         )
 
         # MemoryState: store K/V produced by this layer (outside compile)
@@ -1205,7 +1273,12 @@ def _impl_forward(
     final_lbl_metadata = _stack_lbl_metadata(lbl_metadata_all)
 
     hidden_states_out = zeros_like(hidden_states)
-    set_und_seq(hidden_states_out, self.norm(get_und_seq(hidden_states)))  # [N_und,hidden_size]
+    if prepared_text is None:
+        set_und_seq(hidden_states_out, self.norm(get_und_seq(hidden_states)))
+    else:
+        und = torch.cat([prepared_text.hidden[i, :n] for i, n in enumerate(prepared_text.text.lengths)])
+        pad = get_und_seq(hidden_states).shape[0] - und.shape[0]
+        set_und_seq(hidden_states_out, F.pad(und, (0, 0, 0, pad)))
     set_gen_seq(hidden_states_out, self.norm_moe_gen(get_gen_seq(hidden_states)))  # [N_gen,hidden_size]
 
     return hidden_states_out, final_lbl_metadata
@@ -1408,6 +1481,7 @@ class MoTDecoderLayer(nn.Module):
         memory_value: MemoryValue | None = None,
         gen_only: bool = False,
         memory_prefix_context: MemoryPrefixContext | None = None,
+        prepared_text_kv: UNDLayerKV | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata], KVToStore | None]:
         """Forward pass with MoT routing and optional memory-augmented attention.
 
@@ -1427,6 +1501,7 @@ class MoTDecoderLayer(nn.Module):
                 Target-only teacher forcing also slices away control GEN rows
                 before every decoder operation and restores the full layout on return.
         """
+        gen_only = gen_only or prepared_text_kv is not None
         target_only_no_text = gen_only and bool(getattr(memory_value, "target_only_no_text", False))
         layer_input = input
         layer_position_embeddings = packed_position_embeddings
@@ -1479,7 +1554,7 @@ class MoTDecoderLayer(nn.Module):
             )
 
         # Pre-Attention layernorm
-        if target_only_no_text:
+        if target_only_no_text or prepared_text_kv is not None:
             norm_und = get_und_seq(layer_input)  # [0,hidden_size]
         else:
             norm_und = self.input_layernorm(get_und_seq(layer_input))  # [N_und,hidden_size]
@@ -1496,7 +1571,7 @@ class MoTDecoderLayer(nn.Module):
 
         # Self Attention + Residual
         kv_to_store: KVToStore | None = None
-        if gen_only:
+        if gen_only and prepared_text_kv is None:
             assert natten_metadata is None
             # gen_only: skip und, compute gen tokens only (und K/V come from cache)
             _gen_norm = get_gen_seq(pack_norm_out)
@@ -1544,6 +1619,7 @@ class MoTDecoderLayer(nn.Module):
                 natten_metadata=natten_metadata,
                 memory_value=memory_value,
                 memory_prefix_context=normalized_memory_prefix,
+                **({"prepared_text_kv": prepared_text_kv} if prepared_text_kv is not None else {}),
             )
             residual_und = get_und_seq(layer_input) + get_und_seq(pack_attn_out)  # [N_und,hidden_size]
             residual_gen = get_gen_seq(layer_input) + get_gen_seq(pack_attn_out)  # [N_gen,hidden_size]
@@ -1579,32 +1655,23 @@ class MoTDecoderLayer(nn.Module):
                 lbl_metadata_dict["gen"] = lbl_metadata_gen
 
             # Final output with residual (gen only)
-            mlp_out_und_seq = residual_gen.new_empty(0, residual_gen.shape[-1])
+            mlp_out_und_seq = (
+                get_und_seq(layer_input)
+                if prepared_text_kv is not None
+                else residual_gen.new_empty(0, residual_gen.shape[-1])
+            )
             mlp_out_gen_seq = residual_gen + mlp_out_gen
         else:
             # STANDARD PATH: Process both und and gen tokens
-            ln_out_und = self.post_attention_layernorm(residual_und)  # [N_und,hidden_size]
             ln_out_gen = self.post_attention_layernorm_moe_gen(residual_gen)  # [N_gen,hidden_size]
 
             # MASK MLP PADDING ===============
             # NOTE: This is only need for the MoE auxiliary loss computation and to avoid
             #       artificial expert inbalance due to routing padding tokens.
             und_len, gen_len = get_num_real_tokens(pack_attn_out)
-            und_token_mask = _real_token_mask(ln_out_und.shape[0], und_len, ln_out_und.device)  # [N_und]
             gen_token_mask = _real_token_mask(ln_out_gen.shape[0], gen_len, ln_out_gen.device)  # [N_gen]
 
-            und_sample_ids = None
-            und_num_samples = None
-            if self._sample_lbl_und:
-                und_sample_ids, und_num_samples = _get_local_sample_ids(layer_input, "und")
-
-            mlp_out_und, lbl_metadata_und = _run_mlp(
-                self.mlp,
-                ln_out_und,
-                und_token_mask,
-                sample_ids=und_sample_ids,
-                num_samples=und_num_samples,
-            )
+            mlp_out_und, lbl_metadata_und = self._und_mlp(residual_und, layer_input)
             # mlp_out_und: [N_und,hidden_size], zero on the padding rows
             mlp_out_gen, lbl_metadata_gen = _run_mlp(
                 self.mlp_moe_gen,
@@ -1633,6 +1700,36 @@ class MoTDecoderLayer(nn.Module):
             restored_und = get_und_seq(input).new_zeros(get_und_seq(input).shape)  # [N_und,hidden_size]
             layer_output = from_und_gen_splits(restored_und, restored_gen, input)
         return layer_output, lbl_metadata_dict, kv_to_store
+
+    def _und_mlp(self, residual, template):
+        h = self.post_attention_layernorm(residual)
+        mask = _real_token_mask(h.shape[0], template["_num_causal_tokens"], h.device)
+        sample_ids, num_samples = _get_local_sample_ids(template, "und") if self._sample_lbl_und else (None, None)
+        return _run_mlp(self.mlp, h, mask, sample_ids=sample_ids, num_samples=num_samples)
+
+    def prepare_und(self, pack, position_embeddings, *, force_varlen=False):
+        hidden = get_und_seq(pack)
+        norm = self.input_layernorm(hidden)
+        attn_out, kv = self.self_attn.prepare_und(
+            from_und_gen_splits(norm, get_gen_seq(pack)[:0], pack),
+            position_embeddings,
+            force_varlen=force_varlen,
+        )
+        residual = hidden + attn_out
+        mlp_out, _ = self._und_mlp(residual, pack)
+        return from_und_gen_splits(residual + mlp_out, get_gen_seq(pack)[:0], pack), kv
+
+    def prepare_gen_text_kv(self, layer: UNDLayerKV) -> GENLayerKV:
+        a = self.self_attn
+        dummy = layer.key.new_zeros((layer.key.shape[0], a.num_attention_heads, a.head_dim))
+        return GENLayerKV(key=a._gen_text_key(dummy, layer.key, layer.cos, layer.sin), value=layer.value)
+
+    def prepare_global_kv(self, tokens: torch.Tensor) -> GENLayerKV:
+        a = self.self_attn
+        hidden = self.input_layernorm_moe_gen(tokens)
+        key = a.k_norm_moe_gen(a.k_proj_moe_gen(hidden).view(-1, a.num_key_value_heads, a.head_dim))
+        value = a.v_proj_moe_gen(hidden).view(-1, a.num_key_value_heads, a.head_dim)
+        return GENLayerKV(key=key, value=value)
 
     def reasoner_forward(
         self,
@@ -1875,6 +1972,33 @@ class ReasonerKVCache:
         for i in range(self.num_layers):
             self.keys[i] = None
             self.values[i] = None
+
+
+def prepare_und_text_features(model, pack, position_ids, text, *, force_varlen=None):
+    if force_varlen is None:
+        force_varlen = torch.is_grad_enabled()
+    with torch.no_grad():
+        return _prepare_und_text_features(model, pack, position_ids, text, force_varlen=force_varlen)
+
+
+def _prepare_und_text_features(model, pack, position_ids, text, *, force_varlen):
+    """One frozen native UND pass; blocks use their FSDP-registered entry point."""
+    if sum(text.lengths) != pack["_num_causal_tokens"]:
+        raise ValueError("Effective text and native UND row counts differ")
+    positions = _packed_position_embeddings(model, pack, position_ids)
+    hidden = from_und_gen_splits(get_und_seq(pack), get_gen_seq(pack)[:0], pack)
+    layers = []
+    for block in model.layers:
+        hidden, kv = block.prepare_und(hidden, positions, force_varlen=force_varlen)
+        layers.append(kv)
+    post_norm = model.norm(get_und_seq(hidden))[: sum(text.lengths)]
+    pieces = post_norm.split(text.lengths)
+    max_len = max(text.lengths)
+    padded = torch.stack([F.pad(h, (0, 0, 0, max_len - h.shape[0])) for h in pieces])
+    valid = (
+        torch.arange(max_len, device=padded.device)[None, :] < torch.tensor(text.lengths, device=padded.device)[:, None]
+    )
+    return UNDTextFeatures(text=text, hidden=padded, valid_mask=valid, layers=tuple(layers))
 
 
 def _impl_reasoner_forward(
@@ -2526,6 +2650,8 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
         memory_prefix_context: MemoryPrefixContext | None = None,
+        prepared_text: UNDTextFeatures | None = None,
+        prepared_gen_text_kv: tuple[GENLayerKV, ...] | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
         """Training forward pass — delegates to the dense text model."""
         outputs = self.model(
@@ -2535,6 +2661,8 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
             natten_metadata_list=natten_metadata_list,
             memory=memory,
             memory_prefix_context=memory_prefix_context,
+            **({"prepared_text": prepared_text} if prepared_text is not None else {}),
+            **({"prepared_gen_text_kv": prepared_gen_text_kv} if prepared_gen_text_kv is not None else {}),
         )
         return outputs
 
@@ -2695,6 +2823,8 @@ class Qwen3VLMoeTextForCausalLM(Qwen3VLMoePreTrainedModel):
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
         memory_prefix_context: MemoryPrefixContext | None = None,
+        prepared_text: UNDTextFeatures | None = None,
+        prepared_gen_text_kv: tuple[GENLayerKV, ...] | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
         """Training forward pass — delegates to the MoE text model."""
 
@@ -2705,6 +2835,8 @@ class Qwen3VLMoeTextForCausalLM(Qwen3VLMoePreTrainedModel):
             natten_metadata_list=natten_metadata_list,
             memory=memory,
             memory_prefix_context=memory_prefix_context,
+            **({"prepared_text": prepared_text} if prepared_text is not None else {}),
+            **({"prepared_gen_text_kv": prepared_gen_text_kv} if prepared_gen_text_kv is not None else {}),
         )
 
         return outputs
@@ -2868,6 +3000,8 @@ class Nemotron3DenseVLTextForCausalLM(Nemotron3DenseVLPreTrainedModel):
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
         memory_prefix_context: MemoryPrefixContext | None = None,
+        prepared_text: UNDTextFeatures | None = None,
+        prepared_gen_text_kv: tuple[GENLayerKV, ...] | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
         return self.model(
             pack=pack,
@@ -2876,6 +3010,8 @@ class Nemotron3DenseVLTextForCausalLM(Nemotron3DenseVLPreTrainedModel):
             natten_metadata_list=natten_metadata_list,
             memory=memory,
             memory_prefix_context=memory_prefix_context,
+            **({"prepared_text": prepared_text} if prepared_text is not None else {}),
+            **({"prepared_gen_text_kv": prepared_gen_text_kv} if prepared_gen_text_kv is not None else {}),
         )
 
     def generate_reasoner_text(

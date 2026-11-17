@@ -175,6 +175,10 @@ def parallelize_vfm_network(
         # registrations cover every FSDP-wrapped weight touched on the
         # AR path.
         register_fsdp_forward_method(model, "generate_reasoner_text")
+        if getattr(getattr(model, "config", None), "g2_text_enabled", False):
+            for entry in ("prepare_und_text", "prepare_gen_text_kv", "prepare_task_queries", "read_global",
+                          "project_global", "prepare_global_kv", "prepare_global_tokens"):
+                register_fsdp_forward_method(model, entry)
         if getattr(getattr(model, "config", None), "local_memory_enabled", False):
             register_fsdp_forward_method(model, "scan_local_memory")
             model._local_memory_scan_fsdp_registered = True

@@ -24,6 +24,7 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
 from cosmos_framework.utils.generator.spatial_patch import normalize_spatial_patch_hw
 
 if TYPE_CHECKING:
+    from cosmos_framework.model.generator.mot.g2_contracts import G2ConditionBatch
     from cosmos_framework.model.generator.utils.data_and_condition import GenerationDataClean
 
 
@@ -1278,6 +1279,7 @@ class PackedSequence:
 
     # Out-of-band K/V-only payload; one immutable entry per sample.
     local_memory_tokens: tuple[torch.Tensor | None, ...] | None = None
+    g2_condition: G2ConditionBatch | None = None
 
     # Multi-control transfer: per-sample list of per-vision-item token counts.
     # For a multi-control transfer sample with N controls + 1 noisy target,
@@ -1338,6 +1340,45 @@ class PackedSequence:
                 "PackedSequence modality fields must be finalized ModalityData"
             )
 
+    def validate_g2_text(self) -> None:
+        """Compare the sole effective text authority with the actual native pack."""
+        condition = self.g2_condition
+        if condition is None:
+            return
+        text = condition.text
+        if len(text.lengths) != len(self.sample_lens):
+            raise ValueError("G2/native sample count mismatch")
+        causal_lengths, causal_indexes, sample, consumed, causal, cursor = [], [], 0, 0, 0, 0
+        for mode, length in zip(self.attn_modes, self.split_lens, strict=True):
+            consumed += length
+            if mode == "causal":
+                causal += length
+                causal_indexes.extend(range(cursor, cursor + length))
+            cursor += length
+            if consumed == self.sample_lens[sample]:
+                causal_lengths.append(causal)
+                sample, consumed, causal = sample + 1, 0, 0
+        if tuple(causal_lengths) != text.lengths:
+            raise ValueError("effective text lengths disagree with native packing")
+        ids = self.text_ids.new_tensor([t for tokens in text.token_ids for t in tokens])
+        positions = torch.cat([self.position_ids.new_tensor(p) for p in text.position_ids], dim=1)
+        indexes = self.text_indexes.new_tensor(causal_indexes)
+        selection = torch.searchsorted(self.text_indexes, indexes)
+        actual_ids = self.text_ids[selection]
+        actual_positions = self.position_ids[:, indexes]
+        if ids.shape != actual_ids.shape or positions.shape != actual_positions.shape:
+            raise ValueError("effective tokens/positions disagree with native packing")
+        matches = (
+            (self.text_indexes[selection] == indexes).all()
+            & (ids == actual_ids).all()
+            & (positions == actual_positions).all()
+        )
+        if matches.device.type == "cpu":
+            if not bool(matches):
+                raise ValueError("effective tokens/positions disagree with native packing")
+        else:
+            torch._assert_async(matches, "effective tokens/positions disagree with native packing")
+
     def to_cuda(self) -> None:
         """Move all tensor fields to CUDA in-place.
 
@@ -1374,6 +1415,10 @@ class PackedSequence:
                 to_device_nonblocking(token, "cuda") if token is not None else None
                 for token in self.local_memory_tokens
             )
+        if self.g2_condition is not None:
+            from cosmos_framework.model.generator.mot.g2_contracts import move_g2_condition
+
+            self.g2_condition = move_g2_condition(self.g2_condition, "cuda")
         if host_text_indexes is None and self._sequence_pack_metadata is not None:
             return  # already prepared on CUDA; the layout has not changed
         self.prepare_sequence_pack_metadata(host_text_indexes=host_text_indexes)
