@@ -7,7 +7,11 @@ import pytest
 import torch
 
 from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskText
-from cosmos_framework.inference.g2_policy_conditions import G2ConditionRuntime, OnlineSpatialSnapshot
+from cosmos_framework.inference.g2_policy_conditions import (
+    G2ConditionRuntime,
+    OnlineSpatialSnapshot,
+    mask_content_identity,
+)
 from cosmos_framework.model.generator.mot.g2_contract_fixtures import synthetic_view
 from cosmos_framework.model.generator.mot.g2_contracts import (
     EffectiveTextBatch,
@@ -33,6 +37,7 @@ class FixtureHooks:
 
     cache_revision = "test-checkpoint+config-v1"
     tokenizer_identity = "TEST-tokenizer"
+    use_float_positions = False
     training = False
 
     def __init__(self):
@@ -158,7 +163,12 @@ class FixtureProvider:
             rasters=tuple(v.raster for v in selected),
             view_types=tuple((v.scope, v.direction, v.room_id, v.island_id, v.top_variant) for v in selected),
         )
-        result = OnlineSpatialSnapshot(identity=identity, signature=signature, source=self.origin)
+        result = OnlineSpatialSnapshot(
+            identity=identity,
+            signature=signature,
+            source=self.origin,
+            mask_content_ids=tuple(mask_content_identity(view.valid_mask) for view in selected),
+        )
         self.snapshots.append(result)
         return result
 
@@ -262,6 +272,7 @@ def test_state_local_camera_unselected_sg_and_owner_frame_do_not_rebuild_global(
         "reader",
         "projector",
         "mask",
+        "mask-content",
         "geom-encoding",
         "tokens",
         "position-rule",
@@ -302,6 +313,10 @@ def test_each_actual_dependency_invalidates_global(dependency):
             "geom-encoding": "geometry_encoding_version",
         }[dependency]
         setattr(hooks, field, "version-new")
+    elif dependency == "mask-content":
+        mask = view.valid_mask.clone()
+        mask[0, 0] = False
+        provider.change("object", valid_mask=mask)
     elif dependency == "tokens":
         hooks.empty_text = True  # Explicit test identity, not serving-time random dropout.
     elif dependency == "position-rule":
@@ -331,6 +346,18 @@ def test_without_robot_movement_is_reusable_and_missing_variant_never_falls_back
     with pytest.raises(ValueError, match="variant missing"):
         with prepare(rt, request(frame=2, variant="without_robot")):
             pass
+
+
+def test_default_top_is_with_robot_and_matches_explicit_content_identity():
+    rt, hooks, _ = runtime()
+    req = request()
+    del req["g2"]["top_variant"]
+    with prepare(rt, req):
+        pass
+    with prepare(rt, request(frame=1)):
+        pass
+    assert hooks.calls["global"] == 1
+    assert rt.last_request_sources[0].signature.top_variant == "with_robot"
 
 
 def test_static_text_reset_and_scene_session_isolation():
@@ -426,3 +453,82 @@ def test_training_and_missing_online_provider_explicit_errors():
     with pytest.raises(RuntimeError, match="training"):
         with prepare(rt):
             pass
+
+
+def test_multi_rank_cache_is_explicitly_rejected_before_any_model_hook(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    with pytest.raises(RuntimeError, match="one model rank"):
+        runtime()
+
+
+def test_loaded_mask_content_must_match_provider_inventory():
+    rt, _, provider = runtime()
+    load = provider.load_view
+
+    def changed(snapshot, i):
+        view = load(snapshot, i)
+        mask = view.valid_mask.clone()
+        mask[0, 0] = False
+        return replace(view, valid_mask=mask)
+
+    provider.load_view = changed
+    with pytest.raises(ValueError, match="valid_mask differs"):
+        with prepare(rt):
+            pass
+
+
+@pytest.mark.parametrize("variant", ["with_robot", "without_robot"])
+def test_fixed_A_Reader_and_projector_cache_parity_with_CPU_reference_attention(monkeypatch, variant):
+    # Use A's published implementation unchanged. Only its existing attention
+    # dispatcher boundary is a CPU reference, as in A's own CPU tests.
+    from cosmos_framework.model.generator.mot import global_memory as reader_module
+    from cosmos_framework.model.generator.mot.g2_contracts import GlobalMemoryConfig
+
+    def cpu_attention(q, k, v):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(reader_module, "_dispatch_attention", cpu_attention)
+    torch.manual_seed(7)
+    config = GlobalMemoryConfig(enabled=True, top_view_variant=variant)
+    reader = reader_module.GlobalMemoryReader(8, config, latent_channels=4).eval()
+    projector = reader_module.GlobalMemoryProjector(8, config).eval()
+
+    class ActualReaderHooks(FixtureHooks):
+        def prepare_task_queries(self, features):
+            self.calls["task_queries"] += 1
+            return reader.prepare_task_queries(features)
+
+        def read_global(self, queries, views):
+            self.calls["global"] += 1
+            return reader.read_visual(queries, (views,))
+
+        def project_global(self, output):
+            self.calls["global_projection"] += 1
+            return projector(output.tokens)
+
+    cached = ActualReaderHooks()
+    reference = ActualReaderHooks()
+    providers = (FixtureProvider(), FixtureProvider())
+    on = G2ConditionRuntime(cached, profile="g2_r2", provider=providers[0], allow_fixtures=True)
+    off = G2ConditionRuntime(
+        reference, profile="g2_r2", provider=providers[1], allow_fixtures=True, cache_enabled=False
+    )
+    before = {name: value.detach().clone() for name, value in reader.named_parameters()}
+    for frame in range(3):
+        with (
+            prepare(on, request(frame=frame, variant=variant)) as a,
+            prepare(off, request(frame=frame, variant=variant)) as b,
+        ):
+            actual, expected = a["_g2_fixture"][0], b["_g2_fixture"][0]
+            assert torch.equal(actual.global_tokens, expected.global_tokens)
+            assert all(
+                torch.equal(x, y)
+                for pair_a, pair_b in zip(actual.global_kv, expected.global_kv, strict=True)
+                for x, y in zip(pair_a, pair_b, strict=True)
+            )
+    assert cached.calls["global"] == 1 and reference.calls["global"] == 3
+    for name, value in reader.named_parameters():
+        assert torch.equal(before[name], value) and value.grad is None

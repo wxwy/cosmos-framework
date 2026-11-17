@@ -40,6 +40,25 @@ class OnlineSpatialSnapshot:
     identity: G2SampleIdentity
     signature: GlobalCacheSignature
     source: str
+    mask_content_ids: tuple[str, ...]
+
+
+def mask_content_identity(mask: torch.Tensor) -> str:
+    """Provider metadata identity, independently checked against loaded masks on miss."""
+    if mask.dtype != torch.bool or mask.ndim != 2:
+        raise ValueError("Reader valid mask must be bool [H_z,W_z]")
+    return content_key(tuple(mask.shape), mask.detach().cpu().tolist())
+
+
+def _single_rank_only():
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() != 1
+    ):
+        raise RuntimeError(
+            "Session condition preparation supports one model rank only; distributed cache protocol is NOT_IMPLEMENTED"
+        )
 
 
 def _global_content_key(signature: GlobalCacheSignature) -> str:
@@ -52,7 +71,7 @@ def _global_content_key(signature: GlobalCacheSignature) -> str:
     return content_key(G2_ABI_VERSION, payload)
 
 
-def _view_content_key(signature, index):
+def _view_content_key(signature, index, mask_id):
     view = signature.views[index]
     return content_key(
         G2_ABI_VERSION,
@@ -64,6 +83,7 @@ def _view_content_key(signature, index):
         asdict(signature.rasters[index]),
         signature.view_types[index],
         signature.mask_version,
+        mask_id,
     )
 
 
@@ -96,6 +116,7 @@ class G2ConditionRuntime:
         budget: CacheBudget = CacheBudget(),
         allow_fixtures=False,
     ):
+        _single_rank_only()
         if profile not in ("g2_r1", "g2_r2") or type(cache_enabled) is not bool:
             raise ValueError("explicit g2_r1/g2_r2 inference profile and cache switch required")
         if profile == "g2_r2" and provider is None:
@@ -104,17 +125,30 @@ class G2ConditionRuntime:
         self.cache_enabled, self.allow_fixtures = cache_enabled, allow_fixtures
         self.cache = SessionConditionCache(hooks.cache_revision, budget)
         self._tasks: dict[str, tuple] = {}
-        self._telemetry = {name: deque(maxlen=1024) for name in ("queue", "conditions", "backbone_sampling")}
+        self._telemetry = {
+            name: deque(maxlen=1024) for name in ("queue", "text_format_tokenize", "conditions", "backbone_sampling")
+        }
         self.last_request_sources: tuple[OnlineSpatialSnapshot | None, ...] = ()
 
     @staticmethod
     def validate_request(request):
         record = request.get("g2")
-        if not isinstance(record, dict) or set(record) != {"identity", "top_variant", "static_text"}:
-            raise ValueError("exact g2 identity/top_variant/static_text envelope required")
-        if record["top_variant"] not in ("with_robot", "without_robot"):
+        if not isinstance(record, dict) or set(record) not in (
+            {"identity", "top_variant", "static_text"},
+            {"identity", "static_text"},
+        ):
+            raise ValueError("exact g2 identity/static_text with optional top_variant envelope required")
+        if record.get("top_variant", "with_robot") not in ("with_robot", "without_robot"):
             raise ValueError("requested top variant must be explicit")
         identity = G2SampleIdentity(**record["identity"])
+        if any(type(frame) is not int for frame in (identity.decision_frame, identity.logical_state_frame)):
+            raise ValueError("logical condition frames must be exact integers")
+        if any(
+            not isinstance(value, str) or not value or len(value) > 512
+            for value in asdict(identity).values()
+            if isinstance(value, str)
+        ):
+            raise ValueError("bounded condition source/version identities required")
         task = StaticTaskText(**record["static_text"])
         if (task.episode_id, task.subtask_id, task.enhanced_instruction) != (
             identity.episode_id,
@@ -159,6 +193,13 @@ class G2ConditionRuntime:
         if result.source != "online_rollout" and not (self.allow_fixtures and result.source == "synthetic_fixture"):
             raise ValueError("only current-rollout spatial input is permitted; expert playback is unsupported")
         actual = result.signature
+        if len(result.mask_content_ids) != len(actual.views) or any(
+            not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value)
+            for value in result.mask_content_ids
+        ):
+            raise ValueError("provider must bind actual valid_mask content SHA256 per selected view")
+        if len(actual.views) > self.cache.budget.max_entries:
+            raise MemoryError("selected view inventory exceeds explicit entry budget")
         # The provider fills selected-view fields, not model/text versions.
         if replace(actual, views=(), projections=(), rasters=(), view_types=()) != signature:
             raise ValueError("provider changed model/text/geometry recipe or requested top variant")
@@ -184,23 +225,34 @@ class G2ConditionRuntime:
             != signature.view_types[index]
         ):
             raise ValueError("loaded view does not match the selected content/recipe/geometry inventory")
+        if mask_content_identity(view.valid_mask) != snapshot.mask_content_ids[index]:
+            raise ValueError("loaded valid_mask differs from its selected content identity")
         return view
 
     @contextmanager
-    def prepare_many(self, requests, serialized_prompts, *, recipe_ids):
+    def prepare_many(self, requests, serialized_prompts, *, recipe_ids, effective_texts=None):
+        _single_rank_only()
         if len(requests) != len(serialized_prompts) or not requests or len(requests) > 32:
             raise ValueError("bounded per-sample condition routing required")
         if len(recipe_ids) != len(requests) or any(not isinstance(r, str) or not r for r in recipe_ids):
             raise ValueError("shared static prompt recipe identity required per sample")
+        if effective_texts is not None and len(effective_texts) != len(requests):
+            raise ValueError("one C-prepared effective text per native batch sample required")
         if getattr(self.hooks, "training", False):
             raise RuntimeError("Session inference cache must not be used for training")
-        if self.hooks.cache_revision != self.cache.revision:
-            self.reload(self.hooks.cache_revision)
+        refresh = getattr(self.hooks, "refresh_revision", None)
+        if refresh is not None:
+            refresh()
+        revision = self.hooks.cache_revision
+        if revision != self.cache.revision:
+            self.reload(revision)
         started = time.perf_counter_ns()
         texts, text_kvs, projected, global_kvs, sources = [], [], [], [], []
         sessions = set()
         with ExitStack() as stack:
-            for request, serialized, recipe_id in zip(requests, serialized_prompts, recipe_ids, strict=True):
+            for index, (request, serialized, recipe_id) in enumerate(
+                zip(requests, serialized_prompts, recipe_ids, strict=True)
+            ):
                 identity = self.validate_request(request)
                 local = request.get("local_memory", request.get("inference", {}))
                 session = local["session_id"]
@@ -211,7 +263,11 @@ class G2ConditionRuntime:
                     session, identity, request["prompt"], (serialized, recipe_id, request["g2"]["static_text"])
                 )
                 lease = stack.enter_context(self.cache.request(session, enabled=self.cache_enabled))
-                text = self.hooks.tokenize_static_prompt(serialized)
+                text = (
+                    effective_texts[index]
+                    if effective_texts is not None
+                    else self.hooks.tokenize_static_prompt(serialized)
+                )
                 if not isinstance(text, EffectiveTextBatch) or len(text.lengths) != 1:
                     raise ValueError("model hook must return exact effective B1 text tokens/positions")
                 signature = self.hooks.text_signature(session, text)
@@ -235,12 +291,13 @@ class G2ConditionRuntime:
                     global_kvs.append(None)
                     sources.append(None)
                     continue
-                base = self.hooks.global_signature(signature, request["g2"]["top_variant"])
+                variant = request["g2"].get("top_variant", "with_robot")
+                base = self.hooks.global_signature(signature, variant)
                 if (
                     not isinstance(base, GlobalCacheSignature)
                     or base.views
                     or base.text != signature
-                    or base.top_variant != request["g2"]["top_variant"]
+                    or base.top_variant != variant
                 ):
                     raise ValueError("Global model hook must supply an empty current-version signature")
                 snapshot = self._snapshot(identity, base)
@@ -255,14 +312,16 @@ class G2ConditionRuntime:
                 queries = lease.get_or_compute(
                     "task_queries", queries_key, lambda: self._fixed(self.hooks.prepare_task_queries, features)
                 )
-                global_key = content_key(queries_key, _global_content_key(snapshot.signature))
+                global_key = content_key(
+                    queries_key, _global_content_key(snapshot.signature), snapshot.mask_content_ids
+                )
 
                 def build_global():
                     views = tuple(
                         replace(
                             lease.get_or_compute(
                                 "view_latent",
-                                _view_content_key(snapshot.signature, i),
+                                _view_content_key(snapshot.signature, i, snapshot.mask_content_ids[i]),
                                 lambda i=i: self._load_view(snapshot, i),
                             ),
                             identity=snapshot.signature.views[i],
@@ -306,6 +365,9 @@ class G2ConditionRuntime:
     def record_queue(self, seconds):
         self._telemetry["queue"].append(int(seconds * 1e9))
 
+    def record_text_preparation(self, nanoseconds):
+        self._telemetry["text_format_tokenize"].append(nanoseconds)
+
     def reset(self, session_id):
         self.cache.reset(session_id)
         self._tasks.pop(session_id, None)
@@ -321,7 +383,9 @@ class G2ConditionRuntime:
             "profile": self.profile,
             "cache_enabled": self.cache_enabled,
             "cache": self.cache.info(),
+            "model_versions": dict(getattr(self.hooks, "versions", {})),
             "task_bindings": len(self._tasks),
             "host_ns": {name: tuple(values) for name, values in self._telemetry.items()},
+            "telemetry_capacity_per_stage": 1024,
             "limits": "Host elapsed only. Real model parity/latency/provider require separate M08 execution.",
         }

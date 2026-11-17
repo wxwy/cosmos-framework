@@ -55,26 +55,26 @@ class Usage:
         return Usage(*(a - b for a, b in zip(vars(self).values(), vars(other).values(), strict=True)))
 
 
-def _owned_tree(value):
+def _owned_tree(value, *, clone=True):
     """Own immutable containers and detached tensor storage; reject trainable graphs/FDs."""
     if isinstance(value, torch.Tensor):
         if value.requires_grad or value.device.type not in ("cpu", "cuda"):
             raise ValueError("cache accepts only fixed-weight CPU/CUDA tensors without autograd graphs")
-        result = value.detach().clone(memory_format=torch.contiguous_format)
+        result = value.detach().clone(memory_format=torch.contiguous_format) if clone else value
         size = result.numel() * result.element_size()
         return result, Usage(size if result.device.type == "cpu" else 0, size if result.is_cuda else 0, 1)
     if value is None or type(value) in (str, bytes, bool, int, float):
         return value, Usage(cpu_bytes=sys.getsizeof(value))
     if isinstance(value, (tuple, list)):
-        owned = [_owned_tree(item) for item in value]
+        owned = [_owned_tree(item, clone=clone) for item in value]
         result = tuple(item for item, _ in owned)
         usage = Usage(cpu_bytes=sys.getsizeof(result))
         for _, size in owned:
             usage += size
         return result, usage
     if is_dataclass(value) and not isinstance(value, type) and value.__dataclass_params__.frozen:
-        owned = {field.name: _owned_tree(getattr(value, field.name)) for field in fields(value)}
-        result = replace(value, **{key: item for key, (item, _) in owned.items()})
+        owned = {field.name: _owned_tree(getattr(value, field.name), clone=clone) for field in fields(value)}
+        result = replace(value, **{key: item for key, (item, _) in owned.items()}) if clone else value
         usage = Usage(cpu_bytes=sys.getsizeof(result))
         for _, size in owned.values():
             usage += size
@@ -112,8 +112,14 @@ class CacheLease:
             if entry is None:
                 # Existing model-owner serialization is retained. Cache lock also
                 # prevents duplicate fills if used by another caller in this process.
-                value, usage = _owned_tree(build())
-                self.owner._make_room(usage, extra_entry=True)
+                computed = build()
+                _, expected = _owned_tree(computed, clone=False)
+                # Evict/reserve BEFORE allocating owned tensor copies. The
+                # model's temporary working output is outside the cache budget.
+                self.owner._make_room(expected, extra_entry=True)
+                value, usage = _owned_tree(computed)
+                if usage != expected:
+                    raise RuntimeError("condition metadata changed while capturing fixed request storage")
                 entry = _Entry(full_key, value, usage)
                 self.owner._usage += usage
                 if self.enabled:
@@ -165,6 +171,13 @@ class SessionConditionCache:
         self._stats[key[2]]["evictions"] += 1
 
     def _make_room(self, usage, *, extra_entry):
+        if (
+            usage.cpu_bytes > self.budget.cpu_bytes
+            or usage.gpu_bytes > self.budget.gpu_bytes
+            or usage.handles > self.budget.handles
+        ):
+            raise MemoryError("single condition exceeds explicit CPU/GPU/handle budget")
+
         def fits():
             total = self._usage + usage
             return (
@@ -233,5 +246,6 @@ class SessionConditionCache:
                 "request_entries": len(self._transient),
                 "active_requests": sum(self._active.values()),
                 "stages": {key: value.copy() for key, value in self._stats.items()},
+                "counter_scope": "process lifetime; model reload empties all resident derived values",
                 "timing": "host elapsed; hit/miss separated; no CUDA speed inference",
             }

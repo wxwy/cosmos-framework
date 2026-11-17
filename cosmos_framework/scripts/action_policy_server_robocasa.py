@@ -1382,6 +1382,7 @@ class ActionModelService:
             requests,
             [p["augmented_prompt"] for p in preps],
             recipe_ids=[p["g2_text_recipe_id"] for p in preps],
+            effective_texts=[p["g2_effective_text"] for p in preps],
         ) as kwargs:
             yield kwargs
 
@@ -1389,11 +1390,13 @@ class ActionModelService:
         from cosmos_framework.data.generator.action.utils.static_task_text import (
             StaticTaskText,
             StaticTaskTextRecipe,
-            serialize_static_task_prompt,
+            effective_text_batch,
+            prepare_static_task_text,
         )
 
         runtime = self.g2_conditions
         runtime.validate_request(req)
+        started = time.perf_counter_ns()
         task = StaticTaskText(**req["g2"]["static_text"])
         recipe = StaticTaskTextRecipe(
             planned_video_frames=self.cfg.action_chunk_size + 1,
@@ -1402,7 +1405,18 @@ class ActionModelService:
             width=width,
             tokenizer_identity=runtime.hooks.tokenizer_identity,
         )
-        return serialize_static_task_prompt(task, recipe), recipe.identity
+        prepared = prepare_static_task_text(task, recipe, self.model, dropout_applied=False)
+        use_float_positions = runtime.hooks.use_float_positions
+        if type(use_float_positions) is not bool:
+            raise ValueError("model hooks must declare the actual native mRoPE position mode")
+        text = effective_text_batch(
+            (prepared,),
+            recipe,
+            special_tokens=self.model.llm_special_tokens,
+            use_float_positions=use_float_positions,
+        )
+        runtime.record_text_preparation(time.perf_counter_ns() - started)
+        return prepared["ai_caption"], recipe.identity, text
 
     def _build_json_prompt(self, prompt: str, *, video: torch.Tensor, image_size: torch.Tensor) -> str:
         """Reproduce the training-time JSON prompt for format_prompt_as_json=True runs.
@@ -1472,8 +1486,9 @@ class ActionModelService:
             has_text=True,
         )
         g2_recipe_id = None
+        g2_effective_text = None
         if getattr(self, "g2_conditions", None) is not None:
-            augmented_prompt, g2_recipe_id = self._build_g2_prompt(
+            augmented_prompt, g2_recipe_id, g2_effective_text = self._build_g2_prompt(
                 req, height=video_padded.shape[-2], width=video_padded.shape[-1]
             )
         elif self._prompt_json_formatter is not None:
@@ -1502,6 +1517,7 @@ class ActionModelService:
         }
         if g2_recipe_id is not None:
             result["g2_text_recipe_id"] = g2_recipe_id
+            result["g2_effective_text"] = g2_effective_text
         return result
 
     def _build_action_input(self, state_token: "torch.Tensor | None") -> "torch.Tensor":
