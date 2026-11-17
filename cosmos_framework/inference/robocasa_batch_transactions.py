@@ -468,6 +468,8 @@ class BatchedSessionTransactions(SessionTransactions):
                             self._media[t.key].state = "CAPTURING"
                 prepare_start = time.monotonic()
                 for t in members:
+                    if self.conditions is not None:
+                        self.conditions.record_queue(self.clock() - t.enqueued_at)
                     if self.mode == "required" and not self.feature_mode:
                         if getattr(t, "profile_trace", None) is not None:
                             from cosmos_framework.inference.robocasa_feature_trace import use_trace
