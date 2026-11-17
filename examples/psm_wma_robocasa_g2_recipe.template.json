@@ -12,9 +12,9 @@
     "b_stream": null,
     "grad_accum_steps": null,
     "world_size": null,
-    "global_schedule": {"warmup_steps": null, "decay": null, "min_factor": null},
-    "gen_schedule": {"warmup_steps": null, "decay": null, "min_factor": null},
-    "action_schedule": {"warmup_steps": null, "decay": null, "min_factor": null}
+    "global_schedule": {"warmup_steps": null, "decay": null, "min_factor": null, "horizon_steps": null},
+    "gen_schedule": {"warmup_steps": null, "decay": null, "min_factor": null, "horizon_steps": null},
+    "action_schedule": {"warmup_steps": null, "decay": null, "min_factor": null, "horizon_steps": null}
   },
   "text": {
     "planned_video_frames": null,

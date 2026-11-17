@@ -104,9 +104,9 @@ def plan_fixture(profile="R2", *, a=2, b=2, target=7, world=1):
         1,
         1,
         world,
-        GroupSchedule(1, "constant", 1.0) if profile == "R2" else None,
-        GroupSchedule(min(2, b if profile == "R2" else a + b), "linear", 0.2),
-        GroupSchedule(1, "constant", 1.0),
+        GroupSchedule(1, "constant", 1.0, a + b) if profile == "R2" else None,
+        GroupSchedule(min(2, b), "linear", 0.2, a + b),
+        GroupSchedule(1, "constant", 1.0, a + b),
     )
 
 
@@ -378,6 +378,10 @@ def test_plan_has_no_guessed_formal_defaults_and_r1_budget_checkpoints():
     model, optimizer, scheduler, live = setup_fixture(plan)
     assert not hasattr(model.net, "global_memory_reader") and scheduler.stage == TrainingStage.R1
     assert all(role != ParameterGroup.GLOBAL for role in scheduler.roles.values())
+    missing_horizon = asdict(plan)
+    missing_horizon["gen_schedule"].pop("horizon_steps")
+    with pytest.raises(ValueError, match="incomplete"):
+        G2TrainingPlan.from_dict(missing_horizon)
 
 
 def test_existing_optimizer_container_preserves_factory_decay_and_dcp_state_roundtrip():
@@ -462,6 +466,27 @@ def test_r1_r2_comparison_rejects_input_drift_and_nominal_budget_claims():
         validate_actual_comparison_budget(wrong, runs[1])
     with pytest.raises(ValueError, match="unproven"):
         validate_actual_comparison_budget({**runs[0], "effective_consumers": 0}, {**runs[1], "effective_consumers": 0})
+
+
+def test_r1_r2_gen_and_action_lr_match_by_actual_update_count_with_different_budgets():
+    """Equal-GEN-update comparison must not silently rescale the decay curve."""
+    traces = []
+    for profile in ("R1", "R2"):
+        plan = replace(
+            plan_fixture(profile, a=2, b=3, target=10),
+            gen_schedule=GroupSchedule(1, "linear", 0.2, 3),
+            action_schedule=GroupSchedule(1, "cosine", 0.3, 3),
+        )
+        model, optimizer, controller, live = setup_fixture(plan)
+        trace = []
+        for _ in range(5):
+            if ParameterGroup.GEN in controller.active_roles:
+                trace.append({g["g2_role"]: g["lr"] for g in optimizer.param_groups if g["g2_role"] != "global"})
+            run_update(model, optimizer, controller, live, 2)
+        traces.append(trace)
+    assert len(traces[0]) == 5 and len(traces[1]) == 3
+    assert traces[0][:3] == traces[1]
+    assert traces[0][3:] == [traces[1][-1], traces[1][-1]]
 
 
 def _rank_boundary_worker(rank, rendezvous, output, disagree):

@@ -58,6 +58,7 @@ class GroupSchedule:
     warmup_steps: int
     decay: str
     min_factor: float
+    horizon_steps: int
 
     def __post_init__(self):
         if type(self.warmup_steps) is not int or self.warmup_steps < 0:
@@ -66,13 +67,20 @@ class GroupSchedule:
             raise ValueError("explicit supported decay/min_factor is required")
         if not 0 <= self.min_factor <= 1:
             raise ValueError("min_factor must be in [0,1]")
+        if type(self.horizon_steps) is not int or self.horizon_steps < max(1, self.warmup_steps):
+            raise ValueError("explicit schedule horizon must be positive and cover warmup")
 
     def factor(self, completed: int, total: int) -> float:
         if self.warmup_steps > total:
             raise ValueError("group warmup exceeds its own active update budget")
         if completed < self.warmup_steps:
             return (completed + 1) / self.warmup_steps
-        progress = min(1.0, max(0.0, (completed - self.warmup_steps) / max(1, total - self.warmup_steps - 1)))
+        # R1/R2 have the same LR at the same GEN-update count, although their
+        # active budgets differ. Shorter runs truncate this explicit horizon;
+        # longer runs hold the configured minimum. Do not infer it from S_A/B.
+        progress = min(
+            1.0, max(0.0, (completed - self.warmup_steps) / max(1, self.horizon_steps - self.warmup_steps - 1))
+        )
         remaining = {"constant": 1.0, "linear": 1 - progress, "cosine": (1 + math.cos(math.pi * progress)) / 2}[
             self.decay
         ]
@@ -132,10 +140,10 @@ class G2TrainingPlan:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> G2TrainingPlan:
         body = dict(value)
-        for key in ("global_schedule", "gen_schedule", "action_schedule"):
-            if isinstance(body.get(key), dict):
-                body[key] = GroupSchedule(**body[key])
         try:
+            for key in ("global_schedule", "gen_schedule", "action_schedule"):
+                if isinstance(body.get(key), dict):
+                    body[key] = GroupSchedule(**body[key])
             return cls(**body)
         except TypeError as error:
             raise ValueError(f"incomplete/unknown G2 training plan fields: {error}") from error
