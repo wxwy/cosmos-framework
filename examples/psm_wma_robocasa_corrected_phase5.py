@@ -136,6 +136,16 @@ LOCAL_KEYS = (
 )
 OPTIMIZER_KEYS = (*GENERATION_KEYS, *LOCAL_KEYS)
 ACTION_KEYS = ("action2llm", "llm2action", "action_modality_embed")
+
+
+def _g2_recipe(args):
+    if getattr(args, "g2_recipe", None) is None:
+        return None
+    from examples.psm_wma_robocasa_g2_recipe import recipe_from_args
+
+    return recipe_from_args(args)
+
+
 # This changes the gradient accumulation/RNG graph and must not silently
 # same-job resume the legacy per-index native execution checkpoint.
 NATIVE_BATCH_LAYOUT = "v2_a2_member_packed_slot_major_v1"
@@ -183,11 +193,7 @@ NOTTT4_LEGACY_JOB = "no_ttt_packed128_droid_fresh_30k_world4_ga4"
 
 
 def _nottt4_resume_without_job_identity(args: argparse.Namespace) -> bool:
-    return (
-        _nottt4_source_gate_disabled(args)
-        and args.phase == "resume"
-        and args.job_name == NOTTT4_LEGACY_JOB
-    )
+    return _nottt4_source_gate_disabled(args) and args.phase == "resume" and args.job_name == NOTTT4_LEGACY_JOB
 
 
 def _owner_g1_cross_pair_resume(args: argparse.Namespace) -> bool:
@@ -484,6 +490,14 @@ def training_identity(args: argparse.Namespace, config: Any, report: dict[str, A
     profile_from_args(args)  # Runtime validation only; count/prefetch/timeout are not training semantics.
     return {
         **({"training_profile": "matched_no_ttt_v1"} if getattr(args, "no_ttt", False) else {}),
+        **(
+            {
+                "training_profile": "g2_" + _g2_recipe(args).training.profile,
+                "g2_recipe_identity": _g2_recipe(args).identity,
+            }
+            if _g2_recipe(args) is not None
+            else {}
+        ),
         "root": report["lock"]["root"] if _owner_g1_cross_pair_resume(args) else expected_root,
         "child": report["lock"]["child"] if _owner_g1_cross_pair_resume(args) else expected_child,
         "native_batch_layout": NATIVE_BATCH_LAYOUT,
@@ -900,6 +914,8 @@ def overlay_config(
     config.job.name = args.job_name
     if model.max_action_dim != 64 or model.local_memory_action_dim != 15:
         raise ValueError("Edge raw15/64 合同不匹配")
+    if _g2_recipe(args) is not None:
+        _g2_recipe(args).overlay(config)
 
 
 def _load_config(args: argparse.Namespace):
@@ -1074,6 +1090,7 @@ def _execution_stop_iteration(args: argparse.Namespace) -> int:
 
 
 def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindowLocalCatalog, Any]:
+    g2_recipe = _g2_recipe(args)  # Required run fields are checked before CUDA/data access.
     if getattr(args, "dataset_index_root", None) is None:
         raise ValueError("训练/Resume 必须提供已离线验收的 --dataset-index-root；禁止 cold build 与数据全量复检")
     check_job_namespace(args)
@@ -1109,7 +1126,10 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     lock = verify_root_child_lock(args)
     os.environ["HF_HUB_OFFLINE"] = "1"
     check_edge_checkpoint(str(args.edge))
-    check_droid_dcp(args.base_checkpoint)
+    if g2_recipe is None:
+        check_droid_dcp(args.base_checkpoint)
+    else:
+        g2_recipe.check_init_checkpoint(args.base_checkpoint)
     if not args.vae.is_file():
         raise FileNotFoundError("WAN VAE 文件缺失")
     resume = _resume_checkpoint(args)
@@ -1133,13 +1153,30 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
     overlay_config(config, args, contract, resume_checkpoint=resume)
     tokenizer = config.model.config.vlm_config.tokenizer
     stage = time.perf_counter()
+    g2_adapter = g2_recipe.data_adapter() if g2_recipe is not None else None
+    if g2_recipe is not None and g2_recipe.global_memory.enabled:
+        channels = getattr(g2_adapter.provider, "latent_channels", None)
+        if type(channels) is not int or channels < 1:
+            raise ValueError("R2 provider must declare actual VAE recipe latent_channels")
+        config.model.config.global_memory_latent_channels = channels
     dataset = get_action_robocasa_exact_window_cached_sft_dataset(
         cache_root=args.cache_root,
         source_root=args.source_root,
         tokenizer_config=tokenizer,
         catalog=cache,
         verified_index=verified_index,
+        **(
+            {"g2_adapter": g2_adapter, "static_task_text_recipe": dataclasses.asdict(g2_recipe.text)}
+            if g2_recipe is not None
+            else {}
+        ),
     )
+    if g2_recipe is not None and (
+        g2_recipe.text.planned_video_frames != contract.observation_frames
+        or g2_recipe.text.fps != contract.fps
+        or (g2_recipe.text.height, g2_recipe.text.width) != tuple(dataset._dataset._canvas_geometry[:2])
+    ):
+        raise ValueError("G2 fixed text generation recipe differs from actual native input geometry/fps/horizon")
     dataset_create_ms = (time.perf_counter() - stage) * 1000
     stage = time.perf_counter()
     catalog = ExactWindowLocalCatalog(dataset, ttt_tbptt_steps=args.t)
@@ -1170,6 +1207,8 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         witnesses=witnesses,
         transform_rng_mode=getattr(args, "transform_rng_mode", "legacy_global"),
     )
+    if g2_recipe is not None:
+        digest = _json_digest({"phase5": digest, "g2_recipe_identity": g2_recipe.identity})
     planner = ExactWindowRankPlanner(catalog, rank=0, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     plan = planner.plan_window(planner.initial_frontier())
     report = {
@@ -1188,6 +1227,15 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         "checkpoint_load_path": str(resume or args.base_checkpoint),
         "effective_data_source": describe_effective_data_source(
             config, catalog.raw.contract, ttt_steps=args.t, local_memory_enabled=not getattr(args, "no_ttt", False)
+        ),
+        **(
+            {
+                "g2_recipe_identity": g2_recipe.identity,
+                "g2_data": dataset._dataset.g2_adapter.summary(),
+                "g2_training_plan": dataclasses.asdict(g2_recipe.training),
+            }
+            if g2_recipe is not None
+            else {}
         ),
     }
     semantic = training_identity(args, config, report)
@@ -1245,6 +1293,12 @@ def parser() -> argparse.ArgumentParser:
         "--no-ttt", action="store_true", help="Independent matched Packed128 baseline; never a G1 Resume override"
     )
     result.add_argument("--phase", choices=("fresh", "resume"), required=True)
+    result.add_argument(
+        "--g2-recipe",
+        type=Path,
+        default=None,
+        help="Explicit R1/R2 plan + shared text/DATA_C/G1 config witnesses; no formal defaults",
+    )
     result.add_argument(
         "--owner-authorized-g1-cross-pair-resume",
         action="store_true",
@@ -1321,6 +1375,7 @@ def _telemetry_sample_interval(stop_after_iter: int | None) -> int:
 
 def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
+    g2_recipe = _g2_recipe(args)
     profile_from_args(args)  # Reject invalid opt-in settings before CUDA/distributed setup.
     if type(args.num_workers) is not int or not 0 <= args.num_workers <= 16:
         raise ValueError("--num-workers must be 0..16")
@@ -1348,7 +1403,13 @@ def main(argv: list[str] | None = None) -> None:
     trainer._require_committed_execution_boundary = True
     with model_init():
         model = instantiate(config.model)
-    install_optimizer_inventory_check(model, report, no_ttt=args.no_ttt)
+    if g2_recipe is None:
+        install_optimizer_inventory_check(model, report, no_ttt=args.no_ttt)
+    else:
+        from examples.psm_wma_robocasa_g2_recipe import install_g2_training
+
+        trainer.g2_evidence_dir = job_namespace(args)
+        install_g2_training(model, trainer, g2_recipe, report)
     planner = ExactWindowRankPlanner(catalog, rank=rank, world_size=args.world_size, b_stream=args.b, active_ga=args.ga)
     producer = ExactWindowSegmentProducer(
         catalog,
@@ -1374,9 +1435,14 @@ def main(argv: list[str] | None = None) -> None:
         from examples.psm_wma_robocasa_matched_no_ttt import NoTTTPlanObserver
 
         observer_type = NoTTTPlanObserver
+    parameter_group = _telemetry_parameter_group
+    if g2_recipe is not None:
+        from examples.psm_wma_robocasa_g2_recipe import telemetry_parameter_group
+
+        parameter_group = functools.partial(telemetry_parameter_group, trainer)
     observer = observer_type(
         rank=rank,
-        parameter_group=_telemetry_parameter_group,
+        parameter_group=parameter_group,
         cuda_sample_interval=sample_interval,
         parameter_norm_interval=sample_interval,
         audit_missing_gradients=args.audit_missing_grads,
@@ -1403,6 +1469,20 @@ def main(argv: list[str] | None = None) -> None:
     ):
         raise RuntimeError("Phase5 完成的 optimizer iteration 不匹配")
     lifecycle.close()
+    if g2_recipe is not None:
+        controller = trainer._g2_stage_controller
+        (job_namespace(args) / f"g2_training_result_rank_{rank}.json").write_text(
+            json.dumps(
+                {
+                    "stage": controller.state_dict(),
+                    "actual_parameter_inventory": controller.inventory(),
+                    "scope": "actual_runtime",
+                    "comparison_checkpoint_iterations": g2_recipe.training.required_checkpoint_iterations,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
     if rank == 0 and getattr(args, "stop_after_iter", None) is not None:
         print(
             "[CorrectedV3][bounded_stop] "

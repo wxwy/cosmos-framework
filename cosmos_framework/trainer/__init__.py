@@ -429,7 +429,9 @@ class ImaginaireTrainer:
                     ):
                         raise RuntimeError("Missing committed optimizer/Local boundary before checkpoint")
                     # Save checkpoint.
-                    if iteration % self.config.checkpoint.save_iter == 0:
+                    if iteration % self.config.checkpoint.save_iter == 0 or iteration in getattr(
+                        self, "_required_checkpoint_iterations", ()
+                    ):
                         self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
                     self.callbacks.on_training_step_end(model, data_batch, output_batch, loss, iteration=iteration)
                     # Callback consumers have finished; do not retain GPU outputs through
@@ -459,7 +461,8 @@ class ImaginaireTrainer:
         if sm_carveout:
             torch._C._set_sm_carveout_experimental(None)
         if iteration % self.config.checkpoint.save_iter != 0:
-            self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
+            if iteration not in getattr(self, "_required_checkpoint_iterations", ()):
+                self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
         self.callbacks.on_train_end(model, iteration=iteration)
         self.checkpointer.finalize()
         distributed.barrier()
