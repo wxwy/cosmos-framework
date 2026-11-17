@@ -12,6 +12,8 @@ request snapshot; training tensors retain their autograd graph.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -404,14 +406,21 @@ def stack_g2_prepared(*, text_features, text_kv, global_tokens, global_kv, devic
         raise ValueError("one ordered prepared condition per native sample is required")
     first = text_features[0]
     texts = [f.text for f in text_features]
-    identity = (first.text.formatter_id, first.text.tokenizer_id, first.text.dropout_id)
-    if any(len(t.lengths) != 1 or (t.formatter_id, t.tokenizer_id, t.dropout_id) != identity for t in texts):
-        raise ValueError("prepared samples need B1 text and a common formatter/tokenizer/dropout protocol")
+    identity = (first.text.formatter_id, first.text.tokenizer_id)
+    if any(len(t.lengths) != 1 or (t.formatter_id, t.tokenizer_id) != identity for t in texts):
+        raise ValueError("prepared samples need B1 text and a common formatter/tokenizer protocol")
+    dropout_ids = tuple(t.dropout_id for t in texts)
+    dropout_id = (
+        first.text.dropout_id
+        if len(set(dropout_ids)) == 1
+        else "stack-v1:" + hashlib.sha256(json.dumps(dropout_ids, separators=(",", ":")).encode()).hexdigest()
+    )
     text = replace(
         first.text,
         token_ids=tuple(t.token_ids[0] for t in texts),
         position_ids=tuple(t.position_ids[0] for t in texts),
         dropped=tuple(t.dropped[0] for t in texts),
+        dropout_id=dropout_id,
     )
     device = first.hidden.device if device is None else device
     layer_count = len(first.layers)

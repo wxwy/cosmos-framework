@@ -765,7 +765,17 @@ class PackedAttentionMoT(nn.Module):
             )
 
         if prepared_text_kv is None:
-            q_und, k_und, v_und = self._project_und(get_und_seq(pack))
+            # Preserve the legacy UND/GEN projection order, including norm
+            # staging below, for existing compiled BF16 cache materialization.
+            q_und_in = self.q_proj(get_und_seq(pack))
+            q_gen_in = self.q_proj_moe_gen(get_gen_seq(pack))
+            k_und_in = self.k_proj(get_und_seq(pack))
+            k_gen_in = self.k_proj_moe_gen(get_gen_seq(pack))
+            v_und_in = self.v_proj(get_und_seq(pack))
+            v_gen_in = self.v_proj_moe_gen(get_gen_seq(pack))
+            q_und = q_und_in.view(-1, self.num_attention_heads, self.head_dim)
+            k_und = k_und_in.view(-1, self.num_key_value_heads, self.head_dim)
+            v_und = v_und_in.view(-1, self.num_key_value_heads, self.head_dim)
         else:
             count = get_und_seq(pack).shape[0]
             pad = count - prepared_text_kv.key.shape[0]
@@ -774,9 +784,9 @@ class PackedAttentionMoT(nn.Module):
             k_und = F.pad(prepared_text_kv.key, (0, 0, 0, 0, 0, pad))
             v_und = F.pad(prepared_text_kv.value, (0, 0, 0, 0, 0, pad))
             q_und = k_und.new_zeros((count, self.num_attention_heads, self.head_dim))
-        q_gen_in = self.q_proj_moe_gen(get_gen_seq(pack))
-        k_gen_in = self.k_proj_moe_gen(get_gen_seq(pack))
-        v_gen_in = self.v_proj_moe_gen(get_gen_seq(pack))
+            q_gen_in = self.q_proj_moe_gen(get_gen_seq(pack))
+            k_gen_in = self.k_proj_moe_gen(get_gen_seq(pack))
+            v_gen_in = self.v_proj_moe_gen(get_gen_seq(pack))
 
         q_gen = q_gen_in.view(-1, self.num_attention_heads, self.head_dim)  # [N_gen,num_heads,head_dim]
         k_gen = k_gen_in.view(-1, self.num_key_value_heads, self.head_dim)  # [N_gen,num_kv_heads,head_dim]
@@ -794,6 +804,9 @@ class PackedAttentionMoT(nn.Module):
             for head_split in (q_und, k_und, v_und, q_gen, k_gen, v_gen):
                 torch._dynamo.mark_static(head_split, 1)
 
+        if prepared_text_kv is None:
+            q_und = self.q_norm(q_und)
+            k_und = self.k_norm(k_und)
         q_gen = self.q_norm_moe_gen(q_gen)  # [N_gen,num_heads,head_dim]
         k_gen = self.k_norm_moe_gen(k_gen)  # [N_gen,num_kv_heads,head_dim]
 
@@ -1663,15 +1676,17 @@ class MoTDecoderLayer(nn.Module):
             mlp_out_gen_seq = residual_gen + mlp_out_gen
         else:
             # STANDARD PATH: Process both und and gen tokens
+            ln_out_und = self.post_attention_layernorm(residual_und)
             ln_out_gen = self.post_attention_layernorm_moe_gen(residual_gen)  # [N_gen,hidden_size]
 
             # MASK MLP PADDING ===============
             # NOTE: This is only need for the MoE auxiliary loss computation and to avoid
             #       artificial expert inbalance due to routing padding tokens.
             und_len, gen_len = get_num_real_tokens(pack_attn_out)
+            und_token_mask = _real_token_mask(ln_out_und.shape[0], und_len, ln_out_und.device)
             gen_token_mask = _real_token_mask(ln_out_gen.shape[0], gen_len, ln_out_gen.device)  # [N_gen]
 
-            mlp_out_und, lbl_metadata_und = self._und_mlp(residual_und, layer_input)
+            mlp_out_und, lbl_metadata_und = self._und_mlp(ln_out_und, und_token_mask, layer_input)
             # mlp_out_und: [N_und,hidden_size], zero on the padding rows
             mlp_out_gen, lbl_metadata_gen = _run_mlp(
                 self.mlp_moe_gen,
@@ -1701,9 +1716,7 @@ class MoTDecoderLayer(nn.Module):
             layer_output = from_und_gen_splits(restored_und, restored_gen, input)
         return layer_output, lbl_metadata_dict, kv_to_store
 
-    def _und_mlp(self, residual, template):
-        h = self.post_attention_layernorm(residual)
-        mask = _real_token_mask(h.shape[0], template["_num_causal_tokens"], h.device)
+    def _und_mlp(self, h, mask, template):
         sample_ids, num_samples = _get_local_sample_ids(template, "und") if self._sample_lbl_und else (None, None)
         return _run_mlp(self.mlp, h, mask, sample_ids=sample_ids, num_samples=num_samples)
 
@@ -1716,7 +1729,8 @@ class MoTDecoderLayer(nn.Module):
             force_varlen=force_varlen,
         )
         residual = hidden + attn_out
-        mlp_out, _ = self._und_mlp(residual, pack)
+        h = self.post_attention_layernorm(residual)
+        mlp_out, _ = self._und_mlp(h, _real_token_mask(h.shape[0], pack["_num_causal_tokens"], h.device), pack)
         return from_und_gen_splits(residual + mlp_out, get_gen_seq(pack)[:0], pack), kv
 
     def prepare_gen_text_kv(self, layer: UNDLayerKV) -> GENLayerKV:

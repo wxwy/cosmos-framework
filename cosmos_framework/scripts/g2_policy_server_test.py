@@ -1,9 +1,11 @@
 """Real service/Session/Local CPU integration; only spatial/model kernels doubled."""
 
 import json
+import sys
 import threading
 from copy import deepcopy
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -43,6 +45,8 @@ def setup(monkeypatch, *, batch=False, cache=True, profile="g2_r2", slots=2):
     obj = service(monkeypatch)
     obj.local_memory_adapter, obj.model = make_adapter(slots)
     obj.model.eval()
+    obj.model.tokenize_text = lambda text, **_kwargs: [ord(c) for c in text]
+    obj.model.llm_special_tokens = {"bos_token_id": 1, "eos_token_id": 2, "start_of_generation": 3}
     rt, hooks, provider = runtime(profile=profile, cache=cache)
     obj.g2_conditions = rt
     obj.calls = []
@@ -115,6 +119,12 @@ def test_real_service_calls_C_shared_prompt_and_keeps_state_fast(monkeypatch, pr
         assert first["augmented_prompt"] == serialize(task, recipe)
         assert first["g2_text_recipe_id"] == recipe.identity
         assert asdict(called[0][0]) == req["g2"]["static_text"]
+        effective = first["g2_effective_text"]
+        expected_ids = (1, *obj.model.tokenize_text(first["augmented_prompt"]), 2, 3)
+        assert effective.token_ids == (expected_ids,)
+        assert effective.position_ids == ((tuple(range(len(expected_ids))),) * 3,)
+        assert effective.dropped == (False,)
+        assert rt.hooks.calls["tokenize"] == 0
     finally:
         assert actor.close()
 
@@ -259,3 +269,47 @@ def test_service_cache_on_off_exact_actions_and_real_Local_state_parity(monkeypa
         assert on[3].calls["global"] == 1 and off[3].calls["global"] == 3
     finally:
         assert on[1].close() and off[1].close()
+
+
+@pytest.mark.parametrize(
+    "fault,message",
+    [
+        ("transactions", "owned Session"),
+        ("guidance", "guidance=1"),
+        ("hooks", "shared model hooks"),
+        ("provider", "current-rollout provider"),
+    ],
+)
+def test_explicit_profile_rejects_missing_interfaces_before_model_or_GPU_load(monkeypatch, fault, message):
+    obj = service(monkeypatch)
+    cls = type(obj)
+    options = None if fault == "transactions" else {}
+    monkeypatch.setitem(cls.__init__.__globals__, "_transaction_options", lambda _: options)
+    args = SimpleNamespace(
+        g2_profile="g2_r2",
+        guidance=2.0 if fault == "guidance" else 1.0,
+        g2_hooks_factory=None if fault == "hooks" else "B.fixed:model_hooks",
+        g2_provider_factory=None if fault == "provider" else "online.fixed:spatial",
+    )
+    with pytest.raises(ValueError, match=message):
+        cls(args)
+
+
+def test_R1_factory_does_not_import_or_construct_spatial_provider(monkeypatch):
+    obj = service(monkeypatch)
+    _, hooks, _ = runtime(profile="g2_r1")
+    module = SimpleNamespace(model_hooks=lambda _service: hooks)
+    monkeypatch.setitem(sys.modules, "g2_test_factory", module)
+    args = SimpleNamespace(
+        g2_hooks_factory="g2_test_factory:model_hooks",
+        g2_provider_factory="never_import_this:provider",
+        g2_profile="g2_r1",
+        g2_cache_enabled=True,
+        g2_cache_max_sessions=1,
+        g2_cache_max_entries=16,
+        g2_cache_cpu_bytes=1024**2,
+        g2_cache_gpu_bytes=1024**2,
+        g2_cache_handles=64,
+    )
+    obj._configure_g2_conditions(args)
+    assert obj.g2_conditions.profile == "g2_r1" and obj.g2_conditions.provider is None
