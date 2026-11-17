@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import random
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -22,6 +23,9 @@ import torch
 
 from cosmos_framework.data.generator.action.utils.json_formatter import ActionPromptJsonFormatter
 from cosmos_framework.data.generator.action.utils.transform_random import transform_draw
+from cosmos_framework.data.generator.sequence_packing.mrope import get_3d_mrope_ids_text_tokens
+from cosmos_framework.data.generator.sequence_packing.sequence import PackedSequenceBuilder
+from cosmos_framework.model.generator.mot.g2_contracts import EffectiveTextBatch
 
 TEXT_PROTOCOL = "psm_g2_static_initial_text_v1"
 
@@ -171,9 +175,62 @@ def prepare_static_task_text(
         "ai_caption": serialized,
         "text_token_ids": tokens,
         "text_attention_mask": torch.ones_like(tokens, dtype=torch.bool),
-        "text_position_ids": torch.arange(tokens.numel(), dtype=torch.long),
+        "text_position_ids": get_3d_mrope_ids_text_tokens(tokens.numel(), 0)[0],
         "text_condition_identity": condition_identity,
         "text_task_identity": task.identity,
         "text_recipe_identity": recipe.identity,
         "text_dropout_applied": dropout_applied,
     }
+
+
+def effective_text_batch(
+    samples: Sequence[Mapping[str, Any]],
+    recipe: StaticTaskTextRecipe,
+    *,
+    special_tokens: Mapping[str, int],
+    use_float_positions: bool = False,
+) -> EffectiveTextBatch:
+    """C→B/D boundary: actual native text span INCLUDING BOS/EOS/BOV.
+
+    Dataset text_token_ids stay tokenizer IDs for compatibility with the native
+    GEN packer. This function uses that SAME packer's text method, with the
+    actual model.llm_special_tokens, to expose final UND inputs/positions once.
+    B consumes this EffectiveTextBatch, not an independently tokenized caption.
+    """
+    if not samples:
+        raise ValueError("effective text batch must contain consumers")
+    tokens, positions, decisions = [], [], []
+    for sample in samples:
+        raw = sample["text_token_ids"]
+        mask = sample["text_attention_mask"]
+        if (
+            sample["text_recipe_identity"] != recipe.identity
+            or raw.ndim != 1
+            or raw.dtype != torch.long
+            or mask.shape != raw.shape
+            or mask.dtype != torch.bool
+            or not bool(mask.all())
+            or type(sample["text_dropout_applied"]) is not bool
+        ):
+            raise ValueError("prepared tokenizer input/mask/recipe/dropout identity mismatch")
+        builder = PackedSequenceBuilder()
+        builder.begin_sample(0)
+        builder.pack_text_tokens(
+            raw.tolist(), dict(special_tokens), has_generation=True, use_float_positions=use_float_positions
+        )
+        tokens.append(tuple(builder.text_ids))
+        positions.append(tuple(tuple(axis) for axis in builder.position_ids[0].tolist()))
+        decisions.append(sample["text_dropout_applied"])
+    return EffectiveTextBatch(
+        token_ids=tuple(tokens),
+        position_ids=tuple(positions),
+        dropped=tuple(decisions),
+        formatter_id=recipe.identity,
+        tokenizer_id=recipe.tokenizer_identity,
+        dropout_id=_digest({"policy": "consumer_once_v1", "decisions": decisions}),
+    )
+
+
+def effective_text_mask(text: EffectiveTextBatch) -> torch.Tensor:
+    """Exact right-padding validity for the final native UND spans."""
+    return torch.arange(max(text.lengths))[None, :] < torch.tensor(text.lengths)[:, None]

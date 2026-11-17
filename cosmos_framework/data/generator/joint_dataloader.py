@@ -174,6 +174,8 @@ def custom_collate_fn(batch: list[dict[str, Any]] | dict[str, Any]) -> dict[str,
         "image_size",
         "action_processing_record",
         "camera_geometry",
+        "g2_sample_identity",
+        "g2_views",
         # Like "video": a per-sample list of range clips, which default_collate would try to
         # stack even though the two sensors' clips differ in length and resolution.
         "lidar",
