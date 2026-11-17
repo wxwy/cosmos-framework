@@ -7,9 +7,9 @@ import math
 
 import torch
 
-from cosmos_framework.utils import log
 from cosmos_framework.data.generator.action.utils.viewpoint_utils import DEFAULT_VIEWPOINT_TEMPLATES
 from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
+from cosmos_framework.utils import log
 
 
 def _should_append_idle_frame_info(mode: object) -> bool:
@@ -60,6 +60,7 @@ class ActionPromptJsonFormatter:
         append_duration_fps_timestamps: bool = True,
         float_seconds: bool = False,
         video_num_frames_key: str = "video_num_frames",
+        append_idle_frame_text: bool = True,
     ) -> None:
         self.caption_key: str = caption_key
         self.viewpoint_key: str = viewpoint_key
@@ -69,6 +70,9 @@ class ActionPromptJsonFormatter:
         self.idle_frames_key: str = idle_frames_key
         self.total_frames_key: str = total_frames_key
         self.action_key: str = action_key
+        if type(append_idle_frame_text) is not bool:
+            raise TypeError("append_idle_frame_text must be a bool")
+        self.append_idle_frame_text = append_idle_frame_text
         # When True, ``duration`` and action ``time`` are sub-second-precise
         # floats (e.g. "0.57s", "0.00-0.57s") instead of truncated/rounded whole
         # seconds. Useful for short high-fps clips (e.g. 16-frame chunks at 30 fps
@@ -117,10 +121,13 @@ class ActionPromptJsonFormatter:
         if time_str is not None:
             action_entry["time"] = time_str
         action_entry["description"] = self._ensure_sentence(caption)
-        action_entry["idle_frame"] = self._get_idle_frame_info(data_dict)
+        if self.append_idle_frame_text:
+            action_entry["idle_frame"] = self._get_idle_frame_info(data_dict)
         # Appended after the existing keys so prompts without relabeling are
         # byte-identical to before this field existed.
         action_entry.update(self._get_relabel_prompt(data_dict, relabel_prompt))
+        if not self.append_idle_frame_text:
+            action_entry.pop("idle_frame", None)
 
         prompt: dict[str, object] = {
             "cinematography": {
