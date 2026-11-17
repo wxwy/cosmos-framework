@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from cosmos_framework.inference.g2_session_cache import CacheBudget, SessionConditionCache, content_key
+from cosmos_framework.inference.g2_session_cache import CacheBudget, SessionConditionCache, Usage, content_key
 
 
 @dataclass(frozen=True)
@@ -105,6 +105,31 @@ def test_active_request_cannot_reset_reload_or_be_evicted():
                 pass
     with cache.request("other"):
         assert cache.info()["sessions"] == 1
+
+
+def test_GPU_accounting_limit_without_allocating_a_GPU_or_evicting_valid_content():
+    cache = SessionConditionCache("w", CacheBudget(gpu_bytes=32))
+    with cache.request("s") as request:
+        request.get_or_compute("text", content_key("ok"), lambda: torch.ones(1))
+    with pytest.raises(MemoryError, match="single condition"):
+        cache._make_room(Usage(gpu_bytes=33), extra_entry=True)
+    assert cache.info()["entries"] == 1 and cache.info()["usage"]["gpu_bytes"] == 0
+
+
+def test_capacity_is_reserved_before_owned_tensor_copies(monkeypatch):
+    cache = SessionConditionCache("w", CacheBudget(handles=1))
+    value = (torch.ones(2), torch.ones(2))
+    copied = []
+    original = torch.Tensor.clone
+
+    def clone(tensor, *args, **kwargs):
+        copied.append(1)
+        return original(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", clone)
+    with cache.request("s") as request, pytest.raises(MemoryError, match="single condition"):
+        request.get_or_compute("text", content_key("too-big"), lambda: value)
+    assert not copied
 
 
 def test_failed_factory_and_trainable_outputs_are_not_published():
