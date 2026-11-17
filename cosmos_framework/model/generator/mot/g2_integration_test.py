@@ -15,13 +15,18 @@ from cosmos_framework.data.generator.action.utils.static_task_text import (
     prepare_static_task_text,
 )
 from cosmos_framework.data.generator.sequence_packing.packers import pack_input_sequence
+from cosmos_framework.data.generator.sequence_packing.runtime import get_gen_seq, get_und_seq
 from cosmos_framework.data.generator.sequence_packing.sequence import SequencePlan
 from cosmos_framework.model.generator.mot import attention, global_memory
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
 from cosmos_framework.model.generator.mot.g2_contract_fixtures import synthetic_view
 from cosmos_framework.model.generator.mot.g2_contracts import EffectiveTextBatch, G2ConditionBatch
-from cosmos_framework.model.generator.mot.g2_core_test import TinyLM, cpu_attention, tiny_model
+from cosmos_framework.model.generator.mot.g2_core_test import TinyLM, cpu_attention, native_pack, tiny_model
 from cosmos_framework.model.generator.mot.g2_parameters import parameter_inventory, set_trainable_names
+from cosmos_framework.model.generator.mot.unified_mot import Nemotron3DenseVLTextModel, prepare_und_text_features
+from cosmos_framework.model.generator.reasoner.nemotron_3_dense_vl.configuration_nemotron_3_dense_vl import (
+    Nemotron3DenseVLTextConfig,
+)
 from cosmos_framework.model.generator.utils.data_and_condition import GenerationDataClean
 
 SPECIAL = {"bos_token_id": 60, "eos_token_id": 61, "start_of_generation": 62, "end_of_generation": 63}
@@ -199,3 +204,72 @@ def test_c_shared_native_text_normal_and_dropout_use_same_actual_und_input():
     assert len(calls) == 2 and calls[1] == "" and effective.dropped == (False, True)
     assert all(torch.isfinite(p).all() for p in result["preds_action"])
     assert tuple(packed.text_ids.tolist()) == sum(effective.token_ids, ())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("lengths", [(3,), (0,), (3, 0, 1)])
+def test_nemotron_family_native_und_and_current_gen_norm(dtype, lengths):
+    config = Nemotron3DenseVLTextConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        head_dim=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_hidden_layers=3,
+        vocab_size=64,
+        mrope_section=[1, 1, 2],
+    )
+    model = Nemotron3DenseVLTextModel(
+        config, qk_norm_for_text=False, qk_norm_for_diffusion=True, use_und_k_norm_for_gen=True
+    ).to(dtype)
+    model.rotary_emb.float()
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_("moe_gen" in name or "k_norm_und_for_gen" in name)
+    pack, mask, pos, text = native_pack(model, lengths)
+    reference, _ = model(pack, mask, pos)
+    features = prepare_und_text_features(model, pack, pos, text)
+    output, _ = model(pack, mask, pos, prepared_text=features)
+    hidden = torch.cat([features.hidden[i, :n] for i, n in enumerate(lengths)])
+    torch.testing.assert_close(hidden, get_und_seq(reference)[: sum(lengths)], atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(
+        get_gen_seq(output)[: 2 * len(lengths)], get_gen_seq(reference)[: 2 * len(lengths)], atol=2e-6, rtol=2e-5
+    )
+    if sum(lengths):
+        (get_gen_seq(output)[: 2 * len(lengths)].float() * torch.arange(1, 17)).sum().backward()
+        assert all(b.self_attn.k_norm_und_for_gen.weight.grad.abs().sum() > 0 for b in model.layers)
+
+
+@pytest.mark.parametrize("empty_second", [False, True])
+def test_d_actual_cache_sessions_to_native_action_head(empty_second, monkeypatch):
+    from cosmos_framework.inference.g2_model_hooks_test import actual_tiny_model, consumer, hooks
+    from cosmos_framework.inference.g2_policy_conditions import G2ConditionRuntime
+    from cosmos_framework.inference.g2_policy_conditions_test import FixtureProvider, request
+
+    facade, counts = actual_tiny_model(monkeypatch)
+    facade.net = network().eval()
+    facade.llm_special_tokens = SPECIAL
+    provider_on, provider_off = FixtureProvider(), FixtureProvider()
+    provider_on.scene_offsets["scene-b"] = provider_off.scene_offsets["scene-b"] = 3.0
+    on = G2ConditionRuntime(hooks(facade), profile="g2_r2", provider=provider_on, allow_fixtures=True)
+    off = G2ConditionRuntime(
+        hooks(facade), profile="g2_r2", provider=provider_off, allow_fixtures=True, cache_enabled=False
+    )
+    for frame in range(3):
+        reqs = [request(session="a", frame=frame), request(session="b", episode="ep-b", scene="scene-b", frame=frame)]
+        prepared = [consumer(facade, req, empty=empty_second and i == 1) for i, req in enumerate(reqs)]
+        opts = dict(recipe_ids=[p[1] for p in prepared], effective_texts=[p[2] for p in prepared])
+        with (
+            on.prepare_many(reqs, [p[0] for p in prepared], **opts) as cached,
+            off.prepare_many(reqs, [p[0] for p in prepared], **opts) as fresh,
+        ):
+            # Fixture packer adds precisely the SPECIAL entries C already used.
+            prompts = [list(p[2].token_ids[0][1:-2]) for p in prepared]
+            local = (None, torch.randn(4, 32))
+            packed, _, _ = packed_batch(facade.net, prompts, (None, None), local)
+            with torch.no_grad():
+                actual = facade.net(replace(packed, g2_condition=cached["_g2_condition"]))["preds_action"]
+                expected = facade.net(replace(packed, g2_condition=fresh["_g2_condition"]))["preds_action"]
+            for lhs, rhs in zip(actual, expected, strict=True):
+                torch.testing.assert_close(lhs, rhs, atol=3e-6, rtol=3e-5)
+    assert counts["prepare_g2_text"] == counts["read_g2_global"] == 8  # 2 cached + 6 reference
+    assert on.cache.info()["stages"]["global"]["hit"] == 4
