@@ -14,6 +14,7 @@ from torch.utils.data import Dataset
 
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
 from cosmos_framework.data.generator.action.datasets.action_sft_dataset import ActionSFTDataset
+from cosmos_framework.data.generator.action.datasets.g2_training_adapter import G2TrainingDataAdapter
 from cosmos_framework.data.generator.action.datasets.robocasa_exact_window_cache import (
     RoboCasaExactWindowCacheCatalog,
     RoboCasaExactWindowEpisodeReader,
@@ -50,6 +51,7 @@ class RoboCasaExactWindowCachedDataset(Dataset):
         contract: CorrectedRoboCasaPolicyContract,
         *,
         cache_reader: RoboCasaExactWindowEpisodeReader | None = None,
+        g2_adapter: G2TrainingDataAdapter | None = None,
     ) -> None:
         if source_reader.catalog is not catalog or source_reader.index.catalog is not catalog:
             raise ValueError("source reader 与 cache catalog 身份不一致")
@@ -63,6 +65,7 @@ class RoboCasaExactWindowCachedDataset(Dataset):
         self.contract = contract
         self.compact_cached_video = compact_cached_video_enabled()
         self.policy_adapter = OfficialRoboCasaPolicyAdapter(contract)
+        self.g2_adapter = g2_adapter
         proxy = object.__new__(RoboCasaLeRobotDataset)
         proxy._use_base_action = True
         proxy._base_encoding = "raw"
@@ -127,7 +130,7 @@ class RoboCasaExactWindowCachedDataset(Dataset):
         ):
             raise ValueError(f"cache latent 或 raw15 action 合同无效：{key}/{start}")
         idle_frames = RoboCasaLeRobotDataset._compute_idle_frames(self._idle_proxy, policy.action15)
-        return {
+        sample = {
             "ai_caption": policy.ai_caption,
             "video": cached_pixel_placeholder(compact=self.compact_cached_video),
             "video_latent": latent.contiguous(),
@@ -148,6 +151,7 @@ class RoboCasaExactWindowCachedDataset(Dataset):
             "cache_corpus_digest": self.catalog.corpus_digest,
             "source_binding_digest": self.source_reader.source_binding_digest,
         }
+        return sample if self.g2_adapter is None else self.g2_adapter(sample)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -166,6 +170,7 @@ class RoboCasaExactWindowCachedDataset(Dataset):
             "model_video_latent_abi": "list[B] of Tensor[1,5,48,H,W]",
             "transformed_canvas_geometry": list(self._canvas_geometry),
             "model_cache_hit_required": True,
+            **({"g2_data": self.g2_adapter.summary()} if self.g2_adapter is not None else {}),
         }
 
 
@@ -179,6 +184,8 @@ def get_action_robocasa_exact_window_cached_sft_dataset(
     episode_shuffle_seed: int = 42,
     catalog: RoboCasaExactWindowCacheCatalog | None = None,
     verified_index: VerifiedExactWindowIndex | None = None,
+    g2_adapter: G2TrainingDataAdapter | None = None,
+    static_task_text_recipe: dict | None = None,
 ) -> Dataset:
     """Create the strict offline source/cache dataset and reuse the official SFT transform."""
     if tokenizer_config is None:
@@ -191,7 +198,9 @@ def get_action_robocasa_exact_window_cached_sft_dataset(
         verified_index.check_catalog(catalog)
     contract = CorrectedRoboCasaPolicyContract.from_cache_catalog(catalog)
     source_reader = RoboCasaExactWindowSourceReader(catalog, source_root, verified_index=verified_index)
-    raw = RoboCasaExactWindowCachedDataset(catalog, source_reader, contract)
+    if (g2_adapter is None) != (static_task_text_recipe is None):
+        raise ValueError("G2 data adapter and shared static text recipe must be enabled together")
+    raw = RoboCasaExactWindowCachedDataset(catalog, source_reader, contract, g2_adapter=g2_adapter)
     install_rank_shared_reader(raw)
     transform_kwargs = dict(
         tokenizer_config=tokenizer_config,
@@ -203,6 +212,8 @@ def get_action_robocasa_exact_window_cached_sft_dataset(
         append_idle_frames=True,
         format_prompt_as_json=True,
     )
+    if g2_adapter is not None:
+        transform_kwargs.update(append_idle_frame_text=False, static_task_text_recipe=static_task_text_recipe)
     transform = ActionTransformPipeline(**transform_kwargs)
     if raw.compact_cached_video:
         transform.video_resize = CachedGeometryResize(transform.video_resize, tuple(raw._canvas_geometry))
