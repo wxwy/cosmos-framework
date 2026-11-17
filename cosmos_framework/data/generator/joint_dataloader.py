@@ -16,9 +16,6 @@ import torch
 import webdataset
 from torch.utils.data.dataloader import default_collate
 
-from cosmos_framework.utils.lazy_config import instantiate
-from cosmos_framework.utils import log
-from cosmos_framework.utils.generator.cost_model.budget import IterationTimeBudget, IterationTimeBudgetConfig
 from cosmos_framework.data.generator.drop_sample_contract import DROP_SAMPLE_KEY, DROP_SAMPLE_REASON_KEY
 from cosmos_framework.data.generator.token_mix_control import TokenMixControlConfig, TokenMixController
 from cosmos_framework.data.generator.worker_timing import (
@@ -32,8 +29,11 @@ from cosmos_framework.model.generator.tokenizers.uniae.frame_math import (
     get_uniae_latent_num_frames,
     normalize_uniae_chunk_frames,
 )
+from cosmos_framework.utils import log
+from cosmos_framework.utils.generator.cost_model.budget import IterationTimeBudget, IterationTimeBudgetConfig
 from cosmos_framework.utils.generator.data_utils import read_positive_int_metadata
 from cosmos_framework.utils.generator.spatial_patch import normalize_spatial_patch_hw
+from cosmos_framework.utils.lazy_config import instantiate
 
 _BATCH_TIMING_KEYS = {
     "_worker_batch_time",
@@ -159,6 +159,8 @@ def custom_collate_fn(batch: list[dict[str, Any]] | dict[str, Any]) -> dict[str,
     """
     list_collate_keys = {
         "text_token_ids",
+        "text_attention_mask",
+        "text_position_ids",
         "text_token_lengths",
         "images",
         "video",
@@ -1088,7 +1090,16 @@ class JointDataLoader(webdataset.WebLoader):
     # Keys where each sample may hold multiple tensors (e.g. per-view captions
     # or multiple video clips). Nested per-sample lists are preserved; a bare
     # tensor is wrapped so _update_output_batch always yields list[list[Tensor]].
-    _MULTI_ITEM_KEYS = {"text_token_ids", "images", "video", "action", "action_raw", "sound"}
+    _MULTI_ITEM_KEYS = {
+        "text_token_ids",
+        "text_attention_mask",
+        "text_position_ids",
+        "images",
+        "video",
+        "action",
+        "action_raw",
+        "sound",
+    }
 
     def _get_next_sample(self, index_id: int) -> dict:
         """Pop the next single-sample dict from the buffer for the given dataloader.

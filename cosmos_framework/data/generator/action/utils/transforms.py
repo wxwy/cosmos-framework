@@ -22,7 +22,6 @@ from collections.abc import Mapping
 import torch
 import torchvision.transforms.functional as transforms_F
 
-from cosmos_framework.utils import log
 from cosmos_framework.data.generator.action.action_caption_attribute_adapter import (
     append_action_caption_semantics,
 )
@@ -32,13 +31,20 @@ from cosmos_framework.data.generator.action.utils.action_processing import (
     ActionProcessor,
 )
 from cosmos_framework.data.generator.action.utils.json_formatter import ActionPromptJsonFormatter
+from cosmos_framework.data.generator.action.utils.static_task_text import (
+    StaticTaskText,
+    StaticTaskTextRecipe,
+    prepare_static_task_text,
+    resolve_consumer_text_dropout,
+)
 from cosmos_framework.data.generator.action.utils.viewpoint_utils import ViewpointTextInfo
 from cosmos_framework.data.generator.augmentors.duration_fps_text_timestamps import DurationFPSTextTimeStamps
 from cosmos_framework.data.generator.augmentors.idle_frames_text_info import IdleFramesTextInfo
 from cosmos_framework.data.generator.augmentors.resolution_text_info import ResolutionTextInfo
 from cosmos_framework.data.generator.augmentors.text_tokenizer import TextTokenizerTransform
-from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
 from cosmos_framework.data.generator.sequence_packing import SequencePlan
+from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
+from cosmos_framework.utils import log
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 
 ACTION_MODE_DESCRIPTIONS: dict[str, str] = {
@@ -573,6 +579,8 @@ class ActionTransformPipeline:
         format_prompt_as_json: bool = False,
         enable_mode_specific_prompt: bool = False,
         format_prompt_float_seconds: bool = False,
+        append_idle_frame_text: bool | None = None,
+        static_task_text_recipe: StaticTaskTextRecipe | dict | None = None,
     ) -> None:
         self.caption_key: str = caption_key
         self.video_temporal_downsample: int = video_temporal_downsample
@@ -580,6 +588,22 @@ class ActionTransformPipeline:
         self.action_channel_masking: bool = action_channel_masking
         self.enable_mode_specific_prompt: bool = enable_mode_specific_prompt
         self.append_action_caption_semantics: bool = append_action_caption_semantics
+        self.static_task_text_recipe = (
+            StaticTaskTextRecipe(**static_task_text_recipe)
+            if isinstance(static_task_text_recipe, dict)
+            else static_task_text_recipe
+        )
+        if self.static_task_text_recipe is not None:
+            if (
+                not isinstance(self.static_task_text_recipe, StaticTaskTextRecipe)
+                or not format_prompt_as_json
+                or tokenizer_config is None
+                or enable_mode_specific_prompt
+                or append_idle_frame_text is not False
+            ):
+                raise ValueError("static task text requires JSON, tokenizer, idle text OFF and fixed mode metadata")
+            if cfg_dropout_rate != self.static_task_text_recipe.cfg_dropout_rate:
+                raise ValueError("pipeline and static text recipe dropout disagree")
         self.action_processor: ActionProcessor = ActionProcessor(
             max_action_dim=max_action_dim,
             action_channel_masking=action_channel_masking,
@@ -600,6 +624,9 @@ class ActionTransformPipeline:
                 caption_key=caption_key,
                 append_duration_fps_timestamps=append_duration_fps_timestamps,
                 float_seconds=format_prompt_float_seconds,
+                # None preserves the historical JSON default independently of
+                # append_idle_frames (which used to govern plain text only).
+                append_idle_frame_text=True if append_idle_frame_text is None else append_idle_frame_text,
             )
 
         # --- Viewpoint text augmentor (runs after ai_caption, before duration/FPS) ---
@@ -638,7 +665,7 @@ class ActionTransformPipeline:
         # Runs after resolution info, before tokenization. Per-field dropout is
         # independent from the tokenizer's global cfg_dropout_rate.
         self.idle_frames_augmentor: IdleFramesTextInfo | None = None
-        if append_idle_frames and self.prompt_json_formatter is None:
+        if append_idle_frames and append_idle_frame_text is not False and self.prompt_json_formatter is None:
             self.idle_frames_augmentor = IdleFramesTextInfo(
                 input_keys=[caption_key, "idle_frames", "action"],
                 output_keys=[caption_key],
@@ -758,7 +785,25 @@ class ActionTransformPipeline:
         data_dict = self.video_resize(data_dict, resolution)
 
         # 2. Format the caption as structured JSON when requested; otherwise run the legacy string appenders.
-        if self.prompt_json_formatter is not None:
+        if self.static_task_text_recipe is not None:
+            task = data_dict.pop("static_task_text", None)
+            if isinstance(task, dict):
+                task = StaticTaskText(**task)
+            if not isinstance(task, StaticTaskText) or self.text_tokenizer is None:
+                raise ValueError("static task text asset and tokenizer are required")
+            data_dict.update(
+                prepare_static_task_text(
+                    task,
+                    self.static_task_text_recipe,
+                    self.text_tokenizer._processor,
+                    dropout_applied=resolve_consumer_text_dropout(
+                        data_dict, self.static_task_text_recipe.cfg_dropout_rate
+                    ),
+                )
+            )
+            data_dict.pop("relabel_prompt", None)
+            data_dict.pop("additional_view_description", None)
+        elif self.prompt_json_formatter is not None:
             data_dict = self.prompt_json_formatter(data_dict)
             # 3. Optionally add mode metadata after the structured prompt exists.
             if self.enable_mode_specific_prompt:
@@ -782,7 +827,7 @@ class ActionTransformPipeline:
         data_dict.pop("action_caption_attributes", None)
 
         # 8. Tokenize caption text (if enabled).
-        if self.text_tokenizer is not None:
+        if self.text_tokenizer is not None and self.static_task_text_recipe is None:
             data_dict = self.text_tokenizer(data_dict)
 
         # 9. Build a ``SequencePlan`` from the ``"mode"`` key (if present).
