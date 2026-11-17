@@ -3961,6 +3961,8 @@ class OmniMoTModel(ImaginaireModel):
         if _g2_condition is not None:
             if guidance != 1.0 or use_batched_cfg or upsample_task is not None:
                 raise ValueError("G2 conditions currently require guidance=1, no batched CFG or prompt upsampling")
+            if getattr(self, "_diffusion_cache", None) is not None:
+                raise ValueError("G2 diffusion-layer residual caching has not been validated")
             _g2_condition = self.prepare_g2_condition(_g2_condition, net=net)
             gen_data_clean = dataclasses.replace(gen_data_clean, g2_condition=_g2_condition)
 

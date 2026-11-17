@@ -1,0 +1,261 @@
+"""Real service/Session/Local CPU integration; only spatial/model kernels doubled."""
+
+import json
+import threading
+from copy import deepcopy
+from dataclasses import asdict
+
+import pytest
+import torch
+
+from cosmos_framework.data.generator.action.utils import static_task_text
+from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskText, StaticTaskTextRecipe
+from cosmos_framework.inference.g2_policy_conditions_test import request as condition_request
+from cosmos_framework.inference.g2_policy_conditions_test import runtime
+from cosmos_framework.inference.robocasa_batch_transactions import BatchedSessionTransactions
+from cosmos_framework.inference.robocasa_session_transactions import SessionTransactions
+from cosmos_framework.inference.robocasa_session_transactions_test import (
+    ack,
+    clock_kernel,  # noqa: F401 - shared explicit kernel fixture, no real host/GPU claim
+    make_adapter,
+    payload,
+    register,
+    submit,
+    wait_result,
+)
+from cosmos_framework.scripts.robocasa_transactions_b1_test import service
+
+
+def g2_payload(lease, frame=0, start=0, *, subtask="subtask", scene="scene", value=1):
+    result = payload(lease, frame, start, value)
+    extra = condition_request(
+        session=lease["session_id"],
+        episode=lease["episode_id"],
+        scene=scene,
+        subtask=subtask,
+        frame=frame,
+    )
+    result.update(prompt=extra["prompt"], g2=extra["g2"])
+    return result
+
+
+def setup(monkeypatch, *, batch=False, cache=True, profile="g2_r2", slots=2):
+    obj = service(monkeypatch)
+    obj.local_memory_adapter, obj.model = make_adapter(slots)
+    obj.model.eval()
+    rt, hooks, provider = runtime(profile=profile, cache=cache)
+    obj.g2_conditions = rt
+    obj.calls = []
+    obj.before_sample = lambda *_: None
+
+    def generate(data, **kwargs):
+        obj.before_sample(data, kwargs)
+        obj.calls.append((data, kwargs))
+        output = []
+        for i, item in enumerate(kwargs["_g2_fixture"]):
+            prefix = kwargs["_local_memory_prefixes"][i]
+            local = 0.0 if prefix is None else float(prefix.square().sum()) * 0.001
+            global_value = 0.0 if item.global_tokens is None else float(item.global_tokens.mean()) * 1e-5
+            state = data["action"][i][0][0, 0]
+            output.append(torch.full((1, 17, 64), local + global_value + state))
+        return {"action": output, "vision": [torch.empty(0) for _ in output]}
+
+    obj.model.generate_samples_from_batch = generate
+    kwargs = dict(
+        owner_token="cpu-owner",
+        run_lease="run",
+        manifest_digest="a" * 64,
+        slot_ids=tuple(f"slot{i}" for i in range(slots)),
+        model_lock=obj._lock,
+        timeout_s=10,
+        conditions=rt,
+    )
+    if batch:
+        actor = BatchedSessionTransactions(
+            obj.local_memory_adapter,
+            obj._transaction_batch,
+            lambda: None,
+            max_batch_size=slots,
+            batch_wait_ms=80,
+            **kwargs,
+        )
+    else:
+        actor = SessionTransactions(obj.local_memory_adapter, obj._transaction_action, lambda: None, **kwargs)
+    obj.transactions = actor
+    return obj, actor, rt, hooks, provider
+
+
+@pytest.mark.parametrize("profile", ["g2_r1", "g2_r2"])
+def test_real_service_calls_C_shared_prompt_and_keeps_state_fast(monkeypatch, profile):
+    obj, actor, rt, _, _ = setup(monkeypatch, profile=profile)
+    called = []
+    serialize = static_task_text.serialize_static_task_prompt
+
+    def observe(task, recipe):
+        called.append((task, recipe))
+        return serialize(task, recipe)
+
+    monkeypatch.setattr(static_task_text, "serialize_static_task_prompt", observe)
+    lease = register(actor)
+    try:
+        req = g2_payload(lease)
+        first = obj._prep_policy_item(req)
+        req["state"][0] = 0.8
+        req["local_memory"]["consumer_step"] = req["g2"]["identity"]["decision_frame"] = 16
+        req["g2"]["identity"]["logical_state_frame"] = 16
+        second = obj._prep_policy_item(req)
+        assert len(called) == 2
+        assert first["augmented_prompt"] == second["augmented_prompt"]
+        assert "idle" not in json.dumps(json.loads(first["augmented_prompt"]))
+        assert first["state_token"][0] == 0 and second["state_token"][0] == pytest.approx(0.8)
+        task = StaticTaskText(**req["g2"]["static_text"])
+        h, w = map(int, second["padded_image_size"][:2].tolist())
+        assert (h, w) == second["video_padded"].shape[-2:]
+        recipe = StaticTaskTextRecipe(17, 20, h, w, rt.hooks.tokenizer_identity)
+        assert first["augmented_prompt"] == serialize(task, recipe)
+        assert first["g2_text_recipe_id"] == recipe.identity
+        assert asdict(called[0][0]) == req["g2"]["static_text"]
+    finally:
+        assert actor.close()
+
+
+def test_b1_retry_inflight_and_post_ack_does_not_duplicate_Local_or_extend_deadline(monkeypatch):
+    obj, actor, rt, hooks, _ = setup(monkeypatch)
+    lease = register(actor)
+    try:
+        cold = wait_result(actor, lease, submit(actor, lease, g2_payload(lease)))
+        ack(actor, lease, cold)
+        entered, release = threading.Event(), threading.Event()
+
+        def hold(*_):
+            entered.set()
+            assert release.wait(3)
+
+        obj.before_sample = hold
+        req = g2_payload(lease, 2, 0)
+        pending = submit(actor, lease, req)
+        assert entered.wait(3)
+        key = pending.json()["request_key"]
+        original = actor._tickets[key].deadline
+        duplicate = submit(actor, lease, deepcopy(req))
+        assert duplicate.json()["request_key"] == key
+        assert actor._tickets[key].deadline == original
+        assert obj.model.scan_calls == 1
+        release.set()
+        result = wait_result(actor, lease, pending)
+        ack(actor, lease, result)
+        replay = submit(actor, lease, req)
+        assert replay.status == 200 and replay.body == result.body
+        assert obj.model.scan_calls == 1 and len(obj.calls) == 2
+        assert hooks.calls["global"] == 1
+        assert rt.info()["host_ns"]["queue"] and len(rt.info()["host_ns"]["backbone_sampling"]) == 2
+        with pytest.raises(ValueError, match="stale"):
+            submit(actor, lease, g2_payload(lease, 1, 0))
+    finally:
+        if "release" in locals():
+            release.set()
+        assert actor.close()
+    assert rt.info()["cache"]["entries"] == rt.info()["task_bindings"] == 0
+
+
+@pytest.mark.parametrize("fault", ["exception", "expired", "end-during-sampling"])
+def test_abort_expired_and_End_preserve_Local_and_release_conditions(monkeypatch, fault):
+    obj, actor, rt, _, _ = setup(monkeypatch)
+    lease = register(actor)
+    try:
+        cold = wait_result(actor, lease, submit(actor, lease, g2_payload(lease)))
+        ack(actor, lease, cold)
+        before = obj.local_memory_adapter.snapshot
+
+        def break_sampling(*_):
+            if fault == "exception":
+                raise RuntimeError("synthetic model exception")
+            if fault == "expired":
+                ticket = next(iter(actor._tickets.values()))
+                actor.clock = lambda: ticket.deadline + 1
+            else:
+                assert not actor.end(lease).json()["acknowledged"]
+
+        obj.before_sample = break_sampling
+        pending = submit(actor, lease, g2_payload(lease, 2, 0))
+        result = wait_result(actor, lease, pending, expected=409)
+        assert result.status == 409
+        assert obj.local_memory_adapter.snapshot is before
+        assert obj.model.scan_calls == 1
+        assert rt.info()["cache"]["active_requests"] == 0
+        assert actor.end(lease).json()["acknowledged"]
+        assert rt.info()["task_bindings"] == 0
+    finally:
+        assert actor.close()
+
+
+def test_subtask_switch_rebuilds_Global_without_resetting_Local_and_End_clears_both(monkeypatch):
+    obj, actor, rt, hooks, _ = setup(monkeypatch)
+    lease = register(actor)
+    try:
+        first = wait_result(actor, lease, submit(actor, lease, g2_payload(lease)))
+        ack(actor, lease, first)
+        second = wait_result(actor, lease, submit(actor, lease, g2_payload(lease, 2, 0)))
+        ack(actor, lease, second)
+        before = obj.local_memory_adapter.snapshot.fast[lease["session_id"]]
+        next_task = wait_result(actor, lease, submit(actor, lease, g2_payload(lease, 4, 2, subtask="next")))
+        after = obj.local_memory_adapter.snapshot.fast[lease["session_id"]]
+        assert before.state is not None and after.consumer_step == 4 and obj.model.scan_calls == 2
+        assert obj.calls[-1][1]["_local_memory_prefixes"][0] is not None
+        assert hooks.calls["global"] == 2 and hooks.calls["task_queries"] == 2
+        ack(actor, lease, next_task)
+        assert actor.end(lease).json()["acknowledged"]
+        assert lease["session_id"] not in obj.local_memory_adapter.snapshot.fast
+        assert rt.info()["cache"]["entries"] == 0
+        fresh = register(actor, generation=2)
+        result = wait_result(actor, fresh, submit(actor, fresh, g2_payload(fresh)))
+        assert result.json()["local_memory"]["prefix_present"] is False
+        assert hooks.calls["global"] == 3
+    finally:
+        assert actor.close()
+
+
+def test_native_mixed_Session_batch_routes_conditions_and_Local_by_original_index(monkeypatch):
+    obj, actor, rt, hooks, provider = setup(monkeypatch, batch=True)
+    provider.scene_offsets = {"different-scene": 3.0}
+    leases = [register(actor, f"slot{i}") for i in range(2)]
+    try:
+        cold = wait_result(actor, leases[0], submit(actor, leases[0], g2_payload(leases[0])))
+        ack(actor, leases[0], cold)
+        reqs = [g2_payload(leases[0], 2, 0), g2_payload(leases[1], scene="different-scene")]
+        reqs[0]["state"][0] = reqs[1]["state"][0] = 0.125
+        pending = [submit(actor, lease, req) for lease, req in zip(leases, reqs, strict=True)]
+        results = [wait_result(actor, lease, p) for lease, p in zip(leases, pending, strict=True)]
+        assert [r.json()["assignment"]["session_id"] for r in results] == [l["session_id"] for l in leases]
+        assert [r.json()["native_batch"]["index"] for r in results] == [0, 1]
+        batch, kwargs = obj.calls[-1]
+        assert len(batch["prompt"]) == len(kwargs["_g2_fixture"]) == 2
+        assert kwargs["_local_memory_prefixes"][0] is not None
+        assert kwargs["_local_memory_prefixes"][1] is None
+        assert hooks.calls["global"] == 2  # Separate fill even though both instructions match.
+        assert results[0].json()["action"] != results[1].json()["action"]
+        assert [s.identity.scene_id for s in rt.last_request_sources] == ["scene", "different-scene"]
+    finally:
+        assert actor.close()
+
+
+def test_service_cache_on_off_exact_actions_and_real_Local_state_parity(monkeypatch):
+    on = setup(monkeypatch, cache=True, slots=1)
+    off = setup(monkeypatch, cache=False, slots=1)
+    try:
+        leases = [register(item[1]) for item in (on, off)]
+        for frame, start in ((0, 0), (2, 0), (4, 2)):
+            results = [
+                wait_result(item[1], lease, submit(item[1], lease, g2_payload(lease, frame, start)))
+                for item, lease in zip((on, off), leases, strict=True)
+            ]
+            assert results[0].json()["action"] == results[1].json()["action"]
+            a = on[0].local_memory_adapter.snapshot.fast[leases[0]["session_id"]]
+            b = off[0].local_memory_adapter.snapshot.fast[leases[1]["session_id"]]
+            if a.state is not None:
+                assert all(torch.equal(x, y) for x, y in zip(a.state, b.state, strict=True))
+            for item, lease, result in zip((on, off), leases, results, strict=True):
+                ack(item[1], lease, result)
+        assert on[3].calls["global"] == 1 and off[3].calls["global"] == 3
+    finally:
+        assert on[1].close() and off[1].close()
