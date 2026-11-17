@@ -113,6 +113,42 @@ class UndKVCache:
         self.is_initialized = False
 
 
+def request_text_kv_caches(layer_kv: tuple[tuple[torch.Tensor, torch.Tensor], ...]) -> list[UndKVCache]:
+    """Seed a new request from B-prepared GEN-compatible static text K/V only.
+
+    The Session owner must first match its content signature (real tokens,
+    positions, condition and fixed weights). This helper is not that proof and
+    never converts raw reasoner K/V. Local normalization/projection references
+    belong to the current request and are deliberately not imported here.
+    Caller clears the returned caches in its existing sampling finally block.
+    """
+    if torch.is_grad_enabled():
+        raise ValueError("prepared text cache seeding is fixed-weight inference only")
+    caches = []
+    try:
+        for key, value in layer_kv:
+            if (
+                not isinstance(key, torch.Tensor)
+                or not isinstance(value, torch.Tensor)
+                or key.ndim != 4
+                or key.shape[0] != 1
+                or key.shape != value.shape
+                or key.dtype != value.dtype
+                or key.device != value.device
+                or key.requires_grad
+                or value.requires_grad
+            ):
+                raise ValueError("prepared GEN text K/V must be matching fixed [1,S,H,D] tensors")
+            cache = UndKVCache()
+            cache.store(key, value)
+            caches.append(cache)
+        return caches
+    except BaseException:
+        for cache in caches:
+            cache.clear()
+        raise
+
+
 @dataclass
 class InferenceTextKVMemoryValue(MemoryValue):
     """Read-only snapshot passed into attention for one decoder layer."""
