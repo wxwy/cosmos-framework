@@ -12,6 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from cosmos_framework.data.generator.sequence_packing.sequence import SequencePlan
+from cosmos_framework.model.generator.mot.g2_contracts import GENLayerKV
 from cosmos_framework.model.generator.mot.local_evidence import (
     ContinualTTTLocalMemoryCore,
     LocalEvidenceEncoder,
@@ -75,11 +76,87 @@ class MemoryPrefixContext:
     sample_offsets: torch.Tensor
     present: torch.Tensor
     k_local: int
+    global_lengths: tuple[int, ...] | None = None
+    local_lengths: tuple[int, ...] | None = None
+    global_present: torch.Tensor | None = None
+    local_present: torch.Tensor | None = None
+    max_prefix_len: int | None = None
+    global_kv: tuple[GENLayerKV, ...] | None = None
+
+    @property
+    def max_length(self) -> int:
+        return self.k_local if self.max_prefix_len is None else self.max_prefix_len
 
     def replace_hidden(self, hidden: torch.Tensor) -> MemoryPrefixContext:
         if hidden.shape != self.hidden.shape or hidden.device != self.hidden.device:
             raise ValueError("Memory Prefix normalized hidden must preserve shape and device")
-        return MemoryPrefixContext(hidden, self.sample_offsets, self.present, self.k_local)
+        return replace(self, hidden=hidden)
+
+    def for_layer(self, index: int) -> MemoryPrefixContext:
+        return self if self.global_kv is None else replace(self, global_kv=(self.global_kv[index],))
+
+
+def build_joint_memory_prefix_context(
+    global_tokens: tuple[torch.Tensor | None, ...] | None,
+    local_context: MemoryPrefixContext | None,
+    *,
+    target_dtype: torch.dtype,
+    k_local: int = 4,
+    global_kv: tuple[GENLayerKV, ...] | None = None,
+) -> MemoryPrefixContext | None:
+    """A's projected Global rows plus existing Local, interleaved per sample.
+
+    The legacy Local-only object is returned unchanged when Global is absent.
+    k_local keeps its old meaning; max_length bounds the combined K/V prefix.
+    """
+    if global_tokens is None or all(t is None for t in global_tokens):
+        return local_context
+    if local_context is not None and len(global_tokens) + 1 != local_context.sample_offsets.numel():
+        raise ValueError("Global/Local sample counts differ")
+    reference = next(t for t in global_tokens if t is not None)
+    hidden_parts, offsets, g_lengths, l_lengths = [], [0], [], []
+    for i, global_token in enumerate(global_tokens):
+        g_len = 0 if global_token is None else global_token.shape[0]
+        if global_token is not None:
+            if (
+                global_token.ndim != 2
+                or global_token.shape != (64, reference.shape[-1])
+                or global_token.device != reference.device
+                or global_token.dtype != target_dtype
+            ):
+                raise ValueError("Global projector must provide [64,D_model] in native device/dtype")
+            hidden_parts.append(global_token)
+        if local_context is None:
+            l_len = 0
+        else:
+            if local_context.hidden.device != reference.device or local_context.hidden.dtype != target_dtype:
+                raise ValueError("Global/Local device/dtype mismatch")
+            # Offsets are metadata constructed outside compile, not data-dependent GPU scalars.
+            if local_context.local_lengths is None:
+                raise ValueError("joint prefix requires Local length metadata from the native builder")
+            l_len = local_context.local_lengths[i]
+            if l_len:
+                # Local rows occur in sample order; tensor slicing retains the scan graph.
+                start = sum(l_lengths)
+                hidden_parts.append(local_context.hidden[start : start + l_len])
+        g_lengths.append(g_len)
+        l_lengths.append(l_len)
+        offsets.append(offsets[-1] + g_len + l_len)
+    hidden = torch.cat(hidden_parts)
+    global_present = torch.tensor([n > 0 for n in g_lengths], device=hidden.device)
+    local_present = torch.tensor([n > 0 for n in l_lengths], device=hidden.device)
+    return MemoryPrefixContext(
+        hidden=hidden,
+        sample_offsets=torch.tensor(offsets, device=hidden.device),
+        present=global_present | local_present,
+        k_local=k_local,
+        global_lengths=tuple(g_lengths),
+        local_lengths=tuple(l_lengths),
+        global_present=global_present,
+        local_present=local_present,
+        max_prefix_len=max(g + loc for g, loc in zip(g_lengths, l_lengths, strict=True)),
+        global_kv=global_kv,
+    )
 
 
 def build_memory_prefix_context(
@@ -121,6 +198,7 @@ def build_memory_prefix_context(
         sample_offsets=torch.tensor(offsets, device=hidden.device, dtype=torch.long),
         present=torch.tensor(present, device=hidden.device, dtype=torch.bool),
         k_local=k_local,
+        local_lengths=tuple(k_local if flag else 0 for flag in present),
     )
 
 

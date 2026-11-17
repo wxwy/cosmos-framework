@@ -376,6 +376,11 @@ class OmniMoTModelConfig:
     action_gen: bool = False  # whether to use action related parameters and condition/generate action tokens
     max_action_dim: int = 32  # maximum dimension of the action space, we need to pad the data to this dimension.
     local_memory_enabled: bool = False
+    g2_text_enabled: bool = False
+    global_memory_enabled: bool = False
+    global_memory_config: dict | None = None
+    global_memory_latent_channels: int = 48
+    global_memory_top_variant: str = "with_robot"
     local_memory_dim: int = 32
     local_memory_evidence_dim: int = 256
     local_memory_action_dim: int = 15

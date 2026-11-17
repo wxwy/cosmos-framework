@@ -8,8 +8,12 @@ Used for the VFM generation model.
 """
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from cosmos_framework.model.generator.mot.g2_contracts import G2ConditionBatch
 
 
 @dataclass(slots=True)
@@ -70,6 +74,7 @@ class GenerationDataClean:
 
     # Dense over samples whose SequencePlan.has_local_memory is true; never noised.
     x0_tokens_local_memory: list[torch.Tensor] | None = None
+    g2_condition: "G2ConditionBatch | None" = None
 
     # Action (dense list of per-sample tensors, only action-having samples)
     raw_state_action: list[torch.Tensor] | None = None

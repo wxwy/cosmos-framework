@@ -525,6 +525,9 @@ def apply_fsdp(
         )
         setattr(block, "_fsdp_cpu_offloaded", parallel_dims.fsdp_cpu_offload)
         register_fsdp_forward_method(block, "reasoner_forward")
+        for entry in ("prepare_und", "prepare_gen_text_kv", "prepare_global_kv"):
+            if callable(getattr(block, entry, None)):
+                register_fsdp_forward_method(block, entry)
 
 
 def parallelize_unified_mot(
