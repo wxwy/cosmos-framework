@@ -177,6 +177,7 @@ class _Ticket:
     payload: dict
     size: int
     deadline: float
+    enqueued_at: float = 0.0
     state: str = "QUEUED"
     cancelled: bool = False
     quiescent: bool = False
@@ -199,6 +200,7 @@ class SessionTransactions:
         max_bytes=128 * 1024**2,
         clock=time.monotonic,
         capacity_profile="legacy8",
+        conditions=None,
     ):
         self.mode = adapter.mode
         self.protocol = protocol_for_mode(self.mode)
@@ -213,6 +215,7 @@ class SessionTransactions:
         if len(manifest_digest) != 64 or any(c not in "0123456789abcdef" for c in manifest_digest):
             raise ValueError("manifest SHA256 required")
         self.adapter, self.generate, self.quiesce = adapter, generate, quiesce
+        self.conditions = conditions
         self.owner_token = identifier(owner_token, limit=256)
         self.run_lease, self.manifest_digest = identifier(run_lease), manifest_digest
         self.slot_ids = tuple(identifier(slot, limit=64) for slot in slot_ids)
@@ -404,7 +407,7 @@ class SessionTransactions:
                 raise RuntimeError("bounded encoded-request capacity exhausted")
             # Include body validation/serialization/lock wait in the SAME original budget.
             original_deadline(budget, self.clock_domain, self.clock(), self.timeout_s)
-            ticket = _Ticket(key, payload_sha, lease, payload, len(raw), deadline)
+            ticket = _Ticket(key, payload_sha, lease, payload, len(raw), deadline, self.clock())
             self._tickets[key] = ticket
             try:
                 self._schedule(ticket)
@@ -415,7 +418,14 @@ class SessionTransactions:
 
     def _payload_keys_valid(self, payload):
         state_key = "local_memory" if self.mode == "required" else "inference"
-        return set(payload) == {"image", "prompt", "domain_name", "image_size", "state", state_key}
+        expected = {"image", "prompt", "domain_name", "image_size", "state", state_key}
+        if self.conditions is not None:
+            expected.add("g2")
+        if set(payload) != expected:
+            return False
+        if self.conditions is not None:
+            self.conditions.validate_request(payload)
+        return True
 
     def _commit_responses(self, members, caches, *, batch=False):
         # Allocate the complete transaction publication BEFORE any Local commit.
@@ -433,6 +443,8 @@ class SessionTransactions:
         self._responses = replacement
 
     def _reset_session(self, session_id):
+        if self.conditions is not None:
+            self.conditions.reset(session_id)
         if self.mode == "required":
             self.adapter.reset(session_id)
         self._responses.pop(session_id, None)
@@ -524,6 +536,8 @@ class SessionTransactions:
                     self._busy = True
                     ticket.state = "SEALED"
                     self._fence(ticket)
+                if self.conditions is not None:
+                    self.conditions.record_queue(self.clock() - ticket.enqueued_at)
                 if self.mode == "required":
                     ticket.update = self.adapter.prepare(ticket.payload)
                 with self._lock:

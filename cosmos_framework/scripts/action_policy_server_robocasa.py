@@ -53,6 +53,7 @@ import json
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -549,6 +550,18 @@ class ActionServerArgs(pydantic.BaseModel):
     transaction_max_batch_size: int = 1
     transaction_capacity_profile: Literal["legacy8", "streaming32"] = "legacy8"
     transaction_batch_wait_ms: float = 20.0
+    # New condition fields are enabled only by an explicit G2 profile.
+    g2_profile: Literal["legacy", "g2_r1", "g2_r2"] = "legacy"
+    g2_hooks_factory: str | None = None
+    """B-owned module:function creating fixed-model preparation hooks from this service."""
+    g2_provider_factory: str | None = None
+    """module:function creating a current-rollout spatial provider; no expert replay fallback."""
+    g2_cache_enabled: bool = True
+    g2_cache_max_sessions: int = 32
+    g2_cache_max_entries: int = 256
+    g2_cache_cpu_bytes: int = 256 * 1024**2
+    g2_cache_gpu_bytes: int = 256 * 1024**2
+    g2_cache_handles: int = 4096
     media_spool_max_jobs: int = 4
     media_spool_max_bytes: int = 512 * 1024**2
     media_drain_timeout_s: float = 300.0
@@ -894,6 +907,15 @@ def transaction_dispatch(service, method, path, record=None, headers=None) -> Re
 class ActionModelService:
     def __init__(self, args: ActionServerArgs) -> None:
         transaction_options = _transaction_options(args)
+        g2_profile = getattr(args, "g2_profile", "legacy")
+        self.g2_conditions = None
+        if g2_profile != "legacy":
+            if g2_profile not in ("g2_r1", "g2_r2") or transaction_options is None or args.guidance != 1.0:
+                raise ValueError("G2 requires existing owned Session transactions, explicit R1/R2 and guidance=1")
+            if not getattr(args, "g2_hooks_factory", None):
+                raise ValueError("G2 requires B's shared model hooks factory; no substitute UND/Reader forward")
+            if g2_profile == "g2_r2" and not getattr(args, "g2_provider_factory", None):
+                raise ValueError("R2 requires an actual current-rollout provider; expert map playback is unsupported")
         self.transactions = None
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for OmniMoTModel inference in this repo.")
@@ -1113,7 +1135,11 @@ class ActionModelService:
             feature_evidence_owner=self.feature_evidence_owner,
         )
         log.info(f"[action-server] local_memory={self.local_memory_adapter.info()}")
+        if g2_profile != "legacy":
+            self._configure_g2_conditions(args)
         if transaction_options is not None:
+            if self.g2_conditions is not None:
+                transaction_options = dict(transaction_options, conditions=self.g2_conditions)
             if (
                 self.cfg.action_chunk_size != 16
                 or self.raw_action_dim != 15
@@ -1299,6 +1325,9 @@ class ActionModelService:
             "requires_state": self.requires_state,
             "action_stats_path": str(self.cfg.action_stats_path) if self.cfg.action_stats_path else None,
             "local_memory": self.local_memory_adapter.info(),
+            **(
+                {"g2_conditions": self.g2_conditions.info()} if getattr(self, "g2_conditions", None) is not None else {}
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -1310,6 +1339,84 @@ class ActionModelService:
         if input_video_key is None:
             input_video_key = getattr(self.model, "config", None).input_video_key  # type: ignore[union-attr]
         return input_video_key
+
+    def _configure_g2_conditions(self, args):
+        # Factories are trusted startup configuration, never names from a request.
+        # Imports remain lazy: legacy/R1 never import a spatial provider/Reader here.
+        import importlib
+
+        from cosmos_framework.inference.g2_policy_conditions import G2ConditionRuntime
+        from cosmos_framework.inference.g2_session_cache import CacheBudget
+
+        def create(path):
+            module, separator, name = path.partition(":")
+            if not separator or not module or not name.isidentifier():
+                raise ValueError("G2 startup factory must be an explicit module:function")
+            return getattr(importlib.import_module(module), name)(self)
+
+        hooks = create(args.g2_hooks_factory)
+        provider = create(args.g2_provider_factory) if args.g2_profile == "g2_r2" else None
+        self.g2_conditions = G2ConditionRuntime(
+            hooks,
+            profile=args.g2_profile,
+            provider=provider,
+            cache_enabled=args.g2_cache_enabled,
+            budget=CacheBudget(
+                max_sessions=args.g2_cache_max_sessions,
+                max_entries=args.g2_cache_max_entries,
+                cpu_bytes=args.g2_cache_cpu_bytes,
+                gpu_bytes=args.g2_cache_gpu_bytes,
+                handles=args.g2_cache_handles,
+            ),
+        )
+
+    @contextmanager
+    def _g2_generation_context(self, requests, preps):
+        runtime = getattr(self, "g2_conditions", None)
+        if runtime is None:
+            yield {}
+            return
+        if self.model.training or self.cfg.guidance != 1.0:
+            raise ValueError("G2 conditions require fixed-weight eval and guidance=1")
+        with runtime.prepare_many(
+            requests,
+            [p["augmented_prompt"] for p in preps],
+            recipe_ids=[p["g2_text_recipe_id"] for p in preps],
+            effective_texts=[p["g2_effective_text"] for p in preps],
+        ) as kwargs:
+            yield kwargs
+
+    def _build_g2_prompt(self, req, *, height, width):
+        from cosmos_framework.data.generator.action.utils.static_task_text import (
+            StaticTaskText,
+            StaticTaskTextRecipe,
+            effective_text_batch,
+            prepare_static_task_text,
+        )
+
+        runtime = self.g2_conditions
+        runtime.validate_request(req)
+        started = time.perf_counter_ns()
+        task = StaticTaskText(**req["g2"]["static_text"])
+        recipe = StaticTaskTextRecipe(
+            planned_video_frames=self.cfg.action_chunk_size + 1,
+            fps=self.cfg.fps,
+            height=height,
+            width=width,
+            tokenizer_identity=runtime.hooks.tokenizer_identity,
+        )
+        prepared = prepare_static_task_text(task, recipe, self.model, dropout_applied=False)
+        use_float_positions = runtime.hooks.use_float_positions
+        if type(use_float_positions) is not bool:
+            raise ValueError("model hooks must declare the actual native mRoPE position mode")
+        text = effective_text_batch(
+            (prepared,),
+            recipe,
+            special_tokens=self.model.llm_special_tokens,
+            use_float_positions=use_float_positions,
+        )
+        runtime.record_text_preparation(time.perf_counter_ns() - started)
+        return prepared["ai_caption"], recipe.identity, text
 
     def _build_json_prompt(self, prompt: str, *, video: torch.Tensor, image_size: torch.Tensor) -> str:
         """Reproduce the training-time JSON prompt for format_prompt_as_json=True runs.
@@ -1378,7 +1485,13 @@ class ActionModelService:
             action_length=action_length,
             has_text=True,
         )
-        if self._prompt_json_formatter is not None:
+        g2_recipe_id = None
+        g2_effective_text = None
+        if getattr(self, "g2_conditions", None) is not None:
+            augmented_prompt, g2_recipe_id, g2_effective_text = self._build_g2_prompt(
+                req, height=video_padded.shape[-2], width=video_padded.shape[-1]
+            )
+        elif self._prompt_json_formatter is not None:
             augmented_prompt = self._build_json_prompt(
                 prompt, video=video_padded, image_size=prepared.padded_image_size
             )
@@ -1392,7 +1505,7 @@ class ActionModelService:
                 append_duration_fps=self.append_duration_fps,
                 append_resolution_info=self.append_resolution_info,
             )
-        return {
+        result = {
             "img_chw_uint8": img_chw_uint8,
             "video_padded": video_padded,
             "padded_image_size": prepared.padded_image_size,
@@ -1402,6 +1515,10 @@ class ActionModelService:
             "image_size": image_size,
             "state_token": state_token,
         }
+        if g2_recipe_id is not None:
+            result["g2_text_recipe_id"] = g2_recipe_id
+            result["g2_effective_text"] = g2_effective_text
+        return result
 
     def _build_action_input(self, state_token: "torch.Tensor | None") -> "torch.Tensor":
         """Zeros placeholder [T, max_action_dim] for the diffusion start. A state token becomes
@@ -1433,7 +1550,7 @@ class ActionModelService:
     def _transaction_action(self, req, update):
         prep = self._prep_policy_item(req)
         local_kwargs = self._transaction_prefixes([update], batch=False)
-        with torch.inference_mode():
+        with self._g2_generation_context([req], [prep]) as g2_kwargs, torch.inference_mode():
             samples = self.model.generate_samples_from_batch(
                 self._single_policy_batch(prep),
                 guidance=self.cfg.guidance,
@@ -1441,6 +1558,7 @@ class ActionModelService:
                 num_steps=self.cfg.num_steps,
                 has_negative_prompt=False,
                 **local_kwargs,
+                **g2_kwargs,
             )
         if len(samples["action"]) != 1:
             raise ValueError("B1 native output cardinality mismatch")
@@ -1496,6 +1614,7 @@ class ActionModelService:
         trace = get_trace()
         with (
             capture,
+            self._g2_generation_context(reqs, preps) as g2_kwargs,
             torch.inference_mode(),
             span("policy_native_generate", producer="policy"),
             trace.cuda_span("policy_native_generate", producer="policy") if trace else nullcontext(),
@@ -1507,6 +1626,7 @@ class ActionModelService:
                 num_steps=self.cfg.num_steps,
                 has_negative_prompt=False,
                 **self._transaction_prefixes(updates, batch=True),
+                **g2_kwargs,
             )
         if feature_mode:
             boundaries = (capture.boundary,) if n == 1 else capture.boundaries
@@ -1588,6 +1708,8 @@ class ActionModelService:
         The first V3 online Local-TTT gate deliberately supports only serial /predict so
         every session has an unambiguous transactional completed-evidence frontier.
         """
+        if getattr(self, "g2_conditions", None) is not None:
+            raise ValueError("G2 uses the existing owned /v2 Session API")
         if self.local_memory_adapter.mode == "required":
             raise ValueError("required Local-TTT currently supports serial /predict only")
         t0 = time.monotonic()

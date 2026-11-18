@@ -59,6 +59,7 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
 )
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
 from cosmos_framework.model.generator.mot.diffusion_cache import _velocity_pathways
+from cosmos_framework.model.generator.mot.g2_contracts import G2ConditionBatch, move_g2_condition
 from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
     InferenceTextKVMemoryState,
     UndKVCache,
@@ -289,6 +290,54 @@ class OmniMoTModel(ImaginaireModel):
     Mixture of Transformers (MoT) model to be trained with the flow matching objective
     for visual / sound / action generation.
     """
+
+    def g2_parameter_inventory(self):
+        from cosmos_framework.model.generator.mot.g2_parameters import parameter_inventory
+
+        return parameter_inventory(self, net_prefix="net.")
+
+    def set_trainable_names(self, names):
+        from cosmos_framework.model.generator.mot.g2_parameters import set_trainable_names
+
+        set_trainable_names(self, names)
+
+    def prepare_g2_text(self, text):
+        return self.net.prepare_und_text(text)
+
+    def prepare_g2_gen_text_kv(self, features):
+        return self.net.prepare_gen_text_kv(features)
+
+    def prepare_g2_task_queries(self, features):
+        return self.net.prepare_task_queries(features)
+
+    def read_g2_global(self, task_queries, views):
+        return self.net.read_global(task_queries, views)
+
+    def project_g2_global(self, reader):
+        return self.net.project_global(reader)
+
+    def prepare_g2_global_kv(self, projected):
+        return self.net.prepare_global_kv(projected)
+
+    @torch.no_grad()
+    def prepare_g2_condition(self, condition: G2ConditionBatch, *, net=None) -> G2ConditionBatch:
+        """Prepare once per generation request; D may provide cached snapshots."""
+        target = net or self.net
+        condition = move_g2_condition(condition, self.tensor_kwargs["device"])
+        features = condition.text_features
+        cached = features is not None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            flag = torch.tensor(int(cached), device=self.tensor_kwargs["device"])
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+            cached = bool(flag.item())
+        if not cached:
+            features = target.prepare_und_text(condition.text)
+        tokens = condition.global_tokens
+        if target.config.global_memory_enabled:
+            # Root FSDP hooks run on every rank, including Global-absent/cache-hit
+            # ranks. Only the local Reader work depends on local presence.
+            tokens = target.prepare_global_tokens(features, condition.views, prepared=tokens)
+        return dataclasses.replace(condition, text_features=features, global_tokens=tokens)
 
     def __init__(self, config: OmniMoTModelConfig):
         super().__init__()
@@ -535,6 +584,11 @@ class OmniMoTModel(ImaginaireModel):
                 timestep_range=self.config.diffusion_expert_config.timestep_range,
                 action_dim=self.config.max_action_dim,
                 local_memory_enabled=self.config.local_memory_enabled,
+                g2_text_enabled=self.config.g2_text_enabled,
+                global_memory_enabled=self.config.global_memory_enabled,
+                global_memory_config=self.config.global_memory_config,
+                global_memory_latent_channels=self.config.global_memory_latent_channels,
+                global_memory_top_variant=self.config.global_memory_top_variant,
                 local_memory_dim=self.config.local_memory_dim,
                 local_memory_evidence_dim=self.config.local_memory_evidence_dim,
                 local_memory_action_dim=self.config.local_memory_action_dim,
@@ -1363,6 +1417,7 @@ class OmniMoTModel(ImaginaireModel):
         iteration: int,
         *,
         _local_memory_prefixes: tuple[torch.Tensor | None, ...] | None = None,
+        _g2_condition: G2ConditionBatch | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """
         Performs a single training step for the rectified-flow (flow-matching) model.
@@ -1390,6 +1445,9 @@ class OmniMoTModel(ImaginaireModel):
         input_text_indexes, sequence_plans, gen_data_clean, memory_info, data_resolutions, vae_pixel_shapes = (
             self._get_training_inputs(data_batch, iteration)
         )
+        condition = _g2_condition if _g2_condition is not None else data_batch.get("g2_condition")
+        if condition is not None:
+            gen_data_clean = dataclasses.replace(gen_data_clean, g2_condition=condition)
         if _local_memory_prefixes is not None:
             if not self.config.local_memory_enabled or len(_local_memory_prefixes) != gen_data_clean.batch_size:
                 raise ValueError("Local Memory override requires enabled model and one entry per sample")
@@ -3382,6 +3440,7 @@ class OmniMoTModel(ImaginaireModel):
             raw_state_vision=gen_data_clean.raw_state_vision,
             x0_tokens_vision=noise_x_vision,
             x0_tokens_local_memory=gen_data_clean.x0_tokens_local_memory,
+            g2_condition=gen_data_clean.g2_condition,
             fps_vision=gen_data_clean.fps_vision,
             temporal_positions_vision=gen_data_clean.temporal_positions_vision,
             # Action fields
@@ -3730,6 +3789,7 @@ class OmniMoTModel(ImaginaireModel):
         upsample_presence_penalty: float = 0.0,
         upsample_seed: int | None = None,
         _local_memory_prefixes: tuple[torch.Tensor | None, ...] | None = None,
+        _g2_condition: G2ConditionBatch | None = None,
         use_prefix_text_kv_cache: bool = True,
         use_prefix_pack_templates: bool = True,
         use_prefix_projection_cache: bool = True,
@@ -3898,6 +3958,13 @@ class OmniMoTModel(ImaginaireModel):
             condition_mask,
             has_noisy_actions,
         ) = self._prepare_inference_data(data_batch, seed, has_negative_prompt)
+        if _g2_condition is not None:
+            if guidance != 1.0 or use_batched_cfg or upsample_task is not None:
+                raise ValueError("G2 conditions currently require guidance=1, no batched CFG or prompt upsampling")
+            if getattr(self, "_diffusion_cache", None) is not None:
+                raise ValueError("G2 diffusion-layer residual caching has not been validated")
+            _g2_condition = self.prepare_g2_condition(_g2_condition, net=net)
+            gen_data_clean = dataclasses.replace(gen_data_clean, g2_condition=_g2_condition)
 
         has_local_prefixes = _local_memory_prefixes is not None and any(
             token is not None for token in _local_memory_prefixes
@@ -4006,6 +4073,7 @@ class OmniMoTModel(ImaginaireModel):
 
         reuse_prefix_text_kv = (
             has_local_prefixes
+            and _g2_condition is None
             and use_prefix_text_kv_cache
             and guidance == 1.0
             and velocity_postprocess_builder is None
@@ -4108,6 +4176,10 @@ class OmniMoTModel(ImaginaireModel):
                 has_velocity_postprocess=velocity_postprocess is not None,
             )
         )
+        if _g2_condition is not None:
+            # G2 uses the shared prepared-UND authority. Legacy request-local
+            # MemoryState cannot simultaneously supply a second text K/V source.
+            reuse_text_kv = False
         reuse_text_kv = _all_group_ranks_allow(
             reuse_text_kv,
             _dp_shard_group,
