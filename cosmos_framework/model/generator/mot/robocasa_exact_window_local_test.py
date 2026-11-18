@@ -350,3 +350,37 @@ def test_optional_real_data_debug_smoke(monkeypatch: pytest.MonkeyPatch):
         1,
         *cache.latent_shape,
     )
+
+
+def test_g2_certified_train_episode_allowlist_filters_planner_not_g1_flat_indices():
+    raw, transform, original, _ = _setup(
+        (33, 45, 49, 32, 24, 39),
+        ("A", "B", "A", "B", "A", "B"),
+    )
+    selected = frozenset({("A", 0), ("B", 3), ("B", 5)})
+    filtered = ExactWindowLocalCatalog(original.wrapped_sft, ttt_tbptt_steps=16, allowed_episode_keys=selected)
+    assert len(original.episodes) == 6
+    assert len(filtered.episodes) == len(selected) == 3
+    assert {(e.task_class, e.key.episode_index) for e in filtered.episodes} == selected
+    assert len(filtered.raw) == len(raw)  # Original global G1 flat indexing untouched.
+    assert {e.flat_start for e in filtered.episodes} == {original.episodes[i].flat_start for i in (0, 3, 5)}
+    p = ExactWindowRankPlanner(filtered, rank=0, world_size=1, b_stream=2, active_ga=1)
+    plan = p.plan_window(p.initial_frontier())
+    assert all(
+        (req.episode.task_class, req.episode.key.episode_index) in selected for member in plan.members for req in member
+    )
+    assert raw.calls == [] and transform.calls == []
+
+
+@pytest.mark.parametrize(
+    "allowed, message",
+    [
+        (frozenset(), "nonempty immutable"),
+        ({("A", 0)}, "nonempty immutable"),
+        (frozenset({("Missing", 999)}), "absent from original G1"),
+    ],
+)
+def test_g2_certified_episode_allowlist_rejects_unverified_data(allowed, message):
+    _, _, catalog, _ = _setup((33, 45), ("A", "B"))
+    with pytest.raises(ValueError, match=message):
+        ExactWindowLocalCatalog(catalog.wrapped_sft, ttt_tbptt_steps=16, allowed_episode_keys=allowed)
