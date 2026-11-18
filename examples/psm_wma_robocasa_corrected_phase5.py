@@ -1179,7 +1179,12 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         raise ValueError("G2 fixed text generation recipe differs from actual native input geometry/fps/horizon")
     dataset_create_ms = (time.perf_counter() - stage) * 1000
     stage = time.perf_counter()
-    catalog = ExactWindowLocalCatalog(dataset, ttt_tbptt_steps=args.t)
+    allowed = None
+    if g2_recipe is not None:
+        allowed = getattr(g2_adapter.provider, "train_episode_keys", None)
+        if not isinstance(allowed, frozenset) or not allowed:
+            raise ValueError("formal G2 requires verified nonempty G1 Train episode keys")
+    catalog = ExactWindowLocalCatalog(dataset, ttt_tbptt_steps=args.t, allowed_episode_keys=allowed)
     local_catalog_ms = (time.perf_counter() - stage) * 1000
     dataset_init = {
         "verified_index_hit": True,

@@ -56,7 +56,13 @@ class ExactWindowLocalEpisode:
 class ExactWindowLocalCatalog:
     """Build planning metadata from the Phase3 raw dataset, without reading raw items."""
 
-    def __init__(self, wrapped_sft: ActionSFTDataset, *, ttt_tbptt_steps: int) -> None:
+    def __init__(
+        self,
+        wrapped_sft: ActionSFTDataset,
+        *,
+        ttt_tbptt_steps: int,
+        allowed_episode_keys: frozenset[tuple[str, int]] | None = None,
+    ) -> None:
         if not isinstance(wrapped_sft, ActionSFTDataset) or not isinstance(
             wrapped_sft._dataset, RoboCasaExactWindowCachedDataset
         ):
@@ -107,6 +113,17 @@ class ExactWindowLocalCatalog:
             expected_flat += count
         if expected_flat != len(self.raw) or len({episode.uid for episode in episodes}) != len(episodes):
             raise ValueError("Local episode flat layout 或 uid 重复")
+        if allowed_episode_keys is not None:
+            # Filter the G1 planner, never the G1 SourceReader/cache's flat
+            # absolute indices: that preserves all original 20Hz identities.
+            if not isinstance(allowed_episode_keys, frozenset) or not allowed_episode_keys:
+                raise ValueError("G2 training requires a nonempty immutable episode allowlist")
+            available = {(ep.task_class, ep.key.episode_index) for ep in episodes}
+            if not allowed_episode_keys <= available:
+                raise ValueError("G2 certified episode absent from original G1 cache")
+            episodes = [ep for ep in episodes if (ep.task_class, ep.key.episode_index) in allowed_episode_keys]
+            if not episodes:
+                raise ValueError("G2 certified training split is empty")
         self.episodes = tuple(episodes)
         self.by_uid = {episode.uid: episode for episode in self.episodes}
         self.task_classes = tuple(sorted({episode.task_class for episode in self.episodes}))
@@ -407,9 +424,7 @@ class ExactWindowSegmentProducer:
                     16,
                 )
             with scoped_transform_rng(seed):
-                payloads[index] = self.catalog.wrapped_sft._transform(
-                    dict(item), self.catalog.wrapped_sft._resolution
-                )
+                payloads[index] = self.catalog.wrapped_sft._transform(dict(item), self.catalog.wrapped_sft._resolution)
             consumer_valid[0, index] = True
             consumer_step[0, index] = step
             if step > 0:
