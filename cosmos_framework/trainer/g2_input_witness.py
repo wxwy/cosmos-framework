@@ -120,8 +120,10 @@ def inspect_native_g2_inputs(
                 raise ValueError("enhanced CAP2 did not reach the native Prompt formatter") from exc
             if not isinstance(description, str) or not description.strip():
                 raise ValueError("native non-dropout enhanced instruction is empty")
-            augmented += 1
             has_initial_context = "Initial spatial context" in description
+            if not has_initial_context:
+                raise ValueError("CAP2 enhanced spatial context was absent from the native Prompt")
+            augmented += 1
             description_size = len(description)
 
         if profile == "R1" and views is not None:
