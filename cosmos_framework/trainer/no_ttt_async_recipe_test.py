@@ -3,8 +3,9 @@
 import json
 import pickle
 import random
+from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +57,14 @@ class _CpuTextRecipe:
     def token_key(self):
         return self.inner.token_key
 
+    @property
+    def g2(self):
+        return self.inner.g2
+
+    @property
+    def compact(self):
+        return self.inner.compact
+
     def build(self):
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -68,7 +77,7 @@ class _CpuTextRecipe:
 
 
 @pytest.fixture
-def real_recipe(roots, tmp_path, monkeypatch):
+def real_recipe(roots, tmp_path, monkeypatch):  # noqa: F811
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     monkeypatch.setenv("PSM_V3_COMPACT_CACHED_VIDEO", "1")
     processor_path = tmp_path / "processor"
@@ -274,7 +283,80 @@ def test_first_worker_recipe_build_never_calls_full_lerobot_constructor(real_rec
     assert [event["stage"] for event in events] == ["cpu_source", "cpu_transform"]
 
 
-def test_spawned_real_recipe_source_transform_cfg_and_cross_window_cleanup(real_recipe, tmp_path):
+class _G2WorkerFixture:
+    """Synthetic DATA_C values paired with the real local G1 source helpers."""
+
+    evidence_scope = "verified_data_c"
+    identity = "fixture-data"
+    split_identity = "fixture-split"
+    snapshot_identity = "fixture-snapshot"
+
+    def __init__(self, *, source_binding, examples, proof_file, global_memory_enabled):
+        from cosmos_framework.model.generator.mot.g2_contract_fixtures import synthetic_view
+
+        self.source_binding = source_binding
+        self.examples = examples
+        self.proof_file = Path(proof_file)
+        self.global_memory_enabled = global_memory_enabled
+        self.views = (replace(synthetic_view(), top_variant="with_robot"),)
+        self.train_episode_keys = frozenset(("Pick Mug", ep) for ep in range(16))
+        self.witnesses = None
+
+    @contextmanager
+    def capture_prefetch_witnesses(self):
+        self.witnesses = {}
+        try:
+            yield self.witnesses
+        finally:
+            self.witnesses = None
+
+    def read_common(self, *, task_class, episode_index, decision_frame):
+        from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskText
+        from cosmos_framework.model.generator.mot.g2_contracts import G2SampleIdentity
+
+        if self.witnesses is not None:
+            stat = self.proof_file.stat()
+            self.witnesses[self.proof_file] = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+        action, caption = self.examples[f"{episode_index}/{decision_frame}"]
+        ep = f"{task_class}/{episode_index}"
+        text = StaticTaskText(caption, f"{caption} In its initial room.", ep, "atomic", "template", "source", ep)
+        return {
+            "identity": G2SampleIdentity(
+                episode_id=ep,
+                scene_id="scene",
+                subtask_id="atomic",
+                decision_frame=decision_frame,
+                logical_state_frame=decision_frame,
+                data_version=self.identity,
+                alignment_version="align",
+                state15_recipe_id="state-recipe",
+                task_binding_id="binding",
+            ),
+            "static_task_text": text,
+            "state15": torch.tensor(action, dtype=torch.float32),
+            "task_class": task_class,
+            "episode_index": episode_index,
+            "source_binding_digest": self.source_binding,
+            "state15_space": "data_b_model_input",
+        }
+
+    def read_selected_views(self, identity, *, top_view_variant):
+        assert self.global_memory_enabled, "R1 touched the View reader"
+        assert top_view_variant == "with_robot"
+        return self.views
+
+
+@pytest.mark.parametrize("mode", ["g1", "r1", "r2"])
+def test_spawned_real_recipe_source_transform_cfg_and_cross_window_cleanup(real_recipe, tmp_path, mode):
+    from cosmos_framework.data.generator.action.datasets.g2_training_adapter import G2DataRecipe, G2TrainingDataAdapter
+    from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskTextRecipe
+    from cosmos_framework.model.generator.mot.g2_contracts import GlobalMemoryConfig
     from cosmos_framework.trainer.no_ttt_async_loader import NoTTTAsyncLoader
     from cosmos_framework.trainer.no_ttt_async_loader_test import consume, equal_tree, seed
 
@@ -329,10 +411,51 @@ def test_spawned_real_recipe_source_transform_cfg_and_cross_window_cleanup(real_
         tmp_path / "native_index", cache_catalog=dataset._dataset.catalog, source_reader=dataset._dataset.source_reader
     )
     dataset._dataset.source_reader.verified_index = index
+    provider_options = {}
+    if mode != "g1":
+        examples = {}
+        for flat in range(len(dataset._dataset)):
+            sample = dataset._dataset[flat]
+            state = sample["action"][0].tolist()
+            state[:5] = [flat / 16, 0.1, 0.4, 0.3, 0.8]
+            examples[f"{sample['episode_index']}/{sample['start_frame']}"] = [state, sample["ai_caption"]]
+        proof_file = tmp_path / "g2-fixture-source"
+        proof_file.write_text("sealed")
+        kwargs = dict(
+            source_binding=dataset._dataset.source_reader.source_binding_digest,
+            examples=examples,
+            proof_file=str(proof_file),
+        )
+        provider = _G2WorkerFixture(**kwargs, global_memory_enabled=mode == "r2")
+        g2 = G2TrainingDataAdapter(
+            provider,
+            G2DataRecipe(
+                provider.identity,
+                "align",
+                "state-recipe",
+                provider.views[0].identity.recipe_id if mode == "r2" else None,
+                GlobalMemoryConfig(enabled=mode == "r2", top_view_variant="with_robot"),
+            ),
+        )
+        dataset = get_action_robocasa_exact_window_cached_sft_dataset(
+            cache_root=cache,
+            source_root=root,
+            verified_index=index,
+            tokenizer_config=initial.catalog.wrapped_sft._transform.text_tokenizer.args["tokenizer_config"],
+            cfg_dropout_rate=0.5,
+            g2_adapter=g2,
+            static_task_text_recipe=asdict(
+                StaticTaskTextRecipe(17, 20.0, 256, 512, "fake-tokenizer", cfg_dropout_rate=0.5)
+            ),
+        )
+        provider_options = {
+            "g2_provider_factory": "cosmos_framework.trainer.no_ttt_async_recipe_test:_G2WorkerFixture",
+            "g2_provider_kwargs": kwargs,
+        }
     producer = ExactWindowSegmentProducer(
         ExactWindowLocalCatalog(dataset, ttt_tbptt_steps=2), config_digest="test_config"
     )
-    recipe = AsyncRecipe.from_producer(producer, LoaderProfile(2, 1, True, 120))
+    recipe = AsyncRecipe.from_producer(producer, LoaderProfile(2, 1, True, 120), **provider_options)
     planner = ExactWindowRankPlanner(producer.catalog, rank=0, world_size=1, b_stream=8, active_ga=4)
     seed()
     reference = consume(producer, planner)

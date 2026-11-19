@@ -16,11 +16,12 @@ import subprocess
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import nullcontext
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from cosmos_framework.utils.no_ttt_loader_profile import profile_from_args
+from cosmos_framework.utils.no_ttt_loader_profile import LoaderProfile, profile_from_args
 from examples.psm_wma_robocasa_effective_config import (
     describe_effective_data_source,
     synchronize_legacy_chunk_length,
@@ -608,6 +609,8 @@ class JobLifecycle:
             profile = profile_from_args(self.args)
             if profile.workers:
                 record["cpu_loader_runtime"] = profile.identity()
+        if "g2_loader_runtime" in self.report:
+            record["g2_loader_runtime"] = self.report["g2_loader_runtime"]
         if "nottt4_legacy_source_resume" in self.report:
             record["nottt4_legacy_source_resume"] = self.report["nottt4_legacy_source_resume"]
         if _owner_g1_cross_pair_resume(self.args):
@@ -627,8 +630,7 @@ class JobLifecycle:
                 "semantic": semantic,
                 "semantic_digest": _json_digest(semantic),
                 "diagnostic_only_do_not_resume": (
-                    self.args.stop_after_iter is not None
-                    or getattr(self.args, "g2_benchmark_steps", None) is not None
+                    self.args.stop_after_iter is not None or getattr(self.args, "g2_benchmark_steps", None) is not None
                 ),
                 "canonical_config_sha256": {
                     name: _file_sha256(self.path / name) for name in ("config.pkl", "config.yaml")
@@ -1068,11 +1070,11 @@ def _execution_stop_iteration(args: argparse.Namespace) -> int:
             or formal_until is not None
             or getattr(args, "audit_missing_grads", False)
             or type(g2_benchmark) is not int
-            or g2_benchmark != 10
+            or g2_benchmark not in (2, 10)
             or (args.max_iter, args.warmup, args.save_iter) != (30000, 0, 100)
             or not args.job_name.startswith(recipe.training.profile.lower() + "_g2_bench_")
         ):
-            raise ValueError("G2 benchmark requires fresh isolated profile-specific job, 10 steps, 30000/0/100")
+            raise ValueError("G2 benchmark requires fresh isolated profile-specific job, 2 or 10 steps, 30000/0/100")
         namespace = job_namespace(args)
         if namespace.exists() or namespace.is_symlink():
             raise FileExistsError("G2 benchmark requires a new job namespace")
@@ -1111,8 +1113,30 @@ def _execution_stop_iteration(args: argparse.Namespace) -> int:
     return stop_after
 
 
+def _g2_runtime_loader(args: argparse.Namespace, recipe: Any) -> LoaderProfile | None:
+    workers = getattr(args, "g2_spawn_workers", 0)
+    timeout = getattr(args, "g2_spawn_timeout_s", None)
+    if getattr(args, "g2_profile_trace", False) and getattr(args, "g2_benchmark_steps", None) is None:
+        raise ValueError("G2 profiler is available only in a bounded benchmark")
+    if workers == 0:
+        if timeout is not None:
+            raise ValueError("G2 spawn timeout requires workers")
+        return None
+    if (
+        recipe is None
+        or getattr(args, "no_ttt", False)
+        or getattr(args, "num_workers", 0) != 0
+        or getattr(args, "full_segment_prefetch", False)
+        or getattr(args, "transform_rng_mode", "legacy_global") != "legacy_global"
+        or (args.world_size, args.ga, args.b, args.t) != (4, 4, 8, 16)
+    ):
+        raise ValueError("G2 Spawn requires R1/R2 world4/GA4/B8/T16 with legacy_global and no Raw threads")
+    return LoaderProfile(workers, 1, True, 120.0 if timeout is None else timeout)
+
+
 def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindowLocalCatalog, Any]:
     g2_recipe = _g2_recipe(args)  # Required run fields are checked before CUDA/data access.
+    spawn_profile = _g2_runtime_loader(args, g2_recipe)
     if getattr(args, "dataset_index_root", None) is None:
         raise ValueError("训练/Resume 必须提供已离线验收的 --dataset-index-root；禁止 cold build 与数据全量复检")
     check_job_namespace(args)
@@ -1244,9 +1268,25 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         "transform_rng_mode": getattr(args, "transform_rng_mode", "legacy_global"),
         "full_segment_prefetch": getattr(args, "full_segment_prefetch", False),
         "execution_stop_after_iter": execution_stop,
+        **(
+            {
+                "g2_loader_runtime": {
+                    "raw_workers": args.num_workers,
+                    "spawn": spawn_profile.async_identity() if spawn_profile is not None else None,
+                    "compact_cached_video": getattr(catalog.raw, "compact_cached_video", False),
+                    "episode_cache_size": os.environ.get("PSM_G2_EPISODE_CACHE_SIZE", "4"),
+                    "cap2_token_cache": os.environ.get("PSM_G2_CAP2_TOKEN_CACHE", "0"),
+                    "profile_trace": getattr(args, "g2_profile_trace", False),
+                }
+            }
+            if g2_recipe is not None
+            else {}
+        ),
         "execution_scope": (
-            "g2_benchmark_diagnostic" if getattr(args, "g2_benchmark_steps", None) is not None
-            else "bounded_diagnostic" if getattr(args, "stop_after_iter", None) is not None
+            "g2_benchmark_diagnostic"
+            if getattr(args, "g2_benchmark_steps", None) is not None
+            else "bounded_diagnostic"
+            if getattr(args, "stop_after_iter", None) is not None
             else "formal"
         ),
         "cache_manifest_sha256": catalog.manifest_digest,
@@ -1315,6 +1355,11 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="No-TTT-only spawned CPU DataLoader processes; independent of G1 --num-workers threads",
+    )
+    result.add_argument("--g2-spawn-workers", type=int, default=0, help="Opt-in G2 CPU Spawn workers/rank")
+    result.add_argument("--g2-spawn-timeout-s", type=float, default=None)
+    result.add_argument(
+        "--g2-profile-trace", action="store_true", help="Capture one CPU/CUDA step per rank in a diagnostic"
     )
     result.add_argument("--no-ttt-prefetch-factor", type=int, default=None)
     result.add_argument("--no-ttt-persistent-workers", action="store_true", default=None)
@@ -1389,7 +1434,7 @@ def parser() -> argparse.ArgumentParser:
         "--g2-benchmark-steps",
         type=int,
         default=None,
-        help="G2 ONLY: fresh isolated 10-step diagnostic with frozen 30000-step recipe; never formal/Resume",
+        help="G2 ONLY: fresh isolated 2- or 10-step diagnostic with frozen 30000-step recipe; never formal/Resume",
     )
     result.add_argument(
         "--stop-after-iter",
@@ -1413,6 +1458,7 @@ def _telemetry_sample_interval(stop_after_iter: int | None) -> int:
 def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
     g2_recipe = _g2_recipe(args)
+    spawn_profile = _g2_runtime_loader(args, g2_recipe)
     profile_from_args(args)  # Reject invalid opt-in settings before CUDA/distributed setup.
     if type(args.num_workers) is not int or not 0 <= args.num_workers <= 16:
         raise ValueError("--num-workers must be 0..16")
@@ -1459,6 +1505,16 @@ def main(argv: list[str] | None = None) -> None:
         config_digest=report["config_digest"],
         num_workers=args.num_workers,
         full_segment_prefetch=report["full_segment_prefetch"],
+        **(
+            {
+                "spawn_loader_profile": spawn_profile,
+                "spawn_stop_after_iteration": report["execution_stop_after_iter"],
+                "g2_provider_factory": g2_recipe.provider_factory,
+                "g2_provider_kwargs": g2_recipe.provider_kwargs,
+            }
+            if spawn_profile is not None
+            else {}
+        ),
         **({"loader_profile": profile_from_args(args)} if profile_from_args(args).workers else {}),
     )
     sample_interval = _telemetry_sample_interval(
@@ -1491,12 +1547,31 @@ def main(argv: list[str] | None = None) -> None:
     )
     trainer.grouped_observer = observer
     install_checkpoint_save_telemetry(trainer.checkpointer, observer)
-    try:
-        trainer.train(
-            model,
-            GroupedTriggerLoader(args.max_iter, args.ga, on_iteration_start=observer.start_iteration),
-            None,
+    profiler = None
+    if args.g2_profile_trace:
+        trace_dir = job_namespace(args) / "monitor"
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(
+                wait=2 if args.g2_benchmark_steps == 10 else 0, warmup=1, active=1, repeat=1
+            ),
+            on_trace_ready=lambda run: run.export_chrome_trace(str(trace_dir / f"profile_rank{rank}.json")),
+            with_stack=True,
         )
+        observer.torch_profiler_enabled = True
+
+    def on_iteration_start(iteration: int) -> None:
+        if profiler is not None and iteration:
+            profiler.step()
+        observer.start_iteration(iteration)
+
+    try:
+        with profiler if profiler is not None else nullcontext():
+            trainer.train(
+                model,
+                GroupedTriggerLoader(args.max_iter, args.ga, on_iteration_start=on_iteration_start),
+                None,
+            )
     finally:
         if journal is not None:
             journal.close()
@@ -1523,8 +1598,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
     if rank == 0 and (
-        getattr(args, "stop_after_iter", None) is not None
-        or getattr(args, "g2_benchmark_steps", None) is not None
+        getattr(args, "stop_after_iter", None) is not None or getattr(args, "g2_benchmark_steps", None) is not None
     ):
         print(
             "[CorrectedV3][bounded_stop] "

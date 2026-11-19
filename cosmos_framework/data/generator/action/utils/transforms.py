@@ -17,6 +17,8 @@ for the map-to-iterable wrapper.
 
 from __future__ import annotations
 
+import os
+from collections import OrderedDict
 from collections.abc import Mapping
 
 import torch
@@ -593,6 +595,15 @@ class ActionTransformPipeline:
             if isinstance(static_task_text_recipe, dict)
             else static_task_text_recipe
         )
+        # The CAP2 episode prompt is static across all decision frames. Keep
+        # only 256 immutable tokenizations (normal / CFG-dropped) per transform.
+        # Consumer-specific CFG random draws still happen on the trainer
+        # thread, before this cache lookup; native RNG order is unchanged.
+        self._g2_static_token_cache: OrderedDict[tuple[str, bool], dict] = OrderedDict()
+        memo = os.environ.get("PSM_G2_CAP2_TOKEN_CACHE", "0")
+        if memo not in {"0", "1"}:
+            raise ValueError("PSM_G2_CAP2_TOKEN_CACHE must be 0 or 1")
+        self._g2_cache_static_text = memo == "1"
         if self.static_task_text_recipe is not None:
             if (
                 not isinstance(self.static_task_text_recipe, StaticTaskTextRecipe)
@@ -722,6 +733,27 @@ class ActionTransformPipeline:
 
         return data_dict
 
+    def _prepare_cached_g2_text(self, task: StaticTaskText, *, dropout_applied: bool) -> dict:
+        """Reuse exact episode-static CAP2 tokenizer output without changing CFG RNG.
+
+        The cache owns CPU-only tensors; every consumer gets separate clones.
+        Neither the tokenizer nor mutable result tensors are shared with a
+        background thread. The key contains all source and prompt identities.
+        """
+        cache = self._g2_static_token_cache
+        key = (task.identity, dropout_applied)
+        if key not in cache:
+            cache[key] = prepare_static_task_text(
+                task,
+                self.static_task_text_recipe,
+                self.text_tokenizer._processor,
+                dropout_applied=dropout_applied,
+            )
+            if len(cache) > 256:
+                cache.popitem(last=False)
+        cache.move_to_end(key)
+        return {name: value.clone() if isinstance(value, torch.Tensor) else value for name, value in cache[key].items()}
+
     def __call__(
         self,
         data_dict: dict,
@@ -791,16 +823,18 @@ class ActionTransformPipeline:
                 task = StaticTaskText(**task)
             if not isinstance(task, StaticTaskText) or self.text_tokenizer is None:
                 raise ValueError("static task text asset and tokenizer are required")
-            data_dict.update(
-                prepare_static_task_text(
-                    task,
-                    self.static_task_text_recipe,
-                    self.text_tokenizer._processor,
-                    dropout_applied=resolve_consumer_text_dropout(
-                        data_dict, self.static_task_text_recipe.cfg_dropout_rate
-                    ),
+            # Preserve the one per-consumer CFG draw and its original order.
+            # CAP2 prompt/Tokenizer is episode-static, so cache its deterministic
+            # result instead of rebuilding it for each 20Hz decision frame.
+            dropout = resolve_consumer_text_dropout(data_dict, self.static_task_text_recipe.cfg_dropout_rate)
+            text = (
+                self._prepare_cached_g2_text(task, dropout_applied=dropout)
+                if self._g2_cache_static_text
+                else prepare_static_task_text(
+                    task, self.static_task_text_recipe, self.text_tokenizer._processor, dropout_applied=dropout
                 )
             )
+            data_dict.update(text)
             data_dict.pop("relabel_prompt", None)
             data_dict.pop("additional_view_description", None)
         elif self.prompt_json_formatter is not None:

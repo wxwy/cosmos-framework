@@ -69,6 +69,40 @@ def seed(value=81):
     torch.manual_seed(value)
 
 
+def test_g2_packet_detects_drift_before_parent_consumption(tmp_path):
+    path = tmp_path / "view-latent.pt"
+    path.write_bytes(b"original view")
+    witnessed = [list(row) for row in _versions([path])]
+    NoTTTAsyncLoader._verify_g2_sources(witnessed)
+    replacement = tmp_path / "replacement.pt"
+    replacement.write_bytes(b"changed  view")
+    replacement.replace(path)
+    with pytest.raises(ValueError, match="changed before consumption"):
+        NoTTTAsyncLoader._verify_g2_sources(witnessed)
+    with pytest.raises(ValueError, match="missing or malformed"):
+        NoTTTAsyncLoader._verify_g2_sources([])
+
+
+def test_final_window_consumes_admitted_jobs_without_preview():
+    producer, planner, recipe = setup()
+    loader = NoTTTAsyncLoader(producer, LoaderProfile(2, 1, True, 90), planner, recipe=recipe)
+    try:
+        frontier = planner.initial_frontier()
+        for preview_next in (True, False):
+            plan = planner.plan_window(frontier)
+            loader.begin(plan, preview_next=preview_next)
+            for member in plan.members:
+                for request in member:
+                    loader.materialize(request)
+            loader.finish()
+            loader.checkpoint_boundary()
+            frontier = plan.candidate_frontier
+        assert not loader.sampler.jobs and loader.preview is None
+        assert loader.sampler.final_window is True
+    finally:
+        loader.close()
+
+
 def model_draws():
     return random.random(), float(np.random.rand()), float(torch.rand(()))
 
@@ -520,3 +554,18 @@ def test_out_of_order_worker_completion_never_changes_consumer_rng_order(tmp_pat
         assert len(actual[4][0]["worker_pids"]) == 2
     finally:
         loader.close()
+
+
+def test_g2_source_parent_symlink_rejected_even_with_identical_leaf_stat(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    path = source_dir / "projection.json"
+    path.write_bytes(b"same")
+    info = path.stat()
+    witnessed = [[str(path), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]]
+    relocated = tmp_path / "relocated"
+    source_dir.rename(relocated)
+    source_dir.symlink_to(relocated, target_is_directory=True)
+    assert path.stat().st_ino == info.st_ino
+    with pytest.raises(ValueError, match="no longer canonical"):
+        NoTTTAsyncLoader._verify_g2_sources(witnessed)

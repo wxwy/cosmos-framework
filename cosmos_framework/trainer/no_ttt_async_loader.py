@@ -46,10 +46,13 @@ class AsyncJob:
 class PreviewSampler(Sampler):
     def __init__(self):
         self.jobs = deque()
+        self.final_window = False
 
     def __iter__(self):
         while True:
             if not self.jobs:
+                if self.final_window:
+                    return
                 raise RuntimeError("async preview credits exhausted before committed promotion")
             yield self.jobs.popleft()
 
@@ -133,6 +136,9 @@ class PreparedDataset(Dataset):
         _check_versions(job.file_versions)
         segment, events = state.prepare(job.request)
         _check_versions(job.file_versions)
+        g2_versions = getattr(state, "g2_source_versions", ())
+        if len(g2_versions) > 16 * 1024:
+            raise ValueError("async G2 source witness count exceeds bound")
         if _transport_bytes((segment, state.empty_tokens)) > self.max_packet_bytes:
             raise ValueError("async prepared segment exceeds byte bound before transport cloning")
         package = _transport_tree((segment, state.empty_tokens))
@@ -149,6 +155,7 @@ class PreparedDataset(Dataset):
             "window": job.window,
             "token": job.token,
             "file_versions": [list(row) for row in job.file_versions],
+            "g2_source_versions": [list(row) for row in g2_versions],
             "pid": os.getpid(),
             "packet": packet,
             "events": events,
@@ -167,7 +174,7 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
     production recipe only reconstructs the exact validated local SFT pipeline.
     """
 
-    def __init__(self, producer, profile, planner, *, recipe=None):
+    def __init__(self, producer, profile, planner, *, recipe=None, g2_provider_factory=None, g2_provider_kwargs=None):
         if not profile.workers:
             raise ValueError("workers0 must keep the original synchronous path")
         if planner.b_stream != 8 or planner.active_ga != 4:
@@ -175,7 +182,14 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
         from cosmos_framework.trainer.no_ttt_async_recipe import AsyncRecipe
 
         self.producer, self.profile, self.planner = producer, profile, planner
-        self.recipe = AsyncRecipe.from_producer(producer, profile) if recipe is None else recipe
+        self.recipe = (
+            AsyncRecipe.from_producer(
+                producer, profile, g2_provider_factory=g2_provider_factory, g2_provider_kwargs=g2_provider_kwargs
+            )
+            if recipe is None
+            else recipe
+        )
+        self.g2 = getattr(self.recipe, "g2", None)
         self.file_witnesses = recipe is None  # injected synthetic recipes have no external data files
         self._cache_records = {record.key: record for record in producer.catalog.raw.catalog.episodes}
         if len(pickle.dumps(self.recipe, protocol=5)) > 64 * 1024**2:
@@ -202,12 +216,13 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
         self.closed = False
         self.last_cleanup = []
         self.active_rng = None
+        self._preview_next = True
         self.binding = self._binding()
 
     def _binding(self):
         catalog = self.producer.catalog
         raw = catalog.raw
-        return (
+        result = (
             catalog.manifest_digest,
             catalog.cache_corpus_digest,
             catalog.source_binding_digest,
@@ -216,6 +231,10 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
             raw.source_reader.source_binding_digest,
             self.producer.config_digest,
         )
+        if self.g2 is None:
+            return result
+        adapter = raw.g2_adapter
+        return (*result, adapter.recipe, adapter.provider.split_identity, adapter.provider.snapshot_identity)
 
     def _admit(self, plan, serial):
         self.sampler.jobs.extend(
@@ -242,8 +261,14 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
             paths.append(str(path))
         return _versions(paths)
 
+    def begin(self, plan, *, preview_next=True):
+        if type(preview_next) is not bool:
+            raise TypeError("async window preview selection must be boolean")
+        self._preview_next = preview_next
+        return super().begin(plan)
+
     def _begin(self, plan):
-        if self.closed or self.pending is not None or self.binding != self._binding():
+        if self.closed or self.sampler.final_window or self.pending is not None or self.binding != self._binding():
             raise RuntimeError("async loader closed, pending, or source identity changed")
         self.started = time.monotonic()
         self.active_rng = (
@@ -253,7 +278,7 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
         self.index = 0
         self.record_trace = self.serial < 3 or self.serial % 1000 == 0
         self.metrics = {
-            "schema": "nottt_async_loader_timing_v1",
+            "schema": "nottt_async_loader_timing_v1" if self.g2 is None else "g2_async_loader_timing_v1",
             "trainer_pid": os.getpid(),
             "worker_pids": [],
             "loader_profile": self.profile.async_identity(),
@@ -275,8 +300,12 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
                 raise ValueError("speculative plan differs from committed predecessor")
         else:
             self._admit(plan, self.serial)
-        self.preview = self.planner.plan_window(plan.candidate_frontier)
-        self._admit(self.preview, self.serial + 1)
+        if self._preview_next:
+            self.preview = self.planner.plan_window(plan.candidate_frontier)
+            self._admit(self.preview, self.serial + 1)
+        else:
+            self.preview = None
+            self.sampler.final_window = True
         self.pending = tuple(request for member in plan.members for request in member)
         if len(self.sampler.jobs) > 2 * self.planner.b_stream * self.planner.active_ga:
             raise RuntimeError("async preview metadata exceeded two-Window bound")
@@ -310,6 +339,8 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
             raise ValueError("async packet generation/window/token/PID/CFG mismatch")
         if result["file_versions"] != [list(row) for row in self._request_versions(request)]:
             raise ValueError("async prepared source/cache file changed before consumption")
+        if self.g2 is not None:
+            self._verify_g2_sources(result["g2_source_versions"])
         for event in result["events"]:
             key = {"cpu_source": "worker_source_ms_sum", "cpu_transform": "worker_transform_ms_sum"}.get(event["stage"])
             if key is None or event["pid"] != result["pid"] or not event["start"] <= event["end"]:
@@ -339,10 +370,13 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
             raise ValueError("async prepared Segment identity/consumer mismatch")
         # No speculative RNG state exists. This draw is exactly where the
         # synchronous producer's original tokenizer would have drawn it.
-        for payload in segment.consumer_payload[0]:
-            if payload is not None and self.recipe.rate > 0 and random.random() < self.recipe.rate:
-                payload[self.recipe.caption_key] = ""
-                payload[self.recipe.token_key] = empty_tokens.clone()
+        if self.g2 is not None:
+            self._select_g2_text(segment, empty_tokens)
+        else:
+            for payload in segment.consumer_payload[0]:
+                if payload is not None and self.recipe.rate > 0 and random.random() < self.recipe.rate:
+                    payload[self.recipe.caption_key] = ""
+                    payload[self.recipe.token_key] = empty_tokens.clone()
         self.metrics["main_decode_cfg_ms"] += (time.monotonic() - ready) * 1000
         if result["pid"] not in self.metrics["worker_pids"]:
             self.metrics["worker_pids"].append(result["pid"])
@@ -374,6 +408,60 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
         )
         self.index += 1
         return segment
+
+    def _select_g2_text(self, segment, empty):
+        payloads = [payload for payload in segment.consumer_payload[0] if payload is not None]
+        fields = {
+            "ai_caption",
+            "text_token_ids",
+            "text_attention_mask",
+            "text_position_ids",
+            "text_condition_identity",
+            "text_recipe_identity",
+            "text_dropout_applied",
+        }
+        if (
+            not isinstance(empty, dict)
+            or empty.keys() != fields
+            or empty["ai_caption"] != ""
+            or empty["text_dropout_applied"] is not True
+            or any(
+                payload.get("text_dropout_applied") is not False
+                or payload.get("text_recipe_identity") != empty["text_recipe_identity"]
+                or not payload.get("text_task_identity")
+                or not fields <= payload.keys()
+                for payload in payloads
+            )
+        ):
+            raise ValueError("async G2 packet has invalid conditioned/empty text fields")
+        for payload in payloads:
+            if self.recipe.rate > 0 and random.random() < self.recipe.rate:
+                payload.update(_cpu_tree(empty, clone=True))
+            if not self.recipe.compact:
+                # IPC uses a scalar proxy for zero pixels. If the dense path
+                # was requested, restore it before native collation/transfer.
+                video = payload["video"]
+                payload["video"] = video.new_zeros(video.shape)
+
+    @staticmethod
+    def _verify_g2_sources(rows):
+        if (
+            not isinstance(rows, list)
+            or not 0 < len(rows) <= 16 * 1024
+            or any(
+                not isinstance(row, list)
+                or len(row) != 6
+                or not isinstance(row[0], str)
+                or not Path(row[0]).is_absolute()
+                or any(type(value) is not int for value in row[1:])
+                for row in rows
+            )
+            or len({row[0] for row in rows}) != len(rows)
+        ):
+            raise ValueError("async G2 packet source witness is missing or malformed")
+        if any(Path(row[0]).resolve(strict=True) != Path(row[0]) for row in rows):
+            raise ValueError("async G2 source witness path is no longer canonical")
+        _check_versions(tuple(tuple(row) for row in rows))
 
     def _trace(self, event):
         if self.record_trace:

@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import torch
+from torch.profiler import record_function
 
 from cosmos_framework.data.generator.action.utils.json_formatter import ActionPromptJsonFormatter
 from cosmos_framework.data.generator.action.utils.transform_random import transform_draw
@@ -157,12 +158,25 @@ def prepare_static_task_text(
     """
     if type(dropout_applied) is not bool:
         raise TypeError("dropout_applied must be explicitly decided by the consumer")
-    serialized = "" if dropout_applied else serialize_static_task_prompt(task, recipe)
-    ids = processor.tokenize_text(
-        serialized,
-        is_video=False,
-        use_system_prompt=recipe.use_system_prompt,
-    )[: recipe.max_tokens]
+    with record_function("psm.g2.cap2_prompt"):
+        serialized = "" if dropout_applied else serialize_static_task_prompt(task, recipe)
+    result = _prepare_static_tokens(serialized, recipe, processor, dropout_applied)
+    result["text_task_identity"] = task.identity
+    return result
+
+
+def prepare_empty_static_task_text(recipe: StaticTaskTextRecipe, processor: Any) -> dict[str, Any]:
+    """Tokenize the fixed empty branch without synthesizing an episode identity."""
+    return _prepare_static_tokens("", recipe, processor, True)
+
+
+def _prepare_static_tokens(serialized, recipe, processor, dropout_applied):
+    with record_function("psm.g2.cap2_tokenizer"):
+        ids = processor.tokenize_text(
+            serialized,
+            is_video=False,
+            use_system_prompt=recipe.use_system_prompt,
+        )[: recipe.max_tokens]
     tokens = torch.tensor(ids, dtype=torch.long)
     if tokens.ndim != 1:
         raise ValueError("Cosmos tokenizer must emit one token sequence per consumer")
@@ -180,7 +194,6 @@ def prepare_static_task_text(
         "text_attention_mask": torch.ones_like(tokens, dtype=torch.bool),
         "text_position_ids": get_3d_mrope_ids_text_tokens(tokens.numel(), 0)[0],
         "text_condition_identity": condition_identity,
-        "text_task_identity": task.identity,
         "text_recipe_identity": recipe.identity,
         "text_dropout_applied": dropout_applied,
     }

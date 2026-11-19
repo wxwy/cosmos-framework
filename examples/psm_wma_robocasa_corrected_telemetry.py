@@ -18,7 +18,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import Any
 
@@ -53,6 +53,7 @@ CPU_TIMING_STAGES = (
     "backward",
     "optimizer",
 )
+DATA_PREPARE_SUBSTAGES = ("segment_raw", "segment_transform", "segment_ipc_and_cfg")
 GPU_TIMING_STAGES = frozenset(("batch_transfer", "local_scan", "forward", "backward", "optimizer"))
 # Events bracket CPU-only stages. They estimate training CUDA-stream gaps
 # while preparing data, NOT overall GPU-idle time or kernel utilization.
@@ -95,9 +96,10 @@ class GroupedPlanObserver:
         human_progress: bool = False,
         max_iter: int = 0,
     ) -> None:
-        if any(type(value) is not int or value < 0 for value in (
-            cuda_sample_interval, data_stall_sample_interval, parameter_norm_interval
-        )):
+        if any(
+            type(value) is not int or value < 0
+            for value in (cuda_sample_interval, data_stall_sample_interval, parameter_norm_interval)
+        ):
             raise ValueError("telemetry intervals must be non-negative integers")
         if type(audit_missing_gradients) is not bool:
             raise TypeError("audit_missing_gradients must be bool")
@@ -172,7 +174,17 @@ class GroupedPlanObserver:
 
     @contextmanager
     def time_stage(self, name: str) -> Iterator[None]:
-        """Time the CPU dispatch interval and optional current-stream CUDA events."""
+        """Time host dispatch and add stage labels to opt-in per-rank traces."""
+        marker = (
+            torch.profiler.record_function(f"PSM-V3/{name}")
+            if getattr(self, "torch_profiler_enabled", False)
+            else nullcontext()
+        )
+        with marker, self._time_stage(name):
+            yield
+
+    @contextmanager
+    def _time_stage(self, name: str) -> Iterator[None]:
         if self.rank != 0:
             yield
             return
@@ -221,8 +233,10 @@ class GroupedPlanObserver:
     def _weight_for_native_call(plan: Any, member: int, index: int | None, payloads: Any) -> float:
         if type(member) is not int or not 0 <= member < len(plan.members):
             raise ValueError("invalid grouped member")
-        denominator = plan.n_window if hasattr(plan, "n_window") else sum(
-            request.valid_count for group in plan.members for request in group
+        denominator = (
+            plan.n_window
+            if hasattr(plan, "n_window")
+            else sum(request.valid_count for group in plan.members for request in group)
         )
         if denominator <= 0:
             raise ValueError("empty grouped optimizer window")
@@ -511,7 +525,14 @@ class GroupedPlanObserver:
             except RuntimeError as exc:
                 self._errors.append(f"peak_memory:{type(exc).__name__}")
         stage = {f"{key}_ms": self._stage_ms.get(key) for key in CPU_TIMING_STAGES}
-        total_measured = sum(self._stage_ms.values())
+        stage.update(
+            {
+                f"{key}_ms": self._stage_ms[key]
+                for key in (*DATA_PREPARE_SUBSTAGES, "g2_effective_text")
+                if key in self._stage_ms
+            }
+        )
+        total_measured = sum(ms for key, ms in self._stage_ms.items() if key not in DATA_PREPARE_SUBSTAGES)
         step_wall_ms = wall_s * 1000.0 if wall_s is not None else None
         prefetcher = getattr(trainer, "_grouped_prefetcher", None)
         record: dict[str, Any] = {
