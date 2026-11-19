@@ -10,10 +10,12 @@ frontier owner or instantiated tokenizer in the serialized recipe.
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 import pickle
 import time
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
@@ -23,7 +25,7 @@ from typing import Any
 import torch
 
 
-def _known_pipeline(producer):
+def _known_pipeline(producer, *, g2=False):
     from cosmos_framework.data.generator.action.utils.cached_pixel_geometry import CachedGeometryResize
     from cosmos_framework.data.generator.action.utils.json_formatter import ActionPromptJsonFormatter
     from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline, VideoResize
@@ -46,6 +48,7 @@ def _known_pipeline(producer):
         or tokenizer.input_keys != [transform.caption_key]
         or len(tokenizer.output_keys) != 1
         or tokenizer.use_system_prompt
+        or (transform.static_task_text_recipe is not None) != g2
     ):
         raise ValueError("async No-TTT requires the known JSON ActionTransformPipeline and legacy CFG RNG")
     rate = tokenizer.cfg_dropout_rate
@@ -64,6 +67,17 @@ def _known_pipeline(producer):
     # every constructor-owned field rather than trusting copied kwargs alone.
     expected_kwargs = deepcopy(kwargs)
     expected_kwargs["tokenizer_config"] = None
+    static_recipe = expected_kwargs.pop("static_task_text_recipe", None)
+    if g2:
+        from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskTextRecipe
+
+        if (
+            not isinstance(static_recipe, dict)
+            or StaticTaskTextRecipe(**static_recipe) != transform.static_task_text_recipe
+            or transform.caption_key != "ai_caption"
+            or tokenizer.output_keys != ["text_token_ids"]
+        ):
+            raise ValueError("async G2 static text reconstruction differs from the parent")
     expected = ActionTransformPipeline(**expected_kwargs)
     for name in (
         "caption_key",
@@ -101,6 +115,52 @@ def _known_pipeline(producer):
 
 
 @dataclass(frozen=True)
+class G2WorkerBinding:
+    factory: str
+    kwargs: dict[str, Any]
+    recipe: Any
+    split_identity: str
+    snapshot_identity: str
+
+    @classmethod
+    def from_producer(cls, producer, factory, kwargs):
+        from cosmos_framework.data.generator.action.datasets.g2_training_adapter import G2TrainingDataAdapter
+
+        adapter = getattr(producer.catalog.raw, "g2_adapter", None)
+        if not isinstance(adapter, G2TrainingDataAdapter) or (
+            type(factory) is not str or factory.count(":") != 1 or type(kwargs) is not dict
+        ):
+            raise ValueError("async G2 requires verified provider reconstruction metadata")
+        provider = adapter.provider
+        if provider.evidence_scope != "verified_data_c" or not all(
+            isinstance(value, str) and value for value in (provider.split_identity, provider.snapshot_identity)
+        ):
+            raise ValueError("async G2 requires a sealed provider snapshot and split")
+        return cls(factory, deepcopy(kwargs), adapter.recipe, provider.split_identity, provider.snapshot_identity)
+
+    def build(self):
+        from cosmos_framework.data.generator.action.datasets.g2_training_adapter import G2TrainingDataAdapter
+
+        module, name = self.factory.split(":")
+        factory = getattr(importlib.import_module(module), name)
+        provider = factory(**self.kwargs, global_memory_enabled=self.recipe.global_config.enabled)
+        if (
+            provider.evidence_scope != "verified_data_c"
+            or provider.split_identity != self.split_identity
+            or provider.snapshot_identity != self.snapshot_identity
+        ):
+            raise ValueError("async G2 worker reconstructed a different provider snapshot/split")
+        return G2TrainingDataAdapter(provider, self.recipe)
+
+
+def _conditioned_static(transform, sample, resolution):
+    if "text_dropout_applied" in sample:
+        raise ValueError("async G2 worker received a preselected CFG branch")
+    sample["text_dropout_applied"] = False
+    return transform(sample, resolution)
+
+
+@dataclass(frozen=True)
 class AsyncRecipe:
     cache_root: str
     source_root: str
@@ -116,6 +176,7 @@ class AsyncRecipe:
     compact: bool
     workers: int
     max_cache_bytes: int
+    g2: G2WorkerBinding | None = None
 
     @property
     def rate(self):
@@ -130,14 +191,21 @@ class AsyncRecipe:
         return self.transform_kwargs.get("text_token_key", "text_token_ids")
 
     @classmethod
-    def from_producer(cls, producer, profile):
+    def from_producer(cls, producer, profile, *, g2_provider_factory=None, g2_provider_kwargs=None):
         from cosmos_framework.data.generator.action.datasets.robocasa_verified_index import VerifiedExactWindowIndex
         from cosmos_framework.data.generator.processors.nemotron3densevl_processor import Nemotron3DenseVLProcessor
 
         if profile.workers not in (1, 2, 4, 8):
             raise ValueError("async recipe requires positive No-TTT CPU workers")
-        wrapped, _, tokenizer, kwargs = _known_pipeline(producer)
         raw = producer.catalog.raw
+        uses_g2 = getattr(raw, "g2_adapter", None) is not None
+        if uses_g2:
+            g2 = G2WorkerBinding.from_producer(producer, g2_provider_factory, g2_provider_kwargs)
+        elif g2_provider_factory is not None or g2_provider_kwargs is not None:
+            raise ValueError("async G2 provider metadata without an actual G2 adapter")
+        else:
+            g2 = None
+        wrapped, _, tokenizer, kwargs = _known_pipeline(producer, g2=uses_g2)
         source = raw.source_reader
         index = getattr(source, "verified_index", None)
         if type(index) is not VerifiedExactWindowIndex:
@@ -188,6 +256,7 @@ class AsyncRecipe:
             raw.compact_cached_video,
             profile.workers,
             profile.max_cache_bytes,
+            g2,
         )
         if len(pickle.dumps(result, protocol=5)) > 1024**2:
             raise ValueError("async CPU recipe exceeds 1MiB metadata bound")
@@ -250,40 +319,65 @@ class AsyncRecipe:
         # by workers * max_cache_bytes and at most eight cached Episodes.
         reader = MappedEpisodeReader(catalog, max(1, 8 // self.workers), self.max_cache_bytes)
         source.cache_reader = reader
+        adapter = self.g2.build() if self.g2 is not None else None
         raw = RoboCasaExactWindowCachedDataset(
-            catalog, source, CorrectedRoboCasaPolicyContract.from_cache_catalog(catalog), cache_reader=reader
+            catalog,
+            source,
+            CorrectedRoboCasaPolicyContract.from_cache_catalog(catalog),
+            cache_reader=reader,
+            g2_adapter=adapter,
         )
         raw.compact_cached_video = self.compact
         kwargs = deepcopy(self.transform_kwargs)
         rate = kwargs["cfg_dropout_rate"]
-        kwargs["cfg_dropout_rate"] = 0.0
+        if self.g2 is None:
+            kwargs["cfg_dropout_rate"] = 0.0
         transform = ActionTransformPipeline(**kwargs)
         if self.compact:
             transform.video_resize = CachedGeometryResize(transform.video_resize, tuple(raw._canvas_geometry))
-        wrapped = ActionSFTDataset(raw, transform, resolution=None)
-        local = ExactWindowLocalCatalog(wrapped, ttt_tbptt_steps=self.ttt_steps)
+        wrapped = ActionSFTDataset(
+            raw, transform if self.g2 is None else partial(_conditioned_static, transform), resolution=None
+        )
+        local = ExactWindowLocalCatalog(
+            wrapped,
+            ttt_tbptt_steps=self.ttt_steps,
+            allowed_episode_keys=None if adapter is None else adapter.provider.train_episode_keys,
+        )
         producer = ExactWindowSegmentProducer(local, config_digest=self.config_digest)
-        return AsyncWorkerState(producer, rate=rate, cache_reader=reader)
+        return AsyncWorkerState(producer, rate=rate, cache_reader=reader, transform=transform)
 
 
 class AsyncWorkerState:
     """One worker's private deterministic reader/transform and bounded mmap cache."""
 
-    def __init__(self, producer, *, rate, cache_reader):
+    def __init__(self, producer, *, rate, cache_reader, transform=None):
         from cosmos_framework.data.generator.augmentors.text_tokenizer import _MAX_NUM_TOKENS
         from cosmos_framework.trainer.no_ttt_cpu_loader import _require_same_rng, _rng_snapshot
 
         self.producer, self.rate, self.cache_reader = producer, rate, cache_reader
-        transform = producer.catalog.wrapped_sft._transform
+        self.g2_source_versions = ()
+        if transform is None:
+            transform = producer.catalog.wrapped_sft._transform
         tokenizer = transform.text_tokenizer
-        if tokenizer.cfg_dropout_rate != 0:
+        recipe = getattr(transform, "static_task_text_recipe", None)
+        self.g2_provider = producer.catalog.raw.g2_adapter.provider if recipe is not None else None
+        if recipe is None and tokenizer.cfg_dropout_rate != 0:
             raise ValueError("worker must construct only the deterministic conditioned CFG branch")
         self.caption_key, self.token_key = tokenizer.input_keys[0], tokenizer.output_keys[0]
         before = _rng_snapshot()
-        tokens = tokenizer._processor.tokenize_text("", is_video=False, use_system_prompt=tokenizer.use_system_prompt)[
-            :_MAX_NUM_TOKENS
-        ]
-        self.empty_tokens = torch.tensor(tokens)
+        if recipe is None:
+            tokens = tokenizer._processor.tokenize_text(
+                "", is_video=False, use_system_prompt=tokenizer.use_system_prompt
+            )[:_MAX_NUM_TOKENS]
+            self.empty_tokens = torch.tensor(tokens)
+        else:
+            from cosmos_framework.data.generator.action.utils.static_task_text import (
+                prepare_empty_static_task_text,
+            )
+
+            # The dropped branch depends on the fixed recipe/tokenizer only.
+            # Preserve the actual consumer's task identity during selection.
+            self.empty_tokens = prepare_empty_static_task_text(recipe, tokenizer._processor)
         _require_same_rng(before)
 
     def prepare(self, request):
@@ -299,7 +393,12 @@ class AsyncWorkerState:
         events = []
         before = _rng_snapshot()
         started = time.monotonic()
-        prepared = self.producer.prepare(local_request)
+        capture = self.g2_provider.capture_prefetch_witnesses() if self.g2_provider is not None else nullcontext({})
+        with capture as witnesses:
+            prepared = self.producer.prepare(local_request)
+        self.g2_source_versions = tuple(
+            (str(path), *token) for path, token in sorted(witnesses.items(), key=lambda row: str(row[0]))
+        )
         events.append({"stage": "cpu_source", "start": started, "end": time.monotonic(), "pid": os.getpid()})
         _require_same_rng(before)
         started = time.monotonic()

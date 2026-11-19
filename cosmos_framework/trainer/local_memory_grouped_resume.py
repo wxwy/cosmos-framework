@@ -216,6 +216,9 @@ class GroupedLocalMemoryStateCallback(Callback):
         window = getattr(self.trainer, "_grouped_window", None)
         if window is None:
             raise RuntimeError("Local window 尚未建立；禁止零步 checkpoint")
+        loader = getattr(self.trainer, "_grouped_spawn_loader", None)
+        if loader is not None:
+            loader.checkpoint_boundary()
         local = snapshot_grouped_local_state(
             window,
             iteration=self.trainer._grouped_completed_iteration,

@@ -458,7 +458,13 @@ class ExactWindowSegmentProducer:
         return segment
 
     def produce(self, request: ExactWindowSegmentRequest) -> SegmentBatch:
-        return self.materialize(self.prepare(request))
+        telemetry = getattr(self, "_telemetry_stage", None)
+        if telemetry is None:
+            return self.materialize(self.prepare(request))
+        with telemetry("segment_raw"):
+            prepared = self.prepare(request)
+        with telemetry("segment_transform"):
+            return self.materialize(prepared)
 
 
 @dataclass(frozen=True)

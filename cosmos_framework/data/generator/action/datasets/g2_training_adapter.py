@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Protocol
 
 import torch
+from torch.profiler import record_function
 
 from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskText
 from cosmos_framework.model.generator.mot.g2_contracts import G2SampleIdentity, GlobalMemoryConfig, SpatialView
@@ -64,7 +65,8 @@ class G2TrainingDataAdapter:
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         task, episode, frame = (sample[key] for key in ("task_class", "episode_index", "start_frame"))
-        common = self.provider.read_common(task_class=task, episode_index=episode, decision_frame=frame)
+        with record_function("psm.g2.data_c_common"):
+            common = self.provider.read_common(task_class=task, episode_index=episode, decision_frame=frame)
         identity, text, state15 = (common[key] for key in ("identity", "static_task_text", "state15"))
         if isinstance(text, dict):
             text = StaticTaskText(**text)
@@ -113,9 +115,10 @@ class G2TrainingDataAdapter:
         result["g2_views"] = ()
         # R1 NEVER looks up the view method, opens a latent, or creates Reader.
         if self.recipe.global_config.enabled:
-            views = self.provider.read_selected_views(
-                identity, top_view_variant=self.recipe.global_config.top_view_variant
-            )
+            with record_function("psm.g2.data_c_selected_views"):
+                views = self.provider.read_selected_views(
+                    identity, top_view_variant=self.recipe.global_config.top_view_variant
+                )
             if not isinstance(views, tuple) or not views or not all(isinstance(view, SpatialView) for view in views):
                 raise ValueError("R2 provider must return selected actual SpatialView entries")
             ids = [view.identity.view_id for view in views]

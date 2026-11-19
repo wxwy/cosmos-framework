@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from contextlib import nullcontext
 from typing import Any
@@ -33,8 +34,10 @@ from cosmos_framework.trainer.local_memory_grouped_resume import (
     require_dcp_grouped_resume_component,
     restore_grouped_local_state,
 )
+from cosmos_framework.trainer.no_ttt_async_loader import NoTTTAsyncLoader
 from cosmos_framework.utils import misc
 from cosmos_framework.utils.generator.optimizer import OptimizersContainer
+from cosmos_framework.utils.no_ttt_loader_profile import LoaderProfile
 
 
 def collate_grouped_native_batch(payloads: tuple[dict[str, Any], ...]) -> dict[str, Any]:
@@ -105,6 +108,10 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         config_digest: str,
         num_workers: int = 0,
         full_segment_prefetch: bool = False,
+        spawn_loader_profile: LoaderProfile | None = None,
+        g2_provider_factory: str | None = None,
+        g2_provider_kwargs: dict[str, Any] | None = None,
+        spawn_stop_after_iteration: int | None = None,
     ) -> None:
         if type(num_workers) is not int or not 0 <= num_workers <= 16:
             raise ValueError("num_workers must be an integer in [0,16]")
@@ -129,6 +136,25 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             or producer.config_digest != config_digest
         ):
             raise ValueError("grouped catalog/B/GA/config_digest 与 trainer 不匹配")
+        if spawn_loader_profile is not None and (
+            not isinstance(spawn_loader_profile, LoaderProfile)
+            or not spawn_loader_profile.workers
+            or num_workers
+            or full_segment_prefetch
+            or producer.transform_rng_mode != "legacy_global"
+            or (planner.world_size, planner.active_ga, planner.b_stream, planner.catalog.ttt_tbptt_steps)
+            != (4, 4, 8, 16)
+            or getattr(planner.catalog.raw, "g2_adapter", None) is None
+        ):
+            raise ValueError("G2 Spawn requires a native legacy_global world4/GA4/B8/T16 stream")
+        if spawn_loader_profile is None and (g2_provider_factory is not None or g2_provider_kwargs is not None):
+            raise ValueError("G2 worker provider settings require a Spawn loader")
+        if spawn_stop_after_iteration is not None and (
+            spawn_loader_profile is None
+            or type(spawn_stop_after_iteration) is not int
+            or spawn_stop_after_iteration < 1
+        ):
+            raise ValueError("Spawn final optimizer iteration must be a positive integer")
         if not hasattr(self.callbacks, "_callbacks") or any(
             getattr(callback, "checkpoint_component", None) == "dataloader" for callback in self.callbacks._callbacks
         ):
@@ -136,6 +162,18 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         self._grouped_planner, self._grouped_producer = planner, producer
         self._grouped_num_workers = num_workers
         self._grouped_full_segment_prefetch = full_segment_prefetch
+        self._grouped_spawn_stop_after = spawn_stop_after_iteration
+        self._grouped_spawn_loader = (
+            NoTTTAsyncLoader(
+                producer,
+                spawn_loader_profile,
+                planner,
+                g2_provider_factory=g2_provider_factory,
+                g2_provider_kwargs=g2_provider_kwargs,
+            )
+            if spawn_loader_profile is not None
+            else None
+        )
         self._grouped_prefetcher = (
             AsyncExactWindowFullSegmentPrefetcher(producer)
             if full_segment_prefetch
@@ -162,6 +200,9 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             prefetcher = getattr(self, "_grouped_prefetcher", None)
             if prefetcher is not None:
                 prefetcher.close()
+            spawn_loader = getattr(self, "_grouped_spawn_loader", None)
+            if spawn_loader is not None:
+                spawn_loader.close()
 
     @staticmethod
     def _optimizer_parameters(optimizer: Any) -> list[torch.Tensor]:
@@ -260,7 +301,9 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
         window = self._grouped_window
         # Observational context manager only; not part of DCP or Local live state.
         window._telemetry_stage = self._telemetry_stage
+        self._grouped_producer._telemetry_stage = self._telemetry_stage
         prefetcher = getattr(self, "_grouped_prefetcher", None)
+        spawn_loader = getattr(self, "_grouped_spawn_loader", None)
         if grad_accum_iter == 0:
             if hasattr(self, "_g2_stage_controller"):
                 if self._g2_stage_controller.completed_steps != iteration:
@@ -302,19 +345,20 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                     from cosmos_framework.data.generator.action.utils.static_task_text import effective_text_batch
                     from cosmos_framework.model.generator.mot.g2_contracts import G2ConditionBatch
 
-                    batch["g2_condition"] = G2ConditionBatch(
-                        text=effective_text_batch(
-                            payloads,
-                            self._g2_text_recipe,
-                            special_tokens=model.llm_special_tokens,
-                            use_float_positions=getattr(
-                                getattr(model.config, "diffusion_expert_config", model.config),
-                                "enable_fps_modulation",
-                                False,
+                    with self._telemetry_stage("g2_effective_text"):
+                        batch["g2_condition"] = G2ConditionBatch(
+                            text=effective_text_batch(
+                                payloads,
+                                self._g2_text_recipe,
+                                special_tokens=model.llm_special_tokens,
+                                use_float_positions=getattr(
+                                    getattr(model.config, "diffusion_expert_config", model.config),
+                                    "enable_fps_modulation",
+                                    False,
+                                ),
                             ),
-                        ),
-                        views=tuple(views if views else None for views in batch["g2_views"]),
-                    )
+                            views=tuple(views if views else None for views in batch["g2_views"]),
+                        )
             self.callbacks.on_before_forward(iteration=iteration)
             with self._telemetry_stage("forward"):
                 with self.training_timer("forward"):
@@ -395,15 +439,25 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                         # one pending member; abort drains without publication.
                         next_plan = self._grouped_planner.plan_window(window.plan.candidate_frontier)
                         prefetcher.schedule(next_plan.members[0])
+                elif spawn_loader is not None:
+                    with self._telemetry_stage("segment_ipc_and_cfg"):
+                        if grad_accum_iter == 0:
+                            stop = self._grouped_spawn_stop_after
+                            if stop is not None and iteration >= stop:
+                                raise ValueError("Spawn execution exceeded its fixed final optimizer iteration")
+                            spawn_loader.begin(window.plan, preview_next=stop is None or iteration + 1 < stop)
+                        segments = tuple(spawn_loader.materialize(request) for request in requests)
                 elif prefetcher is None:
                     segments = tuple(self._grouped_producer.produce(request) for request in requests)
                 else:
-                    prepared = (
-                        tuple(self._grouped_producer.prepare(request) for request in requests)
-                        if grad_accum_iter == 0
-                        else prefetcher.load_member(requests)
-                    )
-                    segments = tuple(self._grouped_producer.materialize(item) for item in prepared)
+                    with self._telemetry_stage("segment_raw"):
+                        prepared = (
+                            tuple(self._grouped_producer.prepare(request) for request in requests)
+                            if grad_accum_iter == 0
+                            else prefetcher.load_member(requests)
+                        )
+                    with self._telemetry_stage("segment_transform"):
+                        segments = tuple(self._grouped_producer.materialize(item) for item in prepared)
                     if grad_accum_iter + 1 < active_ga:
                         prefetcher.schedule(window.plan.members[grad_accum_iter + 1])
             member_loss = window.run_member(segments, native_loss, backward)
@@ -433,6 +487,17 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                     return self._optimizer_step_success(optimizer, scheduler, grad_scaler)
 
             window.finish(observed_optimizer_step)
+            if spawn_loader is not None:
+                loader_metrics = spawn_loader.finish()
+                loader_metrics.update(iteration=iteration + 1, rank=self._grouped_planner.rank)
+                try:
+                    emit = getattr(self, "cpu_loader_observer", None)
+                    if emit is not None:
+                        emit(loader_metrics)
+                    else:
+                        print("[G2][cpu_loader] " + json.dumps(loader_metrics, sort_keys=True), flush=True)
+                except Exception:
+                    pass  # Passive post-commit telemetry.
             self._observe_grouped("post_commit", iteration=iteration, member=grad_accum_iter)
             self._grouped_completed_iteration = iteration + 1
             self.callbacks.on_before_zero_grad(model, optimizer, scheduler, iteration=iteration)
@@ -449,4 +514,6 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
             if prefetcher is not None:
                 prefetcher.abort()
             window.abort()
+            if spawn_loader is not None:
+                spawn_loader.close()
             raise
