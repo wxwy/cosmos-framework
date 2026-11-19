@@ -12,6 +12,7 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_
 from cosmos_framework.checkpoint.dcp import CustomLoadPlanner, SafeLocalDistributedCheckpointer
 from cosmos_framework.checkpoint.g2_warm_start import G2ModelOnlyCheckpointer
 from cosmos_framework.trainer.g2_training_test import TinyPolicy, equal_tree
+from cosmos_framework.utils.config import CheckpointConfig
 
 
 @pytest.mark.parametrize("damage", [None, "missing_local", "shape"])
@@ -30,7 +31,9 @@ def test_actual_cpu_dcp_model_only_global_allowlist_and_local_inheritance(tmp_pa
     )
     checkpointer = object.__new__(G2ModelOnlyCheckpointer)
     checkpointer.load_training_state = False
-    checkpointer.config_checkpoint = SimpleNamespace(keys_to_skip_loading=["net_ema.", "local_memory"])
+    original_config = CheckpointConfig(keys_to_skip_loading=["net_ema.", "local_memory"])
+    original_config.freeze()  # Trainer freezes configs before actual Phase5 load.
+    checkpointer.config_checkpoint = original_config
     checkpointer.keys_to_resume_during_load = lambda: ({"model"}, SimpleNamespace(path=str(tmp_path), warm_start=True))
     checkpointer.get_storage_reader = lambda path, source: dcp.FileSystemReader(path)
     checkpointer._checked = lambda label, operation: operation()
@@ -58,9 +61,16 @@ def test_actual_cpu_dcp_model_only_global_allowlist_and_local_inheritance(tmp_pa
         with pytest.raises(ValueError, match="inventory mismatch"):
             checkpointer.load(destination)
         assert not called
+        assert checkpointer.config_checkpoint is original_config
     else:
         assert checkpointer.load(destination) == 0
+        assert checkpointer.config_checkpoint is not original_config
+        assert checkpointer.config_checkpoint._is_frozen is True
+        with pytest.raises(AttributeError, match="Cannot modify frozen"):
+            checkpointer.config_checkpoint.keys_to_skip_loading = ["unsafe"]
         for name, value in source.items():
             equal_tree(value, destination.state_dict()[name])
         assert "local_memory" not in checkpointer.keys_to_skip_loading
         assert checkpointer.g2_warm_start_report["local_loaded_names"]
+    assert original_config.keys_to_skip_loading == ["net_ema.", "local_memory"]
+    assert original_config._is_frozen is True
