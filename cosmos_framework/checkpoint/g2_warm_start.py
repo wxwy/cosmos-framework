@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+import attrs
 import torch
 from torch import nn
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
@@ -105,7 +106,13 @@ class G2ModelOnlyCheckpointer(SafeLocalDistributedCheckpointer):
                 return report, skips
 
             report, skips = self._checked("G2 validate G1 model-only inventory", validate)
-            self.config_checkpoint.keys_to_skip_loading = skips
+            # Trainer freezes the shared CheckpointConfig before DCP load.
+            # Evolve a private copy for the exact Global skip names rather than
+            # mutating (or unfreezing) the canonical frozen training config.
+            checkpoint_config = attrs.evolve(self.config_checkpoint, keys_to_skip_loading=skips)
+            if getattr(self.config_checkpoint, "_is_frozen", False):
+                checkpoint_config.freeze()
+            self.config_checkpoint = checkpoint_config
             self.keys_to_skip_loading = skips
             self.g2_warm_start_report = report
         return super().load(model, optimizer, scheduler, grad_scaler)
