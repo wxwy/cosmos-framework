@@ -459,6 +459,8 @@ class NoTTTAsyncLoader(NoTTTCpuLoader):
             or len({row[0] for row in rows}) != len(rows)
         ):
             raise ValueError("async G2 packet source witness is missing or malformed")
+        if any(Path(row[0]).resolve(strict=True) != Path(row[0]) for row in rows):
+            raise ValueError("async G2 source witness path is no longer canonical")
         _check_versions(tuple(tuple(row) for row in rows))
 
     def _trace(self, event):

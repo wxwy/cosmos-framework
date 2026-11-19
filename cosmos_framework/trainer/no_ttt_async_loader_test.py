@@ -552,3 +552,18 @@ def test_out_of_order_worker_completion_never_changes_consumer_rng_order(tmp_pat
         assert len(actual[4][0]["worker_pids"]) == 2
     finally:
         loader.close()
+
+
+def test_g2_source_parent_symlink_rejected_even_with_identical_leaf_stat(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    path = source_dir / "projection.json"
+    path.write_bytes(b"same")
+    info = path.stat()
+    witnessed = [[str(path), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]]
+    relocated = tmp_path / "relocated"
+    source_dir.rename(relocated)
+    source_dir.symlink_to(relocated, target_is_directory=True)
+    assert path.stat().st_ino == info.st_ino
+    with pytest.raises(ValueError, match="no longer canonical"):
+        NoTTTAsyncLoader._verify_g2_sources(witnessed)
