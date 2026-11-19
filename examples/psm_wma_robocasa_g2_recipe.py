@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 import yaml
+from omegaconf import OmegaConf
 from torch.distributed.tensor import DTensor
 
 from cosmos_framework.checkpoint.g2_warm_start import G2ModelOnlyCheckpointer
@@ -163,7 +164,18 @@ class G2RunRecipe:
                 setattr(model, name, value)
         if "rectified_flow_training_config" not in saved["model"]["config"]:
             raise ValueError("G1 loss/sampling recipe must be explicit in the verified config snapshot")
-        model.rectified_flow_training_config = saved["model"]["config"]["rectified_flow_training_config"]
+        # The native OmniMoT field is a structured RectifiedFlowTrainingConfig.
+        # Assigning the G1 YAML dict directly fails OmegaConf type validation.
+        # Merge into the field's existing typed schema, preserving its class
+        # and all G1 loss/sampling values without altering the recipe.
+        flow = saved["model"]["config"]["rectified_flow_training_config"]
+        if OmegaConf.is_config(model):
+            model.rectified_flow_training_config = OmegaConf.merge(
+                model.rectified_flow_training_config, flow
+            )
+        else:
+            # The existing CPU-only lightweight fixture is a SimpleNamespace.
+            model.rectified_flow_training_config = flow
         # B owns these model configuration fields and must publish them with
         # its core candidate. No silent insertion into an old model schema.
         if not hasattr(model, "global_memory_enabled") or not hasattr(model, "global_memory_config"):
