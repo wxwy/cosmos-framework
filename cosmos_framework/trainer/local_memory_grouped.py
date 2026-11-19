@@ -336,6 +336,25 @@ class GroupedLocalMemoryTrainer(ImaginaireTrainer):
                 payloads=payloads,
                 packed_positions=positions,
             )
+            # One read-only rank-local report, sourced from the *actual*
+            # transformed inputs that just passed the native model forward.
+            # The writer owns no model, RNG, optimizer or DCP state. A missing
+            # required G2 input is a hard error rather than a silent fallback.
+            if g2_controller is not None and iteration == 0 and grad_accum_iter == 0:
+                from cosmos_framework.trainer.g2_input_witness import (
+                    append_g2_input_witness,
+                    inspect_native_g2_inputs,
+                )
+
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                report = inspect_native_g2_inputs(
+                    payloads,
+                    batch["g2_condition"],
+                    profile=g2_controller.plan.profile,
+                    iteration=iteration + 1,
+                    rank=rank,
+                )
+                append_g2_input_witness(self.g2_evidence_dir / "monitor", report, rank=rank)
             self.callbacks.on_after_forward(iteration=iteration)
             return loss
 
