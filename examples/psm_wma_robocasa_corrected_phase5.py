@@ -626,7 +626,10 @@ class JobLifecycle:
                 "native_batch_layout": NATIVE_BATCH_LAYOUT,
                 "semantic": semantic,
                 "semantic_digest": _json_digest(semantic),
-                "diagnostic_only_do_not_resume": self.args.stop_after_iter is not None,
+                "diagnostic_only_do_not_resume": (
+                    self.args.stop_after_iter is not None
+                    or getattr(self.args, "g2_benchmark_steps", None) is not None
+                ),
                 "canonical_config_sha256": {
                     name: _file_sha256(self.path / name) for name in ("config.pkl", "config.yaml")
                 },
@@ -1055,6 +1058,25 @@ def _execution_stop_iteration(args: argparse.Namespace) -> int:
     """Bound execution only; preserve the configured training/scheduler horizon."""
     stop_after = getattr(args, "stop_after_iter", None)
     formal_until = getattr(args, "formal_execution_until", None)
+    g2_benchmark = getattr(args, "g2_benchmark_steps", None)
+    if g2_benchmark is not None:
+        recipe = _g2_recipe(args)
+        if (
+            recipe is None
+            or args.phase != "fresh"
+            or stop_after is not None
+            or formal_until is not None
+            or getattr(args, "audit_missing_grads", False)
+            or type(g2_benchmark) is not int
+            or g2_benchmark != 10
+            or (args.max_iter, args.warmup, args.save_iter) != (30000, 0, 100)
+            or not args.job_name.startswith(recipe.training.profile.lower() + "_g2_bench_")
+        ):
+            raise ValueError("G2 benchmark requires fresh isolated profile-specific job, 10 steps, 30000/0/100")
+        namespace = job_namespace(args)
+        if namespace.exists() or namespace.is_symlink():
+            raise FileExistsError("G2 benchmark requires a new job namespace")
+        return g2_benchmark
     if formal_until is not None:
         if (
             stop_after is not None
@@ -1222,7 +1244,11 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         "transform_rng_mode": getattr(args, "transform_rng_mode", "legacy_global"),
         "full_segment_prefetch": getattr(args, "full_segment_prefetch", False),
         "execution_stop_after_iter": execution_stop,
-        "execution_scope": "bounded_diagnostic" if getattr(args, "stop_after_iter", None) is not None else "formal",
+        "execution_scope": (
+            "g2_benchmark_diagnostic" if getattr(args, "g2_benchmark_steps", None) is not None
+            else "bounded_diagnostic" if getattr(args, "stop_after_iter", None) is not None
+            else "formal"
+        ),
         "cache_manifest_sha256": catalog.manifest_digest,
         "cache_corpus_digest": catalog.cache_corpus_digest,
         "source_binding_digest": catalog.source_binding_digest,
@@ -1360,6 +1386,12 @@ def parser() -> argparse.ArgumentParser:
     ):
         result.add_argument(f"--{name}", type=int, default=default)
     result.add_argument(
+        "--g2-benchmark-steps",
+        type=int,
+        default=None,
+        help="G2 ONLY: fresh isolated 10-step diagnostic with frozen 30000-step recipe; never formal/Resume",
+    )
+    result.add_argument(
         "--stop-after-iter",
         type=int,
         default=None,
@@ -1429,7 +1461,9 @@ def main(argv: list[str] | None = None) -> None:
         full_segment_prefetch=report["full_segment_prefetch"],
         **({"loader_profile": profile_from_args(args)} if profile_from_args(args).workers else {}),
     )
-    sample_interval = _telemetry_sample_interval(getattr(args, "stop_after_iter", None))
+    sample_interval = _telemetry_sample_interval(
+        getattr(args, "g2_benchmark_steps", None) or getattr(args, "stop_after_iter", None)
+    )
     journal = (
         TelemetryJournal(args.output_root / "psm_wma_v3" / "corrected_phase5" / args.job_name, rank=0)
         if rank == 0
@@ -1488,7 +1522,10 @@ def main(argv: list[str] | None = None) -> None:
                 sort_keys=True,
             )
         )
-    if rank == 0 and getattr(args, "stop_after_iter", None) is not None:
+    if rank == 0 and (
+        getattr(args, "stop_after_iter", None) is not None
+        or getattr(args, "g2_benchmark_steps", None) is not None
+    ):
         print(
             "[CorrectedV3][bounded_stop] "
             + json.dumps(
