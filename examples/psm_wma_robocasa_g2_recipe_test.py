@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
+from omegaconf import OmegaConf
 
 from cosmos_framework.data.generator.action.utils.static_task_text_test import recipe_fixture
 from cosmos_framework.model.generator.mot.g2_contracts import GlobalMemoryConfig
@@ -117,6 +118,37 @@ def test_overlay_preserves_g1_local_loss_and_optimizer_low_level_settings(tmp_pa
     assert config.optimizer.betas == [0.91, 0.99] and config.optimizer.weight_decay == 0.07
     assert "local_memory" not in config.optimizer.keys_to_select
     assert config.checkpoint.keys_to_skip_loading == ["net_ema."]
+    assert model.global_memory_enabled is True
+    assert config.optimizer.lr == 1e-5
+
+
+def test_overlay_preserves_structured_rectified_flow_type_and_g1_loss(tmp_path):
+    from cosmos_framework.configs.base.defaults.model_config import (
+        RectifiedFlowTrainingConfig,
+    )
+
+    recipe = run_recipe_fixture(tmp_path)
+    model = OmegaConf.create(
+        {
+            "global_memory_enabled": False,
+            "global_memory_config": {},
+            "g2_text_enabled": False,
+            "global_memory_top_variant": "with_robot",
+            "rectified_flow_training_config": OmegaConf.structured(RectifiedFlowTrainingConfig),
+        }
+    )
+    assert OmegaConf.get_type(model.rectified_flow_training_config) is RectifiedFlowTrainingConfig
+    config = SimpleNamespace(
+        model=SimpleNamespace(config=model),
+        optimizer=SimpleNamespace(),
+        trainer=SimpleNamespace(),
+        checkpoint=SimpleNamespace(load_training_state=False),
+    )
+    recipe.overlay(config)
+    assert OmegaConf.get_type(model.rectified_flow_training_config) is RectifiedFlowTrainingConfig
+    assert model.rectified_flow_training_config.loss_scale == 10.0
+    assert model.rectified_flow_training_config.action_loss_weight == 10.0
+    assert model.rectified_flow_training_config.image_loss_scale is None
     assert model.global_memory_enabled is True
     assert config.optimizer.lr == 1e-5
 
