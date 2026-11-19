@@ -246,11 +246,12 @@ def test_g2_episode_static_token_cache_preserves_native_outputs_cfg_rng_and_clon
     from types import SimpleNamespace
 
     import torch
-    from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
+
     from cosmos_framework.data.generator.action.utils.static_task_text import (
         prepare_static_task_text,
         resolve_consumer_text_dropout,
     )
+    from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
 
     class Processor:
         def __init__(self):
@@ -301,6 +302,7 @@ def test_g2_static_text_cache_has_bounded_lru():
     from collections import OrderedDict
     from dataclasses import replace
     from types import SimpleNamespace
+
     from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
 
     class Processor:

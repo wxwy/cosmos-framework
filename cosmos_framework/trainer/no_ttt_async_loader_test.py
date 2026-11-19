@@ -74,7 +74,9 @@ def test_g2_packet_detects_drift_before_parent_consumption(tmp_path):
     path.write_bytes(b"original view")
     witnessed = [list(row) for row in _versions([path])]
     NoTTTAsyncLoader._verify_g2_sources(witnessed)
-    path.write_bytes(b"changed  view")
+    replacement = tmp_path / "replacement.pt"
+    replacement.write_bytes(b"changed  view")
+    replacement.replace(path)
     with pytest.raises(ValueError, match="changed before consumption"):
         NoTTTAsyncLoader._verify_g2_sources(witnessed)
     with pytest.raises(ValueError, match="missing or malformed"):
