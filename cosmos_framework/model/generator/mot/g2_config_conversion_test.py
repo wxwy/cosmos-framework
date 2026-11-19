@@ -29,9 +29,7 @@ def test_native_phase5_dictconfig_has_only_public_memory_fields(enabled):
         }
     )
     assert "_metadata" in vars(given)  # Original vars(DictConfig) bug is real.
-    config = Cosmos3VFMNetworkConfig(
-        global_memory_enabled=enabled, global_memory_config=given
-    )
+    config = Cosmos3VFMNetworkConfig(global_memory_enabled=enabled, global_memory_config=given)
     assert config.global_memory_config == OmegaConf.to_container(given, resolve=True)
     assert config.global_memory_config["enabled"] is enabled
     assert "_metadata" not in config.global_memory_config
@@ -43,9 +41,7 @@ def test_plain_dict_dataclass_and_none_contracts_are_preserved():
         dict(expected),
         GlobalMemoryConfig(enabled=True, top_view_variant="with_robot"),
     ):
-        config = Cosmos3VFMNetworkConfig(
-            global_memory_enabled=True, global_memory_config=value
-        )
+        config = Cosmos3VFMNetworkConfig(global_memory_enabled=True, global_memory_config=value)
         assert config.global_memory_config == expected
     default = Cosmos3VFMNetworkConfig(global_memory_enabled=False)
     assert default.global_memory_config == vars(GlobalMemoryConfig())
