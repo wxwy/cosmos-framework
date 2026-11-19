@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import List, Tuple
 
 import torch
+from omegaconf import OmegaConf
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
@@ -136,13 +137,21 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         self.vision_gen = vision_gen
         self.g2_text_enabled = g2_text_enabled or global_memory_enabled
         self.global_memory_enabled = global_memory_enabled
-        memory_options = (
-            dict(global_memory_config)
-            if isinstance(global_memory_config, dict)
-            else vars(global_memory_config)
-            if global_memory_config is not None
-            else {"top_view_variant": global_memory_top_variant}
-        )
+        # Native Phase5 passes OmegaConf DictConfig; vars(DictConfig) exposes
+        # implementation internals (_metadata/_content), not recipe fields.
+        # Normalize the public mapping before strict GlobalMemoryConfig validation.
+        if global_memory_config is None:
+            memory_options = {"top_view_variant": global_memory_top_variant}
+        elif OmegaConf.is_config(global_memory_config):
+            memory_options = OmegaConf.to_container(global_memory_config, resolve=True)
+            if not isinstance(memory_options, dict):
+                raise TypeError("GlobalMemoryConfig must be a mapping")
+        elif isinstance(global_memory_config, Mapping):
+            memory_options = dict(global_memory_config)
+        elif isinstance(global_memory_config, GlobalMemoryConfig):
+            memory_options = vars(global_memory_config).copy()
+        else:
+            raise TypeError("GlobalMemoryConfig must be a mapping or GlobalMemoryConfig")
         if "enabled" in memory_options and memory_options["enabled"] != global_memory_enabled:
             raise ValueError("Global flag and GlobalMemoryConfig.enabled disagree")
         memory_options["enabled"] = global_memory_enabled
