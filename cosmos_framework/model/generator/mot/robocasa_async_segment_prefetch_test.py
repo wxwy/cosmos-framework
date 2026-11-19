@@ -166,3 +166,70 @@ def test_async_close_rejects_future_work() -> None:
     prefetcher.close()
     with pytest.raises(RuntimeError, match="closed"):
         prefetcher.schedule((_request(catalog),))
+
+def test_g2_raw_worker_forks_shared_provider_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Eight-slot G2 provider must not share OrderedDict LRUs across threads."""
+    from threading import Barrier
+    from types import SimpleNamespace
+
+    from cosmos_framework.data.generator.action.datasets.g2_training_adapter import G2TrainingDataAdapter
+
+    raw, _, catalog, producer = _setup((17, 17), t=16)
+    made = []
+
+    class Provider:
+        identity = "g2-certified"
+        evidence_scope = "verified_data_c"
+
+        def fork_for_worker(self):
+            copy = Provider()
+            made.append(copy)
+            return copy
+
+    shared = Provider()
+    raw.g2_adapter = G2TrainingDataAdapter(shared, SimpleNamespace(data_identity=shared.identity))
+    requests = (
+        _request(catalog, cursor=0, episode_index=0, slot=0),
+        _request(catalog, cursor=0, episode_index=1, slot=1),
+    )
+    orig = producer.prepare
+    barrier = Barrier(2)
+    observed = []
+
+    def check(request, *, raw_getter=None):
+        assert raw_getter is not None
+        worker_adapter = raw_getter.__self__.g2_adapter
+        assert worker_adapter is not raw.g2_adapter
+        assert worker_adapter.provider is not shared
+        observed.append(worker_adapter.provider)
+        barrier.wait(timeout=5)
+        return orig(request, raw_getter=raw_getter)
+
+    monkeypatch.setattr(producer, "prepare", check)
+    prefetch = AsyncExactWindowRawPrefetcher(producer, num_workers=2)
+    try:
+        prefetch.reset_iteration()
+        prefetch.schedule(requests)
+        prepared = prefetch.load_member(requests)
+        assert len(prepared) == 2
+        assert len(made) == 2 and made[0] is not made[1]
+        assert set(observed) == set(made)
+    finally:
+        prefetch.close()
+
+
+def test_g2_raw_worker_rejects_nonforkable_provider() -> None:
+    from types import SimpleNamespace
+    from cosmos_framework.data.generator.action.datasets.g2_training_adapter import G2TrainingDataAdapter
+
+    raw, _, catalog, producer = _setup((17,), t=16)
+    bad = SimpleNamespace(identity="g2", evidence_scope="verified_data_c")
+    raw.g2_adapter = G2TrainingDataAdapter(bad, SimpleNamespace(data_identity="g2"))
+    prefetch = AsyncExactWindowRawPrefetcher(producer, num_workers=1)
+    try:
+        prefetch.reset_iteration()
+        prefetch.schedule((_request(catalog),))
+        with pytest.raises(RuntimeError, match="isolate its caches"):
+            prefetch.load_member((_request(catalog),))
+    finally:
+        prefetch.close()

@@ -54,6 +54,21 @@ class AsyncExactWindowRawPrefetcher(OrderedMemberPrefetch[ExactWindowSegmentRequ
         raw = copy.copy(original)
         raw.source_reader = source
         raw.cache_reader = shared or RoboCasaExactWindowEpisodeReader(original.catalog, max_cached_episodes=2)
+        adapter = getattr(original, "g2_adapter", None)
+        if adapter is not None:
+            # G2 SourceReader/cache can run concurrently in a raw Worker.
+            # The DATA_C provider owns episode, language and ViewReader LRUs:
+            # these may not be shared between the main trainer and workers.
+            # Only immutable recipe/receipt metadata is shared.
+            from cosmos_framework.data.generator.action.datasets.g2_training_adapter import G2TrainingDataAdapter
+
+            if not isinstance(adapter, G2TrainingDataAdapter):
+                raise TypeError("G2 async requires a typed G2TrainingDataAdapter")
+            provider = adapter.provider
+            fork = getattr(provider, "fork_for_worker", None)
+            if not callable(fork):
+                raise RuntimeError("G2 DATA_C provider must isolate its caches per async worker")
+            raw.g2_adapter = G2TrainingDataAdapter(fork(), adapter.recipe)
         self._threads.raw = raw
         return raw
 
