@@ -18,7 +18,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import Any
 
@@ -172,7 +172,17 @@ class GroupedPlanObserver:
 
     @contextmanager
     def time_stage(self, name: str) -> Iterator[None]:
-        """Time the CPU dispatch interval and optional current-stream CUDA events."""
+        """Time host dispatch and add stage labels to opt-in per-rank traces."""
+        marker = (
+            torch.profiler.record_function(f"PSM-V3/{name}")
+            if getattr(self, "torch_profiler_enabled", False)
+            else nullcontext()
+        )
+        with marker, self._time_stage(name):
+            yield
+
+    @contextmanager
+    def _time_stage(self, name: str) -> Iterator[None]:
         if self.rank != 0:
             yield
             return
