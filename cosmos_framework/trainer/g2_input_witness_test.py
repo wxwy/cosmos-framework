@@ -84,6 +84,7 @@ def test_native_witness_rejects_dropped_nonempty_and_bad_state15():
         inspect_native_g2_inputs(items,condition,profile="R1",iteration=1,rank=0)
     items,condition=_case("R1")
     items[0]["action_raw"][0,3:5]=0
+    items[0]["action"][0,3:5]=0
     with pytest.raises(ValueError,match="Pose5"):
         inspect_native_g2_inputs(items,condition,profile="R1",iteration=1,rank=0)
 
