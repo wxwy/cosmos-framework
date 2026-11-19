@@ -170,9 +170,7 @@ class G2RunRecipe:
         # and all G1 loss/sampling values without altering the recipe.
         flow = saved["model"]["config"]["rectified_flow_training_config"]
         if OmegaConf.is_config(model):
-            model.rectified_flow_training_config = OmegaConf.merge(
-                model.rectified_flow_training_config, flow
-            )
+            model.rectified_flow_training_config = OmegaConf.merge(model.rectified_flow_training_config, flow)
         else:
             # The existing CPU-only lightweight fixture is a SimpleNamespace.
             model.rectified_flow_training_config = flow
