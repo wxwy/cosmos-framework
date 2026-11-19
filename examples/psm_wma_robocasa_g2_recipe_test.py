@@ -134,9 +134,7 @@ def test_overlay_preserves_structured_rectified_flow_type_and_g1_loss(tmp_path):
             "global_memory_config": {},
             "g2_text_enabled": False,
             "global_memory_top_variant": "with_robot",
-            "rectified_flow_training_config": OmegaConf.structured(
-                RectifiedFlowTrainingConfig
-            ),
+            "rectified_flow_training_config": OmegaConf.structured(RectifiedFlowTrainingConfig),
         }
     )
     assert OmegaConf.get_type(model.rectified_flow_training_config) is RectifiedFlowTrainingConfig
