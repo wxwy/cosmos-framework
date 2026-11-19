@@ -248,12 +248,14 @@ def test_g2_episode_static_token_cache_preserves_native_outputs_cfg_rng_and_clon
     import torch
     from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
     from cosmos_framework.data.generator.action.utils.static_task_text import (
-        prepare_static_task_text, resolve_consumer_text_dropout,
+        prepare_static_task_text,
+        resolve_consumer_text_dropout,
     )
 
     class Processor:
         def __init__(self):
             self.calls = 0
+
         def tokenize_text(self, text, **kwargs):
             self.calls += 1
             return [7, len(text) % 101, 8]
@@ -282,7 +284,7 @@ def test_g2_episode_static_token_cache_preserves_native_outputs_cfg_rng_and_clon
     assert rng_cached == rng_original
     assert 1 <= live.calls <= 2
     assert reference.calls == 60
-    for a,b in zip(cached_rows, uncached_rows, strict=True):
+    for a, b in zip(cached_rows, uncached_rows, strict=True):
         assert a.keys() == b.keys()
         for k in a:
             if isinstance(a[k], torch.Tensor):

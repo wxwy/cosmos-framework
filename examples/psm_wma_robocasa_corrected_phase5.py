@@ -630,8 +630,7 @@ class JobLifecycle:
                 "semantic": semantic,
                 "semantic_digest": _json_digest(semantic),
                 "diagnostic_only_do_not_resume": (
-                    self.args.stop_after_iter is not None
-                    or getattr(self.args, "g2_benchmark_steps", None) is not None
+                    self.args.stop_after_iter is not None or getattr(self.args, "g2_benchmark_steps", None) is not None
                 ),
                 "canonical_config_sha256": {
                     name: _file_sha256(self.path / name) for name in ("config.pkl", "config.yaml")
@@ -1270,18 +1269,24 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], Any, ExactWindo
         "full_segment_prefetch": getattr(args, "full_segment_prefetch", False),
         "execution_stop_after_iter": execution_stop,
         **(
-            {"g2_loader_runtime": {
-                "raw_workers": args.num_workers,
-                "spawn": spawn_profile.async_identity() if spawn_profile is not None else None,
-                "compact_cached_video": getattr(catalog.raw, "compact_cached_video", False),
-                "episode_cache_size": os.environ.get("PSM_G2_EPISODE_CACHE_SIZE", "4"),
-                "profile_trace": getattr(args, "g2_profile_trace", False),
-            }}
-            if g2_recipe is not None else {}
+            {
+                "g2_loader_runtime": {
+                    "raw_workers": args.num_workers,
+                    "spawn": spawn_profile.async_identity() if spawn_profile is not None else None,
+                    "compact_cached_video": getattr(catalog.raw, "compact_cached_video", False),
+                    "episode_cache_size": os.environ.get("PSM_G2_EPISODE_CACHE_SIZE", "4"),
+                    "cap2_token_cache": os.environ.get("PSM_G2_CAP2_TOKEN_CACHE", "0"),
+                    "profile_trace": getattr(args, "g2_profile_trace", False),
+                }
+            }
+            if g2_recipe is not None
+            else {}
         ),
         "execution_scope": (
-            "g2_benchmark_diagnostic" if getattr(args, "g2_benchmark_steps", None) is not None
-            else "bounded_diagnostic" if getattr(args, "stop_after_iter", None) is not None
+            "g2_benchmark_diagnostic"
+            if getattr(args, "g2_benchmark_steps", None) is not None
+            else "bounded_diagnostic"
+            if getattr(args, "stop_after_iter", None) is not None
             else "formal"
         ),
         "cache_manifest_sha256": catalog.manifest_digest,
@@ -1353,7 +1358,9 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--g2-spawn-workers", type=int, default=0, help="Opt-in G2 CPU Spawn workers/rank")
     result.add_argument("--g2-spawn-timeout-s", type=float, default=None)
-    result.add_argument("--g2-profile-trace", action="store_true", help="Capture one CPU/CUDA step per rank in a diagnostic")
+    result.add_argument(
+        "--g2-profile-trace", action="store_true", help="Capture one CPU/CUDA step per rank in a diagnostic"
+    )
     result.add_argument("--no-ttt-prefetch-factor", type=int, default=None)
     result.add_argument("--no-ttt-persistent-workers", action="store_true", default=None)
     result.add_argument("--no-ttt-nonpersistent-workers", dest="no_ttt_persistent_workers", action="store_false")
@@ -1501,10 +1508,12 @@ def main(argv: list[str] | None = None) -> None:
         **(
             {
                 "spawn_loader_profile": spawn_profile,
+                "spawn_stop_after_iteration": report["execution_stop_after_iter"],
                 "g2_provider_factory": g2_recipe.provider_factory,
                 "g2_provider_kwargs": g2_recipe.provider_kwargs,
             }
-            if spawn_profile is not None else {}
+            if spawn_profile is not None
+            else {}
         ),
         **({"loader_profile": profile_from_args(args)} if profile_from_args(args).workers else {}),
     )
@@ -1543,7 +1552,9 @@ def main(argv: list[str] | None = None) -> None:
         trace_dir = job_namespace(args) / "monitor"
         profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=2 if args.g2_benchmark_steps == 10 else 0, warmup=1, active=1, repeat=1),
+            schedule=torch.profiler.schedule(
+                wait=2 if args.g2_benchmark_steps == 10 else 0, warmup=1, active=1, repeat=1
+            ),
             on_trace_ready=lambda run: run.export_chrome_trace(str(trace_dir / f"profile_rank{rank}.json")),
             with_stack=True,
         )
@@ -1587,8 +1598,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
     if rank == 0 and (
-        getattr(args, "stop_after_iter", None) is not None
-        or getattr(args, "g2_benchmark_steps", None) is not None
+        getattr(args, "stop_after_iter", None) is not None or getattr(args, "g2_benchmark_steps", None) is not None
     ):
         print(
             "[CorrectedV3][bounded_stop] "
