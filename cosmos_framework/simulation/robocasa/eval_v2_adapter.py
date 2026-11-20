@@ -254,9 +254,12 @@ class NativeEpisode:
                     from g2.online.runtime import create_episode_runtime
 
                     g2_options = {
-                        "g2_runtime": create_episode_runtime(profile=g2_profile, settings=self.settings),
+                        "g2_runtime": create_episode_runtime(
+                            profile=g2_profile, settings=self.settings["g2_actor_options"]
+                        ),
                         "g2_task": attempt["task"],
                         "g2_episode_index": attempt["episode"],
+                        "g2_ep_meta": metadata,
                     }
                 with nullcontext() if self.trace is None else use_trace(self.trace):
                     success, steps, prompt = self.policy(

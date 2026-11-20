@@ -104,6 +104,9 @@ def test_g2_replans_use_current_state_and_record_only_completed_steps(monkeypatc
     monkeypatch.setattr(module, "check_success", lambda env: len(env.steps) == 18)
 
     class Env(_Env):
+        def get_ep_meta(self):
+            raise AssertionError("G2 must use the exact admitted metadata without querying again")
+
         def step(self, action):
             if failure == "env" and len(self.steps) == 16:
                 raise RuntimeError("G2 test simulator error")
@@ -123,7 +126,9 @@ def test_g2_replans_use_current_state_and_record_only_completed_steps(monkeypatc
                 "instruction": "close fridge",
                 "frame": 0,
                 "episode_index": 7,
+                "ep_meta": ep_meta,
             }
+            assert identity["ep_meta"] is ep_meta
 
         def decision(self, observation, *, frame, composite, local_memory):
             assert observation["step"] == frame == local_memory["consumer_step"] == len(self.completed)
@@ -161,6 +166,7 @@ def test_g2_replans_use_current_state_and_record_only_completed_steps(monkeypatc
 
     monkeypatch.setattr(module, "predict", predict)
     env, client, runtime = Env(), _Client(), Runtime()
+    ep_meta = {"lang": "close fridge", "fixture_refs": {"fridge": "example"}}
 
     def run():
         return module.run_policy(
@@ -174,10 +180,12 @@ def test_g2_replans_use_current_state_and_record_only_completed_steps(monkeypatc
             use_state=True,
             local_memory_client=client,
             initial_observation={"step": 0},
+            language_instruction=ep_meta["lang"],
             on_prediction=lambda result, latency, *, g2_request: prediction_witnesses.append(g2_request),
             g2_runtime=runtime,
             g2_task="CloseFridge",
             g2_episode_index=7,
+            g2_ep_meta=ep_meta,
         )
 
     if failure is None:

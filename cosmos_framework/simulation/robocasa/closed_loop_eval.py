@@ -280,6 +280,7 @@ def run_policy(
     g2_runtime=None,
     g2_task: str | None = None,
     g2_episode_index: int | None = None,
+    g2_ep_meta: dict | None = None,
 ) -> tuple[bool, int, str]:
     shared_vae = getattr(local_memory_client, "uses_shared_vae", False) is True
     if shared_vae and (action_horizon != 16 or not use_state or not USE_BASE_ACTION or BASE_ENCODING != "raw"):
@@ -352,6 +353,13 @@ def run_policy(
                 prompt = ""
         observe("environment_initialization", instruction=prompt)
         if g2_runtime is not None:
+            if (
+                not isinstance(g2_ep_meta, dict)
+                or not isinstance(prompt, str)
+                or g2_ep_meta.get("lang") != prompt
+                or not prompt.strip()
+            ):
+                raise ValueError("G2 requires the admitted episode's original language and metadata")
             g2_runtime.reset(
                 env,
                 obs,
@@ -360,6 +368,7 @@ def run_policy(
                 instruction=prompt,
                 frame=0,
                 episode_index=g2_episode_index,
+                ep_meta=g2_ep_meta,
             )
         init_comp = compose(obs).astype(np.uint8)
         if save_png is not None:
