@@ -83,6 +83,7 @@ from cosmos_framework.inference.args import OmniSetupArgs, OmniSetupOverrides
 from cosmos_framework.inference.common.args import CheckpointOverrides, ConfigFileType, tyro_cli
 from cosmos_framework.inference.common.config import deserialize_config_dict
 from cosmos_framework.inference.common.init import init_output_dir
+from cosmos_framework.inference.g2_cache_budget import DEFAULT_CACHE_BUDGET, CacheBudget
 from cosmos_framework.inference.inference import OmniInference
 from cosmos_framework.inference.robocasa_batch_transactions import (
     BatchedSessionTransactions,
@@ -553,15 +554,22 @@ class ActionServerArgs(pydantic.BaseModel):
     # New condition fields are enabled only by an explicit G2 profile.
     g2_profile: Literal["legacy", "g2_r1", "g2_r2"] = "legacy"
     g2_hooks_factory: str | None = None
-    """B-owned module:function creating fixed-model preparation hooks from this service."""
+    """Trusted extension factory for explicit non-native profiles."""
+    g2_run_recipe: Path | None = None
+    """Materialized formal G2 recipe for the native DCP model."""
+    g2_checkpoint_metadata_sha256: str | None = None
+    """Expected SHA256 for the formal checkpoint's published model/.metadata."""
     g2_provider_factory: str | None = None
     """module:function creating a current-rollout spatial provider; no expert replay fallback."""
+    g2_spatial_root: Path | None = None
+    g2_view_vae_recipe: Path | None = None
+    g2_view_vae_weights: Path | None = None
     g2_cache_enabled: bool = True
-    g2_cache_max_sessions: int = 32
-    g2_cache_max_entries: int = 256
-    g2_cache_cpu_bytes: int = 256 * 1024**2
-    g2_cache_gpu_bytes: int = 256 * 1024**2
-    g2_cache_handles: int = 4096
+    g2_cache_max_sessions: int = DEFAULT_CACHE_BUDGET.max_sessions
+    g2_cache_max_entries: int = DEFAULT_CACHE_BUDGET.max_entries
+    g2_cache_cpu_bytes: int = DEFAULT_CACHE_BUDGET.cpu_bytes
+    g2_cache_gpu_bytes: int = DEFAULT_CACHE_BUDGET.gpu_bytes
+    g2_cache_handles: int = DEFAULT_CACHE_BUDGET.handles
     media_spool_max_jobs: int = 4
     media_spool_max_bytes: int = 512 * 1024**2
     media_drain_timeout_s: float = 300.0
@@ -909,13 +917,35 @@ class ActionModelService:
         transaction_options = _transaction_options(args)
         g2_profile = getattr(args, "g2_profile", "legacy")
         self.g2_conditions = None
+        self.g2_native_authority = None
+        g2_run_recipe = getattr(args, "g2_run_recipe", None)
+        g2_metadata_sha = getattr(args, "g2_checkpoint_metadata_sha256", None)
+        native_g2 = g2_run_recipe is not None or g2_metadata_sha is not None
+        r2_sources = tuple(
+            getattr(args, field, None) for field in ("g2_spatial_root", "g2_view_vae_recipe", "g2_view_vae_weights")
+        )
+        if native_g2 and (
+            g2_profile not in ("g2_r1", "g2_r2")
+            or not g2_run_recipe
+            or not g2_metadata_sha
+            or getattr(args, "g2_hooks_factory", None)
+            or getattr(args, "g2_provider_factory", None)
+        ):
+            raise ValueError("native G2 requires both recipe/metadata options with an explicit profile")
+        if native_g2 and g2_profile == "g2_r2":
+            if not all(r2_sources):
+                raise ValueError("native R2 requires the live spatial root and pinned View VAE recipe and weights")
+        elif any(value is not None for value in r2_sources):
+            raise ValueError("live spatial root and View VAE settings require native R2")
         if g2_profile != "legacy":
             if g2_profile not in ("g2_r1", "g2_r2") or transaction_options is None or args.guidance != 1.0:
                 raise ValueError("G2 requires existing owned Session transactions, explicit R1/R2 and guidance=1")
-            if not getattr(args, "g2_hooks_factory", None):
+            if not native_g2 and not getattr(args, "g2_hooks_factory", None):
                 raise ValueError("G2 requires B's shared model hooks factory; no substitute UND/Reader forward")
-            if g2_profile == "g2_r2" and not getattr(args, "g2_provider_factory", None):
+            if g2_profile == "g2_r2" and not native_g2 and not getattr(args, "g2_provider_factory", None):
                 raise ValueError("R2 requires an actual current-rollout provider; expert map playback is unsupported")
+            cache_budget = CacheBudget.from_options(vars(args))
+            cache_budget.validate_placement(slots=len(transaction_options["slot_ids"]), servers=1)
         self.transactions = None
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for OmniMoTModel inference in this repo.")
@@ -930,7 +960,28 @@ class ActionModelService:
             raise ValueError("B1 transaction increment requires a single-rank model owner")
 
         setup_overrides = args.build_setup_overrides()
+        if native_g2 and setup_overrides.experiment_overrides:
+            raise ValueError("native G2 does not allow experiment config overrides")
         setup_args = setup_overrides.build_setup()
+        if native_g2:
+            from cosmos_framework.inference.g2_native_policy import NativeG2Authority
+
+            if (
+                setup_args.checkpoint_type != "dcp"
+                or setup_args.config_file_type != "yaml"
+                or args.max_action_dim is not None
+                or args.action_stats_path is not None
+                or args.local_memory_mode != "required"
+                or args.fps != 20
+            ):
+                raise ValueError("native G2 requires frozen DCP/YAML, raw actions, Local Memory and 20 Hz")
+            self.g2_native_authority = NativeG2Authority.open(
+                run_recipe=g2_run_recipe,
+                model_path=Path(setup_args.checkpoint_path),
+                config_path=Path(setup_args.config_file),
+                metadata_sha256=g2_metadata_sha,
+                profile=g2_profile,
+            )
         init_output_dir(setup_args.output_dir)
         setup_args = disable_runtime_ema_for_frozen_config(setup_args)
 
@@ -1088,6 +1139,8 @@ class ActionModelService:
                 "use_base_action=True, base_encoding='raw')."
             )
         log.info(f"[action-server] effective raw_action_dim={self.raw_action_dim} (from {self.raw_action_dim_source})")
+        if native_g2 and _extract_str_from_config(self.experiment_config, "action_normalization") is not None:
+            raise ValueError("native R1 requires unnormalized Raw15 training actions")
         if args.local_memory_mode == "required":
             if self.raw_action_dim != 15:
                 raise ValueError("required V3 RoboCasa Local-TTT needs raw_action_dim=15")
@@ -1136,7 +1189,7 @@ class ActionModelService:
         )
         log.info(f"[action-server] local_memory={self.local_memory_adapter.info()}")
         if g2_profile != "legacy":
-            self._configure_g2_conditions(args)
+            self._configure_g2_conditions(args, budget=cache_budget)
         if transaction_options is not None:
             if self.g2_conditions is not None:
                 transaction_options = dict(transaction_options, conditions=self.g2_conditions)
@@ -1325,9 +1378,7 @@ class ActionModelService:
             "requires_state": self.requires_state,
             "action_stats_path": str(self.cfg.action_stats_path) if self.cfg.action_stats_path else None,
             "local_memory": self.local_memory_adapter.info(),
-            **(
-                {"g2_conditions": self.g2_conditions.info()} if getattr(self, "g2_conditions", None) is not None else {}
-            ),
+            **({"g2_conditions": self._g2_info()} if getattr(self, "g2_conditions", None) is not None else {}),
         }
 
     # ------------------------------------------------------------------
@@ -1340,13 +1391,22 @@ class ActionModelService:
             input_video_key = getattr(self.model, "config", None).input_video_key  # type: ignore[union-attr]
         return input_video_key
 
-    def _configure_g2_conditions(self, args):
+    def _g2_info(self):
+        info = self.g2_conditions.info()
+        authority = getattr(self, "g2_native_authority", None)
+        if authority is not None:
+            info["authority"] = dict(authority.versions)
+        return info
+
+    def _configure_g2_conditions(self, args, *, budget=None):
         # Factories are trusted startup configuration, never names from a request.
         # Imports remain lazy: legacy/R1 never import a spatial provider/Reader here.
         import importlib
 
         from cosmos_framework.inference.g2_policy_conditions import G2ConditionRuntime
-        from cosmos_framework.inference.g2_session_cache import CacheBudget
+
+        if budget is None:
+            budget = CacheBudget.from_options(vars(args))
 
         def create(path):
             module, separator, name = path.partition(":")
@@ -1354,20 +1414,29 @@ class ActionModelService:
                 raise ValueError("G2 startup factory must be an explicit module:function")
             return getattr(importlib.import_module(module), name)(self)
 
-        hooks = create(args.g2_hooks_factory)
-        provider = create(args.g2_provider_factory) if args.g2_profile == "g2_r2" else None
+        authority = getattr(self, "g2_native_authority", None)
+        hooks = authority.hooks(self.model) if authority is not None else create(args.g2_hooks_factory)
+        provider = None
+        if args.g2_profile == "g2_r2":
+            if authority is None:
+                provider = create(args.g2_provider_factory)
+            else:
+                from g2.online.spatial_provider import create_live_provider
+
+                provider = create_live_provider(
+                    scratch_root=args.g2_spatial_root,
+                    recipe_path=args.g2_view_vae_recipe,
+                    recipe_id=authority.versions["view_recipe_id"],
+                    weights=args.g2_view_vae_weights,
+                    timeout_s=args.transaction_timeout_s,
+                    max_views=budget.max_entries,
+                )
         self.g2_conditions = G2ConditionRuntime(
             hooks,
             profile=args.g2_profile,
             provider=provider,
             cache_enabled=args.g2_cache_enabled,
-            budget=CacheBudget(
-                max_sessions=args.g2_cache_max_sessions,
-                max_entries=args.g2_cache_max_entries,
-                cpu_bytes=args.g2_cache_cpu_bytes,
-                gpu_bytes=args.g2_cache_gpu_bytes,
-                handles=args.g2_cache_handles,
-            ),
+            budget=budget,
         )
 
     @contextmanager
@@ -1395,17 +1464,31 @@ class ActionModelService:
         )
 
         runtime = self.g2_conditions
-        runtime.validate_request(req)
+        identity = runtime.validate_request(req)
         started = time.perf_counter_ns()
         task = StaticTaskText(**req["g2"]["static_text"])
-        recipe = StaticTaskTextRecipe(
-            planned_video_frames=self.cfg.action_chunk_size + 1,
-            fps=self.cfg.fps,
-            height=height,
-            width=width,
-            tokenizer_identity=runtime.hooks.tokenizer_identity,
-        )
-        prepared = prepare_static_task_text(task, recipe, self.model, dropout_applied=False)
+        authority = getattr(self, "g2_native_authority", None)
+        if authority is not None:
+            recipe = authority.text_recipe
+            authority.validate_sample(
+                identity,
+                template_identity=task.template_identity,
+                frames=self.cfg.action_chunk_size + 1,
+                fps=self.cfg.fps,
+                height=height,
+                width=width,
+            )
+            processor = self.model.vlm_processor
+        else:
+            recipe = StaticTaskTextRecipe(
+                planned_video_frames=self.cfg.action_chunk_size + 1,
+                fps=self.cfg.fps,
+                height=height,
+                width=width,
+                tokenizer_identity=runtime.hooks.tokenizer_identity,
+            )
+            processor = self.model
+        prepared = prepare_static_task_text(task, recipe, processor, dropout_applied=False)
         use_float_positions = runtime.hooks.use_float_positions
         if type(use_float_positions) is not bool:
             raise ValueError("model hooks must declare the actual native mRoPE position mode")
@@ -1462,6 +1545,9 @@ class ActionModelService:
         # ``use_state`` dataset path.
         state_token: torch.Tensor | None = None
         raw_state = req.get("state")
+        authority = getattr(self, "g2_native_authority", None)
+        if authority is not None:
+            authority.validate_state(raw_state)
         if raw_state is None and self.requires_state:
             raise ValueError(
                 "this checkpoint was trained with use_state=True, so 'state' is required: send the "
@@ -2221,6 +2307,10 @@ def serve(args: ActionServerArgs) -> None:
         httpd.server_close()
         if service.transactions is not None and not service.transactions.close():
             log.error("Session actor cleanup unproven; owned-process decommission is required")
+        conditions = service.g2_conditions
+        close = getattr(conditions.provider, "close", None) if conditions is not None else None
+        if close is not None:
+            close()
 
 
 def main() -> None:

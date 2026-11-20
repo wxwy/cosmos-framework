@@ -267,7 +267,7 @@ def run_policy(
     generated_attempt_id=None,
     video_fps=20,
     local_memory_client: RoboCasaLocalMemoryClient | None = None,
-    on_prediction: Callable[[dict, float], None] | None = None,
+    on_prediction: Callable[..., None] | None = None,
     on_action: Callable[[dict], None] | None = None,
     on_cleanup: Callable[[dict], None] | None = None,
     on_progress: Callable[[dict], None] | None = None,
@@ -277,6 +277,10 @@ def run_policy(
     language_instruction: str | None = None,
     http_client=None,
     trace=None,
+    g2_runtime=None,
+    g2_task: str | None = None,
+    g2_episode_index: int | None = None,
+    g2_ep_meta: dict | None = None,
 ) -> tuple[bool, int, str]:
     shared_vae = getattr(local_memory_client, "uses_shared_vae", False) is True
     if shared_vae and (action_horizon != 16 or not use_state or not USE_BASE_ACTION or BASE_ENCODING != "raw"):
@@ -319,6 +323,20 @@ def run_policy(
                 pass
 
     try:
+        if g2_runtime is not None and (
+            local_memory_client is None
+            or shared_vae
+            or not use_state
+            or not USE_BASE_ACTION
+            or BASE_ENCODING != "raw"
+            or CAMERA_SET != "left_wrist"
+            or action_horizon != 16
+            or video_fps != 20
+            or not g2_task
+            or type(g2_episode_index) is not int
+            or g2_episode_index < 0
+        ):
+            raise ValueError("G2 requires assigned Local, state15, left+wrist, H16, raw15 and a 20 Hz episode")
         observe("environment_initialization")
         with measured("initial_observation", stratum="load"):
             obs = env.reset() if initial_observation is None else initial_observation
@@ -334,6 +352,24 @@ def run_policy(
             except Exception:
                 prompt = ""
         observe("environment_initialization", instruction=prompt)
+        if g2_runtime is not None:
+            if (
+                not isinstance(g2_ep_meta, dict)
+                or not isinstance(prompt, str)
+                or g2_ep_meta.get("lang") != prompt
+                or not prompt.strip()
+            ):
+                raise ValueError("G2 requires the admitted episode's original language and metadata")
+            g2_runtime.reset(
+                env,
+                obs,
+                episode_id=local_memory_client.payload(0)["episode_id"],
+                task=g2_task,
+                instruction=prompt,
+                frame=0,
+                episode_index=g2_episode_index,
+                ep_meta=g2_ep_meta,
+            )
         init_comp = compose(obs).astype(np.uint8)
         if save_png is not None:
             with open(save_png, "xb") as handle:
@@ -352,22 +388,47 @@ def run_policy(
                     local_memory_client.start_replan(0, time.monotonic_ns())
                 with measured("observation_preprocess", source_step=step, stratum=stratum):
                     comp = compose(obs)
-                    state_token = build_state_token(obs) if use_state else None
+                    state_token = build_state_token(obs) if use_state and g2_runtime is None else None
                 with measured("boundary_history_drain", source_step=step, stratum=stratum):
                     local_payload = local_memory_client.payload(0) if local_memory_client is not None else None
+                decision_prompt, request_options = prompt, {}
+                if g2_runtime is not None:
+                    if local_payload["consumer_step"] != step:
+                        raise RuntimeError("G2 decision source frame differs from the completed Local frontier")
+                    with measured("g2_decision", source_step=step, stratum=stratum):
+                        decision = g2_runtime.decision(obs, frame=step, composite=comp, local_memory=local_payload)
+                    if not isinstance(decision, dict) or set(decision) != {"state", "prompt", "g2"}:
+                        raise ValueError("invalid G2 actor decision")
+                    state_token, decision_prompt = decision["state"], decision["prompt"]
+                    if (
+                        not isinstance(state_token, list)
+                        or len(state_token) != 15
+                        or any(type(value) not in (int, float) for value in state_token)
+                        or not np.isfinite(state_token).all()
+                        or not isinstance(decision_prompt, str)
+                        or not decision_prompt.strip()
+                        or not isinstance(decision["g2"], dict)
+                    ):
+                        raise ValueError("G2 requires finite state15, enhanced prompt and request identity")
+                    request_options["g2"] = decision["g2"]
                 observe("predicting")
                 prediction_t0 = time.monotonic()
                 with measured("policy_http", source_step=step, stratum=stratum):
                     result = predict(
                         server_url,
                         comp,
-                        prompt,
+                        decision_prompt,
                         image_size,
                         timeout,
                         state=state_token,
                         local_memory=local_payload,
                         **({"http_session": http_client} if http_client is not None else {}),
+                        **request_options,
                     )
+                if g2_runtime is not None:
+                    chunk = np.asarray(result.get("action"), dtype=np.float32)
+                    if chunk.shape != (16, 15) or not np.isfinite(chunk).all():
+                        raise ValueError("G2 Policy must return a finite H16 raw15 action chunk")
                 if trace is not None:
                     raw_trace = result.get("timing", {}).get("raw_trace")
                     if raw_trace is None:
@@ -386,7 +447,10 @@ def run_policy(
                 progress_latency = prediction_ms
                 observe("executing")
                 if on_prediction is not None:
-                    on_prediction(result, prediction_ms)
+                    if g2_runtime is None:
+                        on_prediction(result, prediction_ms)
+                    else:
+                        on_prediction(result, prediction_ms, g2_request=decision)
                 if local_memory_client is not None:
                     status = result.get("local_memory")
                     if not isinstance(status, dict):
@@ -514,6 +578,14 @@ def run_policy(
                     assert pre_composite is not None
                     with measured("history_capture_png", source_step=step, stratum="chunk_middle"):
                         local_memory_client.record_completed(0, pre_composite, canonical_raw15)
+            if g2_runtime is not None:
+                g2_runtime.record_completed(
+                    env,
+                    obs,
+                    source_frame=step,
+                    canonical_raw15=canonical_raw15,
+                    submitted_env12=env_action,
+                )
             if save_video is not None:
                 frames.append(compose(obs).astype(np.uint8))
             if on_frame is not None:
@@ -525,6 +597,8 @@ def run_policy(
                     break
             else:
                 streak = 0
+            if g2_runtime is not None and env_done and step + 1 < max_steps:
+                raise RuntimeError("G2 environment ended before success or the declared horizon")
 
         return success, done_steps, prompt
     except BaseException as error:
@@ -563,6 +637,12 @@ def run_policy(
             cleanup_error = error
             observe("local_cleanup", event="error", error=f"{type(error).__name__}: {error}"[:2048])
             print(f"[eval] Local-TTT cleanup failure: {type(error).__name__}: {error}", flush=True)
+        if g2_runtime is not None:
+            try:
+                g2_runtime.close()
+            except Exception as error:
+                cleanup_error = cleanup_error or error
+                observe("g2_cleanup", event="error", error=f"{type(error).__name__}: {error}"[:2048])
         witness = {
             "session_id": session_id,
             "reset_ok": cleanup_error is None,

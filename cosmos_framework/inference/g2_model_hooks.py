@@ -127,7 +127,7 @@ class G2ModelHooks:
         return self.model.prepare_g2_task_queries(features)
 
     def read_global(self, queries, views):
-        return self.model.read_g2_global(queries, (views,))
+        return self.model.read_g2_global(queries, (tuple(view.to(queries.device) for view in views),))
 
     def project_global(self, reader):
         return self.model.project_g2_global(reader)

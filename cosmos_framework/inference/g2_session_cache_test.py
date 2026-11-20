@@ -1,8 +1,10 @@
+import json
 from dataclasses import dataclass
 
 import pytest
 import torch
 
+from cosmos_framework.inference import g2_session_cache
 from cosmos_framework.inference.g2_session_cache import CacheBudget, SessionConditionCache, Usage, content_key
 
 
@@ -84,6 +86,53 @@ def test_capacity_lru_and_pinning_and_cleanup_after_exception():
     assert cache.info()["stages"]["text"]["evictions"] == 1
 
 
+@pytest.mark.parametrize("dimension", ["cpu_bytes", "gpu_bytes", "entries", "handles"])
+def test_pinned_pressure_reports_each_actual_blocking_dimension(monkeypatch, dimension):
+    budget_field = "max_entries" if dimension == "entries" else dimension
+    cache = SessionConditionCache("w", CacheBudget(**{budget_field: 1}))
+    # Inject accounting records to exercise GPU-byte pressure on a CPU host.
+    size = Usage(cpu_bytes=1, gpu_bytes=1, handles=1)
+    monkeypatch.setattr(g2_session_cache, "_owned_tree", lambda value, **_: (value, size))
+    with cache.request("first") as first, cache.request("second") as second:
+        first.get_or_compute("text", content_key("first"), lambda: "one")
+        with pytest.raises(MemoryError, match="pinned entries") as exc:
+            second.get_or_compute("text_kv", content_key("second"), lambda: "two")
+        info = cache.info()
+        record = info["rejections"]["last"]
+        assert json.loads(str(exc.value).split(": ", 1)[1]) == record
+        assert record["stage"] == "text_kv"
+        assert record["exceeded"] == [dimension]
+        assert record["current"][dimension] == record["requested"][dimension] == record["pinned"][dimension] == 1
+        assert record["limits"] == {dimension: 1}
+        assert info["high_water"]["active_leases"] == record["current"]["active_leases"] == 2
+        assert info["rejections"]["by_dimension"][dimension] == 1
+        assert info["entries"] == 1
+    assert cache.info()["pinned"]["entries"] == 0
+    assert cache.info()["high_water"]["active_leases"] == 2
+
+
+def test_pinned_rejection_keeps_eligible_cold_entries_and_counts_transient(monkeypatch):
+    cache = SessionConditionCache("w", CacheBudget(gpu_bytes=8))
+    monkeypatch.setattr(g2_session_cache, "_owned_tree", lambda value, **_: (value, Usage(gpu_bytes=value, handles=1)))
+    cold_key = content_key("cold")
+    with cache.request("cold") as cold:
+        cold.get_or_compute("text", cold_key, lambda: 2)
+    with cache.request("active", enabled=False) as active:
+        active.get_or_compute("text", content_key("warm"), lambda: 6)
+        with pytest.raises(MemoryError, match="pinned entries"):
+            active.get_or_compute("text_kv", content_key("miss"), lambda: 4)
+        info = cache.info()
+        assert info["usage"]["gpu_bytes"] == info["high_water"]["gpu_bytes"] == 8
+        assert info["rejections"]["last"]["pinned"]["gpu_bytes"] == 6
+        assert info["entries"] == info["request_entries"] == 1
+        assert info["stages"]["text"]["evictions"] == 0
+    with cache.request("cold") as cold:
+        assert cold.get_or_compute("text", cold_key, lambda: 3) == 2
+    cache.reset("cold")
+    assert cache.info()["usage"]["gpu_bytes"] == 0
+    assert cache.info()["high_water"]["gpu_bytes"] == 8
+
+
 @pytest.mark.parametrize("field", ["cpu_bytes", "handles"])
 def test_bytes_and_handle_limits_reject_oversized_single_entry(field):
     cache = SessionConditionCache("w", CacheBudget(**{field: 1}))
@@ -91,6 +140,7 @@ def test_bytes_and_handle_limits_reject_oversized_single_entry(field):
         with cache.request("s") as request:
             request.get_or_compute("text", content_key("x"), lambda: (torch.ones(2), torch.ones(2)))
     assert cache.info()["entries"] == 0 and cache.info()["usage"]["handles"] == 0
+    assert cache.info()["rejections"]["last"]["exceeded"] == [field]
 
 
 def test_active_request_cannot_reset_reload_or_be_evicted():
@@ -105,6 +155,7 @@ def test_active_request_cannot_reset_reload_or_be_evicted():
                 pass
     with cache.request("other"):
         assert cache.info()["sessions"] == 1
+    assert cache.info()["rejections"]["last"]["exceeded"] == ["sessions"]
 
 
 def test_GPU_accounting_limit_without_allocating_a_GPU_or_evicting_valid_content():

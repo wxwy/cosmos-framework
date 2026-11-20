@@ -73,12 +73,13 @@ def _global_content_key(signature: GlobalCacheSignature) -> str:
 
 def _view_content_key(signature, index, mask_id):
     view = signature.views[index]
+    # The cached tensor/mask can survive a new scene version when the owner
+    # pixels, image projection and raster match. Global still uses current geometry.
     return content_key(
         G2_ABI_VERSION,
         view.view_id,
         view.content_version,
         view.recipe_id,
-        view.geometry_version,
         asdict(signature.projections[index]),
         asdict(signature.rasters[index]),
         signature.view_types[index],
@@ -133,11 +134,21 @@ class G2ConditionRuntime:
     @staticmethod
     def validate_request(request):
         record = request.get("g2")
-        if not isinstance(record, dict) or set(record) not in (
-            {"identity", "top_variant", "static_text"},
-            {"identity", "static_text"},
-        ):
-            raise ValueError("exact g2 identity/static_text with optional top_variant envelope required")
+        required = {"identity", "static_text"}
+        if not isinstance(record, dict) or not required <= set(record) <= required | {"top_variant", "spatial_source"}:
+            raise ValueError("exact G2 identity and static_text envelope required")
+        if "spatial_source" in record:
+            ref = record["spatial_source"]
+            if (
+                not isinstance(ref, dict)
+                or set(ref) != {"path", "sha256"}
+                or not isinstance(ref["path"], str)
+                or not 0 < len(ref["path"]) <= 768
+                or not isinstance(ref["sha256"], str)
+                or len(ref["sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in ref["sha256"])
+            ):
+                raise ValueError("R2 spatial source requires a bounded path and SHA256")
         if record.get("top_variant", "with_robot") not in ("with_robot", "without_robot"):
             raise ValueError("requested top variant must be explicit")
         identity = G2SampleIdentity(**record["identity"])
@@ -186,8 +197,10 @@ class G2ConditionRuntime:
                 raise ValueError("one static instruction/GT binding per subtask; explicit task switch required")
         self._tasks[session] = binding
 
-    def _snapshot(self, identity, signature):
-        result = self.provider.snapshot(identity, signature)
+    def _snapshot(self, identity, signature, record):
+        source = record.get("spatial_source")
+        inputs = {} if source is None else dict(spatial_source=source, static_text=record["static_text"])
+        result = self.provider.snapshot(identity, signature, **inputs)
         if not isinstance(result, OnlineSpatialSnapshot) or result.identity != identity:
             raise ValueError("provider returned conditions for a different logical rollout state")
         if result.source != "online_rollout" and not (self.allow_fixtures and result.source == "synthetic_fixture"):
@@ -254,6 +267,8 @@ class G2ConditionRuntime:
                 zip(requests, serialized_prompts, recipe_ids, strict=True)
             ):
                 identity = self.validate_request(request)
+                if self.profile == "g2_r1" and "spatial_source" in request["g2"]:
+                    raise ValueError("a current View publication requires R2")
                 local = request.get("local_memory", request.get("inference", {}))
                 session = local["session_id"]
                 if session in sessions:
@@ -300,7 +315,7 @@ class G2ConditionRuntime:
                     or base.top_variant != variant
                 ):
                     raise ValueError("Global model hook must supply an empty current-version signature")
-                snapshot = self._snapshot(identity, base)
+                snapshot = self._snapshot(identity, base, request["g2"])
                 sources.append(snapshot)
                 queries_key = content_key(
                     text_key,

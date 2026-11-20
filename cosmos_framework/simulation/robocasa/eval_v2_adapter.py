@@ -181,7 +181,7 @@ class NativeEpisode:
                 actions.write(json.dumps(row, allow_nan=False) + "\n")
                 actions.flush()
 
-            def prediction(result, latency):
+            def prediction(result, latency, *, g2_request=None):
                 nonlocal replans, first_local
                 if not isinstance(result.get("action"), list) or len(result["action"]) != 16:
                     raise ValueError("Action Server must return exactly16 raw15 actions")
@@ -207,6 +207,8 @@ class NativeEpisode:
                     }
                 if transactional is not None and "timing" in result:
                     value["transaction"]["timing"] = result["timing"]
+                if g2_request is not None:
+                    value["g2_request"] = g2_request
                 if first_local is None:
                     first_local = value["local_memory"]
                 predictions.write(json.dumps(value, allow_nan=False) + "\n")
@@ -244,6 +246,21 @@ class NativeEpisode:
                     progress.last = now
 
             try:
+                g2_options = {}
+                g2_profile = self.settings.get("g2_profile", "legacy")
+                if g2_profile != "legacy":
+                    if g2_profile not in ("g2_r1", "g2_r2") or transactional is None or client is None:
+                        raise ValueError("G2 requires an assigned Phase B Episode with Local-TTT")
+                    from g2.online.runtime import create_episode_runtime
+
+                    g2_options = {
+                        "g2_runtime": create_episode_runtime(
+                            profile=g2_profile, settings=self.settings["g2_actor_options"]
+                        ),
+                        "g2_task": attempt["task"],
+                        "g2_episode_index": attempt["episode"],
+                        "g2_ep_meta": metadata,
+                    }
                 with nullcontext() if self.trace is None else use_trace(self.trace):
                     success, steps, prompt = self.policy(
                         self.env,
@@ -266,6 +283,7 @@ class NativeEpisode:
                         on_frame=(lambda frame: media_call("frame", frame)) if rollout_enabled else None,
                         video_fps=20,
                         **({"trace": self.trace} if self.trace is not None else {}),
+                        **g2_options,
                     )
                 if steps != len(outcome.checks) or success != any(outcome.checks):
                     raise ValueError("native result contradicts strict environment checks")

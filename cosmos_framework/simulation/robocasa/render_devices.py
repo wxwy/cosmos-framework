@@ -1,9 +1,9 @@
 """Resolve a physical EGL render device without assuming CUDA/EGL index equality.
 
-Prefer DRM PCI identity; NVIDIA EGL exposes EGL_CUDA_DEVICE_NV through
-eglQueryDeviceAttribEXT. Its CUDA handle is mapped to PCI by an isolated
-CUDA-driver query before accepting exactly one matching EGL device.
-No GPU-address map is pinned to a host, and no GPU context is created here.
+DRM provides a PCI identity directly. NVIDIA EGL can instead expose a
+persistent device UUID while the Actor masks CUDA. An isolated driver probe
+joins that UUID to PCI using EGL and CUDA in the same subprocess. The Actor
+selects its own enumerated device and verifies its actual context handle.
 """
 
 from __future__ import annotations
@@ -26,47 +26,58 @@ def normalize_pci(value):
     return f"{int(domain, 16):04x}:{bus}:{slot_function}"
 
 
-# The simulator keeps CUDA_VISIBLE_DEVICES="" so it never opens a CUDA context.
-# Query CUDA handle -> PCI once in an isolated, short-lived child process; no
-# context creation, model import, or host-specific mapping is involved.
-_CUDA_PCI_PROBE = """
-import ctypes
-import json
-
-lib = ctypes.CDLL("libcuda.so.1")
-lib.cuInit.argtypes = [ctypes.c_uint]
-lib.cuInit.restype = ctypes.c_int
-lib.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
-lib.cuDeviceGetCount.restype = ctypes.c_int
-lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
-lib.cuDeviceGet.restype = ctypes.c_int
-lib.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-lib.cuDeviceGetPCIBusId.restype = ctypes.c_int
-if lib.cuInit(0) != 0:
-    raise RuntimeError("CUDA driver initialization failed")
-count = ctypes.c_int()
-if lib.cuDeviceGetCount(ctypes.byref(count)) != 0 or not 0 < count.value <= 256:
-    raise RuntimeError("CUDA device enumeration failed")
-identity = {}
-for ordinal in range(count.value):
-    device = ctypes.c_int()
-    bus = ctypes.create_string_buffer(64)
-    if lib.cuDeviceGet(ctypes.byref(device), ordinal) != 0:
-        raise RuntimeError("CUDA handle lookup failed")
-    if lib.cuDeviceGetPCIBusId(bus, len(bus), device.value) != 0:
-        raise RuntimeError("CUDA PCI identity lookup failed")
-    identity[str(device.value)] = bus.value.decode("ascii")
-print(json.dumps(identity))
-"""
+# Only a short-lived subprocess runs these queries with CUDA visible. The
+# driver enumeration has no context creation or model imports.
+_CUDA_PCI_PROBE = "--probe-cuda-pci"
+_EGL_PCI_PROBE = "--probe-egl-cuda-pci"
 
 
-def cuda_pci_map(*, run=subprocess.run):
-    """Map CUDA handles to PCI using current driver, not nvidia-smi ordinals."""
+def _cuda_driver_pci():
+    lib = ctypes.CDLL("libcuda.so.1")
+    lib.cuInit.argtypes = [ctypes.c_uint]
+    lib.cuInit.restype = ctypes.c_int
+    lib.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    lib.cuDeviceGetCount.restype = ctypes.c_int
+    lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    lib.cuDeviceGet.restype = ctypes.c_int
+    lib.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    lib.cuDeviceGetPCIBusId.restype = ctypes.c_int
+    if lib.cuInit(0) != 0:
+        raise RuntimeError("CUDA driver initialization failed")
+    count = ctypes.c_int()
+    if lib.cuDeviceGetCount(ctypes.byref(count)) != 0 or not 0 < count.value <= 256:
+        raise RuntimeError("CUDA device enumeration failed")
+    identity = {}
+    for ordinal in range(count.value):
+        device = ctypes.c_int()
+        bus = ctypes.create_string_buffer(64)
+        if lib.cuDeviceGet(ctypes.byref(device), ordinal) != 0 or device.value in identity:
+            raise RuntimeError("invalid or repeated CUDA device handle")
+        if lib.cuDeviceGetPCIBusId(bus, len(bus), device.value) != 0:
+            raise RuntimeError("CUDA PCI identity lookup failed")
+        identity[device.value] = normalize_pci(bus.value.decode("ascii"))
+    return identity
+
+
+def _cuda_handle_key(key):
+    ordinal = int(key)
+    if str(ordinal) != key or not 0 <= ordinal < 256:
+        raise ValueError("invalid CUDA device handle")
+    return ordinal
+
+
+def _egl_uuid_key(key):
+    if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{32}", key) or key == "0" * 32:
+        raise ValueError("invalid EGL persistent device UUID")
+    return key
+
+
+def _driver_pci_probe(mode, parse_key, *, run):
     env = dict(os.environ)
     env.pop("CUDA_VISIBLE_DEVICES", None)
     try:
         result = run(
-            [sys.executable, "-I", "-c", _CUDA_PCI_PROBE],
+            [sys.executable, "-I", str(Path(__file__).resolve()), mode],
             env=env,
             capture_output=True,
             text=True,
@@ -76,17 +87,23 @@ def cuda_pci_map(*, run=subprocess.run):
         raw = json.loads(result.stdout)
         if not isinstance(raw, dict) or not 0 < len(raw) <= 256:
             raise ValueError("invalid CUDA PCI inventory")
-        mapping = {}
-        for key, value in raw.items():
-            ordinal = int(key)
-            if str(ordinal) != key or not 0 <= ordinal < 256 or ordinal in mapping:
-                raise ValueError("invalid CUDA device handle")
-            mapping[ordinal] = normalize_pci(value)
+        mapping = {parse_key(key): normalize_pci(value) for key, value in raw.items()}
         if len(set(mapping.values())) != len(mapping):
             raise ValueError("ambiguous CUDA PCI identity")
         return mapping
     except (OSError, subprocess.SubprocessError, ValueError) as error:
-        raise RuntimeError("CUDA physical PCI identity unavailable") from error
+        name = "CUDA" if mode == _CUDA_PCI_PROBE else "EGL/CUDA"
+        raise RuntimeError(f"{name} physical PCI identity unavailable") from error
+
+
+def cuda_pci_map(*, run=subprocess.run):
+    """Map same-process CUDA handles to PCI for driver diagnostics."""
+    return _driver_pci_probe(_CUDA_PCI_PROBE, _cuda_handle_key, run=run)
+
+
+def egl_cuda_pci_map(*, run=subprocess.run):
+    """Probe persistent EGL UUID -> physical PCI without exposing CUDA in the Actor."""
+    return _driver_pci_probe(_EGL_PCI_PROBE, _egl_uuid_key, run=run)
 
 
 class EGLDevices:
@@ -111,6 +128,15 @@ class EGLDevices:
             ctypes.c_void_p,
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_ssize_t),
+        )
+        self.query_binary = self._optional(
+            b"eglQueryDeviceBinaryEXT",
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
         )
         self.query_display = self._optional(
             b"eglQueryDisplayAttribEXT",
@@ -143,6 +169,22 @@ class EGLDevices:
         if not 0 <= value.value < 256:
             raise RuntimeError("invalid NVIDIA EGL CUDA handle")
         return int(value.value)
+
+    def _nvidia_uuid(self, device):
+        if self.query_binary is None or self.query_string is None:
+            return None
+        raw = self.query_string(device, 0x3055)  # EGL_EXTENSIONS
+        self.lib.eglGetError()
+        extensions = set((raw or b"").split())
+        if not {b"EGL_NV_device_cuda", b"EGL_EXT_device_persistent_id"} <= extensions:
+            return None
+        data, size = (ctypes.c_ubyte * 16)(), ctypes.c_int()
+        if not self.query_binary(device, 0x335C, len(data), data, ctypes.byref(size)):  # EGL_DEVICE_UUID_EXT
+            self.lib.eglGetError()
+            return None
+        if size.value != len(data):
+            raise RuntimeError("invalid NVIDIA EGL persistent device UUID size")
+        return _egl_uuid_key(bytes(data).hex())
 
     def _describe(self, device):
         # EGL_EXT_device_drm / EGL_EXT_device_drm_render_node, if provided.
@@ -182,7 +224,9 @@ class EGLDevices:
                     "handle": device,
                     "pci_bus_id": pci,
                     "device_node": node,
+                    "drm_accessible": os.access(node, os.R_OK | os.W_OK) if node else None,
                     "cuda_device": self._cuda_device(device),
+                    "egl_device_uuid": self._nvidia_uuid(device),
                 }
             )
         return result
@@ -205,7 +249,22 @@ class EGLDevices:
             "handle": device.value,
             "pci_bus_id": pci,
             "cuda_device": self._cuda_device(device.value),
+            "egl_device_uuid": self._nvidia_uuid(device.value),
         }
+
+
+def _egl_driver_pci():
+    cuda = _cuda_driver_pci()
+    mapping = {}
+    for device in EGLDevices().inventory():
+        uuid = device["egl_device_uuid"]
+        if uuid is None:
+            continue
+        pci = cuda.get(device["cuda_device"])
+        if pci is None or uuid in mapping or device["pci_bus_id"] not in (None, pci):
+            raise RuntimeError("missing, duplicate, or conflicting EGL/CUDA PCI identity")
+        mapping[uuid] = pci
+    return mapping
 
 
 def validate_proof(proof, plan, *, context=False):
@@ -224,7 +283,10 @@ def validate_proof(proof, plan, *, context=False):
             or type(proof.get("egl_device_handle")) is not int
             or proof["egl_device_handle"] <= 0
             or actual != expected
-            or (context and proof.get("context_verified") is not True)
+            or (context and (
+                proof.get("context_verified") is not True
+                or proof.get("context_device_handle_verified") is not True
+            ))
         ):
             raise ValueError("unproven physical EGL device/context")
     elif (
@@ -250,19 +312,25 @@ def configure(plan, *, api=None):
     if expected["gpu_id"] != plan["render_gpu_id"] or normalize_pci(expected["pci_bus_id"]) != expected["pci_bus_id"]:
         raise ValueError("physical render assignment identity mismatch")
     devices = (api or EGLDevices()).inventory()
-    if any(v.get("pci_bus_id") is None and v.get("cuda_device") is not None for v in devices):
-        cuda_map = cuda_pci_map()
+    if any(v.get("egl_device_uuid") is not None for v in devices):
+        uuid_pci = egl_cuda_pci_map()
+        seen = set()
         for device in devices:
-            cuda_id = device.get("cuda_device")
-            if cuda_id is None:
+            uuid = device.get("egl_device_uuid")
+            if uuid is None:
                 continue
-            pci = cuda_map.get(cuda_id)
-            if pci is None:
-                raise RuntimeError("EGL CUDA handle has no physical PCI identity")
-            if device["pci_bus_id"] is not None and device["pci_bus_id"] != pci:
+            pci = uuid_pci.get(uuid)
+            if uuid in seen or pci is None:
+                raise RuntimeError("EGL UUID has missing or ambiguous physical PCI identity")
+            if device["pci_bus_id"] not in (None, pci):
                 raise RuntimeError("EGL DRM and CUDA PCI identity conflict")
+            seen.add(uuid)
             device["pci_bus_id"] = pci
-    matches = [v for v in devices if v["pci_bus_id"] == expected["pci_bus_id"]]
+    matches = [
+        v for v in devices
+        if v["pci_bus_id"] == expected["pci_bus_id"]
+        and (v.get("drm_accessible") is not False or v.get("egl_device_uuid") is not None)
+    ]
     if len(matches) != 1:
         raise RuntimeError("selected physical render GPU must have one provable EGL device")
     selected = matches[0]
@@ -273,6 +341,7 @@ def configure(plan, *, api=None):
         actual_device=dict(expected),
         egl_device_index=selected["egl_device_index"],
         egl_device_handle=selected["handle"],
+        egl_device_uuid=selected.get("egl_device_uuid"),
         cuda_device=selected.get("cuda_device"),
         device_node=selected["device_node"],
         physical_identity_verified=True,
@@ -284,13 +353,21 @@ def configure(plan, *, api=None):
 def verify_current(proof, *, api=None):
     if proof["backend"] != "egl":
         return proof
-    if os.environ.get("MUJOCO_GL") != "egl" or os.environ.get("MUJOCO_EGL_DEVICE_ID") != str(proof["egl_device_index"]):
+    if (
+        os.environ.get("MUJOCO_GL") != "egl"
+        or os.environ.get("MUJOCO_EGL_DEVICE_ID") != str(proof["egl_device_index"])
+        or os.environ.get("CUDA_VISIBLE_DEVICES") != ""
+    ):
         raise RuntimeError("render environment changed after physical device attestation")
     # No full device enumeration / CUDA PCI subprocess on every scene reset.
     driver = api or EGLDevices()
     current = driver.current()
-    if current["handle"] is not None and current["handle"] != proof["egl_device_handle"]:
+    if not current.get("handle"):
+        raise RuntimeError("current EGL context device handle unavailable")
+    if current["handle"] != proof["egl_device_handle"]:
         raise RuntimeError("actual EGL context uses a different physical GPU")
+    if proof.get("egl_device_uuid") is not None and current.get("egl_device_uuid") != proof["egl_device_uuid"]:
+        raise RuntimeError("actual EGL context has a different persistent device UUID")
     if current.get("pci_bus_id") is not None and current["pci_bus_id"] != proof["expected_device"]["pci_bus_id"]:
         raise RuntimeError("actual EGL context has a different physical PCI identity")
     if (
@@ -303,8 +380,15 @@ def verify_current(proof, *, api=None):
         dict(
             proof,
             context_verified=True,
-            context_device_handle_verified=current["handle"] is not None,
+            context_device_handle_verified=True,
         ),
         proof,
         context=True,
     )
+
+
+if __name__ == "__main__":
+    commands = {_CUDA_PCI_PROBE: _cuda_driver_pci, _EGL_PCI_PROBE: _egl_driver_pci}
+    if len(sys.argv) != 2 or sys.argv[1] not in commands or "CUDA_VISIBLE_DEVICES" in os.environ:
+        raise SystemExit("expected an isolated driver PCI probe invocation")
+    print(json.dumps(commands[sys.argv[1]]()))

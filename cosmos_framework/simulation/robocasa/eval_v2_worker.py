@@ -50,6 +50,21 @@ def serve(channel, cfg, *, factory=None):
                 from cosmos_framework.simulation.robocasa import eval_v2_transactions
 
                 modules["transactions"] = Path(eval_v2_transactions.__file__)
+            g2_profile = cfg["settings"].get("g2_profile", "legacy")
+            if g2_profile != "legacy":
+                if (
+                    g2_profile not in ("g2_r1", "g2_r2")
+                    or cfg["settings"].get("execution_profile") != "phase_b"
+                    or cfg["settings"].get("local_memory_mode") != "required"
+                    or cfg["settings"].get("local_evidence_profile", "server_vae") != "server_vae"
+                ):
+                    raise ValueError("G2 actor requires an assigned Phase B Local-TTT session with server VAE")
+                from importlib.util import find_spec
+
+                runtime_spec = find_spec("g2.online.runtime")
+                if runtime_spec is None or runtime_spec.origin is None:
+                    raise ValueError("missing Root G2 runtime origin")
+                modules["g2_runtime"] = Path(runtime_spec.origin)
             evidence_profile = cfg["settings"].get("local_evidence_profile", "server_vae")
             if evidence_profile not in ("server_vae", "sim_shared_vae"):
                 raise ValueError("unknown Actor source profile")
@@ -107,6 +122,7 @@ def serve(channel, cfg, *, factory=None):
                 "physical_slot_id": cfg["physical_slot_id"],
                 "state": slot.state,
                 "local_memory_mode": cfg["settings"].get("local_memory_mode", "required"),
+                **({"g2_profile": g2_profile} if factory is None and g2_profile != "legacy" else {}),
                 "runtime_digest": runtime["digest"] if factory is None else "CPU_TEST_FACTORY",
                 "rendering": rendering,
             },

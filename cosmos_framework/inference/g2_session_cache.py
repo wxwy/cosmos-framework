@@ -14,10 +14,14 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
+from itertools import chain
 from typing import Callable
 
 import torch
+
+from cosmos_framework.inference.g2_cache_budget import CacheBudget as CacheBudget
 
 STAGES = ("view_latent", "text", "text_kv", "task_queries", "global", "global_projection", "global_kv")
 
@@ -26,20 +30,6 @@ def content_key(*dependencies) -> str:
     """Hash explicit JSON dependencies; tensor identity is intentionally unsupported."""
     raw = json.dumps(dependencies, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-@dataclass(frozen=True)
-class CacheBudget:
-    # Candidate safety bounds, NOT measured deployment recommendations.
-    max_sessions: int = 32
-    max_entries: int = 256
-    cpu_bytes: int = 256 * 1024**2
-    gpu_bytes: int = 256 * 1024**2
-    handles: int = 4096
-
-    def __post_init__(self):
-        if any(type(v) is not int or v <= 0 for v in vars(self).values()):
-            raise ValueError("positive explicit condition-cache budgets required")
 
 
 @dataclass(frozen=True)
@@ -116,7 +106,7 @@ class CacheLease:
                 _, expected = _owned_tree(computed, clone=False)
                 # Evict/reserve BEFORE allocating owned tensor copies. The
                 # model's temporary working output is outside the cache budget.
-                self.owner._make_room(expected, extra_entry=True)
+                self.owner._make_room(expected, extra_entry=True, stage=stage)
                 value, usage = _owned_tree(computed)
                 if usage != expected:
                     raise RuntimeError("condition metadata changed while capturing fixed request storage")
@@ -126,6 +116,7 @@ class CacheLease:
                     self.owner._entries[full_key] = entry
                 else:
                     self.owner._transient.add(entry)
+                self.owner._track_high_water(self.owner._resident())
             else:
                 self.owner._entries.move_to_end(full_key)
             entry.pins += 1
@@ -163,6 +154,17 @@ class SessionConditionCache:
         self._active: dict[str, int] = {}
         self._transient: set[_Entry] = set()
         self._usage = Usage()
+        self._limits = dict(
+            cpu_bytes=budget.cpu_bytes,
+            gpu_bytes=budget.gpu_bytes,
+            handles=budget.handles,
+            entries=budget.max_entries,
+            sessions=budget.max_sessions,
+        )
+        self._high_water = dict.fromkeys((*self._limits, "active_leases"), 0)
+        self._reject_count = 0
+        self._reject_by_dimension = dict.fromkeys(self._limits, 0)
+        self._last_rejection = None
         self._stats = {s: {"hit": 0, "miss": 0, "hit_ns": 0, "miss_ns": 0, "evictions": 0} for s in STAGES}
 
     def _drop(self, key):
@@ -170,28 +172,73 @@ class SessionConditionCache:
         self._usage -= entry.usage
         self._stats[key[2]]["evictions"] += 1
 
-    def _make_room(self, usage, *, extra_entry):
-        if (
-            usage.cpu_bytes > self.budget.cpu_bytes
-            or usage.gpu_bytes > self.budget.gpu_bytes
-            or usage.handles > self.budget.handles
-        ):
-            raise MemoryError("single condition exceeds explicit CPU/GPU/handle budget")
+    def _resident(self):
+        return {"entries": len(self._entries) + len(self._transient), **vars(self._usage)}
 
-        def fits():
-            total = self._usage + usage
-            return (
-                len(self._entries) + len(self._transient) + int(extra_entry) <= self.budget.max_entries
-                and total.cpu_bytes <= self.budget.cpu_bytes
-                and total.gpu_bytes <= self.budget.gpu_bytes
-                and total.handles <= self.budget.handles
+    def _pinned(self):
+        usage, entries = Usage(), 0
+        for entry in chain(self._entries.values(), self._transient):
+            if entry.pins:
+                entries += 1
+                usage += entry.usage
+        return {"entries": entries, **vars(usage)}
+
+    def _track_high_water(self, values):
+        for dimension, value in values.items():
+            self._high_water[dimension] = max(self._high_water[dimension], value)
+
+    def _exceeded(self, usage, requested):
+        return [name for name, value in requested.items() if usage.get(name, 0) + value > self._limits[name]]
+
+    def _reject(self, message, *, stage, dimensions, requested, pinned):
+        self._reject_count += 1
+        for name in dimensions:
+            self._reject_by_dimension[name] += 1
+        self._last_rejection = {
+            "stage": stage,
+            "exceeded": dimensions,
+            "requested": requested,
+            "current": {
+                **self._resident(),
+                "sessions": len(self._sessions),
+                "active_leases": sum(self._active.values()),
+            },
+            "pinned": pinned,
+            "limits": {name: self._limits[name] for name in dimensions},
+            "high_water": self._high_water.copy(),
+        }
+        raise MemoryError(f"{message}: {json.dumps(self._last_rejection, sort_keys=True)}")
+
+    def _make_room(self, usage, *, extra_entry, stage=None):
+        requested = {"entries": int(extra_entry), **vars(usage)}
+        oversized = self._exceeded({}, requested)
+        if oversized:
+            self._reject(
+                "single condition exceeds budget",
+                stage=stage,
+                dimensions=oversized,
+                requested=requested,
+                pinned=self._pinned(),
             )
-
-        while not fits():
-            victim = next((key for key, entry in self._entries.items() if not entry.pins), None)
-            if victim is None:
-                raise MemoryError("condition cache/request exceeds explicit CPU/GPU/entry/handle budget")
-            self._drop(victim)
+        if not self._exceeded(self._resident(), requested):
+            return
+        pinned = self._pinned()
+        blocked = self._exceeded(pinned, requested)
+        if blocked:
+            self._reject(
+                "condition cache/request exceeds budget with pinned entries",
+                stage=stage,
+                dimensions=blocked,
+                requested=requested,
+                pinned=pinned,
+            )
+        # Evict LRU unpinned values only when the reservation is feasible.
+        for key, entry in tuple(self._entries.items()):
+            if not entry.pins:
+                self._drop(key)
+                if not self._exceeded(self._resident(), requested):
+                    return
+        raise RuntimeError("inconsistent Condition Cache reservation accounting")
 
     @contextmanager
     def request(self, session_id: str, *, enabled=True):
@@ -202,12 +249,19 @@ class SessionConditionCache:
                 if len(self._sessions) >= self.budget.max_sessions:
                     victim = next((s for s in self._sessions if not self._active[s]), None)
                     if victim is None:
-                        raise MemoryError("all bounded cache Sessions have active requests")
+                        self._reject(
+                            "all bounded cache Sessions have active requests",
+                            stage="session",
+                            dimensions=["sessions"],
+                            requested={"sessions": 1},
+                            pinned={**self._pinned(), "sessions": len(self._sessions)},
+                        )
                     self.reset(victim)
                 self._sessions[session_id] = None
                 self._active[session_id] = 0
             self._sessions.move_to_end(session_id)
             self._active[session_id] += 1
+            self._track_high_water(dict(sessions=len(self._sessions), active_leases=sum(self._active.values())))
         lease = CacheLease(self, session_id, enabled)
         try:
             yield lease
@@ -245,6 +299,13 @@ class SessionConditionCache:
                 "entries": len(self._entries),
                 "request_entries": len(self._transient),
                 "active_requests": sum(self._active.values()),
+                "pinned": self._pinned(),
+                "high_water": self._high_water.copy(),
+                "rejections": {
+                    "count": self._reject_count,
+                    "by_dimension": self._reject_by_dimension.copy(),
+                    "last": deepcopy(self._last_rejection),
+                },
                 "stages": {key: value.copy() for key, value in self._stats.items()},
                 "counter_scope": "process lifetime; model reload empties all resident derived values",
                 "timing": "host elapsed; hit/miss separated; no CUDA speed inference",
