@@ -188,9 +188,8 @@ def build_manifest(
             or any(not isinstance(g2[key], str) or not _SHA.fullmatch(g2[key]) for key in bound)
             or local_memory != "required"
             or not isinstance(execution, dict)
-            or execution.get("max_infer_batch_size") != 1
-            or execution.get("sims_per_gpu") != 1
-            or len(execution.get("gpu_ids", [])) != 1
+            or "single_latency" in execution
+            or "shared_vae" in execution
         ):
             raise ValueError("invalid G2 R1 experiment identity")
     for key in ("model_digest", "config_sha256", "runtime_digest"):

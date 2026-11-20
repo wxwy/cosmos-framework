@@ -12,6 +12,10 @@ import torch
 
 from cosmos_framework.data.generator.action.utils import static_task_text
 from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskText, StaticTaskTextRecipe
+from cosmos_framework.inference.g2_model_hooks_test import actual_tiny_model
+from cosmos_framework.inference.g2_model_hooks_test import hooks as actual_hooks
+from cosmos_framework.inference.g2_native_policy import NativeG2R1Authority
+from cosmos_framework.inference.g2_policy_conditions import G2ConditionRuntime
 from cosmos_framework.inference.g2_policy_conditions_test import request as condition_request
 from cosmos_framework.inference.g2_policy_conditions_test import runtime
 from cosmos_framework.inference.robocasa_batch_transactions import BatchedSessionTransactions
@@ -247,6 +251,165 @@ def test_native_mixed_Session_batch_routes_conditions_and_Local_by_original_inde
         assert [s.identity.scene_id for s in rt.last_request_sources] == ["scene", "different-scene"]
     finally:
         assert actor.close()
+
+
+def _native_r1_cpu_service(monkeypatch, tmp_path, slots, batch_size):
+    obj = service(monkeypatch)
+    obj.local_memory_adapter, _ = make_adapter(slots)
+    obj.model, _ = actual_tiny_model(monkeypatch, global_enabled=False)
+    obj.model.vlm_processor = SimpleNamespace(tokenize_text=obj.model.tokenize_text)
+    hooks = actual_hooks(obj.model)
+    obj.g2_native_authority = NativeG2R1Authority(
+        model_path=tmp_path / "model",
+        config_path=tmp_path / "config.yaml",
+        text_recipe=StaticTaskTextRecipe(17, 20, 256, 512, hooks.tokenizer_identity),
+        state15_recipe_id="state15-v1",
+        alignment_version="online-align-v1",
+        data_identity="online-v1",
+        initial_language_recipe_id="template-v1",
+        top_variant="with_robot",
+        versions={},
+        files={},
+    )
+    rt = obj.g2_conditions = G2ConditionRuntime(hooks, profile="g2_r1")
+    observed = {}
+
+    def generate(batch, *, _g2_condition, _local_memory_prefixes, seed, **kwargs):
+        # Native text preparation, packed UND/GEN KV, and Local fast weights
+        # are real tiny CPU computations. Only the diffusion sampler is doubled.
+        condition = _g2_condition
+        count = len(batch["action"])
+        assert seed == [obj.cfg.seed] * count
+        assert condition.views == condition.global_tokens == (None,) * count
+        assert condition.global_kv is None
+        assert len(condition.text.lengths) == len(_local_memory_prefixes) == count
+        features = condition.text_features
+        offset = 0
+        actions = []
+        for i, (length, prefix) in enumerate(zip(condition.text.lengths, _local_memory_prefixes, strict=True)):
+            state = batch["action"][i][0][0, :15]
+            state_id = float(state[0])
+            assert state_id not in observed
+            assert int(features.valid_mask[i].sum()) == length
+            layers = (*features.layers, *condition.gen_text_kv)
+            observed[state_id] = (
+                batch["prompt"][i],
+                condition.text.token_ids[i],
+                condition.text.position_ids[i],
+                state.clone(),
+                features.hidden[i, :length].clone(),
+                tuple(t[offset : offset + length].clone() for layer in layers for t in (layer.key, layer.value)),
+                None if prefix is None else prefix.clone(),
+            )
+            offset += length
+            token_value = sum(condition.text.token_ids[i]) / 100_000
+            local_value = 0 if prefix is None else float(prefix.square().sum()) / 10_000
+            action = torch.zeros(1, 17, 64)
+            action[:, 1:, :15] = state + token_value + local_value
+            actions.append(action)
+        return {"action": actions}
+
+    obj.model.generate_samples_from_batch = generate
+    actor = obj.transactions = BatchedSessionTransactions(
+        obj.local_memory_adapter,
+        obj._transaction_batch,
+        lambda: None,
+        owner_token="cpu-owner",
+        run_lease="run",
+        manifest_digest="a" * 64,
+        slot_ids=tuple(f"slot{i}" for i in range(slots)),
+        capacity_profile="streaming32",
+        max_batch_size=batch_size,
+        batch_wait_ms=100,
+        timeout_s=30,
+        model_lock=obj._lock,
+        conditions=rt,
+    )
+    return obj, actor, rt, observed
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
+def test_native_r1_batch_matches_each_session_serially_with_dense_local_history(monkeypatch, tmp_path, batch_size):
+    slots = 16 if batch_size == 8 else batch_size
+    runs = [_native_r1_cpu_service(monkeypatch, tmp_path, slots, size) for size in (batch_size, 1)]
+
+    def evaluate(run, limit):
+        obj, actor, rt, observed = run
+        leases = [
+            register(actor, f"slot{i}", episode_index=i, task="OpenDrawer" if i % 2 else "CloseFridge")
+            for i in range(slots)
+        ]
+        results, snapshots = {}, {}
+        for frame in (0, 16):
+            # Warm requests deliberately permute batch members and peers.
+            order = list(range(slots)) if frame == 0 else list(reversed(range(slots)))
+            for start in range(0, slots, limit):
+                group = order[start : start + limit]
+                pending = []
+                for i in group:
+                    req = g2_payload(leases[i], frame, scene=f"scene-{i}", subtask=f"subtask-{i}", value=i + 1)
+                    req["state"] = [i / 32 + frame / 32 + j / 1024 for j in range(15)]
+                    req["prompt"] = "Act on the " + "wooden " * i + f"fixture {i}."
+                    req["g2"]["static_text"].update(enhanced_instruction=req["prompt"], source_identity=f"sg-{i}")
+                    req["g2"]["identity"].update(task_binding_id=f"binding-{i}", logical_state_frame=0)
+                    pending.append(submit(actor, leases[i], req))
+                rows = [wait_result(actor, leases[i], p) for i, p in zip(group, pending, strict=True)]
+                native = [r.json()["native_batch"] for r in rows]
+                assert len({v["id"] for v in native}) == 1
+                assert [v["size"] for v in native] == [len(group)] * len(group)
+                assert [v["index"] for v in native] == list(range(len(group)))
+                if len(group) > 1:
+                    with pytest.raises(ValueError):
+                        ack(actor, leases[group[1]], rows[0])
+                for i, r in zip(group, rows, strict=True):
+                    value = r.json()
+                    assert value["assignment"]["session_id"] == leases[i]["session_id"]
+                    local = value["local_memory"]
+                    assert local["prefix_present"] == bool(frame)
+                    assert local["encoded_steps"] == frame
+                    if frame:
+                        assert local["adapted_steps"] == frame
+                    action = torch.tensor(value["action"])
+                    assert action.shape == (16, 15) and torch.isfinite(action).all()
+                    results[frame, i] = action
+                    state = obj.local_memory_adapter.snapshot.fast[leases[i]["session_id"]]
+                    assert state.consumer_step == frame
+                    snapshots[frame, i] = state.state
+                    assert ack(actor, leases[i], r).json()["acknowledged"]
+        assert actor.info()["batch_histogram"] == {limit: 2 * slots // limit}
+        assert rt.info()["task_bindings"] == slots
+        for i, lease in enumerate(leases):
+            assert rt._tasks[lease["session_id"]][:4] == (
+                lease["episode_id"],
+                f"scene-{i}",
+                f"subtask-{i}",
+                f"binding-{i}",
+            )
+        assert actor.end(leases[0]).json()["acknowledged"]
+        assert rt.info()["task_bindings"] == slots - 1
+        assert set(obj.local_memory_adapter.snapshot.fast) == {l["session_id"] for l in leases[1:]}
+        return results, snapshots, observed
+
+    try:
+        packed, serial = (evaluate(run, limit) for run, limit in zip(runs, (batch_size, 1), strict=True))
+        for key, action in serial[0].items():
+            torch.testing.assert_close(packed[0][key], action, rtol=0, atol=0)
+            reference = serial[1][key]
+            if reference is None:
+                assert packed[1][key] is None
+            else:
+                torch.testing.assert_close(packed[1][key], reference, rtol=0, atol=0)
+        for key, reference in serial[2].items():
+            actual = packed[2][key]
+            assert actual[:3] == reference[:3]
+            torch.testing.assert_close(actual[3:-1], reference[3:-1], rtol=0, atol=0)
+            if reference[-1] is None:
+                assert actual[-1] is None
+            else:
+                torch.testing.assert_close(actual[-1], reference[-1], rtol=0, atol=0)
+    finally:
+        for _, actor, _, _ in runs:
+            assert actor.close()
 
 
 def test_service_cache_on_off_exact_actions_and_real_Local_state_parity(monkeypatch):
