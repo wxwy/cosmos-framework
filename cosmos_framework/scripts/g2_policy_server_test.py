@@ -262,7 +262,7 @@ def _native_r1_cpu_service(monkeypatch, tmp_path, slots, batch_size):
     obj.g2_native_authority = NativeG2R1Authority(
         model_path=tmp_path / "model",
         config_path=tmp_path / "config.yaml",
-        text_recipe=StaticTaskTextRecipe(17, 20, 256, 512, hooks.tokenizer_identity),
+        text_recipe=StaticTaskTextRecipe(17, 20, 192, 320, hooks.tokenizer_identity),
         state15_recipe_id="state15-v1",
         alignment_version="online-align-v1",
         data_identity="online-v1",
