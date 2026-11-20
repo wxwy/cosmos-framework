@@ -12,6 +12,7 @@ import torch
 
 from cosmos_framework.data.generator.action.utils import static_task_text
 from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskText, StaticTaskTextRecipe
+from cosmos_framework.inference.g2_cache_budget import CacheBudget
 from cosmos_framework.inference.g2_model_hooks_test import actual_tiny_model
 from cosmos_framework.inference.g2_model_hooks_test import hooks as actual_hooks
 from cosmos_framework.inference.g2_native_policy import NativeG2Authority
@@ -254,7 +255,7 @@ def test_native_mixed_Session_batch_routes_conditions_and_Local_by_original_inde
         assert actor.close()
 
 
-def _native_g2_cpu_service(monkeypatch, tmp_path, slots, batch_size, profile):
+def _native_g2_cpu_service(monkeypatch, tmp_path, slots, batch_size, profile, *, budget=CacheBudget()):
     global_enabled = profile == "g2_r2"
     obj = service(monkeypatch)
     obj.local_memory_adapter, _ = make_adapter(slots)
@@ -277,7 +278,9 @@ def _native_g2_cpu_service(monkeypatch, tmp_path, slots, batch_size, profile):
     provider = FixtureProvider() if global_enabled else None
     if provider is not None:
         provider.scene_offsets = {f"scene-{i}": float(i) for i in range(slots)}
-    rt = obj.g2_conditions = G2ConditionRuntime(hooks, profile=profile, provider=provider, allow_fixtures=True)
+    rt = obj.g2_conditions = G2ConditionRuntime(
+        hooks, profile=profile, provider=provider, allow_fixtures=True, budget=budget
+    )
     observed = {}
 
     def generate(batch, *, _g2_condition, _local_memory_prefixes, seed, **kwargs):
@@ -343,7 +346,7 @@ def _native_g2_cpu_service(monkeypatch, tmp_path, slots, batch_size, profile):
         slot_ids=tuple(f"slot{i}" for i in range(slots)),
         capacity_profile="streaming32",
         max_batch_size=batch_size,
-        batch_wait_ms=100,
+        batch_wait_ms=120,
         timeout_s=30,
         model_lock=obj._lock,
         conditions=rt,
@@ -351,7 +354,7 @@ def _native_g2_cpu_service(monkeypatch, tmp_path, slots, batch_size, profile):
     return obj, actor, rt, observed
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("profile", ["g2_r1", "g2_r2"])
 def test_native_g2_batch_matches_each_session_serially_with_dense_local_history(
     monkeypatch, tmp_path, batch_size, profile
@@ -404,6 +407,8 @@ def test_native_g2_batch_matches_each_session_serially_with_dense_local_history(
                     assert ack(actor, leases[i], r).json()["acknowledged"]
         assert actor.info()["batch_histogram"] == {limit: 2 * slots // limit}
         assert rt.info()["task_bindings"] == slots
+        assert rt.cache.info()["high_water"]["active_leases"] == limit
+        assert rt.cache.info()["rejections"]["count"] == 0
         for i, lease in enumerate(leases):
             assert rt._tasks[lease["session_id"]][:4] == (
                 lease["episode_id"],
@@ -436,6 +441,31 @@ def test_native_g2_batch_matches_each_session_serially_with_dense_local_history(
     finally:
         for _, actor, _, _ in runs:
             assert actor.close()
+
+
+def test_native_r1_b3_reports_text_kv_pressure_and_aborts_every_local_update(monkeypatch, tmp_path):
+    obj, actor, rt, observed = _native_g2_cpu_service(
+        monkeypatch, tmp_path, 3, 3, "g2_r1", budget=CacheBudget(max_entries=5)
+    )
+    try:
+        leases = [register(actor, f"slot{i}", episode_index=i) for i in range(3)]
+        pending = [submit(actor, lease, g2_payload(lease)) for lease in leases]
+        for lease, request in zip(leases, pending, strict=True):
+            failed = wait_result(actor, lease, request, expected=409).json()
+            assert failed["error_type"] == "MemoryError"
+            assert '"stage": "text_kv"' in failed["error"] and '"exceeded": ["entries"]' in failed["error"]
+        assert not observed  # No action or ACK left the failed native batch.
+        assert actor.info()["requests_finished"] == 0
+        assert not obj.local_memory_adapter.snapshot.fast
+        info = rt.cache.info()
+        assert info["active_requests"] == info["pinned"]["entries"] == 0
+        assert info["high_water"]["active_leases"] == 3
+        assert info["rejections"]["last"]["pinned"]["entries"] == 5
+        for lease in leases:
+            assert actor.end(lease).json()["acknowledged"]
+        assert rt.cache.info()["entries"] == rt.info()["task_bindings"] == 0
+    finally:
+        assert actor.close()
 
 
 def test_service_cache_on_off_exact_actions_and_real_Local_state_parity(monkeypatch):

@@ -10,9 +10,12 @@ import re
 import sys
 from dataclasses import dataclass, field
 
+from cosmos_framework.inference.g2_cache_budget import CacheBudget
+
 SCHEMA = "psm_robocasa_eval_v2"
 # Existing frozen Native model/protocol contract; not a configurable history default.
 ACTION_CHUNK_SIZE = 16
+G2_R1_FORMAL_BATCH_WAIT_MS = 120
 SAMPLING = "dynamic_slot_environment_seed_then_continuous_reset_v3"
 ROUND_SCHEDULE = "episode_major_frozen_order_round_barrier_v1"
 STREAMING_SCHEDULE = "streaming_task_affinity_v2"
@@ -178,6 +181,7 @@ def build_manifest(
     required = {"model_digest", "config_sha256", "runtime_digest", "root_sha", "child_sha", "task_metadata"}
     if set(experiment) not in (required, required | {"g2"}):
         raise ValueError("complete experiment identity required")
+    g2_budget = None
     if "g2" in experiment:
         g2 = experiment["g2"]
         bound = {"run_recipe_sha256", "checkpoint_metadata_sha256", "actor_options_sha256"}
@@ -185,7 +189,7 @@ def build_manifest(
             bound.add("view_recipe_id")
         if (
             not isinstance(g2, dict)
-            or set(g2) != bound | {"profile"}
+            or set(g2) not in (bound | {"profile"}, bound | {"profile", "cache_budget"})
             or g2["profile"] not in ("g2_r1", "g2_r2")
             or any(not isinstance(g2[key], str) or not _SHA.fullmatch(g2[key]) for key in bound)
             or local_memory != "required"
@@ -194,6 +198,8 @@ def build_manifest(
             or "shared_vae" in execution
         ):
             raise ValueError("invalid G2 experiment identity")
+        if "cache_budget" in g2:
+            g2_budget = CacheBudget.from_record(g2["cache_budget"])
     for key in ("model_digest", "config_sha256", "runtime_digest"):
         if not isinstance(experiment[key], str) or not _SHA.fullmatch(experiment[key]):
             raise ValueError("invalid experiment digest")
@@ -300,6 +306,19 @@ def build_manifest(
             validate_streaming_resources(execution["resources"])
             integer(execution["max_rss_bytes"], 1, 2**63 - 1, "max_rss_bytes")
             body["protocol"].update(schedule=STREAMING_SCHEDULE, sampling=STREAMING_SAMPLING)
+        if g2_budget is not None:
+            g2_budget.validate_placement(
+                slots=execution["sims_per_gpu"],
+                servers=len(gpus),
+                rss_limit=execution.get("max_rss_bytes"),
+                gpu_limit=execution.get("resources", {}).get("max_owned_gpu_bytes"),
+            )
+            if (
+                formal
+                and experiment["g2"]["profile"] == "g2_r1"
+                and execution["batch_wait_ms"] != G2_R1_FORMAL_BATCH_WAIT_MS
+            ):
+                raise ValueError("formal G2 R1 evaluation requires batch_wait_ms=120")
     if rendering is not None:
         if (
             not isinstance(rendering, dict)

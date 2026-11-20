@@ -83,6 +83,7 @@ from cosmos_framework.inference.args import OmniSetupArgs, OmniSetupOverrides
 from cosmos_framework.inference.common.args import CheckpointOverrides, ConfigFileType, tyro_cli
 from cosmos_framework.inference.common.config import deserialize_config_dict
 from cosmos_framework.inference.common.init import init_output_dir
+from cosmos_framework.inference.g2_cache_budget import DEFAULT_CACHE_BUDGET, CacheBudget
 from cosmos_framework.inference.inference import OmniInference
 from cosmos_framework.inference.robocasa_batch_transactions import (
     BatchedSessionTransactions,
@@ -564,11 +565,11 @@ class ActionServerArgs(pydantic.BaseModel):
     g2_view_vae_recipe: Path | None = None
     g2_view_vae_weights: Path | None = None
     g2_cache_enabled: bool = True
-    g2_cache_max_sessions: int = 32
-    g2_cache_max_entries: int = 256
-    g2_cache_cpu_bytes: int = 256 * 1024**2
-    g2_cache_gpu_bytes: int = 256 * 1024**2
-    g2_cache_handles: int = 4096
+    g2_cache_max_sessions: int = DEFAULT_CACHE_BUDGET.max_sessions
+    g2_cache_max_entries: int = DEFAULT_CACHE_BUDGET.max_entries
+    g2_cache_cpu_bytes: int = DEFAULT_CACHE_BUDGET.cpu_bytes
+    g2_cache_gpu_bytes: int = DEFAULT_CACHE_BUDGET.gpu_bytes
+    g2_cache_handles: int = DEFAULT_CACHE_BUDGET.handles
     media_spool_max_jobs: int = 4
     media_spool_max_bytes: int = 512 * 1024**2
     media_drain_timeout_s: float = 300.0
@@ -943,6 +944,8 @@ class ActionModelService:
                 raise ValueError("G2 requires B's shared model hooks factory; no substitute UND/Reader forward")
             if g2_profile == "g2_r2" and not native_g2 and not getattr(args, "g2_provider_factory", None):
                 raise ValueError("R2 requires an actual current-rollout provider; expert map playback is unsupported")
+            cache_budget = CacheBudget.from_options(vars(args))
+            cache_budget.validate_placement(slots=len(transaction_options["slot_ids"]), servers=1)
         self.transactions = None
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for OmniMoTModel inference in this repo.")
@@ -1186,7 +1189,7 @@ class ActionModelService:
         )
         log.info(f"[action-server] local_memory={self.local_memory_adapter.info()}")
         if g2_profile != "legacy":
-            self._configure_g2_conditions(args)
+            self._configure_g2_conditions(args, budget=cache_budget)
         if transaction_options is not None:
             if self.g2_conditions is not None:
                 transaction_options = dict(transaction_options, conditions=self.g2_conditions)
@@ -1395,13 +1398,15 @@ class ActionModelService:
             info["authority"] = dict(authority.versions)
         return info
 
-    def _configure_g2_conditions(self, args):
+    def _configure_g2_conditions(self, args, *, budget=None):
         # Factories are trusted startup configuration, never names from a request.
         # Imports remain lazy: legacy/R1 never import a spatial provider/Reader here.
         import importlib
 
         from cosmos_framework.inference.g2_policy_conditions import G2ConditionRuntime
-        from cosmos_framework.inference.g2_session_cache import CacheBudget
+
+        if budget is None:
+            budget = CacheBudget.from_options(vars(args))
 
         def create(path):
             module, separator, name = path.partition(":")
@@ -1424,20 +1429,14 @@ class ActionModelService:
                     recipe_id=authority.versions["view_recipe_id"],
                     weights=args.g2_view_vae_weights,
                     timeout_s=args.transaction_timeout_s,
-                    max_views=args.g2_cache_max_entries,
+                    max_views=budget.max_entries,
                 )
         self.g2_conditions = G2ConditionRuntime(
             hooks,
             profile=args.g2_profile,
             provider=provider,
             cache_enabled=args.g2_cache_enabled,
-            budget=CacheBudget(
-                max_sessions=args.g2_cache_max_sessions,
-                max_entries=args.g2_cache_max_entries,
-                cpu_bytes=args.g2_cache_cpu_bytes,
-                gpu_bytes=args.g2_cache_gpu_bytes,
-                handles=args.g2_cache_handles,
-            ),
+            budget=budget,
         )
 
     @contextmanager
