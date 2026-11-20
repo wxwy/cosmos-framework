@@ -163,12 +163,15 @@ def predict(
     state: list[float] | None = None,
     local_memory: dict | None = None,
     http_session=None,
+    g2: dict | None = None,
 ) -> dict:
     payload = {"image": b64_png(composite), "prompt": prompt, "domain_name": "robocasa", "image_size": image_size}
     if state is not None:
         payload["state"] = state
     if local_memory is not None:
         payload["local_memory"] = local_memory
+    if g2 is not None:
+        payload["g2"] = g2
     resp = (http_session or requests).post(
         f"{server_url}/predict", json=payload, headers={"Content-Type": "application/json"}, timeout=timeout
     )

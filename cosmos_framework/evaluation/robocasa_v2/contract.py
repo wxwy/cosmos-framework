@@ -175,8 +175,24 @@ def build_manifest(
         raise ValueError("missing official per-task horizons")
     for value in horizons.values():
         integer(value, 1, 100000, "horizon")
-    if set(experiment) != {"model_digest", "config_sha256", "runtime_digest", "root_sha", "child_sha", "task_metadata"}:
+    required = {"model_digest", "config_sha256", "runtime_digest", "root_sha", "child_sha", "task_metadata"}
+    if set(experiment) not in (required, required | {"g2"}):
         raise ValueError("complete experiment identity required")
+    if "g2" in experiment:
+        g2 = experiment["g2"]
+        bound = {"run_recipe_sha256", "checkpoint_metadata_sha256", "actor_options_sha256"}
+        if (
+            not isinstance(g2, dict)
+            or set(g2) != bound | {"profile"}
+            or g2["profile"] != "g2_r1"
+            or any(not isinstance(g2[key], str) or not _SHA.fullmatch(g2[key]) for key in bound)
+            or local_memory != "required"
+            or not isinstance(execution, dict)
+            or execution.get("max_infer_batch_size") != 1
+            or execution.get("sims_per_gpu") != 1
+            or len(execution.get("gpu_ids", [])) != 1
+        ):
+            raise ValueError("invalid G2 R1 experiment identity")
     for key in ("model_digest", "config_sha256", "runtime_digest"):
         if not isinstance(experiment[key], str) or not _SHA.fullmatch(experiment[key]):
             raise ValueError("invalid experiment digest")

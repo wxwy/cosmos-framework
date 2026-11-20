@@ -95,3 +95,100 @@ def test_failure_never_publishes_completed_evidence(monkeypatch, failure: str) -
     with pytest.raises((ValueError, RuntimeError)):
         _run(module, env, client)
     assert client.completed == []
+
+
+@pytest.mark.parametrize("failure", (None, "env", "prediction"))
+def test_g2_replans_use_current_state_and_record_only_completed_steps(monkeypatch, failure):
+    module = _module(monkeypatch)
+    monkeypatch.setattr(module, "CAMERA_SET", "left_wrist")
+    monkeypatch.setattr(module, "check_success", lambda env: len(env.steps) == 18)
+
+    class Env(_Env):
+        def step(self, action):
+            if failure == "env" and len(self.steps) == 16:
+                raise RuntimeError("G2 test simulator error")
+            obs, reward, _, info = super().step(action)
+            return obs, reward, False, info
+
+    class Runtime:
+        def __init__(self):
+            self.completed = []
+            self.closed = False
+
+        def reset(self, env, observation, **identity):
+            assert observation == {"step": 0}
+            assert identity == {
+                "episode_id": client.payload(0)["episode_id"],
+                "task": "CloseFridge",
+                "instruction": "close fridge",
+                "frame": 0,
+                "episode_index": 7,
+            }
+
+        def decision(self, observation, *, frame, composite, local_memory):
+            assert observation["step"] == frame == local_memory["consumer_step"] == len(self.completed)
+            assert composite[0, 0, 0] == frame
+            assert [row["source_step"] for row in local_memory["evidence"]] == list(range(frame))
+            return {
+                "state": [2.0, -1.0, 0.3, 1.0, 0.0] + [float(frame)] * 10,
+                "prompt": f"close fridge with current facts at {frame}",
+                "g2": {"identity": {"episode_id": local_memory["episode_id"], "decision_frame": frame}},
+            }
+
+        def record_completed(self, env, observation, *, source_frame, canonical_raw15, submitted_env12):
+            assert observation["step"] == source_frame + 1 == len(env.steps)
+            np.testing.assert_array_equal(canonical_raw15, client.completed[source_frame][1])
+            np.testing.assert_array_equal(submitted_env12, env.steps[source_frame])
+            self.completed.append(source_frame)
+
+        def close(self):
+            self.closed = True
+
+    frames = []
+    prediction_witnesses = []
+
+    def predict(server_url, image, prompt, image_size, timeout, *, state, local_memory, g2):
+        frame = int(image[0, 0, 0])
+        frames.append(frame)
+        assert state[:5] == [2.0, -1.0, 0.3, 1.0, 0.0]
+        assert state[-1] == frame
+        assert prompt == f"close fridge with current facts at {frame}"
+        assert g2["identity"] == {"episode_id": local_memory["episode_id"], "decision_frame": frame}
+        actions = [_action()] * 16
+        if frame == 16 and failure == "prediction":
+            actions[-1] = _action()[:14]
+        return {"action": actions, "local_memory": local_memory}
+
+    monkeypatch.setattr(module, "predict", predict)
+    env, client, runtime = Env(), _Client(), Runtime()
+
+    def run():
+        return module.run_policy(
+            env,
+            server_url="http://unused",
+            image_size=256,
+            action_horizon=16,
+            max_steps=18,
+            latch=1,
+            timeout=1.0,
+            use_state=True,
+            local_memory_client=client,
+            initial_observation={"step": 0},
+            on_prediction=lambda result, latency, *, g2_request: prediction_witnesses.append(g2_request),
+            g2_runtime=runtime,
+            g2_task="CloseFridge",
+            g2_episode_index=7,
+        )
+
+    if failure is None:
+        assert run() == (True, 18, "close fridge")
+    else:
+        with pytest.raises(RuntimeError if failure == "env" else ValueError):
+            run()
+    assert frames == [0, 16]
+    assert [row["g2"]["identity"]["decision_frame"] for row in prediction_witnesses] == (
+        [0] if failure == "prediction" else [0, 16]
+    )
+    assert runtime.completed == list(range(18 if failure is None else 16))
+    assert len(client.completed) == len(runtime.completed)
+    assert runtime.closed
