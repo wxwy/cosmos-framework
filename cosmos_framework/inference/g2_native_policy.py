@@ -52,6 +52,8 @@ class NativeG2R1Authority:
     text_recipe: StaticTaskTextRecipe
     state15_recipe_id: str
     alignment_version: str
+    data_identity: str
+    initial_language_recipe_id: str
     top_variant: str
     versions: dict[str, str]
     files: dict[Path, tuple]
@@ -93,6 +95,8 @@ class NativeG2R1Authority:
             text = StaticTaskTextRecipe(**recipe["text"])
             global_memory = GlobalMemoryConfig(**recipe["global_memory"])
             state_recipe = training["state15_recipe_identity"]
+            data_identity = training["data_identity"]
+            language_recipe = recipe["provider_kwargs"]["initial_language_recipe_id"]
             alignment = recipe["alignment_version"]
         except (KeyError, TypeError) as error:
             raise ValueError("native G2 requires a complete materialized training recipe") from error
@@ -104,6 +108,8 @@ class NativeG2R1Authority:
             or text.cfg_dropout_rate != 0.1
             or (text.planned_video_frames, text.fps) != (17, 20)
             or not _sha256(state_recipe)
+            or not _sha256(data_identity)
+            or not _sha256(language_recipe)
             or not _sha256(text.tokenizer_identity)
             or not isinstance(alignment, str)
             or not alignment
@@ -162,10 +168,21 @@ class NativeG2R1Authority:
             "config_sha256": config_sha,
             "state15_recipe_id": state_recipe,
             "alignment_version": alignment,
+            "data_identity": data_identity,
+            "initial_language_recipe_id": language_recipe,
             "tokenizer_identity": text.tokenizer_identity,
         }
         authority = cls(
-            model_path, config_path, text, state_recipe, alignment, global_memory.top_view_variant, versions, files
+            model_path,
+            config_path,
+            text,
+            state_recipe,
+            alignment,
+            data_identity,
+            language_recipe,
+            global_memory.top_view_variant,
+            versions,
+            files,
         )
         authority.check_unchanged()
         return authority
@@ -180,12 +197,14 @@ class NativeG2R1Authority:
         ):
             raise ValueError("native G2 State15 must be a flat list of 15 finite float32 numbers")
 
-    def validate_sample(self, identity, *, frames, fps, height, width) -> None:
+    def validate_sample(self, identity, *, template_identity, frames, fps, height, width) -> None:
         recipe = self.text_recipe
         if (frames, fps, height, width) != (recipe.planned_video_frames, recipe.fps, recipe.height, recipe.width):
             raise ValueError("native G2 canvas/FPS differs from the frozen training text recipe")
         if (identity.state15_recipe_id, identity.alignment_version) != (self.state15_recipe_id, self.alignment_version):
             raise ValueError("native G2 sample differs from the frozen State15/alignment recipe")
+        if identity.data_version != self.data_identity or template_identity != self.initial_language_recipe_id:
+            raise ValueError("native G2 sample differs from the frozen DATA_C identity or CAP2 recipe")
 
     def hooks(self, model):
         self.check_unchanged()
@@ -206,7 +225,7 @@ class NativeG2R1Authority:
         ):
             raise ValueError("native R1 model must have fixed-weight G2 text and Local Memory with Global disabled")
         processor = model.vlm_processor
-        tokenizer_path = Path(processor.name) / "tokenizer.json"
+        tokenizer_path = (Path(processor.name) / "tokenizer.json").resolve()
         if (
             processor.tokenizer is not model.vlm_tokenizer
             or not callable(getattr(processor, "tokenize_text", None))

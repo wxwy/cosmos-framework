@@ -1448,7 +1448,12 @@ class ActionModelService:
         if authority is not None:
             recipe = authority.text_recipe
             authority.validate_sample(
-                identity, frames=self.cfg.action_chunk_size + 1, fps=self.cfg.fps, height=height, width=width
+                identity,
+                template_identity=task.template_identity,
+                frames=self.cfg.action_chunk_size + 1,
+                fps=self.cfg.fps,
+                height=height,
+                width=width,
             )
             processor = self.model.vlm_processor
         else:

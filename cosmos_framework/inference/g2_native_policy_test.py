@@ -51,9 +51,11 @@ def training_job(tmp_path):
         "g1_config_path": "/unused/for/inference/frozen_g1.yaml",
         "text": asdict(text),
         "view_recipe_id": None,
+        "provider_kwargs": {"initial_language_recipe_id": sha256(b"language recipe").hexdigest()},
         "training": {
             "profile": "R1",
             "world_size": 4,
+            "data_identity": sha256(b"verified DATA_C").hexdigest(),
             "text_recipe_identity": text.identity,
             "state15_recipe_identity": sha256(b"state15").hexdigest(),
         },
@@ -156,17 +158,24 @@ def test_native_r1_pins_identities_and_reuses_the_two_native_text_stages(trainin
         subtask_id="PickPlace",
         decision_frame=16,
         logical_state_frame=0,
-        data_version="real_source_version",
+        data_version=bound.data_identity,
         alignment_version=bound.alignment_version,
         state15_recipe_id=bound.state15_recipe_id,
         task_binding_id="binding",
     )
-    bound.validate_sample(sample, frames=17, fps=20, height=192, width=320)
+    sample_parameters = dict(
+        template_identity=bound.initial_language_recipe_id, frames=17, fps=20, height=192, width=320
+    )
+    bound.validate_sample(sample, **sample_parameters)
     bound.validate_state([0] * 14 + [1.0])
     with pytest.raises(ValueError, match="State15/alignment"):
-        bound.validate_sample(replace(sample, state15_recipe_id="bad"), frames=17, fps=20, height=192, width=320)
+        bound.validate_sample(replace(sample, state15_recipe_id="bad"), **sample_parameters)
     with pytest.raises(ValueError, match="canvas/FPS"):
-        bound.validate_sample(sample, frames=17, fps=20, height=224, width=320)
+        bound.validate_sample(sample, **dict(sample_parameters, height=224))
+    with pytest.raises(ValueError, match="DATA_C identity or CAP2"):
+        bound.validate_sample(sample, **dict(sample_parameters, template_identity="other recipe"))
+    with pytest.raises(ValueError, match="DATA_C identity or CAP2"):
+        bound.validate_sample(replace(sample, data_version="other data"), **sample_parameters)
     for bad in (None, [[0] * 15], [False] * 15, [float("nan")] * 15, [1e50] * 15, [10**400] * 15):
         with pytest.raises(ValueError, match="State15"):
             bound.validate_state(bad)
@@ -175,6 +184,10 @@ def test_native_r1_pins_identities_and_reuses_the_two_native_text_stages(trainin
     with pytest.raises(ValueError, match="Global disabled"):
         bound.hooks(model)
     del model.net.global_memory_reader
+    backing_tokenizer = job.tokenizer.with_suffix(".hf")
+    job.tokenizer.rename(backing_tokenizer)
+    job.tokenizer.symlink_to(backing_tokenizer)
+    assert bound.hooks(model).tokenizer_identity == job.text.tokenizer_identity
     job.tokenizer.write_text("changed")
     with pytest.raises(ValueError, match="tokenizer"):
         bound.hooks(model)
