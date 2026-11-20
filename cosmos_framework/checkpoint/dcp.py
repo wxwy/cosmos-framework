@@ -41,7 +41,6 @@ The sharded format enables efficient distributed saving/loading by:
 
 import dataclasses
 import enum
-import hashlib
 import io
 import json
 import multiprocessing
@@ -88,6 +87,12 @@ from cosmos_framework.checkpoint.background_store import (
 )
 from cosmos_framework.checkpoint.base import AbstractCheckpointer, CheckpointLoadSource
 from cosmos_framework.checkpoint.s3_filesystem import S3StorageReader, S3StorageWriter
+from cosmos_framework.checkpoint.safe_local_witness import (
+    SAFE_LOCAL_COMPLETE,
+    SAFE_LOCAL_PROFILE,
+    component_witness,
+    file_witness,
+)
 from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import callback, distributed, log, misc
 from cosmos_framework.utils.config import CheckpointConfig, JobConfig
@@ -1308,8 +1313,8 @@ class SafeLocalDistributedCheckpointer(DistributedCheckpointer):
     Incomplete attempts remain unadvertised for diagnosis; no old checkpoint is edited.
     """
 
-    PROFILE = "psm_v3_sync_local_v1"
-    COMPLETE_FILE = "complete.v1.json"
+    PROFILE = SAFE_LOCAL_PROFILE
+    COMPLETE_FILE = SAFE_LOCAL_COMPLETE
     COMPONENTS = ("model", "optim", "scheduler", "trainer")
     RNG_FIELDS = (
         "torch",
@@ -1386,37 +1391,8 @@ class SafeLocalDistributedCheckpointer(DistributedCheckpointer):
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    @staticmethod
-    def _file_witness(path):
-        path = Path(path)
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"checkpoint file missing, nonregular or symlinked: {path}")
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        return {"size": path.stat().st_size, "sha256": digest.hexdigest()}
-
-    @classmethod
-    def _component_witness(cls, directory):
-        directory = Path(directory)
-        if directory.is_symlink():
-            raise ValueError("checkpoint component symlink is forbidden")
-        metadata_witness = cls._file_witness(directory / ".metadata")
-        metadata = FileSystemReader(str(directory)).read_metadata()
-        files = {}
-        for entry in (metadata.storage_data or {}).values():
-            relative = Path(entry.relative_path)
-            path = directory / relative
-            if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 1:
-                raise ValueError("DCP shard path is not a local component file")
-            if path.is_symlink() or not path.is_file() or entry.offset < 0 or entry.length < 0:
-                raise ValueError("missing/invalid DCP shard")
-            size = path.stat().st_size
-            if size < entry.offset + entry.length:
-                raise ValueError("truncated DCP shard")
-            files[str(relative)] = size
-        return {"metadata": metadata_witness, "files": files}
+    _file_witness = staticmethod(file_witness)
+    _component_witness = staticmethod(component_witness)
 
     @classmethod
     def _validate_rng_metadata(cls, metadata, world_size, template=None):

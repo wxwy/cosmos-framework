@@ -25,6 +25,13 @@ G2_ABI_VERSION = "psm_g2_c0_v1"
 G2_MODEL_ABI_VERSION = "psm_g2_b1_v1"
 
 
+def g2_run_recipe_identity(materialized_recipe):
+    """Stable training/serving identity. The G1 snapshot bytes, not its path, bind the run."""
+    semantic = dict(materialized_recipe)
+    semantic.pop("g1_config_path")
+    return hashlib.sha256(json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 class TrainingStage(StrEnum):
     TRAIN_A = "TRAIN_A"
     TRAIN_B = "TRAIN_B"

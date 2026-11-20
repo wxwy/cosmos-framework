@@ -553,7 +553,11 @@ class ActionServerArgs(pydantic.BaseModel):
     # New condition fields are enabled only by an explicit G2 profile.
     g2_profile: Literal["legacy", "g2_r1", "g2_r2"] = "legacy"
     g2_hooks_factory: str | None = None
-    """B-owned module:function creating fixed-model preparation hooks from this service."""
+    """Trusted extension factory for explicit non-native profiles."""
+    g2_run_recipe: Path | None = None
+    """Materialized formal R1 training recipe for the native DCP model hook factory."""
+    g2_checkpoint_metadata_sha256: str | None = None
+    """Expected SHA256 for the formal R1 checkpoint's published model/.metadata."""
     g2_provider_factory: str | None = None
     """module:function creating a current-rollout spatial provider; no expert replay fallback."""
     g2_cache_enabled: bool = True
@@ -909,10 +913,22 @@ class ActionModelService:
         transaction_options = _transaction_options(args)
         g2_profile = getattr(args, "g2_profile", "legacy")
         self.g2_conditions = None
+        self.g2_native_authority = None
+        g2_run_recipe = getattr(args, "g2_run_recipe", None)
+        g2_metadata_sha = getattr(args, "g2_checkpoint_metadata_sha256", None)
+        native_g2 = g2_run_recipe is not None or g2_metadata_sha is not None
+        if native_g2 and (
+            g2_profile != "g2_r1"
+            or not g2_run_recipe
+            or not g2_metadata_sha
+            or getattr(args, "g2_hooks_factory", None)
+            or getattr(args, "g2_provider_factory", None)
+        ):
+            raise ValueError("native G2 requires R1 and both recipe/metadata options together")
         if g2_profile != "legacy":
             if g2_profile not in ("g2_r1", "g2_r2") or transaction_options is None or args.guidance != 1.0:
                 raise ValueError("G2 requires existing owned Session transactions, explicit R1/R2 and guidance=1")
-            if not getattr(args, "g2_hooks_factory", None):
+            if not native_g2 and not getattr(args, "g2_hooks_factory", None):
                 raise ValueError("G2 requires B's shared model hooks factory; no substitute UND/Reader forward")
             if g2_profile == "g2_r2" and not getattr(args, "g2_provider_factory", None):
                 raise ValueError("R2 requires an actual current-rollout provider; expert map playback is unsupported")
@@ -930,7 +946,27 @@ class ActionModelService:
             raise ValueError("B1 transaction increment requires a single-rank model owner")
 
         setup_overrides = args.build_setup_overrides()
+        if native_g2 and setup_overrides.experiment_overrides:
+            raise ValueError("native G2 does not allow experiment config overrides")
         setup_args = setup_overrides.build_setup()
+        if native_g2:
+            from cosmos_framework.inference.g2_native_policy import NativeG2R1Authority
+
+            if (
+                setup_args.checkpoint_type != "dcp"
+                or setup_args.config_file_type != "yaml"
+                or args.max_action_dim is not None
+                or args.action_stats_path is not None
+                or args.local_memory_mode != "required"
+                or args.fps != 20
+            ):
+                raise ValueError("native G2 requires frozen DCP/YAML, raw actions, Local Memory and 20 Hz")
+            self.g2_native_authority = NativeG2R1Authority.open(
+                run_recipe=g2_run_recipe,
+                model_path=Path(setup_args.checkpoint_path),
+                config_path=Path(setup_args.config_file),
+                metadata_sha256=g2_metadata_sha,
+            )
         init_output_dir(setup_args.output_dir)
         setup_args = disable_runtime_ema_for_frozen_config(setup_args)
 
@@ -1088,6 +1124,8 @@ class ActionModelService:
                 "use_base_action=True, base_encoding='raw')."
             )
         log.info(f"[action-server] effective raw_action_dim={self.raw_action_dim} (from {self.raw_action_dim_source})")
+        if native_g2 and _extract_str_from_config(self.experiment_config, "action_normalization") is not None:
+            raise ValueError("native R1 requires unnormalized Raw15 training actions")
         if args.local_memory_mode == "required":
             if self.raw_action_dim != 15:
                 raise ValueError("required V3 RoboCasa Local-TTT needs raw_action_dim=15")
@@ -1326,7 +1364,7 @@ class ActionModelService:
             "action_stats_path": str(self.cfg.action_stats_path) if self.cfg.action_stats_path else None,
             "local_memory": self.local_memory_adapter.info(),
             **(
-                {"g2_conditions": self.g2_conditions.info()} if getattr(self, "g2_conditions", None) is not None else {}
+                {"g2_conditions": self._g2_info()} if getattr(self, "g2_conditions", None) is not None else {}
             ),
         }
 
@@ -1339,6 +1377,13 @@ class ActionModelService:
         if input_video_key is None:
             input_video_key = getattr(self.model, "config", None).input_video_key  # type: ignore[union-attr]
         return input_video_key
+
+    def _g2_info(self):
+        info = self.g2_conditions.info()
+        authority = getattr(self, "g2_native_authority", None)
+        if authority is not None:
+            info["authority"] = dict(authority.versions)
+        return info
 
     def _configure_g2_conditions(self, args):
         # Factories are trusted startup configuration, never names from a request.
@@ -1354,7 +1399,8 @@ class ActionModelService:
                 raise ValueError("G2 startup factory must be an explicit module:function")
             return getattr(importlib.import_module(module), name)(self)
 
-        hooks = create(args.g2_hooks_factory)
+        authority = getattr(self, "g2_native_authority", None)
+        hooks = authority.hooks(self.model) if authority is not None else create(args.g2_hooks_factory)
         provider = create(args.g2_provider_factory) if args.g2_profile == "g2_r2" else None
         self.g2_conditions = G2ConditionRuntime(
             hooks,
@@ -1395,17 +1441,26 @@ class ActionModelService:
         )
 
         runtime = self.g2_conditions
-        runtime.validate_request(req)
+        identity = runtime.validate_request(req)
         started = time.perf_counter_ns()
         task = StaticTaskText(**req["g2"]["static_text"])
-        recipe = StaticTaskTextRecipe(
-            planned_video_frames=self.cfg.action_chunk_size + 1,
-            fps=self.cfg.fps,
-            height=height,
-            width=width,
-            tokenizer_identity=runtime.hooks.tokenizer_identity,
-        )
-        prepared = prepare_static_task_text(task, recipe, self.model, dropout_applied=False)
+        authority = getattr(self, "g2_native_authority", None)
+        if authority is not None:
+            recipe = authority.text_recipe
+            authority.validate_sample(
+                identity, frames=self.cfg.action_chunk_size + 1, fps=self.cfg.fps, height=height, width=width
+            )
+            processor = self.model.vlm_processor
+        else:
+            recipe = StaticTaskTextRecipe(
+                planned_video_frames=self.cfg.action_chunk_size + 1,
+                fps=self.cfg.fps,
+                height=height,
+                width=width,
+                tokenizer_identity=runtime.hooks.tokenizer_identity,
+            )
+            processor = self.model
+        prepared = prepare_static_task_text(task, recipe, processor, dropout_applied=False)
         use_float_positions = runtime.hooks.use_float_positions
         if type(use_float_positions) is not bool:
             raise ValueError("model hooks must declare the actual native mRoPE position mode")
@@ -1462,6 +1517,9 @@ class ActionModelService:
         # ``use_state`` dataset path.
         state_token: torch.Tensor | None = None
         raw_state = req.get("state")
+        authority = getattr(self, "g2_native_authority", None)
+        if authority is not None:
+            authority.validate_state(raw_state)
         if raw_state is None and self.requires_state:
             raise ValueError(
                 "this checkpoint was trained with use_state=True, so 'state' is required: send the "

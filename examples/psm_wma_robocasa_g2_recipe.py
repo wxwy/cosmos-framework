@@ -27,7 +27,7 @@ from cosmos_framework.data.generator.action.datasets.g2_training_adapter import 
     G2TrainingDataAdapter,
 )
 from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskTextRecipe
-from cosmos_framework.model.generator.mot.g2_contracts import GlobalMemoryConfig
+from cosmos_framework.model.generator.mot.g2_contracts import GlobalMemoryConfig, g2_run_recipe_identity
 from cosmos_framework.trainer.g2_training import (
     G2_OPTIMIZER_SELECTION,
     G2StageController,
@@ -94,10 +94,7 @@ class G2RunRecipe:
 
     @property
     def identity(self):
-        # The path itself is operational; actual G1 configuration bytes bind semantics.
-        body = asdict(self)
-        body.pop("g1_config_path")
-        return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return g2_run_recipe_identity(asdict(self))
 
     def g1_snapshot(self):
         path = Path(self.g1_config_path)
