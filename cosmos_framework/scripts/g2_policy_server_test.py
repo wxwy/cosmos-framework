@@ -14,10 +14,10 @@ from cosmos_framework.data.generator.action.utils import static_task_text
 from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskText, StaticTaskTextRecipe
 from cosmos_framework.inference.g2_model_hooks_test import actual_tiny_model
 from cosmos_framework.inference.g2_model_hooks_test import hooks as actual_hooks
-from cosmos_framework.inference.g2_native_policy import NativeG2R1Authority
+from cosmos_framework.inference.g2_native_policy import NativeG2Authority
 from cosmos_framework.inference.g2_policy_conditions import G2ConditionRuntime
+from cosmos_framework.inference.g2_policy_conditions_test import FixtureProvider, runtime
 from cosmos_framework.inference.g2_policy_conditions_test import request as condition_request
-from cosmos_framework.inference.g2_policy_conditions_test import runtime
 from cosmos_framework.inference.robocasa_batch_transactions import BatchedSessionTransactions
 from cosmos_framework.inference.robocasa_session_transactions import SessionTransactions
 from cosmos_framework.inference.robocasa_session_transactions_test import (
@@ -29,6 +29,7 @@ from cosmos_framework.inference.robocasa_session_transactions_test import (
     submit,
     wait_result,
 )
+from cosmos_framework.model.generator.mot.g2_contracts import GlobalMemoryConfig
 from cosmos_framework.scripts.robocasa_transactions_b1_test import service
 
 
@@ -253,13 +254,14 @@ def test_native_mixed_Session_batch_routes_conditions_and_Local_by_original_inde
         assert actor.close()
 
 
-def _native_r1_cpu_service(monkeypatch, tmp_path, slots, batch_size):
+def _native_g2_cpu_service(monkeypatch, tmp_path, slots, batch_size, profile):
+    global_enabled = profile == "g2_r2"
     obj = service(monkeypatch)
     obj.local_memory_adapter, _ = make_adapter(slots)
-    obj.model, _ = actual_tiny_model(monkeypatch, global_enabled=False)
+    obj.model, _ = actual_tiny_model(monkeypatch, global_enabled=global_enabled)
     obj.model.vlm_processor = SimpleNamespace(tokenize_text=obj.model.tokenize_text)
     hooks = actual_hooks(obj.model)
-    obj.g2_native_authority = NativeG2R1Authority(
+    obj.g2_native_authority = NativeG2Authority(
         model_path=tmp_path / "model",
         config_path=tmp_path / "config.yaml",
         text_recipe=StaticTaskTextRecipe(17, 20, 192, 320, hooks.tokenizer_identity),
@@ -270,8 +272,12 @@ def _native_r1_cpu_service(monkeypatch, tmp_path, slots, batch_size):
         top_variant="with_robot",
         versions={},
         files={},
+        global_memory=GlobalMemoryConfig(enabled=global_enabled),
     )
-    rt = obj.g2_conditions = G2ConditionRuntime(hooks, profile="g2_r1")
+    provider = FixtureProvider() if global_enabled else None
+    if provider is not None:
+        provider.scene_offsets = {f"scene-{i}": float(i) for i in range(slots)}
+    rt = obj.g2_conditions = G2ConditionRuntime(hooks, profile=profile, provider=provider, allow_fixtures=True)
     observed = {}
 
     def generate(batch, *, _g2_condition, _local_memory_prefixes, seed, **kwargs):
@@ -280,8 +286,9 @@ def _native_r1_cpu_service(monkeypatch, tmp_path, slots, batch_size):
         condition = _g2_condition
         count = len(batch["action"])
         assert seed == [obj.cfg.seed] * count
-        assert condition.views == condition.global_tokens == (None,) * count
-        assert condition.global_kv is None
+        assert condition.views == (None,) * count
+        assert condition.global_present == (global_enabled,) * count
+        assert (condition.global_kv is not None) == global_enabled
         assert len(condition.text.lengths) == len(_local_memory_prefixes) == count
         features = condition.text_features
         offset = 0
@@ -292,6 +299,21 @@ def _native_r1_cpu_service(monkeypatch, tmp_path, slots, batch_size):
             assert state_id not in observed
             assert int(features.valid_mask[i].sum()) == length
             layers = (*features.layers, *condition.gen_text_kv)
+            global_context = 0
+            if global_enabled:
+                tokens = condition.global_tokens[i]
+                assert tokens.shape == (64, 16)
+                global_context = float(tokens.square().sum()) / 10_000
+                global_snapshot = (
+                    tokens.clone(),
+                    tuple(
+                        t[64 * i : 64 * (i + 1)].clone()
+                        for layer in condition.global_kv
+                        for t in (layer.key, layer.value)
+                    ),
+                )
+            else:
+                global_snapshot = ()
             observed[state_id] = (
                 batch["prompt"][i],
                 condition.text.token_ids[i],
@@ -299,13 +321,14 @@ def _native_r1_cpu_service(monkeypatch, tmp_path, slots, batch_size):
                 state.clone(),
                 features.hidden[i, :length].clone(),
                 tuple(t[offset : offset + length].clone() for layer in layers for t in (layer.key, layer.value)),
+                global_snapshot,
                 None if prefix is None else prefix.clone(),
             )
             offset += length
             token_value = sum(condition.text.token_ids[i]) / 100_000
             local_value = 0 if prefix is None else float(prefix.square().sum()) / 10_000
             action = torch.zeros(1, 17, 64)
-            action[:, 1:, :15] = state + token_value + local_value
+            action[:, 1:, :15] = state + token_value + local_value + global_context
             actions.append(action)
         return {"action": actions}
 
@@ -329,9 +352,12 @@ def _native_r1_cpu_service(monkeypatch, tmp_path, slots, batch_size):
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
-def test_native_r1_batch_matches_each_session_serially_with_dense_local_history(monkeypatch, tmp_path, batch_size):
+@pytest.mark.parametrize("profile", ["g2_r1", "g2_r2"])
+def test_native_g2_batch_matches_each_session_serially_with_dense_local_history(
+    monkeypatch, tmp_path, batch_size, profile
+):
     slots = 16 if batch_size == 8 else batch_size
-    runs = [_native_r1_cpu_service(monkeypatch, tmp_path, slots, size) for size in (batch_size, 1)]
+    runs = [_native_g2_cpu_service(monkeypatch, tmp_path, slots, size, profile) for size in (batch_size, 1)]
 
     def evaluate(run, limit):
         obj, actor, rt, observed = run

@@ -21,12 +21,13 @@ from cosmos_framework.checkpoint.safe_local_witness import (
     file_witness,
 )
 from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskTextRecipe
-from cosmos_framework.inference.g2_native_policy import NativeG2R1Authority
+from cosmos_framework.inference.g2_native_policy import NativeG2Authority
 from cosmos_framework.model.generator.mot.g2_contracts import (
     G2SampleIdentity,
     GlobalMemoryConfig,
     g2_run_recipe_identity,
 )
+from cosmos_framework.model.generator.mot.global_memory import GlobalMemoryProjector, GlobalMemoryReader
 
 
 def _write(path, value):
@@ -116,7 +117,7 @@ def _open(job, **overrides):
         "metadata_sha256": job.metadata_sha,
     }
     arguments.update(overrides)
-    return NativeG2R1Authority.open(**arguments)
+    return NativeG2Authority.open(**arguments)
 
 
 def test_native_r1_pins_identities_and_reuses_the_two_native_text_stages(training_job):
@@ -241,6 +242,68 @@ def test_native_r1_checks_model_inputs_again_after_loading(training_job):
     replacement.replace(shard)
     with pytest.raises(ValueError, match="changed during startup"):
         bound.check_unchanged()
+
+
+def test_native_r2_binds_its_own_formal_checkpoint_view_recipe_and_reader(training_job):
+    job = training_job
+    with pytest.raises(ValueError, match="Global"):
+        _open(job, profile="g2_r2")
+    recipe = json.loads(job.run_recipe.read_text())
+    global_memory = GlobalMemoryConfig(enabled=True)
+    recipe["global_memory"] = asdict(global_memory)
+    recipe["training"]["profile"] = "R2"
+    recipe["view_recipe_id"] = "b" * 64
+    _write(job.run_recipe, recipe)
+    receipt = json.loads(job.receipt.read_text())
+    semantic = receipt["semantic"]
+    semantic.update(training_profile="g2_R2", g2_recipe_identity=g2_run_recipe_identity(recipe))
+    receipt["semantic_digest"] = sha256(
+        json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    _write(job.receipt, receipt)
+    with pytest.raises(ValueError, match="Global"):
+        _open(job, profile="g2_r1")
+    bound = _open(job, profile="g2_r2")
+    assert bound.versions["view_recipe_id"] == "b" * 64
+
+    model = job.model.eval()
+    model.vlm_tokenizer = object()
+    model.vlm_processor = SimpleNamespace(
+        tokenizer=model.vlm_tokenizer, name=str(job.tokenizer.parent), tokenize_text=lambda *a, **kw: [2, 3]
+    )
+    model.config = SimpleNamespace(
+        g2_text_enabled=True,
+        global_memory_enabled=True,
+        diffusion_expert_config=SimpleNamespace(enable_fps_modulation=False),
+    )
+    model.net = SimpleNamespace(
+        config=SimpleNamespace(
+            local_memory_enabled=True,
+            g2_text_enabled=True,
+            global_memory_enabled=True,
+        )
+    )
+    for name in (
+        "prepare_g2_text",
+        "prepare_g2_gen_text_kv",
+        "prepare_g2_task_queries",
+        "read_g2_global",
+        "project_g2_global",
+        "prepare_g2_global_kv",
+    ):
+        setattr(model, name, lambda *_: None)
+    model.precision = torch.float32
+    with pytest.raises(ValueError, match="Reader and projector"):
+        bound.hooks(model)
+    model.net.global_memory_reader = GlobalMemoryReader(4, global_memory)
+    model.net.global_memory_projector = GlobalMemoryProjector(4, global_memory)
+    hooks = bound.hooks(model)
+    assert hooks.versions["reader_version"] == model.net.global_memory_reader.reader_version
+    assert hooks.versions["mask_version"] == model.net.global_memory_reader.spatial.mask_version
+    assert hooks.top_variant == "with_robot"
+    model.net.global_memory_reader.config = replace(global_memory, top_view_variant="without_robot")
+    with pytest.raises(ValueError, match="frozen top variant"):
+        bound.hooks(model)
 
 
 def _save_four_rank_model(rank, checkpoint, rendezvous):

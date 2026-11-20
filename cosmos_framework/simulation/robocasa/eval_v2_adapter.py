@@ -249,8 +249,8 @@ class NativeEpisode:
                 g2_options = {}
                 g2_profile = self.settings.get("g2_profile", "legacy")
                 if g2_profile != "legacy":
-                    if g2_profile != "g2_r1" or transactional is None or client is None:
-                        raise ValueError("G2 R1 requires an assigned Phase B Episode with Local-TTT")
+                    if g2_profile not in ("g2_r1", "g2_r2") or transactional is None or client is None:
+                        raise ValueError("G2 requires an assigned Phase B Episode with Local-TTT")
                     from g2.online.runtime import create_episode_runtime
 
                     g2_options = {

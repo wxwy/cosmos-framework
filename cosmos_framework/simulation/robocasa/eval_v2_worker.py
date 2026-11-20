@@ -53,7 +53,7 @@ def serve(channel, cfg, *, factory=None):
             g2_profile = cfg["settings"].get("g2_profile", "legacy")
             if g2_profile != "legacy":
                 if (
-                    g2_profile != "g2_r1"
+                    g2_profile not in ("g2_r1", "g2_r2")
                     or cfg["settings"].get("execution_profile") != "phase_b"
                     or cfg["settings"].get("local_memory_mode") != "required"
                     or cfg["settings"].get("local_evidence_profile", "server_vae") != "server_vae"

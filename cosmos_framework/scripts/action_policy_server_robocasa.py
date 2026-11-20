@@ -555,11 +555,14 @@ class ActionServerArgs(pydantic.BaseModel):
     g2_hooks_factory: str | None = None
     """Trusted extension factory for explicit non-native profiles."""
     g2_run_recipe: Path | None = None
-    """Materialized formal R1 training recipe for the native DCP model hook factory."""
+    """Materialized formal G2 recipe for the native DCP model."""
     g2_checkpoint_metadata_sha256: str | None = None
-    """Expected SHA256 for the formal R1 checkpoint's published model/.metadata."""
+    """Expected SHA256 for the formal checkpoint's published model/.metadata."""
     g2_provider_factory: str | None = None
     """module:function creating a current-rollout spatial provider; no expert replay fallback."""
+    g2_spatial_root: Path | None = None
+    g2_view_vae_recipe: Path | None = None
+    g2_view_vae_weights: Path | None = None
     g2_cache_enabled: bool = True
     g2_cache_max_sessions: int = 32
     g2_cache_max_entries: int = 256
@@ -917,20 +920,28 @@ class ActionModelService:
         g2_run_recipe = getattr(args, "g2_run_recipe", None)
         g2_metadata_sha = getattr(args, "g2_checkpoint_metadata_sha256", None)
         native_g2 = g2_run_recipe is not None or g2_metadata_sha is not None
+        r2_sources = tuple(
+            getattr(args, field, None) for field in ("g2_spatial_root", "g2_view_vae_recipe", "g2_view_vae_weights")
+        )
         if native_g2 and (
-            g2_profile != "g2_r1"
+            g2_profile not in ("g2_r1", "g2_r2")
             or not g2_run_recipe
             or not g2_metadata_sha
             or getattr(args, "g2_hooks_factory", None)
             or getattr(args, "g2_provider_factory", None)
         ):
-            raise ValueError("native G2 requires R1 and both recipe/metadata options together")
+            raise ValueError("native G2 requires both recipe/metadata options with an explicit profile")
+        if native_g2 and g2_profile == "g2_r2":
+            if not all(r2_sources):
+                raise ValueError("native R2 requires the live spatial root and pinned View VAE recipe and weights")
+        elif any(value is not None for value in r2_sources):
+            raise ValueError("live spatial root and View VAE settings require native R2")
         if g2_profile != "legacy":
             if g2_profile not in ("g2_r1", "g2_r2") or transaction_options is None or args.guidance != 1.0:
                 raise ValueError("G2 requires existing owned Session transactions, explicit R1/R2 and guidance=1")
             if not native_g2 and not getattr(args, "g2_hooks_factory", None):
                 raise ValueError("G2 requires B's shared model hooks factory; no substitute UND/Reader forward")
-            if g2_profile == "g2_r2" and not getattr(args, "g2_provider_factory", None):
+            if g2_profile == "g2_r2" and not native_g2 and not getattr(args, "g2_provider_factory", None):
                 raise ValueError("R2 requires an actual current-rollout provider; expert map playback is unsupported")
         self.transactions = None
         if not torch.cuda.is_available():
@@ -950,7 +961,7 @@ class ActionModelService:
             raise ValueError("native G2 does not allow experiment config overrides")
         setup_args = setup_overrides.build_setup()
         if native_g2:
-            from cosmos_framework.inference.g2_native_policy import NativeG2R1Authority
+            from cosmos_framework.inference.g2_native_policy import NativeG2Authority
 
             if (
                 setup_args.checkpoint_type != "dcp"
@@ -961,11 +972,12 @@ class ActionModelService:
                 or args.fps != 20
             ):
                 raise ValueError("native G2 requires frozen DCP/YAML, raw actions, Local Memory and 20 Hz")
-            self.g2_native_authority = NativeG2R1Authority.open(
+            self.g2_native_authority = NativeG2Authority.open(
                 run_recipe=g2_run_recipe,
                 model_path=Path(setup_args.checkpoint_path),
                 config_path=Path(setup_args.config_file),
                 metadata_sha256=g2_metadata_sha,
+                profile=g2_profile,
             )
         init_output_dir(setup_args.output_dir)
         setup_args = disable_runtime_ema_for_frozen_config(setup_args)
@@ -1363,9 +1375,7 @@ class ActionModelService:
             "requires_state": self.requires_state,
             "action_stats_path": str(self.cfg.action_stats_path) if self.cfg.action_stats_path else None,
             "local_memory": self.local_memory_adapter.info(),
-            **(
-                {"g2_conditions": self._g2_info()} if getattr(self, "g2_conditions", None) is not None else {}
-            ),
+            **({"g2_conditions": self._g2_info()} if getattr(self, "g2_conditions", None) is not None else {}),
         }
 
     # ------------------------------------------------------------------
@@ -1401,7 +1411,21 @@ class ActionModelService:
 
         authority = getattr(self, "g2_native_authority", None)
         hooks = authority.hooks(self.model) if authority is not None else create(args.g2_hooks_factory)
-        provider = create(args.g2_provider_factory) if args.g2_profile == "g2_r2" else None
+        provider = None
+        if args.g2_profile == "g2_r2":
+            if authority is None:
+                provider = create(args.g2_provider_factory)
+            else:
+                from g2.online.spatial_provider import create_live_provider
+
+                provider = create_live_provider(
+                    scratch_root=args.g2_spatial_root,
+                    recipe_path=args.g2_view_vae_recipe,
+                    recipe_id=authority.versions["view_recipe_id"],
+                    weights=args.g2_view_vae_weights,
+                    timeout_s=args.transaction_timeout_s,
+                    max_views=args.g2_cache_max_entries,
+                )
         self.g2_conditions = G2ConditionRuntime(
             hooks,
             profile=args.g2_profile,
@@ -2284,6 +2308,10 @@ def serve(args: ActionServerArgs) -> None:
         httpd.server_close()
         if service.transactions is not None and not service.transactions.close():
             log.error("Session actor cleanup unproven; owned-process decommission is required")
+        conditions = service.g2_conditions
+        close = getattr(conditions.provider, "close", None) if conditions is not None else None
+        if close is not None:
+            close()
 
 
 def main() -> None:

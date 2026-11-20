@@ -201,6 +201,9 @@ class SpatialView:
         if (self.projection.height_px, self.projection.width_px) != self.raster.original_hw:
             raise ValueError("projection must describe the actual source image")
 
+    def to(self, device) -> SpatialView:
+        return replace(self, latent=self.latent.to(device), valid_mask=self.valid_mask.to(device))
+
 
 @dataclass(frozen=True, kw_only=True)
 class G2SampleIdentity:
@@ -387,12 +390,7 @@ def move_g2_condition(condition: G2ConditionBatch, device) -> G2ConditionBatch:
     return replace(
         condition,
         text_features=features,
-        views=tuple(
-            None
-            if views is None
-            else tuple(replace(v, latent=v.latent.to(device), valid_mask=v.valid_mask.to(device)) for v in views)
-            for views in condition.views
-        ),
+        views=tuple(None if views is None else tuple(v.to(device) for v in views) for views in condition.views),
         global_tokens=None
         if condition.global_tokens is None
         else tuple(None if t is None else t.to(device) for t in condition.global_tokens),

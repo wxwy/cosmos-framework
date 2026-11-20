@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-"""Read-only startup authority for the native, single-rank G2 R1 Policy Server."""
+"""Read-only startup authority for the native, single-rank G2 Policy Server."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def _sha256(value) -> bool:
 
 
 @dataclass(frozen=True)
-class NativeG2R1Authority:
+class NativeG2Authority:
     model_path: Path
     config_path: Path
     text_recipe: StaticTaskTextRecipe
@@ -57,13 +57,18 @@ class NativeG2R1Authority:
     top_variant: str
     versions: dict[str, str]
     files: dict[Path, tuple]
+    global_memory: GlobalMemoryConfig = GlobalMemoryConfig()
 
     def check_unchanged(self) -> None:
         if any(_file_generation(path) != witness for path, witness in self.files.items()):
             raise ValueError("native G2 model/config/source changed during startup")
 
     @classmethod
-    def open(cls, *, run_recipe: Path, model_path: Path, config_path: Path, metadata_sha256: str):
+    def open(cls, *, run_recipe: Path, model_path: Path, config_path: Path, metadata_sha256: str, profile="g2_r1"):
+        if profile not in ("g2_r1", "g2_r2"):
+            raise ValueError("explicit native G2 profile required")
+        global_enabled = profile == "g2_r2"
+        training_profile = "R2" if global_enabled else "R1"
         if not _sha256(metadata_sha256):
             raise ValueError("native G2 requires an explicit model/.metadata SHA256")
         model_path, config_path = Path(model_path), Path(config_path)
@@ -100,11 +105,12 @@ class NativeG2R1Authority:
             alignment = recipe["alignment_version"]
         except (KeyError, TypeError) as error:
             raise ValueError("native G2 requires a complete materialized training recipe") from error
+        view_recipe_id = recipe.get("view_recipe_id")
         if (
-            training.get("profile") != "R1"
+            training.get("profile") != training_profile
             or training.get("text_recipe_identity") != text.identity
-            or global_memory.enabled
-            or recipe.get("view_recipe_id") is not None
+            or global_memory.enabled is not global_enabled
+            or (not _sha256(view_recipe_id) if global_enabled else view_recipe_id is not None)
             or text.cfg_dropout_rate != 0.1
             or (text.planned_video_frames, text.fps) != (17, 20)
             or not _sha256(state_recipe)
@@ -114,7 +120,7 @@ class NativeG2R1Authority:
             or not isinstance(alignment, str)
             or not alignment
         ):
-            raise ValueError("native G2 requires the frozen R1 text, State15 and Raw15/H16 contract")
+            raise ValueError("native G2 requires the frozen text, State15, Global and Raw15/H16 contract")
         recipe_id = g2_run_recipe_identity(recipe)
         receipt = _record(job_path)
         semantic = receipt.get("semantic") or {}
@@ -123,7 +129,7 @@ class NativeG2R1Authority:
             receipt.get("schema") != "corrected_phase5_f0_v1"
             or receipt.get("diagnostic_only_do_not_resume") is not False
             or receipt.get("semantic_digest") != _digest(semantic)
-            or semantic.get("training_profile") != "g2_R1"
+            or semantic.get("training_profile") != f"g2_{training_profile}"
             or semantic.get("g2_recipe_identity") != recipe_id
             or semantic.get("checkpoint", {}).get("safety_profile") != SAFE_LOCAL_PROFILE
             or any(
@@ -172,6 +178,8 @@ class NativeG2R1Authority:
             "initial_language_recipe_id": language_recipe,
             "tokenizer_identity": text.tokenizer_identity,
         }
+        if global_enabled:
+            versions["view_recipe_id"] = view_recipe_id
         authority = cls(
             model_path,
             config_path,
@@ -183,6 +191,7 @@ class NativeG2R1Authority:
             global_memory.top_view_variant,
             versions,
             files,
+            global_memory,
         )
         authority.check_unchanged()
         return authority
@@ -210,20 +219,50 @@ class NativeG2R1Authority:
         self.check_unchanged()
         config, net_config = model.config, model.net.config
         use_float_positions = config.diffusion_expert_config.enable_fps_modulation
+        reader = getattr(model.net, "global_memory_reader", None)
+        projector = getattr(model.net, "global_memory_projector", None)
+        enabled = self.global_memory.enabled
         if (
             model.training
             or type(use_float_positions) is not bool
             or getattr(config, "g2_text_enabled", None) is not True
             or getattr(net_config, "g2_text_enabled", None) is not True
             or getattr(net_config, "local_memory_enabled", None) is not True
-            or getattr(config, "global_memory_enabled", None) is not False
-            or getattr(net_config, "global_memory_enabled", None) is not False
-            or getattr(model.net, "global_memory_reader", None) is not None
-            or getattr(model.net, "global_memory_projector", None) is not None
+            or getattr(config, "global_memory_enabled", None) is not enabled
+            or getattr(net_config, "global_memory_enabled", None) is not enabled
             or not callable(getattr(model, "prepare_g2_text", None))
             or not callable(getattr(model, "prepare_g2_gen_text_kv", None))
         ):
-            raise ValueError("native R1 model must have fixed-weight G2 text and Local Memory with Global disabled")
+            raise ValueError(
+                "native G2 model must match the fixed-weight text, Local and Global training configuration"
+            )
+        global_versions = dict.fromkeys(
+            ("reader_version", "projector_version", "geometry_encoding_version", "mask_version"),
+            "disabled:r1",
+        )
+        if enabled:
+            if (
+                getattr(reader, "config", None) != self.global_memory
+                or getattr(projector, "config", None) != self.global_memory
+                or any(
+                    not callable(getattr(model, method, None))
+                    for method in (
+                        "prepare_g2_task_queries",
+                        "read_g2_global",
+                        "project_g2_global",
+                        "prepare_g2_global_kv",
+                    )
+                )
+            ):
+                raise ValueError("native R2 requires the checkpoint's Reader and projector with the frozen top variant")
+            global_versions = {
+                "reader_version": reader.reader_version,
+                "projector_version": projector.projector_version,
+                "geometry_encoding_version": reader.spatial.encoding_version,
+                "mask_version": reader.spatial.mask_version,
+            }
+        elif reader is not None or projector is not None:
+            raise ValueError("native R1 requires Global disabled")
         processor = model.vlm_processor
         tokenizer_path = (Path(processor.name) / "tokenizer.json").resolve()
         if (
@@ -243,10 +282,7 @@ class NativeG2R1Authority:
                 "tokenizer_identity": self.text_recipe.tokenizer_identity,
                 "und_version": checkpoint_id,
                 "gen_version": checkpoint_id,
-                "reader_version": "disabled:r1",
-                "projector_version": "disabled:r1",
-                "geometry_encoding_version": "disabled:r1",
-                "mask_version": "disabled:r1",
+                **global_versions,
                 "position_rule": "native_mrope_float" if use_float_positions else "native_mrope_long",
                 "dtype": str(model.precision),
             },

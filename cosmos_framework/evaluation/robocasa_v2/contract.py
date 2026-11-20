@@ -181,17 +181,19 @@ def build_manifest(
     if "g2" in experiment:
         g2 = experiment["g2"]
         bound = {"run_recipe_sha256", "checkpoint_metadata_sha256", "actor_options_sha256"}
+        if isinstance(g2, dict) and g2.get("profile") == "g2_r2":
+            bound.add("view_recipe_id")
         if (
             not isinstance(g2, dict)
             or set(g2) != bound | {"profile"}
-            or g2["profile"] != "g2_r1"
+            or g2["profile"] not in ("g2_r1", "g2_r2")
             or any(not isinstance(g2[key], str) or not _SHA.fullmatch(g2[key]) for key in bound)
             or local_memory != "required"
             or not isinstance(execution, dict)
             or "single_latency" in execution
             or "shared_vae" in execution
         ):
-            raise ValueError("invalid G2 R1 experiment identity")
+            raise ValueError("invalid G2 experiment identity")
     for key in ("model_digest", "config_sha256", "runtime_digest"):
         if not isinstance(experiment[key], str) or not _SHA.fullmatch(experiment[key]):
             raise ValueError("invalid experiment digest")
