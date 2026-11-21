@@ -229,7 +229,7 @@ class SessionTransactions:
         self._leases: dict[str, SessionLease] = {}
         self._closed: dict[str, SessionLease] = {}
         self._generations = dict.fromkeys(self.slot_ids, 0)
-        self._closing: set[str] = set()
+        self._closing: dict[str, str] = {}
         self._failed: dict[str, dict] = {}
         self._tickets: dict[str, _Ticket] = {}
         self._responses: dict[str, _CommittedResponse] = {}
@@ -506,21 +506,53 @@ class SessionTransactions:
     def end(self, proof):
         with self._lock:
             lease = self._lease(proof, closed=True)
-            if self._leases.get(lease.slot_id) is None:
+            slot = lease.slot_id
+            if slot not in self._leases:
                 return self._reply(200, {"acknowledged": True, **lease.identity()})
-            self._closing.add(lease.slot_id)
-            owned = [ticket for ticket in self._tickets.values() if ticket.lease == lease]
-            for ticket in owned:
-                ticket.cancelled = True
-            if self._busy or self._quarantined or any(not ticket.quiescent for ticket in owned):
+            if self._closing.setdefault(slot, "DRAINING") == "DRAINING":
+                owned = [ticket for ticket in self._tickets.values() if ticket.lease == lease]
+                for ticket in owned:
+                    ticket.cancelled = True
+                if all(ticket.quiescent for ticket in owned):
+                    self._closing[slot] = "READY"
+                self._changed.notify_all()
+            if self._closing[slot] == "READY":
+                self._complete_end_cleanups()
+            if self._closing[slot] == "FAILED":
+                raise RuntimeError("Session End cleanup failed; owned Server recovery required")
+            if self._closing[slot] != "CLEANED":
                 return self._reply(202, {"acknowledged": False, "state": "draining", **lease.identity()})
-            for ticket in owned:
-                self._release(ticket)
-            self._reset_session(lease.session_id)
-            del self._leases[lease.slot_id]
-            self._closed[lease.slot_id] = lease
-            self._closing.remove(lease.slot_id)
+            # Keep the Slot fenced through cleanup until this ACK is issued.
+            del self._leases[slot]
+            self._closed[slot] = lease
+            del self._closing[slot]
             return self._reply(200, {"acknowledged": True, **lease.identity()})
+
+    def _complete_end_cleanups(self):
+        # Called under the actor lock at a proven idle point or at the end of
+        # executor work. Take the model lock without blocking: an executor
+        # acquiring the two locks in the opposite order must be able to proceed.
+        if self._busy or self._quarantined or not self._closing:
+            return
+        ready = [slot for slot, state in self._closing.items() if state == "READY"]
+        if not ready or not self._model_lock.acquire(blocking=False):
+            return
+        try:
+            for slot in ready:
+                lease = self._leases[slot]
+                try:
+                    for ticket in tuple(self._tickets.values()):
+                        if ticket.lease == lease:
+                            self._release(ticket)
+                    self._reset_session(lease.session_id)
+                except BaseException:
+                    self._closing[slot] = "FAILED"
+                    self._quarantined = True
+                    logging.getLogger(__name__).exception("Session End cleanup failed for Slot %s", slot)
+                    return
+                self._closing[slot] = "CLEANED"
+        finally:
+            self._model_lock.release()
 
     def _fence(self, ticket):
         self._usable(ticket.lease)
@@ -618,6 +650,7 @@ class SessionTransactions:
             ticket.update = None
             if not committed:
                 self._release(ticket)
+            self._complete_end_cleanups()
             self._changed.notify_all()
 
     def close(self, timeout_s=10.0) -> bool:
@@ -637,7 +670,8 @@ class SessionTransactions:
                     for ticket in tuple(self._tickets.values()):
                         self._release(ticket)
                     for lease in tuple(self._leases.values()):
-                        self._reset_session(lease.session_id)
+                        if self._closing.get(lease.slot_id) != "CLEANED":
+                            self._reset_session(lease.session_id)
                         self._closed[lease.slot_id] = lease
                     self._leases.clear()
                     self._closing.clear()
