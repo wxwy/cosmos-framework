@@ -363,6 +363,7 @@ class BatchedSessionTransactions(SessionTransactions):
                     if ticket.lease.slot_id in self._failed:
                         self._failed[ticket.lease.slot_id]["quiescent"] = True
                     self._release(ticket)
+                self._complete_end_cleanups()
             self._changed.notify_all()
 
     def _queue_native(self, ticket):
@@ -387,6 +388,9 @@ class BatchedSessionTransactions(SessionTransactions):
         last_was_media = False
         while True:
             with self._changed:
+                if self._quarantined:
+                    self._pumping = False
+                    return
                 # Strict clients cannot fetch until decode runs. Prioritize these
                 # bounded jobs so a busy inference queue cannot starve completion.
                 strict_job = next((j for j in self._media.values() if j.required and j.state == "QUEUED"), None)
@@ -449,10 +453,6 @@ class BatchedSessionTransactions(SessionTransactions):
             else:
                 last_was_media = True
                 self._decode(job)
-            with self._lock:
-                if self._quarantined:
-                    self._pumping = False
-                    return
 
     def _execute_many(self, members):
         committed, drained, abort_failed = False, False, False
@@ -664,6 +664,7 @@ class BatchedSessionTransactions(SessionTransactions):
                     self._failed[t.lease.slot_id]["quiescent"] = True
                 if not committed:
                     self._release(t)
+            self._complete_end_cleanups()
             self._changed.notify_all()
 
     def _profile_snapshot(self, ticket):
@@ -742,6 +743,7 @@ class BatchedSessionTransactions(SessionTransactions):
             else:
                 job.body, job.candidate, job.state = body, None, "FAILED" if job.error else "READY"
             self._busy = not drained
+            self._complete_end_cleanups()
             self._changed.notify_all()
 
     def media_result(self, proof, key, sha):
@@ -820,11 +822,11 @@ class BatchedSessionTransactions(SessionTransactions):
         with self._lock:
             lease = self._lease(proof, closed=True)
             self._cancel_media(lease)
-            self._changed.notify_all()
-            reply = super().end(proof)
-            if reply.json().get("acknowledged") is True:
-                self._acked_media.pop(lease.session_id, None)
-            return reply
+            return super().end(proof)
+
+    def _reset_session(self, session_id):
+        super()._reset_session(session_id)
+        self._acked_media.pop(session_id, None)
 
     def close(self, timeout_s=10):
         with self._lock:
