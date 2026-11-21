@@ -327,6 +327,31 @@ def test_end_waits_for_owned_executor_and_releases_only_after_drain(runtime, dur
     assert fresh["session_id"] != lease["session_id"]
 
 
+def test_idle_end_is_cleaned_when_unrelated_serial_work_finishes(runtime):
+    actor, adapter, _, _ = runtime
+    a, b = register(actor), register(actor, "slot1")
+    ack(actor, a, wait_result(actor, a, submit(actor, a, payload(a))))
+    entered, release = threading.Event(), threading.Event()
+    generate = actor.generate
+
+    def block(*args):
+        entered.set()
+        assert release.wait(5)
+        return generate(*args)
+
+    actor.generate = block
+    pending = submit(actor, b, payload(b))
+    try:
+        assert entered.wait(5) and actor.end(a).status == 202
+        assert a["session_id"] in adapter.snapshot.fast
+    finally:
+        release.set()
+    wait_result(actor, b, pending)
+    assert a["session_id"] not in adapter.snapshot.fast
+    assert b["session_id"] in adapter.snapshot.fast
+    assert actor.end(a).status == 200
+
+
 def test_unproven_gpu_drain_quarantines_without_state_commit_or_end_ack():
     adapter, _ = make_adapter(1)
 

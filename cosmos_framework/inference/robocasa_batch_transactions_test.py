@@ -31,7 +31,7 @@ from cosmos_framework.scripts.robocasa_transactions_b1_test import DirectTranspo
 def make_native(monkeypatch):
     actors = []
 
-    def make(slots=3, cap=3, wait=80):
+    def make(slots=3, cap=3, wait=80, *, capacity_profile="legacy8"):
         obj = service(monkeypatch)
         obj.local_memory_adapter, obj.model = make_adapter(slots)
         obj.model.eval()
@@ -71,6 +71,7 @@ def make_native(monkeypatch):
             run_lease="run",
             manifest_digest="a" * 64,
             slot_ids=tuple(f"slot{i}" for i in range(slots)),
+            capacity_profile=capacity_profile,
             model_lock=obj._lock,
             timeout_s=5,
         )
@@ -250,6 +251,103 @@ def test_End_during_sealed_generation_aborts_all_members_and_waits_for_executor(
         wait_result(actor, l, p, expected=409)
     assert obj.local_memory_adapter.snapshot is before
     assert actor.end(leases[0]).json()["acknowledged"] is True
+
+
+@pytest.mark.parametrize("cap", [2, 8])
+def test_quiescent_end_is_acknowledged_during_next_peer_batch(make_native, monkeypatch, cap):
+    obj, actor = make_native(cap + 2, cap, capacity_profile="streaming32")
+    closing, running, *queued = [register(actor, f"slot{i}") for i in range(cap + 2)]
+    for lease, result in zip(
+        (closing, running), group(actor, (closing, running), [payload(closing), payload(running)]), strict=True
+    ):
+        ack(actor, lease, result)
+    closed_id = closing["session_id"]
+    first_started, first_release = threading.Event(), threading.Event()
+    next_started, next_release = threading.Event(), threading.Event()
+    generation = actor.generate_many
+    reset = actor._reset_session
+    actual_resets = []
+
+    def reset_session(session_id):
+        if session_id == closed_id:
+            assert actor._model_lock.locked()
+            actual_resets.append((first_release.is_set(), next_started.is_set()))
+        reset(session_id)
+
+    def blocking_generation(requests, updates):
+        if len(requests) == 1:
+            first_started.set()
+            assert first_release.wait(5)
+        else:
+            assert len(requests) == cap
+            next_started.set()
+            assert next_release.wait(5)
+        return generation(requests, updates)
+
+    monkeypatch.setattr(actor, "_reset_session", reset_session)
+    monkeypatch.setattr(actor, "generate_many", blocking_generation)
+    current = submit(actor, running, payload(running, 1, 0, 2))
+    try:
+        assert first_started.wait(5)
+        pending = [submit(actor, lease, payload(lease)) for lease in queued]
+        assert actor.end(closing).status == actor.end(closing).status == 202
+        assert closed_id in actor.adapter.snapshot.fast
+        first_release.set()
+        assert next_started.wait(5) and actor.info()["busy"]
+        peer = actor.adapter.snapshot.fast[running["session_id"]]
+        assert peer.consumer_step == 1
+        with pytest.raises(ValueError, match="previous physical Slot assignment"):
+            register(actor, generation=2)
+        reply = actor.end(closing)
+        assert reply.status == 200 and reply.json()["acknowledged"] is True
+        assert actor.end(closing) == reply
+        assert actual_resets == [(True, False)] and closed_id not in actor.adapter.snapshot.fast
+        assert actor.adapter.snapshot.fast[running["session_id"]] is peer
+        assert register(actor, generation=2)["session_id"] != closed_id
+    finally:
+        first_release.set()
+        next_release.set()
+    assert wait_result(actor, running, current).status == 200
+    results = [wait_result(actor, lease, receipt).json() for lease, receipt in zip(queued, pending, strict=True)]
+    assert [r["native_batch"]["size"] for r in results] == [cap] * cap
+    assert [r["assignment"]["session_id"] for r in results] == [l["session_id"] for l in queued]
+
+
+@pytest.mark.parametrize("fault", ["quiescence", "reset"])
+def test_deferred_end_preserves_ownership_if_cleanup_cannot_be_proven(make_native, monkeypatch, fault):
+    _, actor = make_native(slots=2, cap=1)
+    a, b = register(actor), register(actor, "slot1")
+    ack(actor, a, wait_result(actor, a, submit(actor, a, payload(a))))
+    before = actor.adapter.snapshot.fast[a["session_id"]]
+    entered, release = threading.Event(), threading.Event()
+    generate = actor.generate_many
+
+    def block(requests, updates):
+        entered.set()
+        assert release.wait(5)
+        return generate(requests, updates)
+
+    def fail(*_):
+        raise RuntimeError("injected cleanup failure")
+
+    monkeypatch.setattr(actor, "generate_many", block)
+    monkeypatch.setattr(actor, "quiesce" if fault == "quiescence" else "_reset_session", fail)
+    submit(actor, b, payload(b))
+    try:
+        assert entered.wait(5)
+        assert actor.end(a).status == 202
+    finally:
+        release.set()
+    actor._executor.submit(lambda: None).result(timeout=5)
+    assert actor.info()["quarantined"]
+    if fault == "quiescence":
+        assert actor.end(a).json()["acknowledged"] is False
+    else:
+        with pytest.raises(RuntimeError, match="End cleanup failed"):
+            actor.end(a)
+    assert actor.adapter.snapshot.fast[a["session_id"]] is before
+    with pytest.raises(RuntimeError, match="owned Server recovery required"):
+        register(actor, generation=2)
 
 
 def test_original_deadline_failure_after_shared_generation_aborts_every_member(make_native):
