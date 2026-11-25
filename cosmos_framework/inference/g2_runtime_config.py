@@ -243,7 +243,7 @@ def validate_project_runtime_config(
         inventory = json.loads(inventory_file.read_bytes())
         if (type(inventory) is not dict or inventory.get("schema") != "psm_robocasa365_v5_asset_identity_v1"
             or type(inventory.get("tokenizer_files")) is not dict
-            or len(inventory["tokenizer_files"]) != 13
+            or len(inventory["tokenizer_files"]) != 14
             or type(inventory.get("vae")) is not dict):
             raise ValueError("native G2/G1 extended tokenizer/processor witness inventory invalid")
         if inventory["vae"]["sha256"] != witnesses["vae_file"] or inventory["vae"]["bytes"] != vae.stat().st_size:
