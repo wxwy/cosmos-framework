@@ -559,6 +559,8 @@ class ActionServerArgs(pydantic.BaseModel):
     """Materialized formal G2 recipe for the native DCP model."""
     g2_checkpoint_metadata_sha256: str | None = None
     """Expected SHA256 for the formal checkpoint's published model/.metadata."""
+    g2_runtime_asset_manifest: Path | None = None
+    """Project-owned configs/ contract for strictly approved G2 model asset relocation."""
     g2_provider_factory: str | None = None
     """module:function creating a current-rollout spatial provider; no expert replay fallback."""
     g2_spatial_root: Path | None = None
@@ -920,7 +922,8 @@ class ActionModelService:
         self.g2_native_authority = None
         g2_run_recipe = getattr(args, "g2_run_recipe", None)
         g2_metadata_sha = getattr(args, "g2_checkpoint_metadata_sha256", None)
-        native_g2 = g2_run_recipe is not None or g2_metadata_sha is not None
+        g2_runtime_assets = getattr(args, "g2_runtime_asset_manifest", None)
+        native_g2 = any(value is not None for value in (g2_run_recipe, g2_metadata_sha, g2_runtime_assets))
         r2_sources = tuple(
             getattr(args, field, None) for field in ("g2_spatial_root", "g2_view_vae_recipe", "g2_view_vae_weights")
         )
@@ -981,6 +984,7 @@ class ActionModelService:
                 config_path=Path(setup_args.config_file),
                 metadata_sha256=g2_metadata_sha,
                 profile=g2_profile,
+                runtime_asset_manifest=g2_runtime_assets,
             )
         init_output_dir(setup_args.output_dir)
         setup_args = disable_runtime_ema_for_frozen_config(setup_args)
