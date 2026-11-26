@@ -26,7 +26,7 @@ class InvalidInitialSuccess(ValueError):
 
 
 class NativeEpisode:
-    def __init__(self, env, settings, *, policy=native.run_policy, media_factory=MediaSink):
+    def __init__(self, env, settings, *, policy=native.run_policy, media_factory=MediaSink, environment_id=None):
         self.env, self.settings, self.policy, self.media_factory = env, settings, policy, media_factory
         self.observation = None
         self.admitted = False
@@ -43,12 +43,32 @@ class NativeEpisode:
         native.CAMERA_SET = "left_wrist"
         native.USE_BASE_ACTION = True
         native.BASE_ENCODING = "raw"
+        self.environment = None
+        self._reset_failure = None
+        if environment_id is not None:
+            from inspect import signature
 
-    def initialize(self):
+            from environment.robocasa import RoboCasaEnvironment
+
+            if "on_env_step" not in signature(self.policy).parameters:
+                raise ValueError("W1 Actor requires the W2-owned env.step seam")
+            self.environment = RoboCasaEnvironment(
+                env,
+                environment_id=environment_id,
+                canonicalize=native.canonicalize_raw15_for_env,
+                reset=self._reset_for_environment,
+            )
+
+    def initialize(self, *, environment_reset_index=None):
         stage = "reset"
         try:
             with nullcontext() if self.trace is None else self.trace.span("initial_reset", stratum="load"):
-                self.observation = self.env.reset()
+                self._reset_failure = None
+                self.observation = (
+                    self.env.reset()
+                    if self.environment is None
+                    else self.environment.sample_reset(environment_reset_index)
+                )
             stage = "initial_success"
             try:
                 initial = boolean(self.env._check_success())
@@ -58,34 +78,46 @@ class NativeEpisode:
             return {"initial_success": initial, "stage": stage, "error": None}
         except Exception as error:
             self.admitted = False
-            # Only known pure sampling/typed-precheck errors with a positive
-            # physics probe may retry. EGL/device/unknown exceptions safe-stop.
-            pure = isinstance(error, InvalidInitialSuccess) or (
-                type(error).__name__ == "RandomizationError" and type(error).__module__.startswith("robosuite.")
-            )
-            proof = {"physics_finite": False, "forward_ok": False, "sampling_error_class": pure}
-            # V5 explicitly retires a failed reset and forbids environment reuse.
-            # A finite physics probe cannot reverse that lifecycle decision.
-            lifecycle_failed = bool(getattr(self.env, "_egl_reset_failed", False))
-            if lifecycle_failed:
-                proof["egl_reset_failed"] = True
-            if pure and not lifecycle_failed:
-                try:
-                    sim = self.env.sim
-                    proof["physics_finite"] = bool(
-                        np.isfinite(sim.data.qpos).all() and np.isfinite(sim.data.qvel).all()
-                    )
-                    sim.forward()
-                    proof["forward_ok"] = True
-                except Exception:
-                    pass
-            return {
-                "initial_success": None,
-                "stage": stage,
-                "error": {"type": type(error).__name__, "message": str(error)},
-                "safe_to_retry": pure and not lifecycle_failed and proof["physics_finite"] and proof["forward_ok"],
-                "resource_proof": proof,
-            }
+            return self._reset_failure or self._initialization_failure(stage, error)
+
+    def _reset_for_environment(self):
+        try:
+            return self.env.reset()
+        except Exception as error:
+            from environment.runtime import ResetRejected
+
+            self._reset_failure = self._initialization_failure("reset", error)
+            if self._reset_failure["safe_to_retry"]:
+                raise ResetRejected("native sampler rejected a scene with a positive resource proof") from error
+            raise
+
+    def _initialization_failure(self, stage, error):
+        # Only known pure sampling/typed-precheck errors with a positive
+        # physics probe may retry. EGL/device/unknown exceptions safe-stop.
+        pure = isinstance(error, InvalidInitialSuccess) or (
+            type(error).__name__ == "RandomizationError" and type(error).__module__.startswith("robosuite.")
+        )
+        proof = {"physics_finite": False, "forward_ok": False, "sampling_error_class": pure}
+        # V5 explicitly retires a failed reset and forbids environment reuse.
+        # A finite physics probe cannot reverse that lifecycle decision.
+        lifecycle_failed = bool(getattr(self.env, "_egl_reset_failed", False))
+        if lifecycle_failed:
+            proof["egl_reset_failed"] = True
+        if pure and not lifecycle_failed:
+            try:
+                sim = self.env.sim
+                proof["physics_finite"] = bool(np.isfinite(sim.data.qpos).all() and np.isfinite(sim.data.qvel).all())
+                sim.forward()
+                proof["forward_ok"] = True
+            except Exception:
+                pass
+        return {
+            "initial_success": None,
+            "stage": stage,
+            "error": {"type": type(error).__name__, "message": str(error)},
+            "safe_to_retry": pure and not lifecycle_failed and proof["physics_finite"] and proof["forward_ok"],
+            "resource_proof": proof,
+        }
 
     def execute(
         self,
@@ -110,6 +142,12 @@ class NativeEpisode:
         scene.update(initial_success=False, reset_index=reset_index)
         if sampling is not None:
             scene["sampling"] = sampling
+        if self.environment is not None:
+            scene["environment_runtime"] = {
+                "scene_id": self.environment.scene_id,
+                "environment_profile_sha256": self.environment.runtime.profile.digest,
+                "embodiment_profile_sha256": self.environment.runtime.embodiment.digest,
+            }
         metadata = self.env.get_ep_meta()
         instruction = metadata.get("lang")
         if not isinstance(instruction, str) or not instruction.strip():
@@ -141,6 +179,11 @@ class NativeEpisode:
             client = RoboCasaLocalMemoryClient(enabled=True)
             http_client = requests.Session()
             http_client.trust_env = False
+        edge_options = {}
+        binding = lease_identity = None
+        if self.environment is not None and (transactional is None or client is None):
+            http_client.close()
+            raise ValueError("W1 benchmark Actor requires an admitted transactional Episode with Local")
         try:
             strict = self.settings.get("save_generated_video") == "all"
             media_options = {}
@@ -210,6 +253,20 @@ class NativeEpisode:
                             "media",
                         )
                     }
+                if self.environment is not None:
+                    from environment.contracts import Request
+
+                    if result["assignment"] != lease_identity or result["frontier"] != len(outcome.checks):
+                        raise ValueError("prediction lease or completed frontier does not match the W1 Actor")
+                    self.environment.bind_chunk(
+                        Request(
+                            binding.lease_identity_sha256,
+                            result["request_key"],
+                            result["payload_sha256"],
+                            result["frontier"],
+                        ),
+                        result["action"],
+                    )
                 if transactional is not None and "timing" in result:
                     value["transaction"]["timing"] = result["timing"]
                 if g2_request is not None:
@@ -237,6 +294,8 @@ class NativeEpisode:
                         "local_memory_mode": "off",
                         "local_state": "not_instantiated",
                     }
+                if self.environment is not None and value.get("reset_ok") is True:
+                    self.environment.end_benchmark_episode(value["session_id"])
                 cleanup = value
                 atomic_json(directory / "local_memory.json", value)
 
@@ -251,6 +310,23 @@ class NativeEpisode:
                     progress.last = now
 
             try:
+                if self.environment is not None:
+                    from cosmos_framework.inference.robocasa_session_transactions import digest
+                    from environment.contracts import SessionBinding
+
+                    lease_identity = {key: value for key, value in transactional.lease.items() if key != "capability"}
+                    binding = SessionBinding(
+                        lease_identity["episode_id"], lease_identity["session_id"], digest(lease_identity)
+                    )
+                    self.environment.begin_benchmark_run(
+                        binding,
+                        task=attempt["task"],
+                        episode_index=attempt["episode"],
+                        run_id=attempt["attempt_id"],
+                        horizon=self.settings["horizon"],
+                        deadline_s=episode_deadline,
+                    )
+                    edge_options["on_env_step"] = self.environment.step
                 g2_options = {}
                 g2_profile = self.settings.get("g2_profile", "legacy")
                 if g2_profile != "legacy":
@@ -266,6 +342,8 @@ class NativeEpisode:
                         "g2_episode_index": attempt["episode"],
                         "g2_ep_meta": metadata,
                     }
+                if self.environment is not None and g2_options:
+                    self.environment.attach_spatial(g2_options["g2_runtime"].native, binding)
                 with nullcontext() if self.trace is None else use_trace(self.trace):
                     success, steps, prompt = self.policy(
                         self.env,
@@ -289,6 +367,7 @@ class NativeEpisode:
                         video_fps=20,
                         **({"trace": self.trace} if self.trace is not None else {}),
                         **g2_options,
+                        **edge_options,
                     )
                 if steps != len(outcome.checks) or success != any(outcome.checks):
                     raise ValueError("native result contradicts strict environment checks")
