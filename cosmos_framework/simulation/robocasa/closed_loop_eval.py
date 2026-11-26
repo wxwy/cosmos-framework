@@ -40,7 +40,9 @@ import json
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -86,14 +88,15 @@ def _upright(img: np.ndarray) -> np.ndarray:
     return img[::-1]
 
 
-def compose(obs) -> np.ndarray:
-    if CAMERA_SET == "left_wrist":
+def compose(obs, *, camera_set=None) -> np.ndarray:
+    camera_set = CAMERA_SET if camera_set is None else camera_set
+    if camera_set == "left_wrist":
         # LIBERO-style: [agentview_left | wrist], full-res, horizontal -> 256x512.
         # Mirrors RoboCasaLeRobotDataset._compose_left_wrist (left | wrist, no downscale).
         l = _upright(obs[f"{CAMS[0]}_image"])
         w = _upright(obs[f"{CAMS[2]}_image"])
         return np.concatenate([l, w], axis=1)  # [H, 2W, 3]
-    if CAMERA_SET == "lrw":
+    if camera_set == "lrw":
         # All three cameras side by side at full res -> 256x768.
         # Mirrors RoboCasaLeRobotDataset._compose_lrw (left | right | wrist).
         l = _upright(obs[f"{CAMS[0]}_image"])
@@ -249,6 +252,16 @@ def verify_runtime(args, task_name: str) -> dict | None:
     return runtime
 
 
+@dataclass
+class PolicyEpisodeState:
+    """Native rollout state retained by the host across goal boundaries."""
+
+    observation: Any = None
+    prompt: str | None = None
+    frontier: int = 0
+    replans: int = 0
+
+
 def run_policy(
     env,
     *,
@@ -281,9 +294,18 @@ def run_policy(
     g2_task: str | None = None,
     g2_episode_index: int | None = None,
     g2_ep_meta: dict | None = None,
+    control=None,
 ) -> tuple[bool, int, str]:
+    """Run the native policy loop, optionally inside a host-owned G2 Episode."""
+    episode = PolicyEpisodeState() if control is None else control.episode
+    mobile_base = USE_BASE_ACTION if control is None else True
+    base_encoding = BASE_ENCODING if control is None else "raw"
+    camera_set = CAMERA_SET if control is None else "left_wrist"
+    compose_obs = compose if control is None else lambda obs: compose(obs, camera_set=camera_set)
     shared_vae = getattr(local_memory_client, "uses_shared_vae", False) is True
-    if shared_vae and (action_horizon != 16 or not use_state or not USE_BASE_ACTION or BASE_ENCODING != "raw"):
+    if control is not None and (initial_observation is None or g2_runtime is None or shared_vae):
+        raise ValueError("managed R2 requires an admitted observation, native conditions and server-side Local")
+    if shared_vae and (action_horizon != 16 or not use_state or not mobile_base or base_encoding != "raw"):
         raise ValueError("shared VAE C requires H16/state15/mobile canonical raw15")
     rollout_error: BaseException | None = None
     trace = trace if trace is not None else get_trace()
@@ -327,9 +349,9 @@ def run_policy(
             local_memory_client is None
             or shared_vae
             or not use_state
-            or not USE_BASE_ACTION
-            or BASE_ENCODING != "raw"
-            or CAMERA_SET != "left_wrist"
+            or not mobile_base
+            or base_encoding != "raw"
+            or camera_set != "left_wrist"
             or action_horizon != 16
             or video_fps != 20
             or not g2_task
@@ -338,56 +360,65 @@ def run_policy(
         ):
             raise ValueError("G2 requires assigned Local, state15, left+wrist, H16, raw15 and a 20 Hz episode")
         observe("environment_initialization")
-        with measured("initial_observation", stratum="load"):
-            obs = env.reset() if initial_observation is None else initial_observation
-        observation_ready_ns = trace.now_ns() if trace is not None else None
         last_step_end_ns = None
-        if local_memory_client is not None:
-            local_memory_client.begin(0, image_size=image_size)
-        if language_instruction is not None:
-            prompt = language_instruction
+        if episode.prompt is None:
+            with measured("initial_observation", stratum="load"):
+                obs = env.reset() if initial_observation is None else initial_observation
+            observation_ready_ns = trace.now_ns() if trace is not None else None
+            if local_memory_client is not None:
+                local_memory_client.begin(0, image_size=image_size)
+            if language_instruction is not None:
+                prompt = language_instruction
+            else:
+                try:
+                    prompt = env.get_ep_meta().get("lang", "") or ""
+                except Exception:
+                    prompt = ""
+            observe("environment_initialization", instruction=prompt)
+            if g2_runtime is not None:
+                if (
+                    not isinstance(g2_ep_meta, dict)
+                    or not isinstance(prompt, str)
+                    or g2_ep_meta.get("lang") != prompt
+                    or not prompt.strip()
+                ):
+                    raise ValueError("G2 requires the admitted episode's original language and metadata")
+                g2_runtime.reset(
+                    env,
+                    obs,
+                    episode_id=local_memory_client.payload(0)["episode_id"],
+                    task=g2_task,
+                    instruction=prompt,
+                    frame=0,
+                    episode_index=g2_episode_index,
+                    ep_meta=g2_ep_meta,
+                )
+            episode.prompt, episode.observation = prompt, obs
         else:
-            try:
-                prompt = env.get_ep_meta().get("lang", "") or ""
-            except Exception:
-                prompt = ""
-        observe("environment_initialization", instruction=prompt)
-        if g2_runtime is not None:
-            if (
-                not isinstance(g2_ep_meta, dict)
-                or not isinstance(prompt, str)
-                or g2_ep_meta.get("lang") != prompt
-                or not prompt.strip()
-            ):
-                raise ValueError("G2 requires the admitted episode's original language and metadata")
-            g2_runtime.reset(
-                env,
-                obs,
-                episode_id=local_memory_client.payload(0)["episode_id"],
-                task=g2_task,
-                instruction=prompt,
-                frame=0,
-                episode_index=g2_episode_index,
-                ep_meta=g2_ep_meta,
-            )
-        init_comp = compose(obs).astype(np.uint8)
+            prompt, obs = episode.prompt, episode.observation
+            observation_ready_ns = trace.now_ns() if trace is not None else None
+        if control is not None:
+            control.bound(g2_runtime)
+        init_comp = compose_obs(obs).astype(np.uint8)
         if save_png is not None:
             with open(save_png, "xb") as handle:
                 Image.fromarray(init_comp).save(handle, format="PNG")
         frames = [init_comp] if save_video is not None else []
         if on_frame is not None:
             on_frame(init_comp)
-        replans = 0
+        replans = episode.replans
         streak, queue, success, done_steps = 0, [], False, max_steps
         observe("executing")
-        for step in range(max_steps):
+        for step in range(episode.frontier, max_steps):
             if not queue:
-                replan_started_ns = observation_ready_ns if replans == 0 else last_step_end_ns
+                if control is not None and not control.before_prediction(step, action_horizon, max_steps):
+                    return False, step, prompt
+                replan_started_ns = observation_ready_ns if last_step_end_ns is None else last_step_end_ns
                 stratum = "first_no_history" if replans == 0 else "steady_full16"
                 if shared_vae:
                     local_memory_client.start_replan(0, time.monotonic_ns())
                 with measured("observation_preprocess", source_step=step, stratum=stratum):
-                    comp = compose(obs)
+                    comp = compose_obs(obs)
                     state_token = build_state_token(obs) if use_state and g2_runtime is None else None
                 with measured("boundary_history_drain", source_step=step, stratum=stratum):
                     local_payload = local_memory_client.payload(0) if local_memory_client is not None else None
@@ -411,6 +442,8 @@ def run_policy(
                     ):
                         raise ValueError("G2 requires finite state15, enhanced prompt and request identity")
                     request_options["g2"] = decision["g2"]
+                    if control is not None:
+                        control.condition(g2_runtime, decision)
                 observe("predicting")
                 prediction_t0 = time.monotonic()
                 with measured("policy_http", source_step=step, stratum=stratum):
@@ -451,7 +484,7 @@ def run_policy(
                         on_prediction(result, prediction_ms)
                     else:
                         on_prediction(result, prediction_ms, g2_request=decision)
-                if local_memory_client is not None:
+                if local_memory_client is not None and control is None:
                     status = result.get("local_memory")
                     if not isinstance(status, dict):
                         raise RuntimeError("required Local-TTT server response is missing local_memory status")
@@ -483,8 +516,11 @@ def run_policy(
                     )
                     observe("executing")
                 replans += 1
+                episode.replans = replans
                 acts = result["action"]
                 queue = acts[:action_horizon] if action_horizon > 0 else list(acts)
+                if control is not None and not control.grant_chunk(result, decision, step, len(queue), max_steps):
+                    return False, step, prompt
                 if trace is not None:
                     trace.record(
                         "first_action" if replans == 1 else "replan",
@@ -502,18 +538,18 @@ def run_policy(
                 or getattr(local_memory_client, "history_k", action_horizon) == action_horizon
                 or local_memory_client.needs_history_image(step)
             )
-            pre_composite = compose(obs).astype(np.uint8) if history_image else None
-            if USE_BASE_ACTION:
-                want = _ACTION_DIM_BY_ENCODING[BASE_ENCODING]
+            pre_composite = compose_obs(obs).astype(np.uint8) if history_image else None
+            if mobile_base:
+                want = _ACTION_DIM_BY_ENCODING[base_encoding]
                 if a.shape[-1] != want:
                     raise ValueError(
-                        f"--base-encoding={BASE_ENCODING} expects {want}D actions but the server "
+                        f"--base-encoding={base_encoding} expects {want}D actions but the server "
                         f"returned {a.shape[-1]}D. Check that the flag matches the checkpoint."
                     )
                 if local_memory_client is not None:
                     env_action, canonical_raw15 = canonicalize_raw15_for_env(a, False)
                 else:
-                    env_action = (decode_15d_to_env12 if BASE_ENCODING == "raw" else decode_20d_to_env12)(a, False)
+                    env_action = (decode_15d_to_env12 if base_encoding == "raw" else decode_20d_to_env12)(a, False)
             else:
                 if a.shape[-1] != 10:
                     raise ValueError(
@@ -534,16 +570,17 @@ def run_policy(
                     stratum="chunk_middle",
                 )
             with measured("sim_step", source_step=step, stratum="chunk_middle", egl_separate="unavailable"):
-                if prepared_step is None:
-                    obs, reward, env_done, info = env.step(env_action)
-                    step_completed_ns = time.monotonic_ns() if trace is not None else None
-                else:
-                    try:
+                try:
+                    if control is None:
                         obs, reward, env_done, info = env.step(env_action)
-                        step_completed_ns = time.monotonic_ns()
-                    except BaseException as error:
+                    else:
+                        obs, reward, env_done, info = control.step(step, a, canonical_raw15, env_action)
+                    step_completed_ns = time.monotonic_ns() if trace is not None or prepared_step is not None else None
+                except BaseException as error:
+                    if prepared_step is not None:
                         local_memory_client.abort_step(0, prepared_step, error)
-                        raise
+                    raise
+                episode.observation, episode.frontier = obs, step + 1
             if trace is not None:
                 last_step_end_ns = step_completed_ns
                 trace.record(
@@ -577,7 +614,10 @@ def run_policy(
                 if prepared_step is None:
                     assert pre_composite is not None
                     with measured("history_capture_png", source_step=step, stratum="chunk_middle"):
-                        local_memory_client.record_completed(0, pre_composite, canonical_raw15)
+                        if control is None:
+                            local_memory_client.record_completed(0, pre_composite, canonical_raw15)
+                        else:
+                            local_memory_client.record_completed(0, pre_composite, canonical_raw15, source_step=step)
             if g2_runtime is not None:
                 g2_runtime.record_completed(
                     env,
@@ -587,9 +627,9 @@ def run_policy(
                     submitted_env12=env_action,
                 )
             if save_video is not None:
-                frames.append(compose(obs).astype(np.uint8))
+                frames.append(compose_obs(obs).astype(np.uint8))
             if on_frame is not None:
-                on_frame(compose(obs).astype(np.uint8))
+                on_frame(compose_obs(obs).astype(np.uint8))
             if (success_check or check_success)(env):
                 streak += 1
                 if streak >= latch:
@@ -598,6 +638,8 @@ def run_policy(
             else:
                 streak = 0
             if g2_runtime is not None and env_done and step + 1 < max_steps:
+                if control is not None:
+                    control.unexpected_terminal()
                 raise RuntimeError("G2 environment ended before success or the declared horizon")
 
         return success, done_steps, prompt
@@ -621,9 +663,8 @@ def run_policy(
         cleanup_error = None
         session_id = None
         try:
-            if local_memory_client is not None:
+            if control is None and local_memory_client is not None:
                 observe("local_cleanup")
-            if local_memory_client is not None:
                 with measured("end", stratum="cleanup"):
                     session_id = local_memory_client.end(0)
                 if session_id is not None:
@@ -637,7 +678,7 @@ def run_policy(
             cleanup_error = error
             observe("local_cleanup", event="error", error=f"{type(error).__name__}: {error}"[:2048])
             print(f"[eval] Local-TTT cleanup failure: {type(error).__name__}: {error}", flush=True)
-        if g2_runtime is not None:
+        if control is None and g2_runtime is not None:
             try:
                 g2_runtime.close()
             except Exception as error:

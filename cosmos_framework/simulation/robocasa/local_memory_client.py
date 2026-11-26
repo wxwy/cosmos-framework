@@ -75,10 +75,14 @@ class RoboCasaLocalMemoryClient:
         slot: int,
         composite_image: np.ndarray,
         executed_action15: np.ndarray | list[float],
+        *,
+        source_step: int | None = None,
     ) -> None:
         if not self.enabled:
             return
         episode = self._get(slot)
+        if source_step is not None and (type(source_step) is not int or source_step != episode.consumer_step):
+            raise ValueError("Local-TTT requires the next confirmed source step")
         composite = self._image(composite_image, "composite_image")
         action = np.asarray(executed_action15, dtype=np.float32).reshape(-1)
         if action.shape != (EVIDENCE_ACTION_DIM,) or not np.isfinite(action).all():
@@ -132,3 +136,8 @@ class RoboCasaLocalMemoryClient:
         if not self.enabled:
             return None
         return self._get(slot).session_id
+
+    def frontiers(self, slot: int = 0) -> tuple[int, int]:
+        """Return recorded and consumed boundaries on the Episode owner thread."""
+        episode = self._get(slot)
+        return episode.consumer_step, episode.consumer_step - len(episode.evidence)

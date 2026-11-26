@@ -11,6 +11,7 @@ import math
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from urllib.parse import urlsplit
 
 import requests
@@ -91,6 +92,7 @@ class PolicyTransport:
                 raise ValueError("shared VAE credentials require explicit C profile")
             self.local = AssignedLocalMemoryClient(self.lease) if self.client.mode == "required" else None
         self._failed, self._ended, self.replan = False, False, 0
+        self._run = None
         self._last_delivered = -1
         self._stop = threading.Event()
         self._changed = threading.Condition()
@@ -109,6 +111,24 @@ class PolicyTransport:
     def _error(self, error):
         if len(self.errors) < 16:
             self.errors.append(str(error)[:1024])
+
+    @contextmanager
+    def controlled_run(self, *, deadline, observe, on_retry):
+        if self._run is not None or deadline > self.episode_deadline:
+            raise ValueError("one run within the original Episode deadline required")
+        self._run = (deadline, observe, on_retry)
+        try:
+            yield
+        finally:
+            self._run = None
+
+    def read_info(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("original run deadline exhausted")
+        reply = self.http.request("GET", self.base + "/info", timeout=min(remaining, 5.0))
+        reply.raise_for_status()
+        return reply.json()
 
     def post(self, url, *, json, timeout, **kwargs):
         if urlsplit(url).path != "/predict" or url.rstrip("/") != self.base + "/predict":
@@ -129,7 +149,8 @@ class PolicyTransport:
         if type(frontier) is not int or frontier <= self._last_delivered:
             self._failed = True
             raise ValueError("native Episode cannot execute a delivered frontier twice")
-        remaining = self.episode_deadline - time.monotonic()
+        deadline = self.episode_deadline if self._run is None else self._run[0]
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             self._failed = True
             raise TimeoutError("original Episode deadline exhausted")
@@ -169,6 +190,15 @@ class PolicyTransport:
             if getattr(self.local, "uses_shared_vae", False) is True:
                 result = self.client.predict(record, budget=self.local.prediction_budget)
                 self.local.accept_policy_result(result)
+            elif self._run is not None:
+                run_deadline, observe, on_retry = self._run
+                started_at = self.client.clock()
+                budget = {
+                    "clock_domain": self.client.clock_domain,
+                    "started_at": started_at,
+                    "deadline": min(run_deadline, started_at + self.client.timeout_s),
+                }
+                result = self.client.predict(record, budget=budget, observe=observe, on_retry=on_retry)
             else:
                 result = self.client.predict(record)
             self._last_delivered = frontier

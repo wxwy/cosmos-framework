@@ -53,7 +53,7 @@ class TransactionPolicyClient:
         self.lease = None
         self._registration_pending = False
 
-    def _call(self, method, path, deadline, **kwargs):
+    def _call(self, method, path, deadline, *, on_retry=None, **kwargs):
         while True:
             if self.cancelled():
                 raise RuntimeError("coordinator cancelled transaction")
@@ -65,12 +65,13 @@ class TransactionPolicyClient:
 
                 with span("policy_http", producer="sim", method=method, path=path):
                     response = self.transport.request(method, self.base_url + path, timeout=remaining, **kwargs)
-                if response.status_code in (429, 503):
-                    self.pause(min(0.02, max(0, deadline - self.clock())))
-                    continue
-                break
+                if response.status_code not in (429, 503):
+                    break
             except (requests.Timeout, requests.ConnectionError):
-                self.pause(min(0.02, max(0, deadline - self.clock())))
+                pass
+            if self.clock() < deadline and on_retry is not None:
+                on_retry()
+            self.pause(min(0.02, max(0, deadline - self.clock())))
         if self.clock() >= deadline:
             raise TimeoutError("original transaction deadline exhausted during transport")
         if response.status_code not in (200, 202):
@@ -148,7 +149,8 @@ class TransactionPolicyClient:
             and 0 <= batch["index"] < batch["size"]
         )
 
-    def predict(self, payload: dict, *, budget: dict | None = None):
+    def predict(self, payload: dict, *, budget: dict | None = None, observe=None, on_retry=None):
+        """Observe verified model commit and delivery separately from executable return."""
         # Freeze before encoding/upload; retries reuse these exact absolute values.
         if budget is None:
             started_at = self.clock()
@@ -174,8 +176,15 @@ class TransactionPolicyClient:
             }
         )
         expected_sha = hashlib.sha256(raw).hexdigest()
+        request = {"request_key": expected_key, "payload_sha256": expected_sha, "frontier": frontier}
+        if observe is not None:
+            observe("request", request)
         status, result = self._call(
-            "POST", "/v2/inference", deadline, json={"lease": self.lease, "payload": payload, "budget": budget}
+            "POST",
+            "/v2/inference",
+            deadline,
+            on_retry=on_retry,
+            json={"lease": self.lease, "payload": payload, "budget": budget},
         )
         while status == 202:
             if result.get("request_key") != expected_key or result.get("payload_sha256") != expected_sha:
@@ -185,6 +194,7 @@ class TransactionPolicyClient:
                 "GET",
                 f"/v2/inference/{expected_key}",
                 deadline,
+                on_retry=on_retry,
                 headers={
                     "X-Cosmos-Assignment": json_bytes(self.lease).decode(),
                     "X-Cosmos-Payload-SHA256": expected_sha,
@@ -219,14 +229,19 @@ class TransactionPolicyClient:
             or any(type(v) not in (float, int) or not math.isfinite(v) for row in action for v in row)
         ):
             raise ValueError("committed action/Local status contract mismatch")
+        if observe is not None:
+            observe("commit", result)
         _, ack = self._call(
             "POST",
             "/v2/inference/ack",
             deadline,
+            on_retry=on_retry,
             json={"lease": self.lease, "request_key": expected_key, "payload_sha256": expected_sha},
         )
         if ack.get("acknowledged") is not True or ack.get("request_key") != expected_key:
             raise ValueError("delivery ACK mismatch")
+        if observe is not None:
+            observe("delivery_ack", request)
         return result
 
     def end(self):
