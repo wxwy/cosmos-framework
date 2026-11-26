@@ -91,6 +91,24 @@ def serve(channel, cfg, *, factory=None):
                 if runtime_spec is None or runtime_spec.origin is None:
                     raise ValueError("missing Root G2 runtime origin")
                 modules["g2_runtime"] = Path(runtime_spec.origin)
+            if cfg["settings"].get("environment_runtime") is True:
+                from importlib.util import find_spec
+                from inspect import signature
+
+                if g2_profile != "g2_r2" or "on_env_step" not in signature(native.run_policy).parameters:
+                    raise ValueError("W1 Actor requires R2 and the W2-owned env.step seam")
+                for name, module in {
+                    "w1_environment___init__": "environment",
+                    "w1_environment_contracts": "environment.contracts",
+                    "w1_environment_robocasa": "environment.robocasa",
+                    "w1_environment_runtime": "environment.runtime",
+                    "w1_environment_spatial": "environment.spatial",
+                    "w1_nav_session": "g2.online.nav_session",
+                }.items():
+                    spec = find_spec(module)
+                    if spec is None or spec.origin is None:
+                        raise ValueError(f"missing Root W1 source origin: {module}")
+                    modules[name] = Path(spec.origin)
             evidence_profile = cfg["settings"].get("local_evidence_profile", "server_vae")
             if evidence_profile not in ("server_vae", "sim_shared_vae"):
                 raise ValueError("unknown Actor source profile")

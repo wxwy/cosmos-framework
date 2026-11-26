@@ -60,7 +60,11 @@ class SimSlot:
             )
         )
         settings = dict(self.cfg["settings"], horizon=spec["horizon"])
-        self.engine = NativeEpisode(self.env, settings)
+        self.engine = NativeEpisode(
+            self.env,
+            settings,
+            **({"environment_id": grant["environment_id"]} if settings.get("environment_runtime") is True else {}),
+        )
         self.grant, self.reset_index, self.task = grant, -1, task
 
     def _claim(self, attempt, health_only):
@@ -87,8 +91,7 @@ class SimSlot:
             raise RuntimeError("Task switch requires an owned idle Slot claim")
         self._state("TASK_SWITCH")
         if self.env is not None:
-            self.env.close()
-            self.env = self.engine = None
+            self._close_environment(clean=True)
         if grant is None:
             raise ValueError("new Task environment requires durable seed grant")
         self._make(task, grant)
@@ -135,7 +138,8 @@ class SimSlot:
             raise RuntimeError("Slot cannot reset with an open/unowned Episode")
         self._state("RESETTING")
         self.reset_index += 1  # Includes failed and initially successful scene samples.
-        value = self.engine.initialize()
+        options = {"environment_reset_index": self.reset_index} if self.engine.environment is not None else {}
+        value = self.engine.initialize(**options)
         if value.get("error") is None and self.cfg.get("rendering", {}).get("backend") == "egl":
             try:
                 value["rendering"] = verify_current(self.cfg["rendering"])
@@ -237,10 +241,17 @@ class SimSlot:
             self._state("FAILED_QUARANTINED")
             raise
 
+    def _close_environment(self, *, clean):
+        if clean and self.engine is not None and self.engine.environment is not None:
+            self.engine.environment.disconnect()
+        else:
+            # The Actor process is being retired. Never reuse an unknown scene.
+            self.env.close()
+        self.env = self.engine = None
+
     def close(self):
         was_clean = self.state in ("IDLE", "CLEAN")
         self._state("PROCESS_RECOVERY" if not was_clean else "CLEAN")
         if self.env is not None:
-            self.env.close()
-            self.env = self.engine = None
+            self._close_environment(clean=was_clean)
         return {"closed": True, "clean": was_clean}
