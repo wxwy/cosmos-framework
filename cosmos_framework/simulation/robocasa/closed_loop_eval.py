@@ -325,7 +325,6 @@ def run_policy(
     try:
         if g2_runtime is not None and (
             local_memory_client is None
-            or shared_vae
             or not use_state
             or not USE_BASE_ACTION
             or BASE_ENCODING != "raw"
@@ -363,7 +362,7 @@ def run_policy(
             g2_runtime.reset(
                 env,
                 obs,
-                episode_id=local_memory_client.payload(0)["episode_id"],
+                episode_id=local_memory_client.episode_id(0),
                 task=g2_task,
                 instruction=prompt,
                 frame=0,

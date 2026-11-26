@@ -249,9 +249,16 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                 "deadline": self._budget["deadline"],
             }
 
-    def _rpc_deadline(self):
+    def _rpc_deadline(self, *, owner=False):
         original = self.episode_deadline_ns if self._budget is None else self._budget["deadline_ns"]
-        return min(original, time.monotonic_ns() + 250_000_000)
+        # The scoped relay performs multiple authenticated Policy/Worker hops.
+        # A sub-second scheduler stall must not invent an Episode failure.
+        # Keep the background I/O cap below the independent Session End budget,
+        # and never extend the already-frozen Replan or Episode deadline.
+        transport_ns = (
+            10_000_000_000 if owner else min(3_000_000_000, max(1, self.end_timeout_ns // 2))
+        )
+        return min(original, time.monotonic_ns() + transport_ns)
 
     def accept_policy_result(self, result):
         with self._changed:
@@ -274,7 +281,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                 result["payload_sha256"],
                 header["source_step"],
                 16,
-                self._rpc_deadline(),
+                self._rpc_deadline(owner=True),
             )
             self._pending_boundary = boundary
 
@@ -343,7 +350,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                             snapshot.source_rgb_sha256,
                             snapshot.raw15,
                             step_completed_ns,
-                            self._rpc_deadline(),
+                            self._rpc_deadline(owner=True),
                         )
                     )
                 if (
@@ -440,7 +447,7 @@ class SimSharedVAEClient(RoboCasaLocalMemoryClient):
                         raise RuntimeError(
                             "shared VAE Worker failed completed evidence: " + str(result.get("error", {}))
                         )
-                    self._stop.wait(0.002)
+                    self._stop.wait(0.01)
         except BaseException as error:
             with self._changed:
                 if self._error is None and not self._closed:

@@ -213,7 +213,9 @@ def test_cached_text_and_global_kv_equal_current_projection():
             block.prepare_gen_text_kv(layer) for block, layer in zip(model.layers, features.layers, strict=True)
         )
         global_kv = tuple(block.prepare_global_kv(torch.cat(globals[2:])) for block in model.layers)
-        cached = replace(joint, global_kv=global_kv)
+        cached = build_joint_memory_prefix_context(
+            globals, local, target_dtype=torch.float32, global_kv=global_kv
+        )
         output, _ = model(
             pack, mask, pos, prepared_text=features, prepared_gen_text_kv=text_kv, memory_prefix_context=cached
         )
@@ -395,3 +397,96 @@ def test_d_prepared_mixed_batch_uses_tokens_presence_without_views():
     assert condition.text.lengths == (3, 0, 1) and condition.text_features.hidden.shape == (3, 3, 16)
     assert all(k.key.shape == (4, 1, 8) for k in condition.gen_text_kv)
     assert all(k.key.shape == (64, 1, 8) for k in condition.global_kv)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cached_global_local_routing_matches_legacy_slices(dtype):
+    from cosmos_framework.model.generator.mot.g2_contracts import GENLayerKV
+    from cosmos_framework.model.generator.mot.memory_prefix import cached_global_local_kv
+
+    torch.manual_seed(33)
+    bridge = nn.Linear(4, 16).to(dtype)
+    cases = [
+        ((64,), (0,)), ((64,), (4,)),
+        ((64, 64), (0, 4)), ((64, 64), (4, 0)),
+        ((0, 64, 0, 64), (0, 0, 4, 4)),
+        ((64,) * 8, (0,) * 8),
+        ((64,) * 8, (0, 4) * 4),
+        ((64,) * 8, (4,) * 8),
+    ]
+    with torch.no_grad():
+        for gs, ls in cases:
+            g = tuple(torch.randn(n, 16, dtype=dtype) if n else None for n in gs)
+            l = tuple(torch.randn(n, 4, dtype=dtype) if n else None for n in ls)
+            lc = build_memory_prefix_context(l, bridge, torch.zeros(16), target_dtype=dtype)
+            gk = torch.randn(sum(gs), 1, 8, dtype=dtype)
+            gv = torch.randn_like(gk)
+            kv = (GENLayerKV(key=gk, value=gv),)
+            ctx = build_joint_memory_prefix_context(g, lc, target_dtype=dtype, global_kv=kv)
+            ref_local, hi = [], 0
+            for gn, ln in zip(gs, ls, strict=True):
+                ref_local.append(ctx.hidden[hi + gn:hi + gn + ln])
+                hi += gn + ln
+            assert torch.equal(ctx.hidden.index_select(0, ctx.cached_local_rows), torch.cat(ref_local))
+            lk = torch.randn(sum(ls), 1, 8, dtype=dtype)
+            lv = torch.randn_like(lk)
+            ek, ev, gi, li = [], [], 0, 0
+            for gn, ln in zip(gs, ls, strict=True):
+                ek.extend((gk[gi:gi + gn], lk[li:li + ln]))
+                ev.extend((gv[gi:gi + gn], lv[li:li + ln]))
+                gi, li = gi + gn, li + ln
+            k, v = cached_global_local_kv(ctx, lk, lv)
+            assert torch.equal(k, torch.cat(ek))
+            assert torch.equal(v, torch.cat(ev))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA Inductor regression")
+def test_cached_global_local_routing_inductor_mixed_batches():
+    from cosmos_framework.model.generator.mot.g2_contracts import GENLayerKV
+    from cosmos_framework.model.generator.mot.memory_prefix import cached_global_local_kv
+
+    device, dtype = "cuda", torch.bfloat16
+    torch.manual_seed(36)
+    bridge = nn.Linear(32, 128, device=device, dtype=dtype)
+    key_proj = nn.Linear(128, 64, bias=False, device=device, dtype=dtype)
+    value_proj = nn.Linear(128, 64, bias=False, device=device, dtype=dtype)
+    norm = nn.RMSNorm(64, device=device, dtype=dtype)
+
+    def route(context):
+        local = context.hidden.index_select(0, context.cached_local_rows)
+        key = norm(key_proj(local).view(-1, 1, 64))
+        value = value_proj(local).view(-1, 1, 64)
+        return cached_global_local_kv(context, key, value)
+
+    compiled = torch.compile(route, backend="inductor", dynamic=True, fullgraph=True)
+    cases = [
+        ((64,), (0,)), ((64,), (4,)),
+        ((64, 64), (0, 0)), ((64, 64), (0, 4)),
+        ((64, 64), (4, 0)), ((64, 64), (4, 4)),
+        ((64, 0, 64), (0, 4, 4)),
+        ((64,) * 8, (0,) * 8), ((64,) * 8, (0, 4) * 4),
+        ((64,) * 8, (4,) * 8), ((64,), (0,)), ((64, 64), (0, 4)),
+    ]
+    try:
+        with torch.inference_mode():
+            for gs, ls in cases:
+                global_tokens = tuple(
+                    torch.randn(n, 128, device=device, dtype=dtype) if n else None for n in gs
+                )
+                local_tokens = tuple(
+                    torch.randn(n, 32, device=device, dtype=dtype) if n else None for n in ls
+                )
+                local = build_memory_prefix_context(
+                    local_tokens, bridge, torch.zeros(128, device=device, dtype=dtype), target_dtype=dtype
+                )
+                gk = torch.randn(sum(gs), 1, 64, device=device, dtype=dtype)
+                gv = torch.randn_like(gk)
+                context = build_joint_memory_prefix_context(
+                    global_tokens, local, target_dtype=dtype, global_kv=(GENLayerKV(key=gk, value=gv),)
+                )
+                expected = route(context)
+                actual = compiled(context)
+                for x, y in zip(actual, expected, strict=True):
+                    torch.testing.assert_close(x, y, rtol=0.015, atol=0.015)
+    finally:
+        torch.compiler.reset()

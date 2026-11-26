@@ -82,9 +82,9 @@ def serve(channel, cfg, *, factory=None):
                     g2_profile not in ("g2_r1", "g2_r2")
                     or cfg["settings"].get("execution_profile") != "phase_b"
                     or cfg["settings"].get("local_memory_mode") != "required"
-                    or cfg["settings"].get("local_evidence_profile", "server_vae") != "server_vae"
+                    or cfg["settings"].get("local_evidence_profile", "server_vae") not in ("server_vae", "sim_shared_vae")
                 ):
-                    raise ValueError("G2 actor requires an assigned Phase B Local-TTT session with server VAE")
+                    raise ValueError("G2 actor requires an assigned Phase B Local-TTT session with a supported history VAE profile")
                 from importlib.util import find_spec
 
                 runtime_spec = find_spec("g2.online.runtime")

@@ -235,7 +235,7 @@ def build_manifest(
             or local_memory != "required"
             or not isinstance(execution, dict)
             or "single_latency" in execution
-            or "shared_vae" in execution
+            or "local_ttt_history_k" in execution
         ):
             raise ValueError("invalid G2 experiment identity")
         if project_runtime is not None and (

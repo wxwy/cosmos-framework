@@ -132,3 +132,10 @@ class RoboCasaLocalMemoryClient:
         if not self.enabled:
             return None
         return self._get(slot).session_id
+
+
+    def episode_id(self, slot: int = 0) -> str | None:
+        """Read the assigned identity without freezing a prediction frontier."""
+        if not self.enabled:
+            return None
+        return self._get(slot).episode_id

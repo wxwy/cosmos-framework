@@ -281,7 +281,7 @@ def run_daemon(
     device_attestor=_physical_device,
 ):
     """Injecting a fake encoder is a Python-only CPU-test seam, not a CLI mode."""
-    from cosmos_framework.inference.robocasa_vae_client import UnixVAEServer
+    from cosmos_framework.inference.robocasa_vae_client import UnixVAEServer, worker_ipc_capacity
     from cosmos_framework.inference.robocasa_vae_worker import SharedVAEWorker, WorkerConfig
 
     worker = server = None
@@ -319,6 +319,7 @@ def run_daemon(
             config["socket_path"],
             bytes.fromhex(private["control_capability_hex"]),
             connection_timeout_s=10,
+            **worker_ipc_capacity(worker.config.max_sessions),
         ).start()
         socket_proof = {}
         for name in (config["socket_path"], config["socket_path"] + ".ctl"):
