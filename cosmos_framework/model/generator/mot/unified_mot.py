@@ -33,7 +33,7 @@ from cosmos_framework.model.generator.mot.attention import (
     dispatch_attention,
 )
 from cosmos_framework.model.generator.mot.g2_contracts import GENLayerKV, UNDLayerKV, UNDTextFeatures
-from cosmos_framework.model.generator.mot.memory_prefix import MemoryPrefixContext
+from cosmos_framework.model.generator.mot.memory_prefix import MemoryPrefixContext, cached_global_local_kv
 
 # Nemotron 3 Dense VL imports
 from cosmos_framework.model.generator.reasoner.nemotron_3_dense_vl.configuration_nemotron_3_dense_vl import (
@@ -862,25 +862,16 @@ class PackedAttentionMoT(nn.Module):
                     raise ValueError("Frozen Prefix projection cache identity mismatch")
                 prefix_k, prefix_v, normalized_prefix_k = source[0], value[0], key[0]
             elif memory_prefix_context.global_kv is not None:
-                cached = memory_prefix_context.global_kv[0]
                 if torch.is_grad_enabled():
                     raise ValueError("cached Global K/V is inference-only")
-                gs, ls = memory_prefix_context.global_lengths, memory_prefix_context.local_lengths
-                local_rows, start = [], 0
-                for g, loc in zip(gs, ls, strict=True):
-                    local_rows.append(memory_prefix_context.hidden[start + g : start + g + loc])
-                    start += g + loc
-                local_hidden = torch.cat(local_rows)
+                if memory_prefix_context.cached_local_rows is None or memory_prefix_context.cached_joint_rows is None:
+                    raise ValueError("cached Global K/V requires the joint prefix routing indices")
+                local_hidden = memory_prefix_context.hidden.index_select(0, memory_prefix_context.cached_local_rows)
                 lk = self.k_norm_moe_gen(
                     self.k_proj_moe_gen(local_hidden).view(-1, self.num_key_value_heads, self.head_dim)
                 )
                 lv = self.v_proj_moe_gen(local_hidden).view(-1, self.num_key_value_heads, self.head_dim)
-                keys, values, gi, li = [], [], 0, 0
-                for g, loc in zip(gs, ls, strict=True):
-                    keys.extend((cached.key[gi : gi + g], lk[li : li + loc]))
-                    values.extend((cached.value[gi : gi + g], lv[li : li + loc]))
-                    gi, li = gi + g, li + loc
-                normalized_prefix_k, prefix_v = torch.cat(keys), torch.cat(values)
+                normalized_prefix_k, prefix_v = cached_global_local_kv(memory_prefix_context, lk, lv)
                 prefix_k = normalized_prefix_k  # legacy prefix capture is disallowed with G2 snapshots
             else:
                 prefix_k = self.k_proj_moe_gen(memory_prefix_context.hidden).view(

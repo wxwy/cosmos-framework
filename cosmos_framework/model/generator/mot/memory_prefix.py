@@ -82,6 +82,11 @@ class MemoryPrefixContext:
     local_present: torch.Tensor | None = None
     max_prefix_len: int | None = None
     global_kv: tuple[GENLayerKV, ...] | None = None
+    # Immutable routing indices for the cached-Global inference path. Construct
+    # them before decoder compilation; never slice a symbolic zero-row Local
+    # tensor by Python sample lengths inside the compiled attention block.
+    cached_local_rows: torch.Tensor | None = None
+    cached_joint_rows: torch.Tensor | None = None
 
     @property
     def max_length(self) -> int:
@@ -143,6 +148,22 @@ def build_joint_memory_prefix_context(
         l_lengths.append(l_len)
         offsets.append(offsets[-1] + g_len + l_len)
     hidden = torch.cat(hidden_parts)
+    local_indices = joint_indices = None
+    if global_kv is not None:
+        # The combined hidden layout is [G_i, L_i] per sample, while cached
+        # Global and freshly projected Local K/V are each packed separately.
+        # Gather Local rows, then reorder [all Global, all Local] into the
+        # exact original sample order. Empty Local is a real zero-row tensor.
+        local_rows, joint_rows = [], []
+        g_total = sum(g_lengths)
+        hi = gi = li = 0
+        for g, loc in zip(g_lengths, l_lengths, strict=True):
+            local_rows.extend(range(hi + g, hi + g + loc))
+            joint_rows.extend(range(gi, gi + g))
+            joint_rows.extend(range(g_total + li, g_total + li + loc))
+            hi, gi, li = hi + g + loc, gi + g, li + loc
+        local_indices = torch.tensor(local_rows, device=hidden.device, dtype=torch.long)
+        joint_indices = torch.tensor(joint_rows, device=hidden.device, dtype=torch.long)
     global_present = torch.tensor([n > 0 for n in g_lengths], device=hidden.device)
     local_present = torch.tensor([n > 0 for n in l_lengths], device=hidden.device)
     return MemoryPrefixContext(
@@ -156,6 +177,26 @@ def build_joint_memory_prefix_context(
         local_present=local_present,
         max_prefix_len=max(g + loc for g, loc in zip(g_lengths, l_lengths, strict=True)),
         global_kv=global_kv,
+        cached_local_rows=local_indices,
+        cached_joint_rows=joint_indices,
+    )
+
+
+def cached_global_local_kv(
+    context: MemoryPrefixContext,
+    local_key: torch.Tensor,
+    local_value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reassemble per-sample cached Global and newly projected Local rows.
+
+    Routing tensors are prepared with the prefix, outside decoder compile.
+    The compiled operation has no Python integer-dependent variable slices.
+    """
+    cached = context.global_kv[0]
+    rows = context.cached_joint_rows
+    return (
+        torch.cat((cached.key, local_key), dim=0).index_select(0, rows),
+        torch.cat((cached.value, local_value), dim=0).index_select(0, rows),
     )
 
 
