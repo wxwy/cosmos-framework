@@ -21,6 +21,7 @@ from cosmos_framework.checkpoint.safe_local_witness import (
 )
 from cosmos_framework.data.generator.action.utils.static_task_text import StaticTaskTextRecipe
 from cosmos_framework.inference.g2_model_hooks import G2ModelHooks
+from cosmos_framework.inference.g2_runtime_config import validate_project_runtime_config
 from cosmos_framework.model.generator.mot.g2_contracts import GlobalMemoryConfig, g2_run_recipe_identity
 
 
@@ -64,7 +65,7 @@ class NativeG2Authority:
             raise ValueError("native G2 model/config/source changed during startup")
 
     @classmethod
-    def open(cls, *, run_recipe: Path, model_path: Path, config_path: Path, metadata_sha256: str, profile="g2_r1"):
+    def open(cls, *, run_recipe: Path, model_path: Path, config_path: Path, metadata_sha256: str, profile="g2_r1", runtime_asset_manifest: Path | None = None):
         if profile not in ("g2_r1", "g2_r2"):
             raise ValueError("explicit native G2 profile required")
         global_enabled = profile == "g2_r2"
@@ -84,15 +85,17 @@ class NativeG2Authority:
         ):
             raise ValueError("native G2 requires a published SafeLocal training checkpoint iteration")
         job = step.parent.parent
-        if config_path.is_symlink() or config_path.resolve() != (job / "config.yaml").resolve():
-            raise ValueError("native G2 requires the checkpoint job's canonical config.yaml")
+        canonical_config = job / "config.yaml"
+        if config_path.is_symlink() or canonical_config.is_symlink():
+            raise ValueError("native G2 refuses symlinked training/effective config")
 
         run_recipe = Path(run_recipe)
         job_path = job / "v3_job_identity.json"
         marker_path = step / SAFE_LOCAL_COMPLETE
         metadata_path = model_path / ".metadata"
         files = {
-            path: _file_generation(path) for path in (run_recipe, job_path, marker_path, config_path, metadata_path)
+            path: _file_generation(path) for path in
+            (run_recipe, job_path, marker_path, canonical_config, config_path, metadata_path)
         }
         recipe = _record(run_recipe)
         try:
@@ -143,9 +146,22 @@ class NativeG2Authority:
             )
         ):
             raise ValueError("native G2 recipe or Raw15/State15/H16 disagrees with the formal training job")
-        config_sha = file_witness(config_path)["sha256"]
+        config_sha = file_witness(canonical_config)["sha256"]
         if config_sha != receipt.get("canonical_config_sha256", {}).get("config.yaml"):
             raise ValueError("native G2 config differs from the canonical training manifest")
+        # The model's *training* identity is always this immutable job config.
+        # An external project-owned effective runtime YAML is allowed only if
+        # it preserves every scientific field and pins exactly three
+        # deployment paths through an explicit immutable asset manifest.
+        runtime = validate_project_runtime_config(
+            canonical_config=canonical_config,
+            runtime_config=config_path,
+            asset_manifest=runtime_asset_manifest,
+            checkpoint_job=job,
+            training_profile=profile,
+            expected_tokenizer_sha256=text.tokenizer_identity,
+        )
+        files.update({path: _file_generation(path) for path in runtime["protected_files"]})
         marker = _record(marker_path)
         model_receipt = marker.get("components", {}).get("model") or {}
         expected_metadata = model_receipt.get("metadata") or {}
@@ -172,6 +188,10 @@ class NativeG2Authority:
             "checkpoint_id": _digest({"job": receipt["semantic_digest"], "publication": marker}),
             "checkpoint_metadata_sha256": metadata_sha256,
             "config_sha256": config_sha,
+            "runtime_config_sha256": runtime["runtime_config_sha256"],
+            "runtime_asset_manifest_sha256": runtime["asset_manifest_sha256"],
+            "runtime_asset_hashes": dict(runtime["asset_sha256"]),
+            "approved_deployment_fields": list(runtime["approved_deployment_fields"]),
             "state15_recipe_id": state_recipe,
             "alignment_version": alignment,
             "data_identity": data_identity,

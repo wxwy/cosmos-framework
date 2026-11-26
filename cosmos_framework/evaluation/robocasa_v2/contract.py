@@ -179,25 +179,70 @@ def build_manifest(
     for value in horizons.values():
         integer(value, 1, 100000, "horizon")
     required = {"model_digest", "config_sha256", "runtime_digest", "root_sha", "child_sha", "task_metadata"}
-    if set(experiment) not in (required, required | {"g2"}):
+    project_key = "project_model_runtime"
+    if set(experiment) not in (
+        required,
+        required | {"g2"},
+        required | {project_key},
+        required | {"g2", project_key},
+    ):
         raise ValueError("complete experiment identity required")
+    # An optional *explicit* project-owned model runtime identity does not
+    # relax any historical manifest. Existing G1/G2 manifests stay byte-exact
+    # with exactly their original field sets. New configs must bind the
+    # original training job, effective runtime YAML, and actual asset manifest
+    # independently, never replacing a scientific/architecture identity.
+    runtime_keys = {
+        "canonical_training_config_sha256",
+        "effective_runtime_config_sha256",
+        "runtime_asset_manifest_sha256",
+    }
+    project_runtime = experiment.get(project_key)
+    if project_key in experiment:
+        if (
+            type(project_runtime) is not dict
+            or set(project_runtime) != runtime_keys | {"profile"}
+            or project_runtime["profile"] not in ("g1_no_ttt", "g1_local_ttt", "g2_r1", "g2_r2")
+            or any(
+                type(project_runtime[k]) is not str or _SHA.fullmatch(project_runtime[k]) is None
+                for k in runtime_keys
+            )
+            or project_runtime["effective_runtime_config_sha256"] != experiment["config_sha256"]
+        ):
+            raise ValueError("invalid project-owned runtime model identity")
+        if project_runtime["profile"] in ("g1_no_ttt", "g1_local_ttt"):
+            if (
+                "g2" in experiment
+                or local_memory != ("off" if project_runtime["profile"] == "g1_no_ttt" else "required")
+            ):
+                raise ValueError("project-owned G1 model/Local profile mismatch")
+        elif "g2" not in experiment or local_memory != "required":
+            raise ValueError("project-owned G2 runtime requires native G2 experiment identity")
+
     g2_budget = None
     if "g2" in experiment:
         g2 = experiment["g2"]
         bound = {"run_recipe_sha256", "checkpoint_metadata_sha256", "actor_options_sha256"}
         if isinstance(g2, dict) and g2.get("profile") == "g2_r2":
             bound.add("view_recipe_id")
+        if project_runtime is not None:
+            bound |= runtime_keys
         if (
             not isinstance(g2, dict)
             or set(g2) not in (bound | {"profile"}, bound | {"profile", "cache_budget"})
             or g2["profile"] not in ("g2_r1", "g2_r2")
-            or any(not isinstance(g2[key], str) or not _SHA.fullmatch(g2[key]) for key in bound)
+            or any(type(g2[key]) is not str or _SHA.fullmatch(g2[key]) is None for key in bound)
             or local_memory != "required"
             or not isinstance(execution, dict)
             or "single_latency" in execution
             or "shared_vae" in execution
         ):
             raise ValueError("invalid G2 experiment identity")
+        if project_runtime is not None and (
+            g2["profile"] != project_runtime["profile"]
+            or any(g2[key] != project_runtime[key] for key in runtime_keys)
+        ):
+            raise ValueError("G2 project runtime identity must match canonical/effective/asset SHA bindings")
         if "cache_budget" in g2:
             g2_budget = CacheBudget.from_record(g2["cache_budget"])
     for key in ("model_digest", "config_sha256", "runtime_digest"):

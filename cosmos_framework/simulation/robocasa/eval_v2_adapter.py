@@ -64,7 +64,12 @@ class NativeEpisode:
                 type(error).__name__ == "RandomizationError" and type(error).__module__.startswith("robosuite.")
             )
             proof = {"physics_finite": False, "forward_ok": False, "sampling_error_class": pure}
-            if pure:
+            # V5 explicitly retires a failed reset and forbids environment reuse.
+            # A finite physics probe cannot reverse that lifecycle decision.
+            lifecycle_failed = bool(getattr(self.env, "_egl_reset_failed", False))
+            if lifecycle_failed:
+                proof["egl_reset_failed"] = True
+            if pure and not lifecycle_failed:
                 try:
                     sim = self.env.sim
                     proof["physics_finite"] = bool(
@@ -78,7 +83,7 @@ class NativeEpisode:
                 "initial_success": None,
                 "stage": stage,
                 "error": {"type": type(error).__name__, "message": str(error)},
-                "safe_to_retry": pure and proof["physics_finite"] and proof["forward_ok"],
+                "safe_to_retry": pure and not lifecycle_failed and proof["physics_finite"] and proof["forward_ok"],
                 "resource_proof": proof,
             }
 

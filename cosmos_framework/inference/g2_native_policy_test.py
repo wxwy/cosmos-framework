@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+import yaml
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
@@ -64,7 +65,18 @@ def training_job(tmp_path):
     }
     recipe_sha = _write(run_recipe, recipe)
     config = tmp_path / "config.yaml"
-    config.write_text("model: frozen\n")
+    config.write_text(yaml.safe_dump({
+        "model": {"config": {
+            "tokenizer": {"vae_path": "/training/original/Wan2.2_VAE.pth"},
+            "vlm_config": {
+                "model_name": "/training/original/Cosmos3-Edge-Policy-DROID",
+                "tokenizer": {"tokenizer_type": "/training/original/Cosmos3-Edge-Policy-DROID"},
+            },
+            "g2_text_enabled": True, "local_memory_enabled": True,
+            "action_chunk_size": 16, "state_dim": 15,
+        }},
+        "dataloader_train": {"use_state": True},
+    }))
     semantic = {
         "training_profile": "g2_R1",
         "g2_recipe_identity": g2_run_recipe_identity(recipe),
@@ -332,3 +344,67 @@ def test_four_rank_dtensor_model_dcp_loads_as_single_rank_full_tensor(tmp_path):
         torch.testing.assert_close(model.weight, torch.arange(24, dtype=torch.float32).view(4, 6), rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
+
+def test_native_r1_accepts_project_owned_effective_config_and_protects_real_assets(training_job, tmp_path):
+    from cosmos_framework.inference.g2_runtime_config import RUNTIME_ASSET_SCHEMA
+    job = training_job
+    project = tmp_path / "run_project"
+    folder = project / "configs/eval/model_assets"
+    folder.mkdir(parents=True)
+    generated = project / "configs/eval/.runtime/config.yaml"
+    generated.parent.mkdir(parents=True)
+    asset_root = tmp_path / "host_models"
+    model = asset_root / "Cosmos3-Edge-Policy-DROID"
+    model.mkdir(parents=True)
+    hashes = {}
+    for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors.index.json"):
+        target = model / name
+        target.write_bytes(job.tokenizer.read_bytes() if name == "tokenizer.json" else name.encode())
+        hashes[name] = file_witness(target)["sha256"]
+    vae = asset_root / "Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    vae.parent.mkdir(parents=True)
+    vae.write_bytes(b"vaemodel")
+    values = yaml.safe_load(job.config.read_text())
+    values["model"]["config"]["tokenizer"]["vae_path"] = str(vae)
+    values["model"]["config"]["vlm_config"]["model_name"] = str(model)
+    values["model"]["config"]["vlm_config"]["tokenizer"]["tokenizer_type"] = str(model)
+    generated.write_text(yaml.safe_dump(values))
+    manifest = folder / "g2_assets.json"
+    _write(manifest, {
+        "schema": RUNTIME_ASSET_SCHEMA,
+        "checkpoint_job": job.config.parent.name,
+        "training_profile": "g2_r1",
+        "canonical_config_sha256": file_witness(job.config)["sha256"],
+        "asset_relative_paths": {
+            "vlm_dir": "Cosmos3-Edge-Policy-DROID",
+            "vae_file": "Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
+        },
+        "asset_sha256": {"vae_file": file_witness(vae)["sha256"], "vlm_files": hashes},
+    })
+    authority = _open(job, config_path=generated, runtime_asset_manifest=manifest)
+    assert authority.versions["config_sha256"] == file_witness(job.config)["sha256"]
+    assert authority.versions["runtime_config_sha256"] == file_witness(generated)["sha256"]
+    assert authority.versions["runtime_config_sha256"] != authority.versions["config_sha256"]
+    assert set(authority.versions["approved_deployment_fields"]) == {
+        "model.config.tokenizer.vae_path",
+        "model.config.vlm_config.model_name",
+        "model.config.vlm_config.tokenizer.tokenizer_type",
+    }
+    authority.check_unchanged()
+    with pytest.raises(ValueError, match="project-owned asset manifest"):
+        _open(job, config_path=generated)
+    with pytest.raises(ValueError, match="config differs from the canonical training manifest"):
+        job.config.write_text("model: corrupted training source\n")
+        _open(job, config_path=generated)
+    # Restore original training bytes by reconstructing the synthetic training
+    # fixture from the effective values, changing only the approved path fields.
+    original = yaml.safe_load(generated.read_text())
+    original["model"]["config"]["tokenizer"]["vae_path"] = "/training/original/Wan2.2_VAE.pth"
+    original["model"]["config"]["vlm_config"]["model_name"] = "/training/original/Cosmos3-Edge-Policy-DROID"
+    original["model"]["config"]["vlm_config"]["tokenizer"]["tokenizer_type"] = "/training/original/Cosmos3-Edge-Policy-DROID"
+    # This reserialized YAML may have a different key order and therefore SHA,
+    # which is correctly rejected unless the authoritative receipt matches.
+    job.config.write_text(yaml.safe_dump(original))
+    vae.write_bytes(b"changed file")
+    with pytest.raises(ValueError, match="changed during startup"):
+        authority.check_unchanged()

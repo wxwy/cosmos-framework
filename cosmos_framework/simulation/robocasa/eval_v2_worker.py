@@ -21,13 +21,37 @@ def serve(channel, cfg, *, factory=None):
     # Factory is a Python CPU test boundary, never selectable via production CLI.
     from cosmos_framework.evaluation.robocasa_v2 import generated_video, media
     from cosmos_framework.simulation.robocasa import closed_loop_eval as native
-    from cosmos_framework.simulation.robocasa import render_devices
+    from cosmos_framework.simulation.robocasa import egl_lifecycle, render_devices
     from cosmos_framework.simulation.robocasa.eval_v2_adapter import NativeEpisode
     from cosmos_framework.simulation.robocasa.eval_v2_slot import SimSlot
 
     timings["imports"] = (time.perf_counter() - started) * 1000
 
     slot = None
+    lifecycle = None
+    cleanup_attempted = False
+    cleanup_response = None
+    primary_error = None
+
+    def cleanup():
+        nonlocal cleanup_attempted, cleanup_response
+        if cleanup_attempted:
+            return cleanup_response
+        # Never retry an uncertain native free, including when slot.close raises.
+        cleanup_attempted = True
+        try:
+            cleanup_response = slot.close() if slot is not None else {"closed": True, "clean": True}
+            if lifecycle is not None:
+                cleanup_response["egl_lifecycle"] = lifecycle.finish()
+            return cleanup_response
+        except BaseException as error:
+            if lifecycle is not None:
+                try:
+                    lifecycle.failure(error)
+                except BaseException:
+                    pass  # Preserve the real cleanup error and nonzero process exit.
+            raise
+
     os.set_inheritable(channel.fileno(), False)
     try:
         if factory is None:
@@ -43,6 +67,8 @@ def serve(channel, cfg, *, factory=None):
                 "adapter": Path(sys.modules[NativeEpisode.__module__].__file__),
                 "slot": Path(sys.modules[SimSlot.__module__].__file__),
                 "rendering": Path(render_devices.__file__),
+                "egl_lifecycle": Path(egl_lifecycle.__file__),
+                "egl_lifecycle_core": egl_lifecycle.CORE_PATH,
                 "media": Path(media.__file__),
                 "generated_video": Path(generated_video.__file__),
             }
@@ -111,6 +137,11 @@ def serve(channel, cfg, *, factory=None):
             ):
                 raise ValueError("missing/incorrect authoritative runtime horizons")
             timings["vendor_attestation"] = (time.perf_counter() - stage) * 1000
+        # All native G1 No-TTT/Local-TTT and G2 workers share this admission.
+        # Native vendor/device checks precede V5; no environment exists yet.
+        stage = time.perf_counter()
+        lifecycle = egl_lifecycle.start(cfg, test_factory=factory is not None)
+        timings["egl_lifecycle"] = (time.perf_counter() - stage) * 1000
         slot = SimSlot(cfg, factory=factory)
         send(
             channel,
@@ -125,6 +156,7 @@ def serve(channel, cfg, *, factory=None):
                 **({"g2_profile": g2_profile} if factory is None and g2_profile != "legacy" else {}),
                 "runtime_digest": runtime["digest"] if factory is None else "CPU_TEST_FACTORY",
                 "rendering": rendering,
+                "egl_lifecycle": lifecycle.startup_receipt,
             },
         )
         while True:
@@ -155,7 +187,7 @@ def serve(channel, cfg, *, factory=None):
                     )
                 )
             elif op == "close":
-                response.update(slot.close())
+                response.update(cleanup())
                 send(channel, response)
                 return
             else:
@@ -165,15 +197,31 @@ def serve(channel, cfg, *, factory=None):
     except EOFError:
         pass
     except BaseException as error:
+        primary_error = error
+        if lifecycle is not None:
+            try:
+                lifecycle.failure(error)
+            except BaseException:
+                pass  # A failed evidence write must not hide the original error.
         try:
             send(channel, {"kind": "FATAL", "nonce": cfg["nonce"], "error": f"{type(error).__name__}: {error}"})
         except OSError:
             pass
         raise
     finally:
-        if slot is not None:
-            slot.close()
-        channel.close()
+        try:
+            if not cleanup_attempted:
+                try:
+                    cleanup()
+                except BaseException as cleanup_error:
+                    if primary_error is None:
+                        raise
+                    # The cleanup helper records its own failure. Preserve the
+                    # initiating exception as the worker's propagated error.
+                    if hasattr(primary_error, "add_note"):
+                        primary_error.add_note(f"V5 cleanup also failed: {cleanup_error!r}")
+        finally:
+            channel.close()
 
 
 def main():
