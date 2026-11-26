@@ -26,9 +26,23 @@ _CONTROL_BYTES = 65536
 
 
 class VAEIPCError(RuntimeError):
-    def __init__(self, code, remote_type):
-        self.code, self.remote_type = code, remote_type
-        super().__init__("VAE IPC request rejected: " + code)
+    def __init__(self, code, remote_type, operation=None):
+        self.code, self.remote_type, self.operation = code, remote_type, operation
+        super().__init__("VAE IPC request rejected: " + code + f" ({remote_type}; op={operation or 'unknown'})")
+
+
+def worker_ipc_capacity(max_sessions):
+    """One foreground Owner request and one background poll per active Slot.
+
+    All listeners remain independently bounded; larger topologies reuse the
+    existing absolute-deadline reconnect/backpressure path.
+    """
+    if type(max_sessions) is not int or max_sessions < 1:
+        raise ValueError("positive Worker Session capacity required")
+    return {
+        "max_data_connections": min(32, max(4, max_sessions)),
+        "max_control_connections": min(32, max(2, 2 * max_sessions + 2)),
+    }
 
 
 def _json(value):
@@ -433,9 +447,8 @@ class _Client:
             try:
                 remaining = _remaining(deadline_ns)
             except TimeoutError as error:
-                if first_error is not None:
-                    raise error from first_error
-                raise
+                expired = TimeoutError(f"original IPC deadline exhausted (op={op})")
+                raise expired from (first_error if first_error is not None else error)
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                     connection.settimeout(remaining)
@@ -455,7 +468,7 @@ class _Client:
                     or set(reply["error"]) != {"code", "type"}
                 ):
                     raise ValueError("exact IPC error response required")
-                error = VAEIPCError(reply["error"]["code"], reply["error"]["type"])
+                error = VAEIPCError(reply["error"]["code"], reply["error"]["type"], op)
                 if first_error is not None:
                     raise error from first_error
                 raise error

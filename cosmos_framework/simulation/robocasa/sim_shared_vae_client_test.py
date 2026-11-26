@@ -454,3 +454,49 @@ def test_actual_native_env_failure_never_publishes_that_step_or_retries_action(m
     assert [row["source_step"] for row in channel.completed] == list(range(fail_at))
     assert all(frame.header["source_step"] < fail_at for frame in worker.frames)
     assert channel.ends == 1 and not client.diagnostics()["worker_alive"]
+
+
+def test_owner_completion_can_survive_loaded_host_ipc_delay_without_extending_episode(monkeypatch):
+    """A successful Sim step can take >250ms to traverse both authority hops."""
+    from cosmos_framework.inference.robocasa_vae_client import _remaining
+
+    client, worker, channel = _client(timeout=2)
+    original = channel.post_step
+    deadlines = []
+
+    def delayed(*args):
+        deadline_ns = args[-1]
+        deadlines.append(deadline_ns)
+        time.sleep(0.35)
+        _remaining(deadline_ns)
+        return original(*args)
+
+    monkeypatch.setattr(channel, "post_step", delayed)
+    client.begin()
+    try:
+        _issue(client, 0)
+        _complete(client, 0)
+        assert client._get(0).consumer_step == 1
+        assert len(channel.completed) == 1 and not worker.frames
+        assert deadlines[0] <= client.episode_deadline_ns
+    finally:
+        client.end()
+
+
+def test_rpc_deadlines_use_original_replan_and_bounded_transport_caps():
+    client, _, _ = _client(timeout=0.5)
+    client.begin()
+    try:
+        now = time.monotonic_ns()
+        # Owner may need two round trips; background Worker I/O must drain
+        # within the separate cleanup budget, even when no Replan exists yet.
+        assert now + 250_000_000 < client._rpc_deadline(owner=True) <= client.episode_deadline_ns
+        assert now + 250_000_000 < client._rpc_deadline() <= min(client.episode_deadline_ns, now + 3_100_000_000)
+        client.start_replan()
+        original = client.prediction_budget
+        bound = client._budget["deadline_ns"]
+        assert client._rpc_deadline(owner=True) == bound
+        assert client._rpc_deadline() == bound
+        assert client.prediction_budget == original
+    finally:
+        client.end()

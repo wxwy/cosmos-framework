@@ -779,3 +779,44 @@ def test_real_subprocess_boundary_skip_encodes_only_true_history_steps_one_throu
         assert child.sim.end(deadline)["quiescent"] is True
     finally:
         child.cleanup()
+
+
+@pytest.mark.parametrize("sessions", [2, 4, 16])
+def test_worker_control_lane_covers_concurrent_poll_and_owner_hops(socket_root, sessions):
+    """Exercise real Unix sockets: both control operations can overlap per slot."""
+    from concurrent.futures import ThreadPoolExecutor
+    from cosmos_framework.inference.robocasa_vae_client import worker_ipc_capacity
+
+    capacity = worker_ipc_capacity(sessions)
+    assert capacity["max_control_connections"] >= 2 * sessions
+    assert 4 <= capacity["max_data_connections"] <= 32
+    barrier = threading.Barrier(2 * sessions)
+
+    class ConcurrentWorker(_Worker):
+        def info(self):
+            barrier.wait(timeout=5)
+            return {"ok": True}
+
+    service = UnixVAEServer(
+        ConcurrentWorker(), socket_root / "parallel" / "v", b"x" * 32,
+        connection_timeout_s=8, **capacity,
+    ).start()
+    try:
+        end = _deadline(7)
+        def request(index):
+            return LocalVAEClient(service.path, f"session-{index}", "sim").info(end)
+        with ThreadPoolExecutor(max_workers=2 * sessions) as pool:
+            replies = list(pool.map(request, range(2 * sessions)))
+        assert replies == [{"ok": True}] * (2 * sessions)
+    finally:
+        assert service.close(_deadline())["quiescent"]
+
+
+def test_worker_control_and_data_capacity_remain_bounded():
+    from cosmos_framework.inference.robocasa_vae_client import worker_ipc_capacity
+
+    assert worker_ipc_capacity(1) == {"max_data_connections": 4, "max_control_connections": 4}
+    assert worker_ipc_capacity(64) == {"max_data_connections": 32, "max_control_connections": 32}
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="Session capacity"):
+            worker_ipc_capacity(invalid)
