@@ -2095,6 +2095,13 @@ class ActionModelService:
 # ---------------------------------------------------------------------------
 
 
+class _TransactionHTTPServer(ThreadingHTTPServer):
+    # Default socketserver backlog is small relative to concurrent physical
+    # Slots and their Owner callbacks. Queue connections without increasing
+    # the existing SessionActor.http_slots admission or Policy batch capacity.
+    request_queue_size = 128
+
+
 class _ActionHandler(BaseHTTPRequestHandler):
     """
     ThreadingHTTPServer handler.
@@ -2300,7 +2307,8 @@ def serve(args: ActionServerArgs) -> None:
     log.info("  - GET  /info   : Model info (run_name, checkpoint, sampling params)")
     log.info("  - POST /predict: Policy inference (image + prompt + domain_name + image_size -> action)")
 
-    httpd: ThreadingHTTPServer = ThreadingHTTPServer((args.host, int(args.port)), _ActionHandler)
+    server_type = _TransactionHTTPServer if service.transactions is not None else ThreadingHTTPServer
+    httpd: ThreadingHTTPServer = server_type((args.host, int(args.port)), _ActionHandler)
     setattr(httpd, "service", service)
     if service.transactions is None:
         httpd.serve_forever()
