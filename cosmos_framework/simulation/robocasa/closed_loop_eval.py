@@ -295,8 +295,11 @@ def run_policy(
     g2_episode_index: int | None = None,
     g2_ep_meta: dict | None = None,
     control=None,
+    on_env_step: Callable | None = None,
 ) -> tuple[bool, int, str]:
     """Run the native policy loop, optionally inside a host-owned G2 Episode."""
+    if control is not None and on_env_step is not None:
+        raise ValueError("managed control and the benchmark action callback are mutually exclusive")
     episode = PolicyEpisodeState() if control is None else control.episode
     mobile_base = USE_BASE_ACTION if control is None else True
     base_encoding = BASE_ENCODING if control is None else "raw"
@@ -571,10 +574,14 @@ def run_policy(
                 )
             with measured("sim_step", source_step=step, stratum="chunk_middle", egl_separate="unavailable"):
                 try:
-                    if control is None:
-                        obs, reward, env_done, info = env.step(env_action)
-                    else:
+                    if control is not None:
                         obs, reward, env_done, info = control.step(step, a, canonical_raw15, env_action)
+                    elif on_env_step is not None:
+                        obs, reward, env_done, info = on_env_step(
+                            step, a, canonical_raw15 if local_memory_client is not None else None, env_action
+                        )
+                    else:
+                        obs, reward, env_done, info = env.step(env_action)
                     step_completed_ns = time.monotonic_ns() if trace is not None or prepared_step is not None else None
                 except BaseException as error:
                     if prepared_step is not None:
